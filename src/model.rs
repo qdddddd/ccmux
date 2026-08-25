@@ -48,6 +48,9 @@ impl Group {
         [Group::Working, Group::Idle, Group::Completed]
     }
 
+    /// SPEC §3.1 surface. `App::cycle_group` walks `rows`' header positions
+    /// instead, because only that skips groups the current filter emptied.
+    #[allow(dead_code)]
     pub fn next(self) -> Group {
         match self {
             Group::Working => Group::Idle,
@@ -56,6 +59,8 @@ impl Group {
         }
     }
 
+    /// See `next`.
+    #[allow(dead_code)]
     pub fn prev(self) -> Group {
         match self {
             Group::Working => Group::Completed,
@@ -89,6 +94,9 @@ pub struct Session {
 
 impl Session {
     /// Identity key. Always `&self.session_id`.
+    ///
+    /// SPEC §3.1 surface; call sites reach for `session_id` directly.
+    #[allow(dead_code)]
     pub fn key(&self) -> &str {
         &self.session_id
     }
@@ -329,6 +337,7 @@ pub fn format_age(started_at_ms: i64, now_ms: i64) -> String {
 /// 3. Otherwise drop leading path components, replacing them with `…/`, until
 ///    it fits, always keeping at least the final component.
 /// 4. If the final component alone exceeds `max`, end-truncate it with `…`.
+///
 /// Returns a string of at most `max` chars. `max == 0` returns "".
 ///
 /// SPEC NOTE: §3.1 step 3 and §10.1's assertion
