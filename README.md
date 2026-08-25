@@ -64,7 +64,25 @@ ccmux sidebar --interval 2500
 |---|---|---|
 | `--session <NAME>` | `ccmux` | tmux session to create/attach. `[A-Za-z0-9_-]{1,64}` |
 | `--width <COLS>` | `34` | Pinned sidebar width, clamped to `20..=120` |
-| `--light` | off | Light gruvbox palette instead of dark |
+| `--light` | off | Light gruvbox palette, for a light terminal background |
+| `--dark` | on | Dark gruvbox palette (the default); mutually exclusive with `--light` |
+
+### Theme
+
+The palette is **not** auto-detected — `COLORFGBG` is unset under kitty and most
+modern terminals, and an OSC 11 background query could not be verified end to end
+through tmux, so ccmux does not gamble on one at startup.
+
+Pick it once. On a light terminal background:
+
+```sh
+export CCMUX_THEME=light      # in your shell rc, or
+ccmux --light                 # per invocation
+```
+
+`--light`/`--dark` beat `CCMUX_THEME`, which beats the dark default. The launcher
+resolves the choice and forwards the answer to the sidebar pane, so it holds even
+though the pane may not inherit the variable.
 | `-L`, `--socket <NAME>` | tmux default | Use `tmux -L <NAME>`, a separate tmux server |
 | `--interval <MS>` | `2500` | *(`sidebar` only)* `claude agents --json` poll interval |
 

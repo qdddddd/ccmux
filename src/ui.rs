@@ -56,8 +56,12 @@ impl Palette {
     pub fn dark() -> Self {
         Self {
             fg: Color::Rgb(0xeb, 0xdb, 0xb2),
-            gray: Color::Rgb(0x92, 0x83, 0x74),
-            dim: Color::Rgb(0x66, 0x5c, 0x54),
+            // Contrast on the gruvbox dark ground (#282828), WCAG AA needs 4.5:1
+            // for body text and 3:1 for secondary. The originals were gray 4.02:1
+            // and dim 2.26:1 — dim was unreadable, so both moved up one gruvbox
+            // step: fg4 and gray. See `palette_contrast_is_readable`.
+            gray: Color::Rgb(0xa8, 0x99, 0x84), // 5.30:1
+            dim: Color::Rgb(0x92, 0x83, 0x74),  // 4.02:1
             red: Color::Rgb(0xfb, 0x49, 0x34),
             green: Color::Rgb(0xb8, 0xbb, 0x26),
             yellow: Color::Rgb(0xfa, 0xbd, 0x2f),
@@ -71,9 +75,12 @@ impl Palette {
 
     pub fn light() -> Self {
         Self {
-            fg: Color::Rgb(0x3c, 0x37, 0x35),
-            gray: Color::Rgb(0x92, 0x83, 0x73),
-            dim: Color::Rgb(0x7c, 0x6f, 0x64),
+            fg: Color::Rgb(0x3c, 0x38, 0x36), // gruvbox fg1, 10.22:1
+            // On the gruvbox light ground (#fbf1c7) the originals were gray
+            // 3.24:1 and dim 4.29:1 — both below AA for body text, and the
+            // ladder was inverted (dim darker than gray). Now fg > gray > dim.
+            gray: Color::Rgb(0x50, 0x49, 0x45), // 7.78:1
+            dim: Color::Rgb(0x66, 0x5c, 0x54),  // 5.74:1
             red: Color::Rgb(0xcc, 0x23, 0x1c),
             green: Color::Rgb(0x98, 0x97, 0x19),
             yellow: Color::Rgb(0xd7, 0x99, 0x20),
@@ -1487,6 +1494,51 @@ mod tests {
         app.dark = false;
         assert_eq!(Palette::for_app(&app).fg, Palette::light().fg);
         assert_ne!(Palette::dark().sel_bg, Palette::light().sel_bg);
+    }
+
+
+    /// Guards the fix for "the grey in the session list is too light". Every
+    /// palette colour that carries text must clear a readable ratio against its
+    /// OWN ground, and the ladder must descend fg > gray > dim. Before this,
+    /// dark `dim` sat at 2.26:1 (unreadable) and light `gray` at 3.24:1, with
+    /// the light ladder inverted — `dim` was darker than `gray`.
+    #[test]
+    fn palette_contrast_is_readable() {
+        fn lum(c: Color) -> f64 {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("palette entries must be true-colour: {c:?}")
+            };
+            let f = |v: u8| {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        }
+        fn ratio(a: Color, b: Color) -> f64 {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+        // The grounds these palettes are actually drawn on.
+        let dark_bg = Color::Rgb(0x28, 0x28, 0x28);
+        let light_bg = Color::Rgb(0xfb, 0xf1, 0xc7);
+
+        for (name, p, bg) in [
+            ("dark", Palette::dark(), dark_bg),
+            ("light", Palette::light(), light_bg),
+        ] {
+            for (field, c) in [("fg", p.fg), ("gray", p.gray), ("dim", p.dim)] {
+                let r = ratio(c, bg);
+                assert!(r >= 4.0, "{name}.{field} is {r:.2}:1, needs >= 4.0:1");
+            }
+            assert!(
+                ratio(p.fg, bg) > ratio(p.gray, bg),
+                "{name}: fg must be more prominent than gray"
+            );
+            assert!(
+                ratio(p.gray, bg) > ratio(p.dim, bg),
+                "{name}: gray must be more prominent than dim"
+            );
+        }
     }
 
 }

@@ -45,9 +45,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 34, global = true)]
     pub width: u16,
 
-    /// Use the light palette (default: dark)
-    #[arg(long, global = true)]
+    /// Use the light palette (for a light terminal background)
+    #[arg(long, global = true, conflicts_with = "dark")]
     pub light: bool,
+
+    /// Use the dark palette (the default)
+    #[arg(long, global = true)]
+    pub dark: bool,
 
     /// tmux socket name (`tmux -L <name>`); default is tmux's own socket.
     ///
@@ -138,6 +142,25 @@ fn main() -> anyhow::Result<()> {
 /// `CCMUX_TMUX_SOCKET=` env-assignment prefix the Tmux lane proposed. Same
 /// effect, one quoting rule instead of two: the whole command stays a plain
 /// `sh_join` of quoted argv words. Env seeding still works and is untouched.
+/// Which palette to use: explicit flag, then `CCMUX_THEME=light|dark`, then dark.
+///
+/// There is deliberately NO terminal auto-detection. `COLORFGBG` is unset under
+/// kitty and most modern terminals, and while tmux does emit an OSC 11
+/// background query on client attach, a response could not be verified
+/// end-to-end headlessly — shipping it would mean shipping an unverified
+/// startup path that can hang the TUI waiting on a reply that never comes.
+/// An operator on a light terminal sets `--light` once, or exports
+/// `CCMUX_THEME=light`.
+fn resolve_dark(cli: &Cli) -> bool {
+    if cli.light {
+        return false;
+    }
+    if cli.dark {
+        return true;
+    }
+    !matches!(std::env::var("CCMUX_THEME"), Ok(v) if v.eq_ignore_ascii_case("light"))
+}
+
 fn sidebar_command(cli: &Cli, width: u16) -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("cannot resolve the ccmux executable path")?;
     let exe = exe
@@ -146,7 +169,10 @@ fn sidebar_command(cli: &Cli, width: u16) -> anyhow::Result<String> {
 
     let width = width.to_string();
     let mut parts: Vec<&str> = vec![exe, "sidebar", "--session", &cli.session, "--width", &width];
-    if cli.light {
+    // Resolve here, in the launcher, and forward the ANSWER rather than the
+    // flag: the sidebar runs in a tmux pane that may not inherit CCMUX_THEME,
+    // so re-resolving there could disagree with what the operator asked for.
+    if !resolve_dark(cli) {
         parts.push("--light");
     }
     if let Some(sock) = cli.socket.as_deref() {
@@ -286,7 +312,7 @@ fn install_panic_hook() {
 fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     let width = cli.width.clamp(WIDTH_MIN, WIDTH_MAX);
     let interval = Duration::from_millis(interval_ms.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS));
-    let mut app = app::App::new(cli.session.clone(), width, interval, !cli.light);
+    let mut app = app::App::new(cli.session.clone(), width, interval, resolve_dark(cli));
 
     install_panic_hook();
     enable_raw_mode().context("cannot enter raw mode")?;
@@ -481,4 +507,20 @@ mod tests {
             INTERVAL_MAX_MS
         );
     }
+
+    /// `--light`/`--dark` are mutually exclusive, and the launcher forwards the
+    /// RESOLVED answer to the sidebar rather than the raw flag — the pane may
+    /// not inherit `CCMUX_THEME`, so re-resolving there could disagree.
+    #[test]
+    fn theme_flags_resolve_and_forward() {
+        let light = Cli::try_parse_from(["ccmux", "--light"]).expect("parse");
+        assert!(!resolve_dark(&light));
+        let dark = Cli::try_parse_from(["ccmux", "--dark"]).expect("parse");
+        assert!(resolve_dark(&dark));
+        assert!(Cli::try_parse_from(["ccmux", "--light", "--dark"]).is_err());
+
+        assert!(sidebar_command(&light, 34).expect("cmd").contains("--light"));
+        assert!(!sidebar_command(&dark, 34).expect("cmd").contains("--light"));
+    }
+
 }
