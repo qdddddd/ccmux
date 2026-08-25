@@ -24,7 +24,13 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
     Working,
+    /// Finished on its own.
     Done,
+    /// Halted by `claude stop`. NOT a failure and NOT unknown: the conversation
+    /// is kept and `claude attach <id>` resumes it (verified). Modelled
+    /// explicitly because otherwise it lands in `Unknown` and renders as a
+    /// purple `?` under Idle — reading as broken when it is merely parked.
+    Stopped,
     Unknown(String),
 }
 
@@ -110,7 +116,8 @@ impl Session {
     pub fn group(&self) -> Group {
         match &self.state {
             Some(State::Working) => Group::Working,
-            Some(State::Done) => Group::Completed,
+            // Stopped is finished-and-not-running, like Done.
+            Some(State::Done) | Some(State::Stopped) => Group::Completed,
             None | Some(State::Unknown(_)) => match self.status {
                 Status::Busy => Group::Working,
                 _ => Group::Idle,
@@ -215,6 +222,7 @@ impl RawSession {
         let state = self.state.map(|s| match s.as_str() {
             "working" => State::Working,
             "done" => State::Done,
+            "stopped" => State::Stopped,
             _ => State::Unknown(s),
         });
 
@@ -264,13 +272,18 @@ pub fn parse_sessions(json: &str) -> Result<Vec<Session>, ParseError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
     Header { group: Group, count: usize },
+    /// A blank line separating a group from the one above it. Emitted before
+    /// every header EXCEPT the first, so the list never opens on a wasted line.
+    /// Never selectable: `App::is_session_row` excludes it exactly as it
+    /// excludes a header, so `j`/`k` and `Tab` step straight over it.
+    Spacer,
     /// Index into the `&[Session]` slice that was passed to `build_rows`.
     Session { idx: usize },
 }
 
 /// Build the flat render list: for each group in Working, Idle, Completed
 /// order, emit a `Header` (only if the group has >=1 matching session) followed
-/// by its `Session` rows.
+/// by its `Session` rows. Groups after the first are preceded by a `Spacer`.
 ///
 /// Filtering: case-insensitive substring of `filter` against
 /// `Session::filter_haystack()`. An empty `filter` matches everything.
@@ -284,7 +297,8 @@ pub fn build_rows(sessions: &[Session], filter: &str, show_completed: bool) -> V
         .filter(|&i| needle.is_empty() || sessions[i].filter_haystack().contains(&needle))
         .collect();
 
-    let mut rows = Vec::with_capacity(matching.len() + 3);
+    // 3 headers + 2 spacers in the worst case.
+    let mut rows = Vec::with_capacity(matching.len() + 5);
     for group in Group::all() {
         if group == Group::Completed && !show_completed {
             continue;
@@ -303,6 +317,9 @@ pub fn build_rows(sessions: &[Session], filter: &str, show_completed: bool) -> V
                 .cmp(&sessions[a].started_at)
                 .then_with(|| sessions[a].session_id.cmp(&sessions[b].session_id))
         });
+        if !rows.is_empty() {
+            rows.push(Row::Spacer);
+        }
         rows.push(Row::Header { group, count: in_group.len() });
         rows.extend(in_group.into_iter().map(|idx| Row::Session { idx }));
     }
@@ -653,8 +670,12 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["ccmux scaffold", "bt/reg-update", "Kernel bugs investigation"]);
-        assert_eq!(rows[4], Row::Header { group: Group::Completed, count: 1 });
-        assert_eq!(rows.len(), 6);
+        // A Spacer separates Completed from the group above it.
+        assert_eq!(rows[4], Row::Spacer);
+        assert_eq!(rows[5], Row::Header { group: Group::Completed, count: 1 });
+        assert_eq!(rows.len(), 7);
+        // The list never opens on a blank line.
+        assert_ne!(rows[0], Row::Spacer);
         // no Idle header: the group is empty
         assert!(!rows.iter().any(|r| matches!(r, Row::Header { group: Group::Idle, .. })));
     }
@@ -674,7 +695,8 @@ mod tests {
         // case-insensitive across name, cwd and short id
         assert_eq!(build_rows(&s, "KERNEL", true).len(), 2); // header + row
         assert_eq!(build_rows(&s, "kernel", true).len(), 2);
-        assert_eq!(build_rows(&s, "foundation", true).len(), 4); // 2 groups, 2 rows
+        // 2 groups, 2 rows, 1 spacer between them
+        assert_eq!(build_rows(&s, "foundation", true).len(), 5);
         assert_eq!(build_rows(&s, "674b1d29", true).len(), 2);
     }
 
@@ -812,4 +834,28 @@ mod tests {
         // interactive row has no short id, and must not panic
         assert!(!sample()[3].filter_haystack().is_empty());
     }
+
+    /// `claude agents --json` emits a THIRD state value beyond working/done:
+    /// a session halted by `claude stop` reports `state: "stopped"`. It must not
+    /// fall into `Unknown`, which renders as a purple `?` under Idle.
+    #[test]
+    fn stopped_state_is_modelled_and_groups_as_completed() {
+        let raw = r#"[{
+            "id": "a2b509dd",
+            "sessionId": "a2b509dd-0000-0000-0000-000000000000",
+            "cwd": "/home/dev",
+            "kind": "background",
+            "startedAt": 1787640000000,
+            "name": "halted probe",
+            "state": "stopped"
+        }]"#;
+        let parsed = parse_sessions(raw).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        let s = &parsed[0];
+        assert_eq!(s.state, Some(State::Stopped));
+        assert_eq!(s.group(), Group::Completed);
+        // A stopped session is still openable: `claude attach` resumes it.
+        assert!(s.is_attachable());
+    }
+
 }

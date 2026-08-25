@@ -1993,8 +1993,9 @@ mod tests {
                 idle_interactive,
             ],
         );
-        // Working(one) + Idle(three) + Completed(two) => 3 headers, 3 sessions.
-        assert_eq!(a.rows.len(), 6);
+        // Working(one) + Idle(three) + Completed(two) => 3 headers, 3 sessions,
+        // and 2 spacers (one before each group after the first).
+        assert_eq!(a.rows.len(), 8);
 
         for _ in 0..12 {
             a.on_key(press('j'));

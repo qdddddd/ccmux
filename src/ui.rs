@@ -340,6 +340,9 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     if matches!(sess.state, Some(State::Done)) {
         return ("✓", p.green);
     }
+    if matches!(sess.state, Some(State::Stopped)) {
+        return ("■", p.gray);
+    }
     let unknown_status = matches!(sess.status, Status::Unknown(_));
     let unknown_state = matches!(sess.state, Some(State::Unknown(_)));
     if unknown_status || unknown_state {
@@ -482,6 +485,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         let abs = start + i;
         match row {
             Row::Header { group, count } => lines.push(group_header_line(*group, *count, w, p)),
+            Row::Spacer => lines.push(Line::from("")),
             Row::Session { idx } => match app.sessions.get(*idx) {
                 Some(sess) => lines.push(session_line(app, sess, abs == app.selected, w, p)),
                 None => lines.push(Line::from(Span::styled(
@@ -550,6 +554,8 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     // "Completed" while the detail block says "?".
     let status = if matches!(sess.state, Some(State::Done)) {
         "done".to_string()
+    } else if matches!(sess.state, Some(State::Stopped)) {
+        "stopped".to_string()
     } else {
         match &sess.status {
             Status::Busy => "busy".to_string(),

@@ -21,7 +21,12 @@ Element shape (keys union across all observed rows):
   "sessionId": "1c45d64f-9bba-4038-8de7-d5f112c92360",  // UUID, stable
   "name": "bt/reg-update",        // live-updating; Claude renames sessions as work evolves
   "status": "busy",               // "busy" | "idle"
-  "state": "working"              // "working" | "done"; ABSENT for kind=="interactive"
+  "state": "working"              // "working" | "done" | "stopped";
+                                  // ABSENT for kind=="interactive".
+                                  // "stopped" = halted by `claude stop`; the
+                                  // conversation is kept and `claude attach`
+                                  // resumes it (verified). Do NOT treat it as
+                                  // an error state.
 }
 ```
 
