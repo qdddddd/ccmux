@@ -1,0 +1,196 @@
+# ccmux — verified environment findings
+
+Everything below was **empirically verified** on this machine (devhost, Claude Code
+2.1.241/2.1.245, tmux 3.4) before design started. Do not contradict it. Do not
+re-test destructively against live sessions.
+
+## 1. Data source: `claude agents --json`
+
+Returns a JSON array. Add `--all` to include completed sessions. Cost: **0.21s** per
+invocation (measured 3x) — polling every 2–3s is fine.
+
+Element shape (keys union across all observed rows):
+
+```json
+{
+  "pid": 2877291,                 // UNSTABLE - changes across attach/detach. NEVER key on this.
+  "id": "1c45d64f",               // 8-hex short id. ABSENT for kind=="interactive".
+  "cwd": "/home/dev/projects/...",
+  "kind": "background",           // "background" | "interactive"
+  "startedAt": 1787626475282,     // epoch ms
+  "sessionId": "1c45d64f-9bba-4038-8de7-d5f112c92360",  // UUID, stable
+  "name": "bt/reg-update",        // live-updating; Claude renames sessions as work evolves
+  "status": "busy",               // "busy" | "idle"
+  "state": "working"              // "working" | "done"; ABSENT for kind=="interactive"
+}
+```
+
+Grouping used by the stock fleet view (mirror it): **Working** (state=working),
+**Idle**, **Completed** (state=done).
+
+## 2. Session verbs (hidden subcommands — NOT in `claude --help` Commands list)
+
+| Command | Behavior | Verified |
+|---|---|---|
+| `claude attach <id>` | Opens the background session in the current terminal, full TUI fidelity, transcript restored. `←` returns to agent view, `Ctrl+Z` drops back to shell. Session keeps running either way. | YES |
+| `claude logs <id>` | Prints recent terminal output as a **raw ANSI/PTY dump** (includes alt-screen setup, cursor moves). Needs VT stripping before it can be shown in a sidebar preview. | YES |
+| `claude stop <id>` | Stops the session; conversation kept; resume later with `claude attach <id>`. | YES |
+| `claude kill <id>` | Alias of `stop`. | YES |
+
+`claude resume` and `claude list` are **NOT** subcommands — they fall through to the
+generic help (verified against a `bogus123` control). Only `attach`, `logs`, `stop`,
+`kill` are real.
+
+## 3. Safety properties (both verified — these make the design safe)
+
+- **Killing the tmux pane does NOT kill the agent — FOR BACKGROUND SESSIONS ONLY.**
+  Attached session in a pane, `tmux kill-pane`, agent survived with the same pid still
+  `state=working`. This was tested against a **daemon-owned `kind: background`**
+  session, and the result holds *because* the agent process is owned by the daemon and
+  is not a child of the pane.
+  **It does NOT generalize to `kind: interactive` sessions.** Per §4, an interactive
+  session's process IS a descendant of its pane's pid, so `kill-pane` WOULD kill it and
+  destroy in-flight work. Treat "close pane" as safe for background sessions and as
+  DESTRUCTIVE — refuse it, or require confirmation — for interactive ones.
+- **Double-attach is allowed.** The same session attached in two panes simultaneously
+  works; both render live, no error, agent unaffected. So "jump to existing pane" is a
+  UX preference, not a correctness requirement.
+- `Ctrl+Z` in an attached pane detaches cleanly, returns the pane to the shell, and
+  leaves the session running.
+
+## 4. Session -> tmux pane resolution
+
+- **Background sessions are daemon-owned.** Their pid is NOT a descendant of any tmux
+  pane pid. They can only be opened via `claude attach <id>`.
+- **Interactive sessions ARE descendants of their pane's pid.** Resolve by walking
+  `/proc/<pid>/stat` ppid chain up and matching against `#{pane_pid}` from
+  `tmux list-panes -a`. Verified: interactive session pid 2936154 resolved to pane
+  `agents:3.1`.
+- **A pane's cmdline does NOT identify which session it displays.** Panes opened from
+  the stock fleet view all show cmdline `claude agents` (one process that switches
+  surfaces). Therefore **ccmux must own its own `pane_id -> session` map**, keyed on
+  tmux `#{pane_id}` (the `%N` form — stable across window/pane renumbering).
+  Reconcile the map each tick against `tmux list-panes -a -F '#{pane_id}'`.
+
+## 5. Hard constraint: documented surfaces only
+
+Build ONLY on: `claude agents --json`, `claude attach|logs|stop`, `claude --bg`,
+`claude --resume`, `claude --session-id`, `claude --fork-session`, and tmux commands.
+
+Do NOT build on these internal, version-churning surfaces:
+`~/.claude/daemon/roster.json`, `ptySock`, `rendezvousSock`, `~/.claude/daemon/dispatch/`,
+`~/.claude/daemon/attach-journal/`, `CLAUDE_CODE_MESSAGING_SOCKET`.
+Three CLI versions already sit side by side (2.1.241, 2.1.243, 2.1.245); internals move.
+
+## 6. Host environment
+
+- tmux 3.4. Prefix `C-q`. `mode-keys vi`. `mouse on`. `base-index 1`, `pane-base-index 1`.
+  `renumber-windows on`. vim-tmux-navigator style `bind-key h/j/k/l` pane nav already configured.
+- Rust 1.94, edition 2024. Match the user's existing TUI stack (`~/projects/slurm-tui`):
+  `ratatui 0.29`, `crossterm 0.28`, `clap 4 (derive)`, `chrono 0.4`, `dirs 6`.
+- Terminal is 274x76 in the reference window.
+
+## 7. Reference UI (the target — user pointed at their tmux window `agents:2`)
+
+Layout string: `274x76,0,0{103x76,0,0, 102x76,104,0, 67x76,207,0[67x37, 67x38]}`
+
+```
++----------+---------------------+---------------------+
+| SESSIONS | prediction analy... | bt/reg-update       |
+| (sidebar)|  live claude TUI    |  live claude TUI    |
+| Working  |                     |                     |
+|  run-a  |  * Thundering... 3m |  * Bunning... 16m   |
+|  gnome   |  >                  |  >                  |
+| Idle     |                     |                     |
+|  alpha   |                     |                     |
++----------+---------------------+---------------------+
+```
+
+The user wants the session explorer **on the LEFT** (their hand-built reference has it
+on the right; left is the explicit request), persistently visible, with the live
+Claude TUIs filling the remaining space as splits.
+
+---
+
+## 8. TESTING POLICY — MANDATORY. READ TWICE. THIS SECTION OVERRIDES YOUR PROMPT.
+
+### What already went wrong — the incident this rule exists to prevent
+
+During spec authoring an agent ran this, intending to work in its own throwaway session:
+
+```sh
+SIDEBAR=$(tmux list-panes -t "$S:cc" -F '#{pane_id}' | head -1)   # <-- FAILED, printed nothing
+P1=$(tmux split-window -h -t "$SIDEBAR" ...)                       # <-- -t "" 
+```
+
+The target lookup failed, so `SIDEBAR` was **empty**. `tmux split-window -t ""` does
+not error — **tmux silently defaults an empty or omitted `-t` to the caller's current
+pane**, and the agent's shell inherits `$TMUX` from the user's live session. Three
+stray panes were created inside `agents:2`, the user's live window running three real
+Claude sessions. The agent's attempt to clean them up was blocked, and **the user had
+to delete them by hand.** They then instructed: do not manipulate my panes.
+
+Naming the right target is NOT sufficient protection. The bug was an empty variable,
+not a wrong name. So the rule below is structural, not a matter of care.
+
+### RULE T1 — all testing runs on a SEPARATE TMUX SERVER
+
+Every mutating tmux command you run for testing MUST carry `-L ccmux`:
+
+```sh
+tmux -L ccmux new-session -d -s test -x 200 -y 50
+tmux -L ccmux split-window -h -t test:1
+tmux -L ccmux capture-pane -p -t test:1.1
+tmux -L ccmux kill-server          # your cleanup: safe, wipes only YOUR server
+```
+
+`-L ccmux` selects a different socket. That server contains **only panes you created**.
+An empty `-t`, a typo'd name, a failed lookup, `kill-server` — none of it can reach the
+user's panes, because the user's panes live on a different socket entirely. This makes
+the incident above impossible by construction rather than by discipline.
+
+**Never run a mutating bare `tmux ...` command** (no `-L`) — that is the user's server.
+Forbidden on the default socket: `split-window`, `kill-pane`, `kill-window`,
+`kill-session`, `kill-server`, `resize-pane`, `respawn-pane`, `send-keys`,
+`select-pane`, `select-window`, `select-layout`, `switch-client`, `set-option`,
+`new-window`, `new-session`.
+
+### RULE T2 — read-only on the default socket is allowed
+
+ccmux must resolve real sessions on the user's server, so these remain permitted
+WITHOUT `-L`: `list-panes`, `list-windows`, `list-sessions`, `display-message -p`,
+`capture-pane -p`, `show-options -v`, `has-session`. Nothing else.
+
+### RULE T3 — never inherit the ambient session
+
+At the top of every test script, unset the inherited context so a missing `-t` cannot
+resolve to one of the user's panes:
+
+```sh
+env -u TMUX -u TMUX_PANE tmux -L ccmux <command>
+```
+
+### RULE T4 — always capture and verify the target before mutating
+
+Never pass an unvalidated variable to `-t`. Guard every one:
+
+```sh
+[ -n "$TARGET" ] || { echo "FATAL: empty target, refusing"; exit 1; }
+```
+
+### The user's scratch tab
+
+`agents:ccmux-test` exists on the user's server (created for visibility). You may NOT
+split, kill, or send-keys into it — it is on the default socket. It is there so the
+*user* can watch your test server by running `tmux -L ccmux attach` in it themselves.
+
+### Off limits, absolutely
+
+Session `agents` (windows 1, 2, 3, and the `ccmux-test` tab) and session `dev`, on the
+default socket. Never steal focus: no `select-window`, `switch-client`, or
+`attach-session` against the attached client.
+
+### Testing ccmux's own launcher
+
+`ccmux` must accept a socket override (`-L/--socket`, default none) precisely so it can
+be tested here. Test it as `ccmux --socket ccmux ...`, never against the default socket.
