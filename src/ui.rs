@@ -81,13 +81,20 @@ impl Palette {
             // ladder was inverted (dim darker than gray). Now fg > gray > dim.
             gray: Color::Rgb(0x50, 0x49, 0x45), // 7.78:1
             dim: Color::Rgb(0x66, 0x5c, 0x54),  // 5.74:1
-            red: Color::Rgb(0xcc, 0x23, 0x1c),
-            green: Color::Rgb(0x98, 0x97, 0x19),
-            yellow: Color::Rgb(0xd7, 0x99, 0x20),
-            blue: Color::Rgb(0x45, 0x85, 0x88),
-            purple: Color::Rgb(0xb1, 0x62, 0x86),
-            aqua: Color::Rgb(0x68, 0x9d, 0x69),
-            orange: Color::Rgb(0xd6, 0x5d, 0x0e),
+            // The accents used to be gruvbox's DARK-theme hues, which fail
+            // the house 4.0:1 floor on the light ground (#fbf1c7) — the theme
+            // that ships by default: green 2.73, aqua 2.80, orange 3.41,
+            // blue 3.73, purple 3.73, yellow 2.19. Six of seven were below the
+            // floor, which is why every status glyph read as decoration. These
+            // are gruvbox's light-theme "faded" hues; each clears 5.0:1 on the
+            // ground and 4.1:1 on `sel_bg`. See `light_accents_are_readable`.
+            red: Color::Rgb(0x9d, 0x00, 0x06),    // 7.60:1
+            green: Color::Rgb(0x6d, 0x68, 0x0d),  // 5.09:1
+            yellow: Color::Rgb(0x8d, 0x5c, 0x10), // 5.04:1
+            blue: Color::Rgb(0x07, 0x66, 0x78),   // 5.82:1
+            purple: Color::Rgb(0x8f, 0x3f, 0x71), // 5.94:1
+            aqua: Color::Rgb(0x3d, 0x71, 0x51),   // 5.03:1
+            orange: Color::Rgb(0xaf, 0x3a, 0x03), // 5.40:1
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
         }
     }
@@ -179,7 +186,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_list(f, r, app, &p);
     }
     if let Some(r) = s.sep {
-        let rule: String = "─".repeat(r.width as usize);
+        // Inset by the margin so the sidebar's ONE rule terminates on the same
+        // two columns every other line does.
+        let w = r.width as usize;
+        let m = margin(w);
+        let rule = format!("{0}{1}{0}", " ".repeat(m), "─".repeat(w.saturating_sub(2 * m)));
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(rule, Style::default().fg(p.dim)))),
             r,
@@ -293,6 +304,57 @@ fn push(spans: &mut Vec<Span<'static>>, used: &mut usize, text: &str, style: Sty
 
 // ── List (§6.3, §6.4) ───────────────────────────────────────────────────────
 
+// ── The one system rule (§0) ────────────────────────────────────────────────
+//
+// **Column W-1 is the rail; column W is the margin.** Every line that carries
+// one small fact puts that fact's LAST CELL on column W-1 and leaves column W
+// blank: the session age, the group count, the detail block's status word, the
+// header's poll dot, the footer's help key. Nothing else touches those two
+// columns. `draw_header` already right-aligns its poll dot at `w - 2`, i.e.
+// column W-1, which is why it needs no edit.
+
+/// The fixed left gutter: cap/marker(1) + pane badge(1) + glyph(1) + space(1).
+/// It is FOUR columns at every width that has a gutter and never varies, which
+/// is what puts the status glyph on column 3 and the name on column 5 of every
+/// row alike. See `session_line` for why the badge cannot be allowed to grow.
+const GUTTER: usize = 4;
+/// One blank column between the name field and the rail.
+const GAP: usize = 1;
+/// Nominal rail field. A wider age (`9999d`) spills into that row's own name.
+const NUM_W: usize = 3;
+/// The gutter and the right margin exist at or above this width.
+const MARGIN_MIN: usize = 20;
+/// The age rail exists at or above this width.
+const RAIL_MIN: usize = 28;
+/// Detail labels are right-flushed into columns 1..4.
+const LABEL_W: usize = 4;
+/// `LABEL_W + 2` — detail values start on column 7.
+const VALUE_COL: usize = LABEL_W + 2;
+/// An 8-column short id plus an ellipsis. Below this the detail block's status
+/// word yields the rail: the glyph on the row already states the status, while
+/// the short id is stated nowhere else and is what you type into `claude`.
+const MIN_BODY: usize = 9;
+
+/// 1 when the layout has a right margin (and therefore a gutter), else 0.
+fn margin(w: usize) -> usize {
+    if w >= MARGIN_MIN { 1 } else { 0 }
+}
+
+/// Group -> name weight. The ladder `palette_contrast_is_readable` already
+/// guarantees (fg > gray > dim), spent on the one axis the list is sorted by,
+/// so the weight still names the group when its header has scrolled off the
+/// top. Interactive sessions keep their hue: a kind is not a tier.
+fn name_tier(sess: &Session, p: &Palette) -> Color {
+    if sess.kind == Kind::Interactive {
+        return p.purple;
+    }
+    match sess.group() {
+        Group::Working => p.fg,
+        Group::Idle => p.gray,
+        Group::Completed => p.dim,
+    }
+}
+
 fn group_accent(g: Group, p: &Palette) -> Color {
     match g {
         Group::Working => p.orange,
@@ -301,27 +363,48 @@ fn group_accent(g: Group, p: &Palette) -> Color {
     }
 }
 
+/// `── Title` from column 5, the count's last cell on the rail (column W-1).
+///
+/// The full-width `────────` rule this used to draw is gone: `Row::Spacer`
+/// already separates one group from the next, and the rule was doing that job a
+/// second time, louder. The accent survives as a two-cell chip in columns 2..3,
+/// so per-group hue identity is kept while the readable text moves to `p.gray`
+/// (7.78:1 light) — painting the title itself in the accent put the Working
+/// header at 3.41:1 on the default ground. The title starts on column 5, the
+/// same column the session names start on, so it reads as a column heading.
 fn group_header_line(g: Group, count: usize, w: usize, p: &Palette) -> Line<'static> {
-    let title = format!("{} ({})", g.title(), count);
-    if w < 20 {
+    if w == 0 {
+        return Line::from(Vec::<Span>::new());
+    }
+    let cs = count.to_string();
+    if w < MARGIN_MIN {
+        // The narrow rung, with the parens dropped: the count is a bare number
+        // at every width, and `Completed 12` fits 12 columns where
+        // `Completed (12)` did not.
         return Line::from(Span::styled(
-            truncate_end(&title, w),
+            truncate_end(&format!("{} {}", g.title(), count), w),
             Style::default().fg(group_accent(g, p)),
         ));
     }
-    let lead = "── ";
-    let title_w = display_width(&title);
-    let tail = w.saturating_sub(display_width(lead) + title_w + 1);
+    let m = margin(w);
+    let cw = display_width(&cs);
+    // " " + "──" + " " => the label starts on column 5.
+    const USED0: usize = 4;
+    let title = truncate_end(g.title(), w.saturating_sub(USED0 + m + cw + 1));
+    let used = USED0 + display_width(&title);
+    let stop = w.saturating_sub(m + cw); // the count's first column - 1
     let mut spans = vec![
-        Span::styled(lead.to_string(), Style::default().fg(p.dim)),
-        Span::styled(title, Style::default().fg(group_accent(g, p))),
+        Span::styled(" ".to_string(), Style::default()),
+        Span::styled("──".to_string(), Style::default().fg(group_accent(g, p))),
+        Span::styled(" ".to_string(), Style::default()),
+        Span::styled(title, Style::default().fg(p.gray).add_modifier(Modifier::BOLD)),
     ];
-    if tail > 0 {
-        spans.push(Span::styled(
-            format!(" {}", "─".repeat(tail)),
-            Style::default().fg(p.dim),
-        ));
+    if stop > used {
+        spans.push(Span::styled(" ".repeat(stop - used), Style::default()));
+        spans.push(Span::styled(cs, Style::default().fg(p.dim)));
     }
+    let used: usize = spans.iter().map(|sp| display_width(&sp.content)).sum();
+    pad_to(&mut spans, used, w, Style::default());
     Line::from(spans)
 }
 
@@ -358,21 +441,36 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     }
 }
 
+/// One list row, on the one grid: gutter(4) | name | gap(1) | rail(3) | margin(1).
+///
+/// The pane badge lives in gutter column 2, immediately right of the marker,
+/// so the name field's right edge no longer moves when a session is opened and
+/// every line in the sidebar carries exactly ONE token on the rail. ONE
+/// documented spill, the policy the age field already used: an age of `100d`
+/// or more takes one to three columns from that row's own name. It never
+/// shifts a neighbouring row, because the age's last cell is anchored to
+/// column W-1 and grows leftward into a field only that row owns.
+///
+/// The badge takes no such licence. It is one column wide always — the gutter
+/// is the row's LEFT edge, so a badge that grew would push this row's glyph
+/// and name right while its neighbours stayed put, and the eye reads a broken
+/// left edge as broken far more readily than a short name.
 fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette) -> Line<'static> {
     if w == 0 {
         return Line::from(Vec::<Span>::new());
     }
     let (glyph, glyph_color) = status_glyph(sess, p);
-    let name_color = if sess.kind == Kind::Interactive { p.purple } else { p.fg };
     let base = if selected {
         Style::default().bg(p.sel_bg)
     } else {
         Style::default()
     };
+    // Selection forces `p.fg`: `p.dim` is 3.16:1 on the dark `sel_bg`, so a
+    // selected Completed row would otherwise be dim-on-band.
     let name_style = if selected {
-        base.fg(p.fg)
+        base.fg(p.fg).add_modifier(Modifier::BOLD)
     } else {
-        base.fg(name_color)
+        base.fg(name_tier(sess, p))
     };
 
     // W < 6: glyph only.
@@ -382,8 +480,8 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         return Line::from(spans);
     }
 
-    // 6..=19: glyph + space + name (truncated to W-2), no open marker.
-    if w < 20 {
+    // 6..=19: glyph + space + name (truncated to W-2), no gutter, no margin.
+    if w < MARGIN_MIN {
         let mut spans = vec![
             Span::styled(glyph.to_string(), base.fg(glyph_color)),
             Span::styled(" ".to_string(), base),
@@ -395,71 +493,74 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         return Line::from(spans);
     }
 
+    let m = margin(w);
     let open = is_open(app, &sess.session_id);
-    let show_age = w >= 28;
-    let show_badge = w >= 34;
-
-    // Right-hand segment, laid out left to right: [badge] [age].
-    let badge = if show_badge && open {
-        pane_index_for(app, &sess.session_id).map(|i| i.to_string())
+    let idx = if open {
+        pane_index_for(app, &sess.session_id)
     } else {
         None
     };
-    let age = if show_age {
+    // Ten or more panes in one tmux window is exactly where a per-window index
+    // stops being something you can eyeball anyway, so the badge degrades to
+    // `+` — "open, somewhere further down this window" — rather than taking a
+    // second column and shifting the row off the grid. The exact index is
+    // still stated where it is actionable: the `opened <name> in pane N` flash.
+    let badge = idx.map(|i| char::from_digit(i, 10).unwrap_or('+'));
+    let (age, field) = if w >= RAIL_MIN {
         let a = format_age(sess.started_at, app.now_ms);
-        // The field is 4 columns wide; a degenerate "9999d" is allowed to spill
-        // into the name budget rather than be truncated into nonsense.
-        let width = display_width(&a).max(4);
-        Some((a, width))
+        let f = display_width(&a).max(NUM_W);
+        (Some(a), f)
     } else {
-        None
+        (None, 0)
     };
-
-    let badge_w = badge.as_ref().map(|b| 1 + display_width(b)).unwrap_or(0);
-    let age_w = age.as_ref().map(|(_, wd)| 1 + wd).unwrap_or(0);
-
-    // marker(1) + glyph(1) + space(1) = 3 fixed left columns.
-    let name_budget = w.saturating_sub(3 + badge_w + age_w);
+    let right = if age.is_some() { GAP + field } else { 0 };
+    let name_budget = w.saturating_sub(GUTTER + right + m);
     let name = truncate_end(&sess.name, name_budget);
 
     let mut spans: Vec<Span> = Vec::with_capacity(8);
-    let marker = if open { "▌" } else { " " };
-    let marker_style = if open { base.fg(p.aqua) } else { base };
-    spans.push(Span::styled(marker.to_string(), marker_style));
+    // Column 1. Open wins over selected: the aqua `▌` is the one thing that
+    // says "this session is on screen", and the selected row is already carried
+    // by the band, the BOLD name and the promoted age. `▏` (U+258F) is a
+    // hairline where `▌` (U+258C) is a thick bar — different weight, not just
+    // a different colour.
+    if open {
+        spans.push(Span::styled("▌".to_string(), base.fg(p.aqua)));
+    } else if selected {
+        spans.push(Span::styled("▏".to_string(), base.fg(p.fg)));
+    } else {
+        spans.push(Span::styled(" ".to_string(), base));
+    }
+    // Column 2. An open row whose index does not resolve (no pane inventory
+    // yet) keeps the marker and leaves this column blank.
+    match badge {
+        Some(b) => spans.push(Span::styled(b.to_string(), base.fg(p.fg))),
+        None => spans.push(Span::styled(" ".to_string(), base)),
+    }
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
     spans.push(Span::styled(" ".to_string(), base));
-    let mut used = 3 + display_width(&name);
+    let mut used = GUTTER + display_width(&name);
     spans.push(Span::styled(name, name_style));
 
-    // Pad so the right-hand segment lands flush with the row's right edge.
-    let right_w = badge_w + age_w;
-    let right_start = w.saturating_sub(right_w);
-    if used < right_start {
-        let pad = right_start - used;
-        spans.push(Span::styled(" ".repeat(pad), base));
-        used += pad;
+    // Pad out to the rail's lead so the age lands flush on column W-1.
+    let rail_start = w.saturating_sub(m + right);
+    if used < rail_start {
+        spans.push(Span::styled(" ".repeat(rail_start - used), base));
+        used = rail_start;
     }
-    if let Some(b) = badge {
-        spans.push(Span::styled(" ".to_string(), base));
-        let bw = display_width(&b);
-        spans.push(Span::styled(
-            b,
-            if selected { base.fg(p.fg) } else { base.fg(p.aqua) },
-        ));
-        used += 1 + bw;
-    }
-    if let Some((a, width)) = age {
-        let lead = width.saturating_sub(display_width(&a));
-        spans.push(Span::styled(" ".repeat(1 + lead), base));
+    if let Some(a) = age {
         let aw = display_width(&a);
+        let lead = (GAP + field).saturating_sub(aw);
+        spans.push(Span::styled(" ".repeat(lead), base));
+        // `p.dim` on `sel_bg` is 3.16:1 in the dark theme, so the selected
+        // row's age promotes one rung. This is a contrast fix, not a flourish.
         spans.push(Span::styled(
             a,
-            if selected { base.fg(p.fg) } else { base.fg(p.dim) },
+            base.fg(if selected { p.gray } else { p.dim }),
         ));
-        used += 1 + lead + aw;
+        used += lead + aw;
     }
 
-    // The selection bar must be solid across the full width (§6.4).
+    // The selection bar must be solid across the full width, margin included.
     pad_to(&mut spans, used, w, base);
     Line::from(spans)
 }
@@ -520,28 +621,23 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 
 // ── Detail block (§6.5) ─────────────────────────────────────────────────────
 
+/// Labels right-flushed into columns 1..4, values from column 7, the status
+/// word right-flushed to the rail.
+///
+/// The `· pane N` suffix is gone: it cost 9 columns to restate what the row's
+/// own `▌`+digit gutter says at every width the gutter exists, and reclaiming
+/// them is what stops the id line truncating at the default 34 columns.
 fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let w = area.width as usize;
     if w == 0 || area.height == 0 {
         return;
     }
-    let label = Style::default().fg(p.gray);
 
     let Some(sess) = selected_session(app) else {
         // Empty selection renders three blank lines.
         f.render_widget(Paragraph::new(vec![Line::from(""), Line::from(""), Line::from("")]), area);
         return;
     };
-
-    // " name    " — the value column starts at char 9.
-    const VALUE_COL: usize = 9;
-    let budget = w.saturating_sub(VALUE_COL);
-
-    let name_color = if sess.kind == Kind::Interactive { p.purple } else { p.fg };
-    let l1 = Line::from(vec![
-        Span::styled(" name    ", label),
-        Span::styled(truncate_end(&sess.name, budget), Style::default().fg(name_color)),
-    ]);
 
     let short = sess.id.clone().unwrap_or_else(|| "—".to_string());
     let kind = match sess.kind {
@@ -564,29 +660,77 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
             Status::Unknown(s) => s.clone(),
         }
     };
-    let pane_suffix = pane_index_for(app, &sess.session_id).map(|i| format!(" · pane {i}"));
-    let body = format!("{short}  {kind}  {status}");
-    let suffix_w = pane_suffix.as_ref().map(|s| display_width(s)).unwrap_or(0);
-    let mut l2_spans = vec![
-        Span::styled(" id      ", label),
-        Span::styled(
-            truncate_end(&body, budget.saturating_sub(suffix_w)),
-            Style::default().fg(p.fg),
-        ),
-    ];
-    if let Some(suffix) = pane_suffix
-        && budget > suffix_w
-    {
-        l2_spans.push(Span::styled(suffix, Style::default().fg(p.aqua)));
+
+    // Below 10 columns the label rail would leave nothing for a value, so the
+    // labels drop and the three bare values render at column 1.
+    if w < 10 {
+        let lines = vec![
+            Line::from(Span::styled(
+                truncate_end(&sess.name, w),
+                Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                truncate_end(&short, w),
+                Style::default().fg(p.gray),
+            )),
+            Line::from(Span::styled(
+                shorten_cwd(&sess.cwd, app.home.as_deref(), w),
+                Style::default().fg(p.gray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), area);
+        return;
     }
 
-    let cwd = shorten_cwd(&sess.cwd, app.home.as_deref(), budget);
-    let l3 = Line::from(vec![
-        Span::styled(" cwd     ", label),
-        Span::styled(cwd, Style::default().fg(p.fg)),
+    let m = margin(w);
+    let budget = w.saturating_sub(VALUE_COL + m);
+    let label = |t: &str| {
+        Span::styled(
+            format!("{t:>LABEL_W$}  "),
+            Style::default().fg(p.dim),
+        )
+    };
+
+    let l1 = Line::from(vec![
+        label("name"),
+        Span::styled(
+            truncate_end(&sess.name, budget),
+            Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
+        ),
     ]);
 
-    f.render_widget(Paragraph::new(vec![l1, Line::from(l2_spans), l3]), area);
+    // The status word is redundant with the row's own status glyph; the 8-hex
+    // short id is stated nowhere else in the UI. So when the two cannot both
+    // fit, the status yields and the id survives.
+    let body = format!("{short} {kind}");
+    let st = truncate_end(&status, 8);
+    let sw = display_width(&st);
+    let mut l2 = vec![label("id")];
+    if budget >= sw + 1 + MIN_BODY {
+        let left = truncate_end(&body, budget - sw - 1);
+        let used = VALUE_COL + display_width(&left);
+        l2.push(Span::styled(left, Style::default().fg(p.gray)));
+        let stop = w.saturating_sub(m + sw);
+        if stop > used {
+            l2.push(Span::styled(" ".repeat(stop - used), Style::default()));
+        }
+        l2.push(Span::styled(st, Style::default().fg(p.gray)));
+    } else {
+        l2.push(Span::styled(
+            truncate_end(&body, budget),
+            Style::default().fg(p.gray),
+        ));
+    }
+
+    let l3 = Line::from(vec![
+        label("cwd"),
+        Span::styled(
+            shorten_cwd(&sess.cwd, app.home.as_deref(), budget),
+            Style::default().fg(p.gray),
+        ),
+    ]);
+
+    f.render_widget(Paragraph::new(vec![l1, Line::from(l2), l3]), area);
 }
 
 // ── Footer (§6.8) ───────────────────────────────────────────────────────────
@@ -616,7 +760,21 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
     Some((text, color))
 }
 
-const HINT: &str = "j/k move  ⏎ open  o/s split  x close  S stop  n new  ? help";
+/// Whole key/label pairs, greedily filled from column 1. A pair is never split,
+/// which is what stops the footer clipping mid-word to `x cl…`. `j/k move` is
+/// deliberately absent — it is the one hint a TUI user never needs told, and
+/// dropping it is what makes three whole pairs fit at the default 34 columns.
+const HINTS: &[(&str, &str)] = &[
+    ("⏎", "open"),
+    ("o/s", "split"),
+    ("x", "close"),
+    ("S", "stop"),
+    ("n", "new"),
+    ("L", "logs"),
+    ("/", "filter"),
+];
+/// Pinned to the rail at every width that can hold it.
+const HELP_HINT: &str = "? help";
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let w = area.width as usize;
@@ -668,14 +826,49 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         return;
     }
 
-    // 4. The hint line, truncated from the right.
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_end(HINT, w),
-            Style::default().fg(p.dim),
-        ))),
-        area,
-    );
+    // 4. The hint line: whole pairs from column 1, `? help` pinned to the rail.
+    let hw = display_width(HELP_HINT);
+    if w < hw + 2 {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_end(HELP_HINT, w),
+                Style::default().fg(p.dim),
+            ))),
+            area,
+        );
+        return;
+    }
+    let m = margin(w);
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    // The pairs only start appearing once the layout has a gutter and a margin
+    // at all; below that the pinned help key is the whole footer.
+    if w >= MARGIN_MIN {
+        let budget = w - m - hw - 1; // the rail, plus at least one blank column
+        for (key, text) in HINTS {
+            let pair = display_width(key) + 1 + display_width(text);
+            let want = if used == 0 { pair } else { used + 2 + pair };
+            if want > budget {
+                break;
+            }
+            if used > 0 {
+                spans.push(Span::styled("  ".to_string(), Style::default()));
+            }
+            spans.push(Span::styled((*key).to_string(), Style::default().fg(p.gray)));
+            spans.push(Span::styled(format!(" {text}"), Style::default().fg(p.dim)));
+            used = want;
+        }
+    }
+    spans.push(Span::styled(
+        " ".repeat(w.saturating_sub(m + hw + used)),
+        Style::default(),
+    ));
+    spans.push(Span::styled("?".to_string(), Style::default().fg(p.gray)));
+    spans.push(Span::styled(" help".to_string(), Style::default().fg(p.dim)));
+    if m > 0 {
+        spans.push(Span::styled(" ".repeat(m), Style::default()));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ── Overlays (§6.7) ─────────────────────────────────────────────────────────
@@ -1502,6 +1695,487 @@ mod tests {
         assert_ne!(Palette::dark().sel_bg, Palette::light().sel_bg);
     }
 
+
+    // ── The one grid (§0): column W-1 is the rail, column W is the margin ───
+
+    /// Sum of a built line's span widths — what `draw_list` actually asks for,
+    /// before ratatui pads or clips it to the buffer. A `TestBackend` buffer is
+    /// always exactly W wide, so a buffer-based check of this invariant would
+    /// be vacuous; this is the only place it can be tested.
+    fn line_w(l: &Line<'static>) -> usize {
+        l.spans.iter().map(|s| display_width(&s.content)).sum()
+    }
+
+    fn line_cols(l: &Line<'static>) -> Vec<char> {
+        l.spans
+            .iter()
+            .flat_map(|s| s.content.chars())
+            .collect()
+    }
+
+    /// THE invariant the whole layout rests on: one `Row` is one `Line`, and
+    /// that line is exactly W display columns — otherwise the selection band
+    /// has a hole in it and the rail stops being a rail. Swept over hostile
+    /// names (empty, CJK, 80 columns), hostile ages (`0s` .. `9999d`), pane
+    /// pane indices that clamp the badge to `+` (12, 999) and both palettes.
+    #[test]
+    fn every_session_line_is_exactly_the_sidebar_width() {
+        let long = "x".repeat(80);
+        let names: Vec<&str> = vec![
+            "",
+            "alpha/opt",
+            "Neovim-style TUI with split sessions",
+            "回归模型数据清洗与因子测试流水线重构任务",
+            // Wide symbols below U+1F300 and a variation-selector pair: both
+            // used to be charged one column and drawn in two.
+            "emoji ✅ name test",
+            "build ⚠\u{fe0f} failing",
+            long.as_str(),
+        ];
+        // now_ms is 5_000_000: "0s", "4m", "7h", "15d" and a "9999d" spill.
+        let ages: &[i64] = &[5_000_000, 4_760_000, 4_975_000, -1_290_000_000, i64::MIN / 4];
+        let idxs: &[Option<u32>] = &[None, Some(0), Some(3), Some(12), Some(999)];
+
+        for &idx in idxs {
+            let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+            let sid = app.sessions[0].session_id.clone();
+            app.map.panes.insert(
+                "%7".into(),
+                PaneEntry {
+                    session_id: sid,
+                    short_id: "00000001".into(),
+                    name: "n".into(),
+                    opened_at: 0,
+                },
+            );
+            if let Some(i) = idx {
+                app.panes = vec![PaneInfo {
+                    id: PaneId::parse("%7").expect("pane id"),
+                    pid: 0,
+                    index: i,
+                    left: 0,
+                    top: 0,
+                    width: 60,
+                    height: 24,
+                    active: false,
+                    session_name: "ccmux".into(),
+                    window_index: 1,
+                }];
+            }
+            for name in &names {
+                app.sessions[0].name = (*name).to_string();
+                for &age in ages {
+                    app.sessions[0].started_at = age;
+                    for selected in [false, true] {
+                        for w in 0..=120usize {
+                            for pal in [Palette::light(), Palette::dark()] {
+                                let l = session_line(&app, &app.sessions[0], selected, w, &pal);
+                                assert_eq!(
+                                    line_w(&l),
+                                    w,
+                                    "w={w} idx={idx:?} sel={selected} age={age} name={name:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_group_header_line_fits_and_fills_its_width() {
+        let p = Palette::light();
+        for g in Group::all() {
+            for count in [0usize, 2, 12, 999, 1_000_000] {
+                for w in 0..=120usize {
+                    let l = group_header_line(g, count, w, &p);
+                    let got = line_w(&l);
+                    assert!(got <= w, "{g:?} count={count} w={w} overflowed to {got}");
+                    if w >= MARGIN_MIN {
+                        assert_eq!(got, w, "{g:?} count={count} w={w}");
+                    }
+                }
+            }
+        }
+        // Below the gutter threshold the parens are gone, which is what lets
+        // `Completed 12` fit 12 columns where `Completed (12)` did not.
+        let l = group_header_line(Group::Completed, 12, 12, &p);
+        assert_eq!(line_cols(&l).iter().collect::<String>(), "Completed 12");
+    }
+
+    /// The age, the group count and the footer's help key all terminate on the
+    /// same column, and column W is always blank.
+    #[test]
+    fn one_rail_carries_the_age_the_count_and_the_help_key() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.sessions[0].name = "Neovim-style TUI with split sessions".into();
+        app.sessions[0].started_at = app.now_ms - 4 * 60_000; // "4m"
+        let p = Palette::light();
+
+        for w in [28usize, 34, 44, 80] {
+            let cols = line_cols(&session_line(&app, &app.sessions[0], false, w, &p));
+            assert_eq!(cols[w - 1], ' ', "column W must be the margin at w={w}");
+            assert_eq!(
+                cols[w - 3..w - 1].iter().collect::<String>(),
+                "4m",
+                "the age must end on column W-1 at w={w}"
+            );
+        }
+        for w in [20usize, 28, 34, 44] {
+            let cols = line_cols(&group_header_line(Group::Completed, 12, w, &p));
+            assert_eq!(cols[w - 1], ' ', "column W must be the margin at w={w}");
+            assert_eq!(cols[w - 3..w - 1].iter().collect::<String>(), "12", "w={w}");
+            // The title starts on column 5, aligned with the names below it.
+            assert_eq!(cols[0..4].iter().collect::<String>(), " ── ", "w={w}");
+        }
+    }
+
+    /// The badge lives in gutter column 2 now, so it survives at 28 columns —
+    /// strictly more widths than the old right-hand badge, which needed 34 —
+    /// and the name field's right edge no longer moves when a session opens.
+    #[test]
+    fn the_pane_badge_sits_in_the_gutter_from_twenty_columns_up() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.sessions[0].name = "alpha/opt".into();
+        let sid = app.sessions[0].session_id.clone();
+        let closed_25 = line_cols(&session_line(&app, &app.sessions[0], false, 34, &Palette::light()));
+
+        app.map.panes.insert(
+            "%7".into(),
+            PaneEntry {
+                session_id: sid,
+                short_id: "00000001".into(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+        app.panes = vec![PaneInfo {
+            id: PaneId::parse("%7").expect("pane id"),
+            pid: 0,
+            index: 2,
+            left: 0,
+            top: 0,
+            width: 60,
+            height: 24,
+            active: false,
+            session_name: "ccmux".into(),
+            window_index: 1,
+        }];
+
+        for w in [20usize, 28, 34, 44] {
+            let cols = line_cols(&session_line(&app, &app.sessions[0], false, w, &Palette::light()));
+            assert_eq!(
+                cols[0..4].iter().collect::<String>(),
+                "▌2● ",
+                "marker, badge, glyph, space at w={w}"
+            );
+        }
+
+        // Opening the session must not move the name column's right edge.
+        app.sessions[0].name = "a name that is far too long for this sidebar".into();
+        let open_34 = line_cols(&session_line(&app, &app.sessions[0], false, 34, &Palette::light()));
+        app.map.panes.clear();
+        app.panes.clear();
+        let closed_34 = line_cols(&session_line(&app, &app.sessions[0], false, 34, &Palette::light()));
+        assert_eq!(
+            open_34[4..29].iter().collect::<String>(),
+            closed_34[4..29].iter().collect::<String>(),
+            "the name field moved when the session opened"
+        );
+        assert_eq!(closed_25[0], ' ', "a closed row leaves column 1 blank");
+    }
+
+    /// Column 1 is the marker's, not the selection's: an open row keeps its
+    /// aqua `▌` even while selected, because the band, the BOLD name and the
+    /// promoted age already carry the selection.
+    #[test]
+    fn the_selection_cap_yields_column_one_to_an_open_marker() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        let p = Palette::light();
+        let cols = line_cols(&session_line(&app, &app.sessions[0], true, 34, &p));
+        assert_eq!(cols[0], '▏', "a selected closed row caps column 1");
+
+        let sid = app.sessions[0].session_id.clone();
+        app.map.panes.insert(
+            "%7".into(),
+            PaneEntry {
+                session_id: sid,
+                short_id: "00000001".into(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+        let l = session_line(&app, &app.sessions[0], true, 34, &p);
+        assert_eq!(line_cols(&l)[0], '▌', "the open marker outranks the cap");
+        // `p.dim` is 3.16:1 on the dark band, so a selected row never paints it.
+        let dark = Palette::dark();
+        let l = session_line(&app, &app.sessions[0], true, 34, &dark);
+        assert!(
+            l.spans.iter().all(|s| s.style.fg != Some(dark.dim)),
+            "a selected row must not paint p.dim on sel_bg"
+        );
+    }
+
+    /// A pane index of ten or more must NOT widen the badge. It used to render
+    /// as `12`, which pushed that row's status glyph from column 3 to column 4
+    /// and its name from column 5 to column 6 while every neighbouring row kept
+    /// 3 and 5 — the row still measured W, so nothing overflowed, but the one
+    /// grid the redesign rests on was broken on the left edge, where it is most
+    /// visible. Ten panes in one window is reachable: ccmux opens every session
+    /// as a split of the same window.
+    #[test]
+    fn a_two_digit_pane_index_never_widens_the_gutter() {
+        let p = Palette::light();
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.sessions[0].name = "Kernel bugs investigation".into();
+        let sid = app.sessions[0].session_id.clone();
+        app.map.panes.insert(
+            "%7".into(),
+            PaneEntry {
+                session_id: sid,
+                short_id: "00000001".into(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+        fn pane(app: &mut App, index: u32) {
+            app.panes = vec![PaneInfo {
+                id: PaneId::parse("%7").expect("pane id"),
+                pid: 0,
+                index,
+                left: 0,
+                top: 0,
+                width: 60,
+                height: 24,
+                active: false,
+                session_name: "ccmux".into(),
+                window_index: 1,
+            }];
+        }
+
+        for w in [20usize, 24, 28, 34, 44] {
+            pane(&mut app, 3);
+            let single = line_cols(&session_line(&app, &app.sessions[0], false, w, &p));
+            for index in [10u32, 12, 99, 999] {
+                pane(&mut app, index);
+                let cols = line_cols(&session_line(&app, &app.sessions[0], false, w, &p));
+                assert_eq!(cols[0], '▌', "w={w} index={index}: the marker holds column 1");
+                assert_eq!(cols[1], '+', "w={w} index={index}: the badge clamps to one column");
+                assert_eq!(cols[2], '●', "w={w} index={index}: the glyph stays on column 3");
+                assert_eq!(cols[3], ' ', "w={w} index={index}");
+                // Byte-for-byte the same row as a single-digit index, badge aside.
+                assert_eq!(
+                    cols[2..].iter().collect::<String>(),
+                    single[2..].iter().collect::<String>(),
+                    "w={w} index={index}: the gutter moved the rest of the row"
+                );
+                assert_eq!(line_w(&session_line(&app, &app.sessions[0], false, w, &p)), w);
+            }
+        }
+    }
+
+    /// The width oracle itself, measured against the terminal rather than
+    /// against itself. `every_session_line_is_exactly_the_sidebar_width` sums a
+    /// row with `display_width`, so it cannot catch `display_width` being wrong
+    /// — and it was: the Wide symbol blocks below U+1F300 were charged one
+    /// column and drawn in two, so a name holding `✅` ran its row to W+1 and
+    /// pushed the age onto the margin column. This test measures with numbers
+    /// tmux 3.4 reported for these exact chars (`printf` + `#{cursor_x}`).
+    #[test]
+    fn an_emoji_name_still_ends_the_row_on_the_rail() {
+        /// NOT `display_width` — that is the thing under test.
+        fn tmux_cols(s: &str) -> usize {
+            let mut n = 0;
+            let mut it = s.chars().peekable();
+            while let Some(c) = it.next() {
+                let vs16 = it.peek() == Some(&'\u{fe0f}');
+                n += match c {
+                    '\u{fe0f}' | '\u{fe0e}' => 0,
+                    '✅' | '⭐' | '⌚' | '❌' | '⏳' | '❓' | '🀄' => 2,
+                    c if ('\u{4e00}'..='\u{9fff}').contains(&c) => 2,
+                    _ if vs16 => 2,
+                    _ => 1,
+                };
+            }
+            n
+        }
+        assert_eq!(tmux_cols("emoji ✅ name"), 13, "the test's own oracle");
+
+        let p = Palette::light();
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Idle, None)]);
+        app.sessions[0].started_at = app.now_ms - 3 * 3_600_000; // "3h"
+        for name in [
+            "emoji ✅ name test",
+            "⭐⭐⭐",
+            "build ⚠\u{fe0f} failing",
+            "❌ ⏳ ❓ 🀄 一二三",
+            "✅",
+        ] {
+            app.sessions[0].name = name.to_string();
+            for w in 6..=60usize {
+                for selected in [false, true] {
+                    let l = session_line(&app, &app.sessions[0], selected, w, &p);
+                    let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                    assert_eq!(
+                        tmux_cols(&text),
+                        w,
+                        "the terminal draws {text:?} in {} columns, not {w}",
+                        tmux_cols(&text)
+                    );
+                    if w >= RAIL_MIN {
+                        // Column W is the margin, and the age's last cell is on W-1.
+                        assert!(text.ends_with("3h "), "the age left the rail: {text:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_name_weight_ladder_is_keyed_to_the_group() {
+        let p = Palette::light();
+        let working = sess(1, Kind::Background, Status::Busy, Some(State::Working));
+        let idle = sess(2, Kind::Background, Status::Idle, None);
+        let done = sess(3, Kind::Background, Status::Unknown(String::new()), Some(State::Done));
+        let interactive = sess(4, Kind::Interactive, Status::Idle, None);
+        assert_eq!(name_tier(&working, &p), p.fg);
+        assert_eq!(name_tier(&idle, &p), p.gray);
+        assert_eq!(name_tier(&done, &p), p.dim);
+        assert_eq!(name_tier(&interactive, &p), p.purple, "kind is a hue, not a tier");
+    }
+
+    /// The id line's two facts, and which one loses. The status word is
+    /// redundant with the row's own glyph; the 8-hex short id is stated nowhere
+    /// else, so below `MIN_BODY` the status yields and the id survives. HEAD
+    /// truncated the status away at the default 34 columns.
+    #[test]
+    fn the_detail_id_line_keeps_the_status_word_on_the_rail() {
+        let mut app = app_with(vec![sess(
+            1,
+            Kind::Background,
+            Status::Unknown(String::new()),
+            Some(State::Stopped),
+        )]);
+        app.selected = 1;
+
+        let id = rows_at(&app, 34, 24)
+            .into_iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .expect("id line");
+        assert!(id.contains("00000001 background"), "{id:?}");
+        let cols: Vec<char> = id.chars().collect();
+        assert_eq!(cols[33], ' ', "column W must be the margin: {id:?}");
+        assert_eq!(
+            cols[26..33].iter().collect::<String>(),
+            "stopped",
+            "the status word must end on column W-1: {id:?}"
+        );
+
+        let id = rows_at(&app, 20, 24)
+            .into_iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .expect("id line");
+        assert!(id.contains("00000001"), "the short id must survive: {id:?}");
+        assert!(!id.contains("stopped"), "the status word must yield: {id:?}");
+
+        // The `· pane N` suffix is gone; the gutter states the pane index.
+        let all = rows_at(&app, 34, 24).join(" ");
+        assert!(!all.contains("pane"), "the detail pane suffix is gone: {all:?}");
+    }
+
+    /// A pair is never split. HEAD clipped mid-word to `x cl…` at the default
+    /// width; every fill below ends on a whole word with `? help` on the rail.
+    #[test]
+    fn the_footer_fills_whole_pairs_and_pins_the_help_key() {
+        let app = app_with(many(3));
+        for (w, want) in [
+            (44u16, "⏎ open  o/s split  x close  S stop"),
+            (34, "⏎ open  o/s split  x close"),
+            (28, "⏎ open  o/s split"),
+            (20, "⏎ open"),
+        ] {
+            let f = rows_at(&app, w, 24)[23].clone();
+            assert!(f.starts_with(want), "w={w}: {f:?}");
+            assert_eq!(f[want.len()..].trim(), "? help", "w={w}: {f:?}");
+            let cols: Vec<char> = f.chars().collect();
+            let w = w as usize;
+            assert_eq!(cols[w - 1], ' ', "column W must be the margin: {f:?}");
+            assert_eq!(cols[w - 7..w - 1].iter().collect::<String>(), "? help", "{f:?}");
+        }
+        // Below the gutter threshold only the pinned key renders.
+        for w in [19u16, 12, 8] {
+            let f = rows_at(&app, w, 24)[23].clone();
+            assert_eq!(f.trim(), "? help", "w={w}: {f:?}");
+        }
+        for (w, want) in [(6u16, "? help"), (3, "? …"), (1, "…")] {
+            let f = rows_at(&app, w, 24)[23].clone();
+            assert_eq!(f.trim_end(), want, "w={w}: {f:?}");
+        }
+    }
+
+    /// The accents carry facts — the status glyph, the open marker, the message
+    /// level — and on the LIGHT ground, which ships by default, six of the seven
+    /// used to fail the same 4.0:1 floor `palette_contrast_is_readable` enforces
+    /// for the greys: green 2.73, aqua 2.80, orange 3.41, blue 3.73, purple
+    /// 3.73, yellow 2.19. The whole colour channel barely functioned in the
+    /// theme most users see. This guards the fix.
+    ///
+    /// The second half guards the selection band: every colour a SELECTED row
+    /// can paint must clear the floor against `sel_bg` too. `p.dim` (3.16:1 on
+    /// the dark band) and `p.red` (3.37:1) do not — which is exactly why
+    /// `session_line` promotes the selected row's age dim -> gray and forces the
+    /// selected name to `p.fg`, and why red never appears on a list row.
+    #[test]
+    fn light_accents_are_readable_and_the_band_is_safe() {
+        fn lum(c: Color) -> f64 {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("palette entries must be true-colour: {c:?}")
+            };
+            let f = |v: u8| {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        }
+        fn ratio(a: Color, b: Color) -> f64 {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+        let dark_bg = Color::Rgb(0x28, 0x28, 0x28);
+        let light_bg = Color::Rgb(0xfb, 0xf1, 0xc7);
+
+        for (name, p, bg) in [
+            ("dark", Palette::dark(), dark_bg),
+            ("light", Palette::light(), light_bg),
+        ] {
+            for (field, c) in [
+                ("red", p.red),
+                ("green", p.green),
+                ("yellow", p.yellow),
+                ("blue", p.blue),
+                ("purple", p.purple),
+                ("aqua", p.aqua),
+                ("orange", p.orange),
+            ] {
+                let r = ratio(c, bg);
+                assert!(r >= 4.0, "{name}.{field} is {r:.2}:1 on the ground, needs >= 4.0:1");
+            }
+            // Everything `session_line` can paint on a selected row.
+            for (field, c) in [
+                ("fg", p.fg),
+                ("gray", p.gray),
+                ("aqua", p.aqua),
+                ("green", p.green),
+                ("blue", p.blue),
+                ("purple", p.purple),
+                ("orange", p.orange),
+            ] {
+                let r = ratio(c, p.sel_bg);
+                assert!(r >= 4.0, "{name}.{field} is {r:.2}:1 on sel_bg, needs >= 4.0:1");
+            }
+        }
+    }
 
     /// Guards the fix for "the grey in the session list is too light". Every
     /// palette colour that carries text must clear a readable ratio against its

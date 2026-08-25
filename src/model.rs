@@ -403,8 +403,11 @@ pub fn shorten_cwd(cwd: &str, home: Option<&str>, max: usize) -> String {
 /// resulting overflow cosmetic. It is not — a CJK session name overflows the
 /// pane and ratatui clips the age and pane-badge segments off the row entirely.
 /// A local table is used rather than the `unicode-width` crate §6.6 excluded;
-/// it is deliberately coarse, and being wrong by one column for an exotic
-/// script only reproduces the old cosmetic overflow.
+/// it is deliberately coarse, but only ever in the safe direction — charging a
+/// column too many shortens a name, charging one too few overflows the row.
+///
+/// Per-char only: the U+FE0F widening rule needs the NEXT char, so
+/// `display_width` / `truncate_end` are the oracle, not this.
 pub fn char_width(c: char) -> usize {
     let u = c as u32;
     // Controls and format/combining characters occupy no cell.
@@ -414,6 +417,7 @@ pub fn char_width(c: char) -> usize {
     if matches!(u,
         0x0300..=0x036f      // combining diacritics
         | 0x200b..=0x200f    // zero width space/joiners, bidi marks
+        | 0x20d0..=0x20ff    // combining marks FOR SYMBOLS (keycap enclosure)
         | 0xfe00..=0xfe0f    // variation selectors
         | 0xfeff
     ) {
@@ -440,13 +444,69 @@ pub fn char_width(c: char) -> usize {
     ) {
         return 2;
     }
+    // The Wide symbol islands scattered BELOW the emoji planes. Omitting them
+    // was the one direction of error this table cannot afford: a name holding
+    // `✅` was charged one column and drawn in two, so the row ran to W+1 and
+    // pushed the age onto the margin. Every range here was measured against
+    // tmux 3.4 with `printf` + `#{cursor_x}`; see the test of the same name.
+    if matches!(u,
+        0x231a..=0x231b      // ⌚⌛
+        | 0x2329..=0x232a    // 〈〉
+        | 0x23e9..=0x23ec | 0x23f0 | 0x23f3
+        | 0x25fd..=0x25fe
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653    // zodiac
+        | 0x267f | 0x2693 | 0x26a1
+        | 0x26aa..=0x26ab
+        | 0x26bd..=0x26be
+        | 0x26c4..=0x26c5
+        | 0x26ce | 0x26d4 | 0x26ea
+        | 0x26f2..=0x26f3
+        | 0x26f5 | 0x26fa | 0x26fd
+        | 0x2705
+        | 0x270a..=0x270b
+        | 0x2728 | 0x274c | 0x274e
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27b0 | 0x27bf
+        | 0x2b1b..=0x2b1c
+        | 0x2b50 | 0x2b55
+        | 0x1f004 | 0x1f0cf | 0x1f18e
+        | 0x1f191..=0x1f19a
+        | 0x1f200..=0x1f2ff  // enclosed CJK/ideographic supplement
+        | 0x1f7e0..=0x1f7eb  // colour circles and squares
+        | 0x1fa70..=0x1faff  // symbols and pictographs extended-A
+    ) {
+        return 2;
+    }
     1
+}
+
+/// Each char of `s` paired with the columns it occupies, applying the one
+/// SEQUENCE rule a per-char table cannot see: a char immediately followed by
+/// U+FE0F (VARIATION SELECTOR-16, "draw the preceding char as emoji") is drawn
+/// two cells wide whatever its own width — tmux 3.4 widens `⚠️` (U+26A0 U+FE0F)
+/// to two columns while `⚠` alone stays at one. U+FE0E (the TEXT selector) does
+/// not widen, and neither selector occupies a cell of its own.
+///
+/// This is the single walk behind BOTH `display_width` and `truncate_end`, so
+/// the two can never disagree about where a string ends. `truncate_end` stops
+/// at the first char that does not fit, and the selector is zero-width, so a
+/// base/selector pair is never split across the cut.
+fn char_widths(s: &str) -> impl Iterator<Item = (char, usize)> + '_ {
+    let mut it = s.chars().peekable();
+    std::iter::from_fn(move || {
+        let c = it.next()?;
+        let w = if it.peek() == Some(&'\u{fe0f}') { 2 } else { char_width(c) };
+        Some((c, w))
+    })
 }
 
 /// Terminal columns `s` occupies. The single source of truth for every row
 /// budget in `ui.rs`.
 pub fn display_width(s: &str) -> usize {
-    s.chars().map(char_width).sum()
+    char_widths(s).map(|(_, w)| w).sum()
 }
 
 /// End-truncate to `max` COLUMNS, appending '…' when truncation occurred.
@@ -466,8 +526,7 @@ pub fn truncate_end(s: &str, max: usize) -> String {
     let budget = max - 1;
     let mut out = String::new();
     let mut used = 0usize;
-    for c in s.chars() {
-        let w = char_width(c);
+    for (c, w) in char_widths(s) {
         if used + w > budget {
             break;
         }
@@ -821,6 +880,100 @@ mod tests {
         assert_eq!(display_width("e\u{301}llo"), 4);
         assert_eq!(display_width("🙂"), 2);
         assert_eq!(display_width("ｆｕｌｌ"), 8);
+    }
+
+    /// Every number here was MEASURED, not derived from this table: each char
+    /// was written to a tmux 3.4 pane with `printf` and the resulting
+    /// `#{cursor_x}` recorded. That matters because `display_width` is the
+    /// oracle every row budget in `ui.rs` is checked against, so a test that
+    /// asked `display_width` what the width should be would agree with itself
+    /// on exactly the inputs that break the grid.
+    ///
+    /// The Wide symbol islands below U+1F300 were the gap: `✅` was charged one
+    /// column and drawn in two, so a session name holding one ran its row to
+    /// W+1 and pushed the age off the rail onto the margin column.
+    #[test]
+    fn wide_symbols_below_the_emoji_planes_are_two_columns() {
+        for (s, want) in [
+            ("✅", 2usize), // U+2705
+            ("⭐", 2),      // U+2B50
+            ("⌚", 2),      // U+231A
+            ("❌", 2),      // U+274C
+            ("⏳", 2),      // U+23F3
+            ("❓", 2),      // U+2753
+            ("❗", 2),      // U+2757
+            ("⚡", 2),      // U+26A1
+            ("⛔", 2),      // U+26D4
+            ("⬛", 2),      // U+2B1B
+            ("⭕", 2),      // U+2B55
+            ("〈", 2),      // U+2329
+            ("🀄", 2),      // U+1F004
+            ("🈁", 2),      // U+1F201
+            ("🟠", 2),      // U+1F7E0
+            ("🩰", 2),      // U+1FA70
+            // Narrow neighbours in the same blocks, which must NOT be charged
+            // two — over-charging shortens a name for no reason.
+            ("⚠", 1),      // U+26A0
+            ("❤", 1),      // U+2764
+            ("✔", 1),      // U+2714
+            ("⬆", 1),      // U+2B06
+            ("✓", 1),      // U+2713, the Completed glyph
+            ("●", 1),      // U+25CF
+            ("▌", 1),      // U+258C, the open marker
+            ("▏", 1),      // U+258F, the selection cap
+            ("─", 1),      // U+2500
+            ("emoji ✅ name", 13),
+        ] {
+            assert_eq!(display_width(s), want, "{s:?}");
+        }
+    }
+
+    /// U+FE0F asks for the emoji rendering of the char BEFORE it, and tmux 3.4
+    /// answers by drawing that char two columns wide whatever its own width —
+    /// `⚠️` is two cells where `⚠` is one. A per-char table cannot see this, so
+    /// `display_width` and `truncate_end` share one sequence-aware walk. U+FE0E
+    /// (the text selector) does not widen; both selectors are themselves
+    /// zero-width, as is the keycap enclosure U+20E3. All measured in tmux 3.4.
+    #[test]
+    fn the_emoji_variation_selector_widens_the_char_before_it() {
+        assert_eq!(display_width("\u{26a0}"), 1, "bare ⚠");
+        assert_eq!(display_width("\u{26a0}\u{fe0f}"), 2, "⚠ + VS16");
+        assert_eq!(display_width("\u{2764}\u{fe0f}"), 2, "❤ + VS16");
+        assert_eq!(display_width("9\u{fe0f}"), 2, "any base widens, even ASCII");
+        assert_eq!(display_width("9\u{fe0f}\u{20e3}"), 2, "the keycap encloses");
+        assert_eq!(display_width("\u{2705}\u{fe0f}"), 2, "already wide, stays 2");
+        assert_eq!(display_width("\u{26a0}\u{fe0e}"), 1, "VS15 does not widen");
+        assert_eq!(display_width("\u{2705}\u{fe0e}"), 2, "VS15 does not narrow");
+    }
+
+    /// The cut never lands between a char and its variation selector: the pair
+    /// is charged as one two-column unit and `truncate_end` stops at the first
+    /// unit that does not fit, so a truncated name can never render wider than
+    /// `display_width` says it is.
+    #[test]
+    fn truncate_end_never_splits_a_variation_selector_pair() {
+        let s = "ab\u{26a0}\u{fe0f}cd";
+        assert_eq!(display_width(s), 6);
+        // budget 4 => "ab" + "…"; the pair needs 2 and only 1 column is left.
+        let out = truncate_end(s, 4);
+        assert_eq!(out, "ab…");
+        assert!(!out.contains('\u{fe0f}'), "a bare selector survived: {out:?}");
+        // budget 5 => the pair fits whole.
+        assert_eq!(truncate_end(s, 5), "ab\u{26a0}\u{fe0f}…");
+        for max in 0..10usize {
+            let out = truncate_end(s, max);
+            assert!(display_width(&out) <= max, "{out:?} exceeds {max}");
+            assert_eq!(
+                out.contains('\u{26a0}'),
+                out.contains('\u{fe0f}'),
+                "base and selector must survive together: {out:?}"
+            );
+        }
+        // The same for a Wide symbol that used to be charged one column.
+        for max in 0..14usize {
+            let out = truncate_end("emoji ✅ name", max);
+            assert!(display_width(&out) <= max, "{out:?} exceeds {max}");
+        }
     }
 
     #[test]
