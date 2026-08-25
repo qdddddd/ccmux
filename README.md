@@ -43,7 +43,7 @@ Requires `tmux` and the `claude` CLI on `PATH`. Rust 1.94+ (edition 2024).
 ```sh
 ccmux                       # create-or-attach the `ccmux` tmux session
 ccmux --session work        # a differently named session
-ccmux --width 40 --light    # wider sidebar, light palette
+ccmux --width 40 --dark     # wider sidebar, dark palette
 ```
 
 Running `ccmux` again from another terminal attaches the **same** session — no
@@ -64,8 +64,8 @@ ccmux sidebar --interval 2500
 |---|---|---|
 | `--session <NAME>` | `ccmux` | tmux session to create/attach. `[A-Za-z0-9_-]{1,64}` |
 | `--width <COLS>` | `34` | Pinned sidebar width, clamped to `20..=120` |
-| `--light` | off | Light gruvbox palette, for a light terminal background |
-| `--dark` | on | Dark gruvbox palette (the default); mutually exclusive with `--light` |
+| `--light` | on | Light gruvbox palette (the default) |
+| `--dark` | off | Dark gruvbox palette, for a dark terminal background; mutually exclusive with `--light` |
 
 ### Theme
 
@@ -73,14 +73,19 @@ The palette is **not** auto-detected — `COLORFGBG` is unset under kitty and mo
 modern terminals, and an OSC 11 background query could not be verified end to end
 through tmux, so ccmux does not gamble on one at startup.
 
-Pick it once. On a light terminal background:
+It defaults to **light**, because a wrong guess is not symmetric: dark `fg`
+(`#ebdbb2`) on a light ground is 1.21:1 and simply cannot be read, while light
+`fg` (`#3c3836`) on a dark ground still resolves. The safer default is the one
+whose failure mode is merely ugly.
+
+On a dark terminal background:
 
 ```sh
-export CCMUX_THEME=light      # in your shell rc, or
-ccmux --light                 # per invocation
+export CCMUX_THEME=dark       # in your shell rc, or
+ccmux --dark                  # per invocation
 ```
 
-`--light`/`--dark` beat `CCMUX_THEME`, which beats the dark default. The launcher
+`--light`/`--dark` beat `CCMUX_THEME`, which beats the light default. The launcher
 resolves the choice and forwards the answer to the sidebar pane, so it holds even
 though the pane may not inherit the variable.
 | `-L`, `--socket <NAME>` | tmux default | Use `tmux -L <NAME>`, a separate tmux server |
