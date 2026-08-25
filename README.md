@@ -98,7 +98,7 @@ environment-variable equivalent of `--socket`.
 | `r` | Force refresh | no |
 | `?` | Help overlay | no |
 | `q` | Quit the sidebar. Sessions and panes are untouched | no |
-| `Esc` | Clear the filter if one is active, otherwise quit | no |
+| `Esc` | Clear the filter if one is active; otherwise does nothing | no |
 
 `o` and `s` are named for vim's geometry, not tmux's: `o` = vertical =
 side-by-side, `s` = horizontal = stacked.
@@ -108,12 +108,14 @@ side-by-side, `s` = horizontal = stacked.
 | Mode | Keys |
 |---|---|
 | Filter (`/`) | Type to filter live · `Ctrl-w` word · `Ctrl-u` clear · `Enter` commit · `Esc` clear and leave |
-| Confirm (`S`) | `y` stop · `n`, `Esc`, `Enter`, anything else cancels |
+| Confirm (`S`) | `y` stop · `n`, `Esc`, `Enter`, anything else cancels. A `y` within 250 ms of the modal opening is treated as type-ahead and cancels |
 | Prompt (`n`, `c`) | `Tab` next field · `Enter` run · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
 | Help (`?`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · any other key closes |
 | Logs (`L`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · `q`/`Esc` close |
 
-`Ctrl-c` quits from any mode.
+`Ctrl-c` quits from any mode; `q` quits from Normal. Pasted text is never
+executed as keys — it is discarded in Normal and taken as literal text in the
+filter and the prompts.
 
 ## Reading the list
 

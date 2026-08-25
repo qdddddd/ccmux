@@ -349,14 +349,79 @@ fn tmux_inherit(args: &[&str]) -> Result<(), TmuxError> {
 
 // ── Environment probes ──────────────────────────────────────────────────────
 
-/// `std::env::var("TMUX").is_ok()`
+/// `std::env::var("TMUX").is_ok()` — true inside ANY tmux server, which is not
+/// the same question as `inside_target_server()`. Only use this where the
+/// server identity does not matter.
+///
+/// SPEC §3.2 surface, kept for the API; every call site now needs the stronger
+/// `inside_target_server()`.
+#[allow(dead_code)]
 pub fn inside_tmux() -> bool {
     std::env::var("TMUX").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// `tmux display-message -p '#{session_name}'`; None when not inside tmux.
+/// The socket path of the server this process is a pane of: `$TMUX`'s first
+/// comma-separated field. None when `$TMUX` is unset or malformed.
+fn env_socket_path() -> Option<String> {
+    let tmux = std::env::var("TMUX").ok().filter(|v| !v.is_empty())?;
+    let path = tmux.split(',').next().unwrap_or("");
+    if path.is_empty() { None } else { Some(path.to_string()) }
+}
+
+/// The socket path of the server every `tmux()` call in this process talks to,
+/// asked of the server itself. `#{socket_path}` is a SERVER property, so even a
+/// mis-resolved target yields the right answer (verified on tmux 3.4).
+fn target_socket_path() -> Option<String> {
+    let out = tmux(&["display-message", "-p", "#{socket_path}"]).ok()?;
+    let out = out.trim();
+    if out.is_empty() { None } else { Some(out.to_string()) }
+}
+
+/// True when `$TMUX` names the SAME tmux server every `tmux()` call is routed
+/// to.
+///
+/// SPEC AMENDMENT (§9.6, §1.2 step 6): the code previously asked
+/// `inside_tmux()`, which only says "some tmux". With `-L <socket>` the caller
+/// sits on one server while every command goes to another, and the two
+/// consequences are real: `switch-client` on a client-less server fails, and
+/// `display-message -p '#{session_name}'` answers about the WRONG server
+/// (`$TMUX_PANE` resolves against whichever server is being addressed), which
+/// short-circuits the launcher into "already inside" without ever creating a
+/// sidebar.
+pub fn inside_target_server() -> bool {
+    let Some(mine) = env_socket_path() else {
+        return false;
+    };
+    let Some(theirs) = target_socket_path() else {
+        // The server could not be asked (no session yet, or it is not running).
+        // Fall back to the socket NAME, which is right whenever both servers
+        // share a socket directory — the normal case.
+        return same_socket_name(&mine);
+    };
+    same_path(&mine, &theirs)
+}
+
+/// Basename comparison against the socket in force. `-L` names have no `/`
+/// (`valid_socket_name`), and tmux's default socket is literally `default`.
+fn same_socket_name(env_path: &str) -> bool {
+    let mine = env_path.rsplit('/').next().unwrap_or("");
+    let want = socket().unwrap_or_else(|| "default".to_string());
+    !mine.is_empty() && mine == want
+}
+
+/// Path equality through symlinks; falls back to a literal compare when either
+/// path cannot be canonicalized.
+fn same_path(a: &str, b: &str) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// `tmux display-message -p '#{session_name}'` on the TARGET server; None when
+/// this process is not a pane of that server.
 pub fn current_session_name() -> Option<String> {
-    if !inside_tmux() {
+    if !inside_target_server() {
         return None;
     }
     let name = tmux(&["display-message", "-p", "#{session_name}"]).ok()?;
@@ -425,12 +490,16 @@ pub fn configure_session(session: &str, sidebar: &PaneId, width: u16) -> Result<
     Ok(())
 }
 
-/// `switch-client -t` when inside tmux, else `attach-session -t`.
-/// On the attach path this replaces the current terminal view and normally
-/// does not return until the client detaches.
+/// `switch-client -t` when this process is a pane of the TARGET server, else
+/// `attach-session -t`. On the attach path this replaces the current terminal
+/// view and normally does not return until the client detaches.
+///
+/// The predicate is `inside_target_server()`, not `inside_tmux()`: with
+/// `-L <socket>` the caller's server has no client on the target socket, and
+/// `switch-client` there fails with "no current client".
 pub fn attach_or_switch(session: &str) -> Result<(), TmuxError> {
     let target = session_target(session)?;
-    if inside_tmux() {
+    if inside_target_server() {
         tmux_inherit(&["switch-client", "-t", &target])
     } else {
         tmux_inherit(&["attach-session", "-t", &target])
@@ -608,13 +677,60 @@ pub fn pin_sidebar(session: &str, sidebar: &PaneId, cols: u16) {
     let _ = resize_pane_width(session, sidebar, cols);
 }
 
+/// `#{window_index}` of the window holding `pane`.
+pub fn window_of(panes: &[PaneInfo], pane: &PaneId) -> Option<u32> {
+    panes.iter().find(|p| &p.id == pane).map(|p| p.window_index)
+}
+
+/// The subset of `panes` in `window`.
+///
+/// MANDATORY before any layout decision. `list_panes_in_session` is
+/// session-scoped (`-s`, every window) because `PaneMap::reconcile` must see
+/// panes in other windows or it would delete their map entries — but
+/// `#{pane_left}`, `#{pane_index}` and `#{pane_active}` are all PER-WINDOW
+/// coordinates. Choosing a split anchor from the unfiltered list can therefore
+/// return a pane in a window the operator is not even looking at.
+pub fn panes_in_window(panes: &[PaneInfo], window: u32) -> Vec<PaneInfo> {
+    panes
+        .iter()
+        .filter(|p| p.window_index == window)
+        .cloned()
+        .collect()
+}
+
+/// Lowest `#{window_index}` present in `panes`. The fallback window when the
+/// sidebar cannot be resolved.
+pub fn lowest_window(panes: &[PaneInfo]) -> Option<u32> {
+    panes.iter().map(|p| p.window_index).min()
+}
+
+/// `#{window_index}` of the window named `name`, if the session has one.
+/// READ-ONLY.
+pub fn window_index_named(session: &str, name: &str) -> Option<u32> {
+    let target = session_target(session).ok()?;
+    let out = tmux(&[
+        "list-windows",
+        "-t",
+        &target,
+        "-F",
+        "#{window_index}\t#{window_name}",
+    ])
+    .ok()?;
+    out.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .find(|(_, n)| *n == name)
+        .and_then(|(i, _)| i.parse().ok())
+}
+
 /// Leftmost pane by `#{pane_left}`, tie-broken by lowest `pane_index`.
+/// Pass a WINDOW-SCOPED slice (`panes_in_window`); `pane_left` means nothing
+/// across windows.
 pub fn leftmost_pane(panes: &[PaneInfo]) -> Option<PaneId> {
     panes.iter().min_by_key(|p| (p.left, p.index)).map(|p| p.id.clone())
 }
 
 /// Rightmost pane by `#{pane_left}` EXCLUDING `sidebar`. None when the sidebar
-/// is alone in the window.
+/// is alone in the window. Pass a WINDOW-SCOPED slice (`panes_in_window`).
 pub fn rightmost_pane_excluding(panes: &[PaneInfo], sidebar: &PaneId) -> Option<PaneId> {
     panes
         .iter()
@@ -1082,6 +1198,42 @@ mod tests {
         // Stacked panes share `left`; the lower pane_index wins for leftmost.
         let stacked = vec![pane("%9", 1, 2, 35), pane("%8", 2, 1, 35)];
         assert_eq!(leftmost_pane(&stacked), PaneId::parse("%8"));
+    }
+
+    #[test]
+    fn window_scoping_separates_per_window_coordinates() {
+        // `pane_left` restarts at 0 in every window, so an unscoped `min`/`max`
+        // over a session's panes mixes windows that share nothing.
+        let mut panes = vec![
+            pane("%1", 1, 1, 0),
+            pane("%10", 2, 2, 35),
+            pane("%11", 3, 1, 0),
+            pane("%12", 4, 2, 41),
+        ];
+        panes[2].window_index = 2;
+        panes[3].window_index = 2;
+
+        let sidebar = PaneId::parse("%1").expect("id");
+        assert_eq!(window_of(&panes, &sidebar), Some(1));
+        assert_eq!(window_of(&panes, &PaneId::parse("%12").expect("id")), Some(2));
+        assert_eq!(window_of(&panes, &PaneId::parse("%99").expect("id")), None);
+        assert_eq!(lowest_window(&panes), Some(1));
+        assert_eq!(lowest_window(&[]), None);
+
+        let w1 = panes_in_window(&panes, 1);
+        assert_eq!(w1.len(), 2);
+        assert_eq!(leftmost_pane(&w1), Some(sidebar.clone()));
+        // Unscoped this returns %12 (left 41) — a pane in a window the operator
+        // is not looking at.
+        assert_eq!(rightmost_pane_excluding(&w1, &sidebar), PaneId::parse("%10"));
+        assert_eq!(
+            rightmost_pane_excluding(&panes, &sidebar),
+            PaneId::parse("%12"),
+            "regression guard: the unscoped call is the bug, keep it visible"
+        );
+
+        assert_eq!(panes_in_window(&panes, 2).len(), 2);
+        assert!(panes_in_window(&panes, 7).is_empty());
     }
 
     // ── PaneMap ─────────────────────────────────────────────────────────────

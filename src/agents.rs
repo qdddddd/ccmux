@@ -11,7 +11,10 @@
 //! event-loop thread* — "No threads, no channels, no async runtime" — and §10.3
 //! lists any background thread as an explicit non-goal. `poll()` is therefore a
 //! blocking call costing ~0.21s (PROBE-FINDINGS §1); `app.rs` calls it from
-//! `tick()` every `effective_interval()`.
+//! `tick()` every `effective_interval()`. AMENDED: the call is still
+//! synchronous and thread-free, but it is now bounded by `POLL_TIMEOUT` — an
+//! unbounded one froze the entire sidebar, Ctrl-C included, whenever `claude`
+//! wedged.
 //!
 //! SPEC NOTE (RULE Q1): every function here builds an argv via
 //! `Command::new(prog).args([..])`. Nothing in this module spawns `sh -c`. The
@@ -19,8 +22,9 @@
 //! which are handed to tmux (RULE Q2) and quote every interpolation through
 //! `tmux::sh_quote`.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crate::model::{ParseError, Session};
 use crate::tmux::sh_quote;
@@ -102,6 +106,74 @@ fn run(args: &[&str]) -> Result<std::process::Output, AgentsError> {
     })
 }
 
+/// Wall-clock ceiling on one `claude agents --json --all`.
+///
+/// SPEC AMENDMENT (§4.2): the spec pins polling as synchronous on the event-loop
+/// thread and §10.3 forbids a background thread, which left `poll()` unbounded —
+/// a wedged `claude` froze the sidebar for as long as it stayed wedged, Ctrl-C
+/// included, while the header still showed a healthy indicator. The synchronous
+/// contract is kept; only the wait is now bounded, and a timeout is reported as
+/// an ordinary `Cmd` error so §9.1's red indicator and footer fire.
+const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+/// `try_wait` granularity inside `run_bounded`.
+const POLL_STEP: Duration = Duration::from_millis(20);
+
+/// `run`, with a deadline. On expiry the child is killed and reaped, and the
+/// call reports `Cmd { code: -1, stderr: "timed out after Ns" }`.
+///
+/// Only for commands whose output is SMALL. It waits on `try_wait` while the
+/// pipes go unread, so a child that produced more than a pipe buffer would
+/// block on write and be killed as if it had hung; `logs` (a raw PTY dump) must
+/// keep using `run`.
+fn run_bounded(args: &[&str], timeout: Duration) -> Result<std::process::Output, AgentsError> {
+    let bin = claude_bin();
+    let mut child = Command::new(&bin)
+        // Same three redirections `output()` implies, spelled out because
+        // `spawn()` does not: stdin MUST be null (the sidebar holds the
+        // terminal in raw mode and a child must never read our keystrokes) and
+        // both output streams MUST be piped so nothing lands on the alternate
+        // screen.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .args(args)
+        .spawn()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => AgentsError::NotFound(bin.clone()),
+            _ => AgentsError::Cmd { code: -1, stderr: e.to_string() },
+        })?;
+
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AgentsError::Cmd { code: -1, stderr: e.to_string() });
+            }
+        }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            // Kill AND wait: an unreaped child would become a zombie in a
+            // process that lives for days.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AgentsError::Cmd {
+                code: -1,
+                stderr: format!("timed out after {}s", timeout.as_secs()),
+            });
+        }
+        std::thread::sleep(POLL_STEP);
+    }
+
+    // The child has exited, so both pipes are at EOF; `wait_with_output` reads
+    // them and returns the status `try_wait` already reaped.
+    child
+        .wait_with_output()
+        .map_err(|e| AgentsError::Cmd { code: -1, stderr: e.to_string() })
+}
+
 /// Non-zero exit → `Cmd`. Checked BEFORE stdout is looked at, so a failing
 /// command with garbage on stdout surfaces as `Cmd`, never as `Parse`.
 /// A process killed by a signal has no code; it reports as `-1`.
@@ -126,7 +198,7 @@ fn check_status(out: &std::process::Output) -> Result<(), AgentsError> {
 /// §9.3: an exit-0 `[]` is a **valid empty result**, not an error — it returns
 /// `Ok(vec![])` and the caller must clear `poll_error`.
 pub fn poll() -> Result<Vec<Session>, AgentsError> {
-    let out = run(&["agents", "--json", "--all"])?;
+    let out = run_bounded(&["agents", "--json", "--all"], POLL_TIMEOUT)?;
     check_status(&out)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     crate::model::parse_sessions(&stdout).map_err(AgentsError::Parse)

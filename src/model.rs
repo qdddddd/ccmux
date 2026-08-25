@@ -338,7 +338,7 @@ pub fn format_age(started_at_ms: i64, now_ms: i64) -> String {
 ///    it fits, always keeping at least the final component.
 /// 4. If the final component alone exceeds `max`, end-truncate it with `…`.
 ///
-/// Returns a string of at most `max` chars. `max == 0` returns "".
+/// Returns a string of at most `max` display COLUMNS. `max == 0` returns "".
 ///
 /// SPEC NOTE: §3.1 step 3 and §10.1's assertion
 /// (`shorten_cwd("/home/dev/projects/shared/Foundation", Some("/home/dev"), 24)`
@@ -361,7 +361,7 @@ pub fn shorten_cwd(cwd: &str, home: Option<&str>, max: usize) -> String {
         }
     }
 
-    if s.chars().count() <= max {
+    if display_width(&s) <= max {
         return s;
     }
 
@@ -372,23 +372,91 @@ pub fn shorten_cwd(cwd: &str, home: Option<&str>, max: usize) -> String {
     let first = if keep_root { 2 } else { 1 };
     for start in first..parts.len() {
         let cand = format!("{root}…/{}", parts[start..].join("/"));
-        if cand.chars().count() <= max {
+        if display_width(&cand) <= max {
             return cand;
         }
     }
     truncate_end(parts.last().copied().unwrap_or(""), max)
 }
 
-/// End-truncate to `max` CHARS, appending '…' when truncation occurred.
-/// `max == 0` -> ""; `max == 1` on an over-long input -> "…".
+/// Terminal columns one char occupies. Zero for combining marks and controls,
+/// two for East Asian Wide/Fullwidth and emoji, one otherwise.
+///
+/// SPEC AMENDMENT (§6.6): the spec pinned char-count budgets and called the
+/// resulting overflow cosmetic. It is not — a CJK session name overflows the
+/// pane and ratatui clips the age and pane-badge segments off the row entirely.
+/// A local table is used rather than the `unicode-width` crate §6.6 excluded;
+/// it is deliberately coarse, and being wrong by one column for an exotic
+/// script only reproduces the old cosmetic overflow.
+pub fn char_width(c: char) -> usize {
+    let u = c as u32;
+    // Controls and format/combining characters occupy no cell.
+    if u < 0x20 || (0x7f..0xa0).contains(&u) {
+        return 0;
+    }
+    if matches!(u,
+        0x0300..=0x036f      // combining diacritics
+        | 0x200b..=0x200f    // zero width space/joiners, bidi marks
+        | 0xfe00..=0xfe0f    // variation selectors
+        | 0xfeff
+    ) {
+        return 0;
+    }
+    if matches!(u,
+        0x1100..=0x115f      // Hangul Jamo
+        | 0x2e80..=0x303e    // CJK radicals, Kangxi, CJK symbols
+        | 0x3041..=0x33ff    // kana, Hangul compat, CJK compat
+        | 0x3400..=0x4dbf    // CJK ext A
+        | 0x4e00..=0x9fff    // CJK unified
+        | 0xa000..=0xa4cf    // Yi
+        | 0xa960..=0xa97f    // Hangul Jamo ext A
+        | 0xac00..=0xd7a3    // Hangul syllables
+        | 0xf900..=0xfaff    // CJK compat ideographs
+        | 0xfe10..=0xfe19
+        | 0xfe30..=0xfe6f    // CJK compat forms
+        | 0xff00..=0xff60    // fullwidth forms
+        | 0xffe0..=0xffe6
+        | 0x1f300..=0x1f64f  // emoji, pictographs
+        | 0x1f680..=0x1f6ff
+        | 0x1f900..=0x1f9ff
+        | 0x20000..=0x3fffd  // CJK ext B and later
+    ) {
+        return 2;
+    }
+    1
+}
+
+/// Terminal columns `s` occupies. The single source of truth for every row
+/// budget in `ui.rs`.
+pub fn display_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
+/// End-truncate to `max` COLUMNS, appending '…' when truncation occurred.
+/// `max == 0` -> ""; a `max` too small for even one column of content -> "…".
+///
+/// SPEC AMENDMENT (§6.6): budgets are display columns, not chars. A wide
+/// character that would straddle the limit is dropped, so the result never
+/// exceeds `max` columns.
 pub fn truncate_end(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    if s.chars().count() <= max {
+    if display_width(s) <= max {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max - 1).collect();
+    // One column is reserved for the ellipsis.
+    let budget = max - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = char_width(c);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
     out.push('…');
     out
 }
@@ -698,9 +766,39 @@ mod tests {
         // multi-byte input: must not panic and must not split a codepoint
         assert_eq!(truncate_end("日本語テキスト", 1), "…");
         assert_eq!(truncate_end("日本語テキスト", 0), "");
-        assert_eq!(truncate_end("日本語テキスト", 3), "日本…");
+        // Width semantics: one wide char (2 cols) + the ellipsis fills 3.
+        assert_eq!(truncate_end("日本語テキスト", 3), "日…");
+        assert_eq!(truncate_end("日本語テキスト", 5), "日本…");
         assert_eq!(truncate_end("héllo wörld", 4), "hél…");
-        assert_eq!(truncate_end("🙂🙂🙂", 2), "🙂…");
+        // A wide char cannot straddle the budget, so 2 columns hold "…" alone.
+        assert_eq!(truncate_end("🙂🙂🙂", 2), "…");
+        assert_eq!(truncate_end("🙂🙂🙂", 3), "🙂…");
+    }
+
+    #[test]
+    fn truncate_end_never_exceeds_the_column_budget() {
+        for s in ["回归模型数据清洗与因子测试流水线重构任务", "bt/reg-update", "🙂ok", "ｆｕｌｌ"] {
+            for max in 0..24usize {
+                let out = truncate_end(s, max);
+                assert!(
+                    display_width(&out) <= max,
+                    "{out:?} is wider than {max} columns"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn display_width_charges_two_columns_for_wide_text() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width(""), 0);
+        assert_eq!(display_width("回归模型"), 8);
+        assert_eq!(display_width("af/回归"), 7);
+        assert_eq!(display_width("héllo"), 5);
+        // combining acute after "e" occupies no cell of its own
+        assert_eq!(display_width("e\u{301}llo"), 4);
+        assert_eq!(display_width("🙂"), 2);
+        assert_eq!(display_width("ｆｕｌｌ"), 8);
     }
 
     #[test]

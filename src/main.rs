@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -26,7 +28,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::Action;
+use crate::app::{Action, Mode};
 use crate::tmux::PaneId;
 
 #[derive(clap::Parser)]
@@ -104,6 +106,10 @@ const INTERVAL_MAX_MS: u64 = 600_000;
 /// `event::poll` slice (SPEC §4.2).
 const TICK_MS: u64 = 120;
 
+/// A `tick()` at least this slow is treated as a freeze: input typed during it
+/// is discarded rather than replayed. Normal ticks cost ~0.21s.
+const SLOW_TICK: Duration = Duration::from_secs(1);
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -159,9 +165,10 @@ fn run_launcher(cli: &Cli) -> anyhow::Result<()> {
     }
 
     // 2 — §9.6: re-running ccmux inside ccmux is a no-op, never a second
-    // new-session.
-    if tmux::inside_tmux() && tmux::current_session_name().as_deref() == Some(cli.session.as_str())
-    {
+    // new-session. `current_session_name` answers only for the server this
+    // process is actually a pane of, so `--socket` cannot short-circuit the
+    // launcher with another server's session name.
+    if tmux::current_session_name().as_deref() == Some(cli.session.as_str()) {
         println!("ccmux: already inside session '{}'", cli.session);
         return Ok(());
     }
@@ -171,6 +178,17 @@ fn run_launcher(cli: &Cli) -> anyhow::Result<()> {
 
     // 3 — a dead server also exits non-zero, which reads correctly as "absent".
     if tmux::has_session(&cli.session) {
+        // A name collision must never turn into a layout change in someone
+        // else's session. `@ccmux_map` is written by `configure_session` and by
+        // nothing else, so its absence proves this session is not ours —
+        // healing it would split a pane into a live window and then hold that
+        // pane at ccmux's width forever (PROBE-FINDINGS §8's incident).
+        if tmux::get_user_option(&cli.session, tmux::OPT_MAP).is_none() {
+            return Err(anyhow!(
+                "tmux session '{}' exists but is not a ccmux session — refusing to modify it",
+                cli.session
+            ));
+        }
         heal_sidebar(cli, width, &sidebar_cmd)?;
     } else {
         // 4
@@ -200,12 +218,28 @@ fn heal_sidebar(cli: &Cli, width: u16, sidebar_cmd: &str) -> anyhow::Result<()> 
     // Present in the option AND still alive, or it does not count.
     let live = recorded.filter(|p| panes.iter().any(|q| &q.id == p));
 
+    // `@ccmux_width` is what the RUNNING sidebar re-pins from every tick, so a
+    // relaunch that only resized the pane would be reverted within one poll.
+    // Write it first; the pin below then agrees with the sidebar process.
+    tmux::set_user_option(&cli.session, tmux::OPT_WIDTH, &width.to_string())
+        .with_context(|| format!("cannot record the sidebar width of '{}'", cli.session))?;
+
     match live {
         // 5c — harmless re-pin.
         Some(pane) => tmux::pin_sidebar(&cli.session, &pane, width),
         // 5b
         None => {
-            let leftmost = tmux::leftmost_pane(&panes).ok_or_else(|| {
+            // Window-scoped: `pane_left` is per-window, so the leftmost pane of
+            // the whole session can live in a window that has nothing to do
+            // with the ccmux layout. Prefer the window ccmux created by name.
+            let window = tmux::window_index_named(&cli.session, tmux::WINDOW_NAME)
+                .filter(|w| panes.iter().any(|p| p.window_index == *w))
+                .or_else(|| tmux::lowest_window(&panes))
+                .ok_or_else(|| {
+                    anyhow!("tmux session '{}' has no windows to host a sidebar", cli.session)
+                })?;
+            let scoped = tmux::panes_in_window(&panes, window);
+            let leftmost = tmux::leftmost_pane(&scoped).ok_or_else(|| {
                 anyhow!("tmux session '{}' has no panes to anchor a sidebar", cli.session)
             })?;
             let pane = tmux::split_left_of(&cli.session, &leftmost, sidebar_cmd)
@@ -227,7 +261,12 @@ type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// error is not an option and a half-restored terminal is worse than none.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
 }
 
 /// A panic inside raw mode + the alternate screen leaves the operator with an
@@ -252,7 +291,10 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     install_panic_hook();
     enable_raw_mode().context("cannot enter raw mode")?;
     let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+    // Bracketed paste is MANDATORY, not a nicety: without it a paste into the
+    // focused sidebar is delivered as individual key events and executed as
+    // §8.1 keymap verbs — `S`+`y` alone stops a running agent.
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
         let _ = disable_raw_mode();
         return Err(e).context("cannot enter the alternate screen");
     }
@@ -282,13 +324,25 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
         }
 
         if app.last_poll.elapsed() >= app.effective_interval() {
+            let started = std::time::Instant::now();
             app.tick();
             needs_draw = true;
+            // A tick that blocked long enough to be felt swallowed every key
+            // pressed during it, and the terminal will now replay them all at
+            // once against whatever is on screen. Those keystrokes were aimed
+            // at a frozen UI; execute none of them.
+            if started.elapsed() >= SLOW_TICK {
+                drain_pending_input()?;
+            }
         }
 
-        // `app.rs` reads `viewport` but never computes it; this is the only
-        // place it is written.
-        app.viewport = ui::list_viewport_rows(terminal.size()?.height);
+        // `app.rs` reads these but never computes them; this is the only place
+        // they are written. `overlay_viewport` is the body height of a bordered
+        // full-area overlay, which is what `Mode::Logs`/`Mode::Help` scroll.
+        let height = terminal.size()?.height;
+        app.viewport = ui::list_viewport_rows(height);
+        app.overlay_viewport = height.saturating_sub(2);
+        app.help_lines = ui::help_line_count();
         app.clamp_scroll();
 
         if needs_draw {
@@ -300,17 +354,44 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
             match event::read()? {
                 // §4.1: filtering on Press is mandatory — without it a terminal
                 // that reports key repeat/release doubles every keystroke.
-                Event::Key(k) if k.kind == KeyEventKind::Press => match app.on_key(k) {
-                    Action::Quit => break,
-                    Action::Redraw => needs_draw = true,
-                    Action::None => {}
-                },
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    let was_confirm = matches!(app.mode, Mode::Confirm(_));
+                    let action = app.on_key(k);
+                    // A confirmation must be answered by a keystroke made AFTER
+                    // it was drawn. Anything already sitting in the tty buffer
+                    // when `S` opened the modal is type-ahead aimed at the list,
+                    // so drop it; `App::key_confirm`'s arming delay is the
+                    // second, unit-testable half of the same guard.
+                    if !was_confirm && matches!(app.mode, Mode::Confirm(_)) {
+                        drain_pending_input()?;
+                    }
+                    match action {
+                        Action::Quit => break,
+                        Action::Redraw => needs_draw = true,
+                        Action::None => {}
+                    }
+                }
+                // Only reachable because `EnableBracketedPaste` is set above.
+                Event::Paste(text) => {
+                    if app.on_paste(&text) == Action::Redraw {
+                        needs_draw = true;
+                    }
+                }
                 Event::Resize(..) => needs_draw = true,
                 _ => {}
             }
         }
     }
 
+    Ok(())
+}
+
+/// Discard every input event already queued. Called the instant a destructive
+/// confirmation opens.
+fn drain_pending_input() -> anyhow::Result<()> {
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
     Ok(())
 }
 

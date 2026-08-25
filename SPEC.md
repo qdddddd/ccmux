@@ -1952,3 +1952,30 @@ to the caller's current pane and created panes in an unrelated live session.
 That is the entire reason `PaneId` is a validated newtype, mutating helpers take
 mandatory targets, and `assert_in_session` gates every mutation (§2). An
 `Option<PaneId>` reaching a tmux mutation is a bug even when it happens to work.
+
+---
+
+## Appendix B — v1 amendments (adversarial review)
+
+Each entry amends the section named, was found by empirical reproduction against
+a throwaway `-L ccmux` server, and is implemented. Where the spec pinned the old
+behaviour, the pin is superseded by this appendix.
+
+| Amends | Was | Is |
+|---|---|---|
+| §8.2 | `y` confirms whenever the modal is open. | `y` is ignored for 250 ms after the modal opens (`CONFIRM_ARM_DELAY`), and the event loop drains queued input the instant the modal is drawn. Type-ahead — a paste, or `Sync` typed without `/` — cannot stop an agent. |
+| §8.9 | Paste arrives as key events and runs the keymap. | Bracketed paste is enabled for the sidebar's lifetime. `Normal` discards a paste; `Filter` and `Prompt` take it as literal text with control characters stripped. |
+| §1.2 step 5 | Any tmux session with the configured name is healed. | Healing requires `@ccmux_map` to be set, which only `configure_session` writes. A foreign session with a colliding name is refused, never split or resized. |
+| §8.4 | The split anchor is chosen from the session-wide pane list. | Anchor selection is scoped to the sidebar's `#{window_index}`. `pane_left`, `pane_index` and `pane_active` are per-window, so the unscoped choice could open Claude in a window the operator is not looking at. `list_panes_in_session` stays session-scoped for `PaneMap::reconcile`. |
+| §1.2 step 5b | The sidebar is re-inserted left of the session's leftmost pane. | Left of the leftmost pane **of the window that will host it** — the `cc` window by name, else the lowest window index. |
+| §9.6, §1.2 step 6 | `inside_tmux()` decides "already inside" and `switch-client` vs `attach-session`. | `inside_target_server()` decides both: `$TMUX`'s socket path compared against the target server's own `#{socket_path}`. Under `--socket` the two disagree, which made the launcher either fail on `switch-client` or report success without creating anything. |
+| §1.2 step 5 | `@ccmux_width` is written once at creation and never read. | It is the source of truth. `heal_sidebar` writes it; the running sidebar re-reads it each tick, so a relaunch with a new `--width` takes effect instead of being reverted. |
+| §1.3, §9.8 | The per-tick re-pin is unconditional; "tmux clamps `resize-pane`". | tmux does not clamp — it takes the columns from the other panes, and a 30-column window left a Claude pane at 1 column. The pin is bounded by the window (`MIN_CONTENT_COLS = 20`) and skipped while the sidebar is alone in its window. |
+| §4.2 | `agents::poll()` is synchronous and unbounded. | Still synchronous and thread-free, now bounded by `POLL_TIMEOUT = 5s`; the child is killed and reaped on expiry and the timeout surfaces as §9.1's red indicator plus `agents: timed out after 5s`. A `tick()` slower than 1 s also drains buffered input, so keys typed at a frozen UI are not replayed against it. |
+| §6.6 | Row budgets count chars; the overflow is "cosmetic". | Budgets count display columns (`model::display_width`). A CJK session name was deleting the age column, the pane badge and the selection bar, not merely overflowing. |
+| §8.9 | `help_scroll` caps at 64; the logs scroll caps at `len - 1`. | Both clamp to `len - overlay_viewport`, written by `main.rs` each frame, so `k` after `G` always moves the view. |
+| §6.8 | The footer truncates to one line. | A message wider than the sidebar takes over the detail block and wraps. §8.5's interactive refusal and its "agent still running" wording do not fit 34 columns. |
+| §8.8, §8.1 | `Esc` in Normal quits when no filter is set. | `Esc` clears the filter and is otherwise inert; `q` and `Ctrl-c` remain the quit keys. |
+| §6.2 | The header shows `matching/total` only while `/` is active. | It shows the ratio whenever fewer than all sessions are listed, so `a` (hide Completed) cannot leave the header contradicting the list. |
+| §6.5 | The detail block renders `Status::Unknown("")` as `?`. | A `state: "done"` session renders `done`, matching `status_glyph`. The live payload omits `status` on almost every completed row. |
+| §5.5 | `PaneEntry::name` is stored verbatim. | Truncated to 80 columns, and a failed `@ccmux_map` write is flashed once and clears `map_dirty` instead of being reissued every tick. tmux rejects a `set-option` value over ~16 KB. |

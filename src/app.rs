@@ -24,10 +24,21 @@ const FAIL_BACKOFF_AT: u32 = 3;
 const LOGS_LINES: usize = 500;
 /// SPEC §9.1: `poll_error` is truncated to 120 chars.
 const POLL_ERR_MAX: usize = 120;
-/// Upper bound on `help_scroll`. The help overlay lists §8.1's bindings, so a
-/// value past this can only blank the overlay; `ui::draw_help` clamps to the
-/// real content height on top of this.
-const HELP_SCROLL_MAX: usize = 64;
+/// How long the `S` confirmation must have been on screen before `y` is
+/// accepted (SPEC AMENDMENT §8.2).
+///
+/// crossterm hands us whatever the tty already buffered, so without this a
+/// paste or a fast typist's "Sy" arrives as two key events in the same instant:
+/// `S` opens the modal and the buffered `y` confirms it before a human could
+/// read the prompt. `claude stop` is the one verb that ends a running agent, so
+/// it must be answered by a keystroke made AFTER the question was visible.
+const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(250);
+/// Names stored in `@ccmux_map`, truncated. tmux rejects a `set-option` value
+/// over ~16 KB (measured: ok at 16323 bytes, "command too long" at 16324), and
+/// `name` is the only unbounded field in a `PaneEntry`.
+const MAP_NAME_MAX: usize = 80;
+/// Columns left for the Claude panes when the sidebar is pinned (§1.3).
+const MIN_CONTENT_COLS: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgLevel {
@@ -117,6 +128,15 @@ pub struct App {
     /// `clamp_scroll` pins `scroll` to the session list's bounds every frame,
     /// which would make the help overlay unscrollable (SPEC §6.7/§8.9).
     pub help_scroll: usize,
+    /// Rows an overlay body can show, written by `main.rs` every frame from the
+    /// terminal height minus the overlay's border. `Mode::Logs` and `Mode::Help`
+    /// clamp their scroll against it; the list's `viewport` is a different
+    /// number because the sidebar has a header, footer and detail block.
+    pub overlay_viewport: u16,
+    /// Lines the `?` overlay renders, written by `main.rs` from
+    /// `ui::help_line_count()` — the keymap table lives in `ui`, and `app` must
+    /// not import it.
+    pub help_lines: usize,
 
     // view state
     pub filter: String,
@@ -142,6 +162,11 @@ pub struct App {
     pub degraded: bool,
 
     // messaging + health
+    /// When the `S` modal went up. `key_confirm` refuses a `y` that arrives
+    /// within `CONFIRM_ARM_DELAY` of it, and `None` means "not armed" — both
+    /// fail closed.
+    pub confirm_armed_at: Option<Instant>,
+
     pub message: Option<(String, MsgLevel)>,
     pub msg_deadline: Option<Instant>,
     pub poll_error: Option<String>,
@@ -152,9 +177,11 @@ pub struct App {
 }
 
 impl App {
-    /// Does no IO beyond `env::var("HOME")` and `tmux::inside_tmux()`.
+    /// Does no IO beyond `env::var("HOME")` and `tmux::inside_target_server()`.
     pub fn new(tmux_session: String, sidebar_width: u16, interval: Duration, dark: bool) -> Self {
-        let degraded = !tmux::inside_tmux();
+        // `inside_target_server`, not `inside_tmux`: under `--socket` the two
+        // disagree, and every pane verb targets the socket, not `$TMUX`.
+        let degraded = !tmux::inside_target_server();
         App {
             tmux_session,
             // Idempotent re-clamp of SPEC §1.1's 20..=120 rule: `main.rs` clamps
@@ -173,6 +200,8 @@ impl App {
             scroll: 0,
             viewport: 0,
             help_scroll: 0,
+            overlay_viewport: 0,
+            help_lines: 0,
 
             filter: String::new(),
             show_completed: true,
@@ -186,6 +215,8 @@ impl App {
             sidebar_pane: None,
             panes: Vec::new(),
             degraded,
+
+            confirm_armed_at: None,
 
             message: None,
             msg_deadline: None,
@@ -205,7 +236,7 @@ impl App {
     /// One-time startup IO: load `@ccmux_map`, resolve `@ccmux_sidebar`,
     /// set `degraded`. Never fails; failures degrade.
     pub fn init(&mut self) {
-        self.degraded = !tmux::inside_tmux();
+        self.degraded = !tmux::inside_target_server();
         if self.degraded {
             // §9.5: the map is held in memory only; load/save are skipped.
             self.map = PaneMap::new();
@@ -315,6 +346,48 @@ impl App {
             Mode::Prompt(_) => self.key_prompt(key),
             Mode::Help => self.key_help(key),
             Mode::Logs => self.key_logs(key),
+        }
+    }
+
+    /// One bracketed-paste event's text.
+    ///
+    /// SPEC AMENDMENT (§8.9): `main.rs` now enables bracketed paste, so pasted
+    /// text arrives here as ONE event instead of as a burst of key events the
+    /// §8.1 keymap would execute. Pasting `Sync branch` into the focused
+    /// sidebar previously ran `S`, `y` (stop the selected agent), `n` (new
+    /// background prompt), the remaining letters as its task text, and `\r` to
+    /// dispatch it.
+    ///
+    /// Normal mode DISCARDS the paste — pasted prose is not a keymap. Filter
+    /// and Prompt take it as literal text, with control characters stripped so
+    /// an embedded newline cannot submit anything.
+    pub fn on_paste(&mut self, text: &str) -> Action {
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if clean.is_empty() {
+            return Action::None;
+        }
+        match self.mode {
+            Mode::Filter => {
+                self.filter.push_str(&clean);
+                self.rebuild_rows();
+                Action::Redraw
+            }
+            Mode::Prompt(_) => {
+                let Some(mut p) = self.prompt.clone() else {
+                    return Action::None;
+                };
+                let mut at = p.cursor;
+                if let Some(field) = p.fields.get_mut(p.focus) {
+                    for c in clean.chars() {
+                        insert_char_at(field, at, c);
+                        at += 1;
+                    }
+                }
+                p.cursor = at;
+                self.prompt = Some(p);
+                Action::Redraw
+            }
+            _ => Action::None,
         }
     }
 
@@ -509,7 +582,10 @@ impl App {
                     PaneEntry {
                         session_id,
                         short_id,
-                        name: name.clone(),
+                        // Bounded: `@ccmux_map` has a hard ~16 KB ceiling and
+                        // this is its only unbounded field. It is display-only,
+                        // used when a session has vanished from polls.
+                        name: model::truncate_end(&name, MAP_NAME_MAX),
                         opened_at: self.now_ms,
                     },
                 );
@@ -626,6 +702,9 @@ impl App {
             short_id: sel.id.clone().unwrap_or_default(),
             name: sel.name.clone(),
         });
+        // The modal is not answerable until it has been on screen for
+        // `CONFIRM_ARM_DELAY`; see the constant for why.
+        self.confirm_armed_at = Some(Instant::now());
     }
 
     /// `y` inside the confirm modal. The ONLY caller of `agents::stop`.
@@ -637,6 +716,7 @@ impl App {
             return;
         };
         self.mode = Mode::Normal;
+        self.confirm_armed_at = None;
 
         // Fail closed: re-validate the CAPTURED id against the current poll.
         let still_there = self
@@ -827,22 +907,88 @@ impl App {
             .filter(|p| panes.iter().any(|i| &i.id == p));
     }
 
+    /// Width to pin to, or `None` when pinning would starve the Claude panes.
+    ///
+    /// SPEC AMENDMENT (§1.3, §9.8): the spec assumed "tmux clamps resize-pane".
+    /// It does not — tmux honours the request and takes the columns from the
+    /// other panes, so on a 30-column window the unconditional pin squeezed a
+    /// Claude pane to ONE column and re-squeezed it every tick. The pin is now
+    /// bounded by the window and skipped while the sidebar is alone.
+    ///
+    /// `@ccmux_width` is the source of truth (§1.2 step 5): a relaunch with a
+    /// new `--width` writes it, and this reads it, so the already-running
+    /// sidebar stops reverting the launcher's resize on the next tick.
+    /// Pure geometry half of `pinned_width`, so the clamp is testable without
+    /// tmux. `want` is the requested width.
+    fn pinned_width_from(&self, want: u16) -> Option<u16> {
+        let sb = self.sidebar_pane.as_ref()?;
+        let win = tmux::window_of(&self.panes, sb)?;
+        let scoped = tmux::panes_in_window(&self.panes, win);
+        // Alone in the window: `resize-pane` is a no-op there anyway, and the
+        // next split re-pins immediately.
+        if scoped.len() < 2 {
+            return None;
+        }
+        let window_cols = scoped
+            .iter()
+            .map(|p| p.left.saturating_add(p.width))
+            .max()
+            .unwrap_or(0);
+        let room = window_cols.saturating_sub(MIN_CONTENT_COLS);
+        if room == 0 {
+            return None;
+        }
+        Some(want.min(room).max(1))
+    }
+
+    fn pinned_width(&self) -> Option<u16> {
+        self.pinned_width_from(self.requested_width())
+    }
+
+    /// `@ccmux_width` when set and sane, else this process's `--width`.
+    fn requested_width(&self) -> u16 {
+        tmux::get_user_option(&self.tmux_session, tmux::OPT_WIDTH)
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .map(|w| w.clamp(crate::WIDTH_MIN, crate::WIDTH_MAX))
+            .unwrap_or(self.sidebar_width)
+    }
+
     fn pin_sidebar(&self) {
         if self.degraded {
             return;
         }
-        if let Some(sb) = &self.sidebar_pane {
-            tmux::pin_sidebar(&self.tmux_session, sb, self.sidebar_width);
-        }
+        let (Some(sb), Some(cols)) = (&self.sidebar_pane, self.pinned_width()) else {
+            return;
+        };
+        tmux::pin_sidebar(&self.tmux_session, sb, cols);
     }
 
+    /// Flush `@ccmux_map`.
+    ///
+    /// `map_dirty` is cleared on FAILURE too: tmux refuses a `set-option` value
+    /// over ~16 KB, and a doomed write left dirty would be reissued every tick
+    /// forever with nothing on screen to say the map had stopped persisting.
+    /// The next map change retries once, and the operator is told.
     fn save_map_now(&mut self) {
         if self.degraded || !self.map_dirty {
             return;
         }
-        if tmux::save_map(&self.tmux_session, &self.map).is_ok() {
-            self.map_dirty = false;
+        match tmux::save_map(&self.tmux_session, &self.map) {
+            Ok(()) => self.map_dirty = false,
+            Err(e) => {
+                self.map_dirty = false;
+                self.flash(format!("pane map not saved: {}", tmux_msg(&e)), MsgLevel::Warn);
+            }
         }
+    }
+
+    /// `#{window_index}` of the window the sidebar lives in — the only window
+    /// ccmux may lay out. Falls back to the lowest window index present.
+    fn sidebar_window(&self) -> Option<u32> {
+        self.sidebar_pane
+            .as_ref()
+            .and_then(|sb| tmux::window_of(&self.panes, sb))
+            .or_else(|| tmux::lowest_window(&self.panes))
     }
 
     /// SPEC §8.4 — deterministic, so two engineers cannot disagree.
@@ -850,16 +996,29 @@ impl App {
     ///   2. else the rightmost non-sidebar pane
     ///   3. else the sidebar itself (first split: it is the only pane, and the
     ///      caller's re-pin immediately restores its width)
+    ///
+    /// SPEC AMENDMENT (§8.4): all three steps run over the SIDEBAR'S WINDOW
+    /// only. `self.panes` is session-scoped because `PaneMap::reconcile` needs
+    /// every window, but `pane_left`, `pane_index` and `pane_active` are
+    /// per-window values: unfiltered, step 1 matches the active pane of some
+    /// other window and step 2's `max_by_key` happily returns a pane the
+    /// operator cannot see, so `o`/`s`/`Enter` opens Claude into a window they
+    /// are not looking at.
     fn split_anchor(&self) -> Option<PaneId> {
+        let scoped = match self.sidebar_window() {
+            Some(win) => tmux::panes_in_window(&self.panes, win),
+            None => return None,
+        };
         let sidebar = self.sidebar_pane.as_ref();
-        if let Some(active) = self.panes.iter().find(|p| p.active)
+        if let Some(active) = scoped.iter().find(|p| p.active)
             && Some(&active.id) != sidebar {
                 return Some(active.id.clone());
             }
-        match sidebar {
-            Some(sb) => tmux::rightmost_pane_excluding(&self.panes, sb).or_else(|| Some(sb.clone())),
-            // §9.8: `@ccmux_sidebar` unresolvable — fall back to the leftmost pane.
-            None => tmux::leftmost_pane(&self.panes),
+        match sidebar.filter(|sb| scoped.iter().any(|p| &p.id == *sb)) {
+            Some(sb) => tmux::rightmost_pane_excluding(&scoped, sb).or_else(|| Some(sb.clone())),
+            // §9.8: `@ccmux_sidebar` unresolvable — fall back to the leftmost
+            // pane OF THAT WINDOW.
+            None => tmux::leftmost_pane(&scoped),
         }
     }
 
@@ -1047,16 +1206,19 @@ impl App {
                 self.should_quit = true;
                 Action::Quit
             }
-            // §8.8: Esc clears an active filter, otherwise quits.
+            // SPEC AMENDMENT (§8.8): Esc clears an active filter and is
+            // otherwise inert. It used to quit, which is the opposite of what
+            // Esc means in a neovim-style app and of what this app's own
+            // overlays do — one reflex keypress tore the explorer out of the
+            // window. `q` and `Ctrl-c` remain the quit keys.
             KeyCode::Esc => {
                 if self.filter.is_empty() {
-                    self.should_quit = true;
-                    Action::Quit
+                    self.flash("press q to quit", MsgLevel::Info);
                 } else {
                     self.filter.clear();
                     self.rebuild_rows();
-                    Action::Redraw
                 }
+                Action::Redraw
             }
             _ => Action::None,
         }
@@ -1110,11 +1272,27 @@ impl App {
 
     /// §8.2: NO default-affirmative. Only the literal lowercase `y` confirms;
     /// `Enter`, `n`, `Esc`, `q` and everything else cancel with no side effect.
+    ///
+    /// SPEC AMENDMENT (§8.2): a `y` that arrives within `CONFIRM_ARM_DELAY` of
+    /// the modal opening is treated as TYPE-AHEAD and cancels. It cannot be an
+    /// answer to a question the operator has not seen yet, and the input it
+    /// most likely came from — a paste, or "Sync" typed without `/` — would
+    /// otherwise stop a running agent.
     fn key_confirm(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
-            self.act_confirm_stop();
+            let armed = self
+                .confirm_armed_at
+                .is_some_and(|t| t.elapsed() >= CONFIRM_ARM_DELAY);
+            if armed {
+                self.act_confirm_stop();
+            } else {
+                self.mode = Mode::Normal;
+                self.confirm_armed_at = None;
+                self.flash("ignored buffered 'y' — press S again", MsgLevel::Warn);
+            }
         } else {
             self.mode = Mode::Normal;
+            self.confirm_armed_at = None;
         }
         Action::Redraw
     }
@@ -1184,16 +1362,31 @@ impl App {
         Action::Redraw
     }
 
+    /// Rows an overlay body shows, never 0. `main.rs` writes
+    /// `overlay_viewport`; a 0 means it has not drawn a frame yet.
+    fn overlay_page(&self) -> usize {
+        (self.overlay_viewport as usize).max(1)
+    }
+
+    /// Largest scroll offset that still shows content, for a `len`-line overlay.
+    ///
+    /// SPEC AMENDMENT (§8.9): the counter used to run to a fixed 64 (help) or
+    /// `len - 1` (logs) while the renderers clamp to `len - visible`. `G` then
+    /// parked the counter tens of steps past the real bottom and `k` looked
+    /// dead for exactly that many presses.
+    fn overlay_scroll_max(&self, len: usize) -> usize {
+        len.saturating_sub(self.overlay_page())
+    }
+
     /// §8.9: any key returns to Normal, except the scroll keys, which move
-    /// `help_scroll`. The counter is capped at `HELP_SCROLL_MAX` so `j` held
-    /// down cannot run away and leave `k` looking dead; `ui::draw_help` clamps
-    /// again against the overlay's real height, which `App` does not know.
+    /// `help_scroll`.
     fn key_help(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let page = self.viewport.max(1) as usize;
+        let page = self.overlay_page();
+        let max = self.overlay_scroll_max(self.help_lines);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.help_scroll = (self.help_scroll + 1).min(HELP_SCROLL_MAX);
+                self.help_scroll = (self.help_scroll + 1).min(max);
                 Action::Redraw
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -1201,7 +1394,7 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('d') if ctrl => {
-                self.help_scroll = (self.help_scroll + page).min(HELP_SCROLL_MAX);
+                self.help_scroll = (self.help_scroll + page).min(max);
                 Action::Redraw
             }
             KeyCode::Char('u') if ctrl => {
@@ -1213,7 +1406,7 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('G') => {
-                self.help_scroll = HELP_SCROLL_MAX;
+                self.help_scroll = max;
                 Action::Redraw
             }
             _ => {
@@ -1229,8 +1422,8 @@ impl App {
             self.mode = Mode::Normal;
             return Action::Redraw;
         };
-        let max = v.lines.len().saturating_sub(1);
-        let page = ((self.viewport as usize) / 2).max(1);
+        let max = self.overlay_scroll_max(v.lines.len());
+        let page = (self.overlay_page() / 2).max(1);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.logs = None;
@@ -1332,6 +1525,8 @@ mod tests {
             scroll: 0,
             viewport: 20,
             help_scroll: 0,
+            overlay_viewport: 20,
+            help_lines: 21,
             filter: String::new(),
             show_completed: true,
             mode: Mode::Normal,
@@ -1345,6 +1540,10 @@ mod tests {
             // NOT degraded: the gates under test must fire on their own merits,
             // not because the degraded check short-circuited them.
             degraded: false,
+            // Armed in the past: the tests answer the modal instantly, which a
+            // human cannot, and `CONFIRM_ARM_DELAY` exists to reject exactly
+            // that. `confirm_gate_ignores_type_ahead` covers the delay itself.
+            confirm_armed_at: Instant::now().checked_sub(Duration::from_secs(1)),
             message: None,
             msg_deadline: None,
             poll_error: None,
@@ -1392,10 +1591,237 @@ mod tests {
         app.select_first();
     }
 
+    fn pane(id: &str, window: u32, index: u32, left: u16, width: u16, active: bool) -> PaneInfo {
+        PaneInfo {
+            id: PaneId::parse(id).expect("pane id"),
+            pid: 0,
+            index,
+            left,
+            top: 0,
+            width,
+            height: 40,
+            active,
+            session_name: "ccmux-test".into(),
+            window_index: window,
+        }
+    }
+
+    #[test]
+    fn confirm_gate_ignores_type_ahead() {
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        // `S` immediately followed by a `y` that was already in the tty buffer.
+        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        assert!(matches!(a.mode, Mode::Confirm(_)));
+        let act = a.on_key(press('y'));
+
+        assert_eq!(act, Action::Redraw);
+        assert_eq!(a.mode, Mode::Normal, "the modal must close");
+        assert!(a.confirm_armed_at.is_none());
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(text, "ignored buffered 'y' — press S again");
+
+        // The session is untouched and still selectable.
+        assert_eq!(a.sessions.len(), 1);
+
+        // Once the modal has been on screen long enough, `y` is honoured. The
+        // session is gone from the poll, so the fail-closed path proves the
+        // gate was passed without `claude stop` ever being spawned.
+        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        a.confirm_armed_at = Instant::now().checked_sub(Duration::from_secs(1));
+        a.sessions.clear();
+        a.rebuild_rows();
+        a.on_key(press('y'));
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "session 1c45d64f is gone — not stopped");
+    }
+
+    #[test]
+    fn confirm_cancel_keys_disarm_the_modal() {
+        for key in [press('n'), press('q'), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)] {
+            let mut a = app();
+            load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+            a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+            a.on_key(key);
+            assert_eq!(a.mode, Mode::Normal);
+            assert!(a.confirm_armed_at.is_none(), "cancel must disarm");
+        }
+    }
+
+    #[test]
+    fn paste_is_never_executed_as_a_keymap() {
+        let mut a = app();
+        load(
+            &mut a,
+            vec![
+                bg("1c45d64f", "bt/reg-update", State::Working),
+                bg("629da7fc", "kernel bugs", State::Working),
+            ],
+        );
+
+        // The exact text that used to run S, y, n and a dispatch.
+        let act = a.on_paste("Sync branch\n");
+        assert_eq!(act, Action::None);
+        assert_eq!(a.mode, Mode::Normal, "Normal mode must discard a paste");
+        assert!(a.filter.is_empty());
+        assert!(a.prompt.is_none());
+        assert!(a.message.is_none());
+
+        // Filter mode takes it as text, minus the control characters.
+        a.on_key(press('/'));
+        assert_eq!(a.on_paste("kernel\nbugs"), Action::Redraw);
+        assert_eq!(a.filter, "kernelbugs");
+    }
+
+    #[test]
+    fn paste_into_a_prompt_is_literal_text() {
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        a.on_key(press('n'));
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground));
+        assert_eq!(a.on_paste("重构 pipeline\r\n"), Action::Redraw);
+        let p = a.prompt.clone().expect("prompt");
+        assert_eq!(p.fields.get(1).map(String::as_str), Some("重构 pipeline"));
+        // char-indexed, so the two wide chars count once each
+        assert_eq!(p.cursor, 11);
+    }
+
+    #[test]
+    fn filter_mode_ignores_unhandled_ctrl_chords() {
+        // `key_filter`'s `_ if ctrl` arm sits BEFORE its printable-char arm, so
+        // Ctrl-a/Ctrl-e/Ctrl-l cannot leak their bare letter into the needle.
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        a.on_key(press('/'));
+        for c in ['a', 'e', 'l', 'k', 'r'] {
+            assert_eq!(
+                a.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)),
+                Action::None
+            );
+        }
+        assert_eq!(a.filter, "");
+
+        // The two chords that ARE bound still work.
+        for c in "af/reg".chars() {
+            a.on_key(press(c));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(a.filter, "");
+        for c in "af reg".chars() {
+            a.on_key(press(c));
+        }
+        a.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(a.filter, "af ");
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(a.filter, "");
+    }
+
+    #[test]
+    fn split_anchor_never_leaves_the_sidebars_window() {
+        let mut a = app();
+        a.sidebar_pane = PaneId::parse("%1");
+        // Window 1 is the ccmux layout; window 2 is a window the operator made
+        // themselves, whose panes have their own `pane_left` and `pane_active`.
+        a.panes = vec![
+            pane("%1", 1, 1, 0, 34, false),
+            pane("%10", 1, 2, 35, 65, false),
+            pane("%11", 2, 1, 0, 10, false),
+            pane("%12", 2, 2, 41, 59, true),
+        ];
+        assert_eq!(a.split_anchor(), PaneId::parse("%10"));
+
+        // The active pane of the ccmux window wins, and only that one.
+        a.panes[1].active = true;
+        assert_eq!(a.split_anchor(), PaneId::parse("%10"));
+
+        // Sidebar alone in its window: it anchors its own first split.
+        a.panes = vec![pane("%1", 1, 1, 0, 100, true), pane("%12", 2, 1, 0, 100, true)];
+        assert_eq!(a.split_anchor(), PaneId::parse("%1"));
+
+        // Sidebar unresolvable: the leftmost pane of the lowest window, never a
+        // pane from some other window.
+        a.sidebar_pane = None;
+        a.panes = vec![
+            pane("%9", 3, 1, 0, 100, false),
+            pane("%10", 1, 2, 35, 65, false),
+            pane("%11", 1, 1, 0, 34, false),
+        ];
+        assert_eq!(a.split_anchor(), PaneId::parse("%11"));
+
+        // No panes at all: nothing to anchor, and nothing is split.
+        a.panes.clear();
+        assert_eq!(a.split_anchor(), None);
+    }
+
+    #[test]
+    fn pinned_width_never_starves_the_content_panes() {
+        let mut a = app();
+        a.sidebar_pane = PaneId::parse("%1");
+
+        // Roomy window: the request is honoured.
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 1, 2, 35, 165, true)];
+        assert_eq!(a.pinned_width_from(34), Some(34));
+        assert_eq!(a.pinned_width_from(60), Some(60));
+
+        // 30-column window: pinning 34 left the Claude pane at ONE column.
+        a.panes = vec![pane("%1", 1, 1, 0, 19, false), pane("%2", 1, 2, 20, 10, true)];
+        assert_eq!(a.pinned_width_from(34), Some(10));
+
+        // Narrower than the content floor: do not resize at all.
+        a.panes = vec![pane("%1", 1, 1, 0, 12, false), pane("%2", 1, 2, 13, 7, true)];
+        assert_eq!(a.pinned_width_from(34), None);
+
+        // Alone in its window: nothing to take columns from.
+        a.panes = vec![pane("%1", 1, 1, 0, 200, true), pane("%9", 2, 1, 0, 200, false)];
+        assert_eq!(a.pinned_width_from(34), None);
+
+        // Unresolved sidebar: no pin.
+        a.sidebar_pane = None;
+        assert_eq!(a.pinned_width_from(34), None);
+    }
+
+    #[test]
+    fn logs_scroll_stops_where_the_view_stops() {
+        let mut a = app();
+        a.overlay_viewport = 28;
+        a.logs = Some(LogsView {
+            title: "bt/reg-update".into(),
+            lines: (0..60).map(|i| format!("log line {i}")).collect(),
+            scroll: 0,
+        });
+        a.mode = Mode::Logs;
+
+        a.on_key(press('G'));
+        assert_eq!(a.logs.as_ref().map(|l| l.scroll), Some(60 - 28));
+        // One `k` must move the view, not burn off phantom scroll.
+        a.on_key(press('k'));
+        assert_eq!(a.logs.as_ref().map(|l| l.scroll), Some(60 - 29));
+
+        // Held `j` cannot run past the last full page.
+        for _ in 0..500 {
+            a.on_key(press('j'));
+        }
+        assert_eq!(a.logs.as_ref().map(|l| l.scroll), Some(60 - 28));
+
+        // A log shorter than the viewport does not scroll at all.
+        a.logs = Some(LogsView {
+            title: String::new(),
+            lines: vec!["one".into(), "two".into()],
+            scroll: 0,
+        });
+        a.on_key(press('j'));
+        a.on_key(press('G'));
+        assert_eq!(a.logs.as_ref().map(|l| l.scroll), Some(0));
+    }
+
     #[test]
     fn help_overlay_scroll_is_its_own_field_and_is_capped() {
         let mut a = app();
         a.viewport = 10;
+        a.overlay_viewport = 10;
+        a.help_lines = 21;
         a.scroll = 7;
 
         assert_eq!(a.on_key(press('?')), Action::Redraw);
@@ -1417,11 +1843,16 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert_eq!(a.help_scroll, 0);
 
-        // Held `j` cannot run away and leave `k` looking dead.
+        // Held `j` stops at the last SCROLLABLE line, so one `k` moves the
+        // view. A fixed cap instead left `k` dead for dozens of presses.
         for _ in 0..500 {
             a.on_key(press('j'));
         }
-        assert_eq!(a.help_scroll, HELP_SCROLL_MAX);
+        assert_eq!(a.help_scroll, 21 - 10);
+        a.on_key(press('G'));
+        assert_eq!(a.help_scroll, 21 - 10);
+        a.on_key(press('k'));
+        assert_eq!(a.help_scroll, 21 - 11, "`k` after `G` must move the view");
 
         // The list scroll is untouched throughout; `clamp_scroll` owns it.
         assert_eq!(a.scroll, 7);
@@ -1491,6 +1922,9 @@ mod tests {
         a.sessions = vec![bg("deadbeef", "something else", State::Working)];
         a.rebuild_rows();
 
+        // Backdate the arming so this stands in for a human who read the modal;
+        // the type-ahead window itself is covered separately.
+        a.confirm_armed_at = Instant::now().checked_sub(Duration::from_secs(1));
         let act = a.on_key(press('y'));
         assert_eq!(act, Action::Redraw);
         assert_eq!(a.mode, Mode::Normal);
@@ -1614,16 +2048,18 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(a.mode, Mode::Normal);
 
-        // §8.8: Esc in Normal with a filter clears it instead of quitting.
+        // §8.8: Esc in Normal with a filter clears it.
         let act = a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(act, Action::Redraw);
         assert!(a.filter.is_empty());
         assert!(!a.should_quit);
-        // With no filter, Esc quits.
+        // AMENDED §8.8: with no filter, Esc is inert — it must NOT quit.
         assert_eq!(
             a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            Action::Quit
+            Action::Redraw
         );
+        assert!(!a.should_quit);
+        assert_eq!(a.mode, Mode::Normal);
     }
 
     #[test]

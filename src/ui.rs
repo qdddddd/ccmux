@@ -24,14 +24,17 @@
 //!    the list's `scroll` because `App::clamp_scroll` pins the latter to the
 //!    session list's bounds every frame.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, Confirm, LogsView, Mode, MsgLevel, Prompt, PromptKind};
-use crate::model::{Group, Kind, Row, Session, State, Status, format_age, shorten_cwd, truncate_end};
+use crate::model::{
+    Group, Kind, Row, Session, State, Status, display_width, format_age, shorten_cwd,
+    truncate_end,
+};
 
 /// Gruvbox, matching ~/projects/slurm-tui/src/palette.rs.
 #[derive(Debug, Clone, Copy)]
@@ -175,11 +178,33 @@ pub fn draw(f: &mut Frame, app: &App) {
             r,
         );
     }
-    if let Some(r) = s.detail {
-        draw_detail(f, r, app, &p);
-    }
-    if let Some(r) = s.footer {
-        draw_footer(f, r, app, &p);
+    // §6.8 AMENDMENT: a message wider than the sidebar takes over the detail
+    // block and wraps, instead of losing its tail to a one-line truncation.
+    // §8.5's refusal and "agent still running" wordings do not fit 34 columns,
+    // and they are the two the operator most needs to read in full.
+    match (s.detail, s.footer, overflow_message(app, area.width as usize, &p)) {
+        (Some(d), Some(ft), Some((text, color))) => {
+            let rect = Rect {
+                x: d.x,
+                y: d.y,
+                width: d.width,
+                height: ft.y.saturating_add(ft.height).saturating_sub(d.y),
+            };
+            f.render_widget(
+                Paragraph::new(text)
+                    .style(Style::default().fg(color))
+                    .wrap(Wrap { trim: true }),
+                rect,
+            );
+        }
+        _ => {
+            if let Some(r) = s.detail {
+                draw_detail(f, r, app, &p);
+            }
+            if let Some(r) = s.footer {
+                draw_footer(f, r, app, &p);
+            }
+        }
     }
 
     // Overlays always render INSIDE the sidebar rect — ccmux never draws over a
@@ -215,7 +240,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
             .iter()
             .filter(|r| matches!(r, Row::Session { .. }))
             .count();
-        let count = if app.filter.trim().is_empty() {
+        // §6.2 AMENDMENT: the ratio shows whenever the list is showing fewer
+        // than all sessions, not only when `/` is active — `a` (hide Completed)
+        // also hides rows, and a bare total then contradicts the visible list.
+        let count = if matching == total {
             format!("{total}")
         } else {
             format!("{matching}/{total}")
@@ -252,7 +280,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 }
 
 fn push(spans: &mut Vec<Span<'static>>, used: &mut usize, text: &str, style: Style) {
-    *used += text.chars().count();
+    *used += display_width(text);
     spans.push(Span::styled(text.to_string(), style));
 }
 
@@ -275,8 +303,8 @@ fn group_header_line(g: Group, count: usize, w: usize, p: &Palette) -> Line<'sta
         ));
     }
     let lead = "── ";
-    let title_w = title.chars().count();
-    let tail = w.saturating_sub(lead.chars().count() + title_w + 1);
+    let title_w = display_width(&title);
+    let tail = w.saturating_sub(display_width(lead) + title_w + 1);
     let mut spans = vec![
         Span::styled(lead.to_string(), Style::default().fg(p.dim)),
         Span::styled(title, Style::default().fg(group_accent(g, p))),
@@ -351,7 +379,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
             Span::styled(" ".to_string(), base),
         ];
         let name = truncate_end(&sess.name, w.saturating_sub(2));
-        let used = 2 + name.chars().count();
+        let used = 2 + display_width(&name);
         spans.push(Span::styled(name, name_style));
         pad_to(&mut spans, used, w, base);
         return Line::from(spans);
@@ -371,13 +399,13 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         let a = format_age(sess.started_at, app.now_ms);
         // The field is 4 columns wide; a degenerate "9999d" is allowed to spill
         // into the name budget rather than be truncated into nonsense.
-        let width = a.chars().count().max(4);
+        let width = display_width(&a).max(4);
         Some((a, width))
     } else {
         None
     };
 
-    let badge_w = badge.as_ref().map(|b| 1 + b.chars().count()).unwrap_or(0);
+    let badge_w = badge.as_ref().map(|b| 1 + display_width(b)).unwrap_or(0);
     let age_w = age.as_ref().map(|(_, wd)| 1 + wd).unwrap_or(0);
 
     // marker(1) + glyph(1) + space(1) = 3 fixed left columns.
@@ -390,7 +418,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     spans.push(Span::styled(marker.to_string(), marker_style));
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
     spans.push(Span::styled(" ".to_string(), base));
-    let mut used = 3 + name.chars().count();
+    let mut used = 3 + display_width(&name);
     spans.push(Span::styled(name, name_style));
 
     // Pad so the right-hand segment lands flush with the row's right edge.
@@ -403,7 +431,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     }
     if let Some(b) = badge {
         spans.push(Span::styled(" ".to_string(), base));
-        let bw = b.chars().count();
+        let bw = display_width(&b);
         spans.push(Span::styled(
             b,
             if selected { base.fg(p.fg) } else { base.fg(p.aqua) },
@@ -411,9 +439,9 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         used += 1 + bw;
     }
     if let Some((a, width)) = age {
-        let lead = width.saturating_sub(a.chars().count());
+        let lead = width.saturating_sub(display_width(&a));
         spans.push(Span::styled(" ".repeat(1 + lead), base));
-        let aw = a.chars().count();
+        let aw = display_width(&a);
         spans.push(Span::styled(
             a,
             if selected { base.fg(p.fg) } else { base.fg(p.dim) },
@@ -458,15 +486,22 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     }
 
     if lines.is_empty() {
+        // §9.3: centred in the list area, vertically and horizontally.
         let text = if app.sessions.is_empty() {
-            "  no sessions"
+            "no sessions"
         } else {
-            "  no matches"
+            "no matches"
         };
-        lines.push(Line::from(Span::styled(
-            truncate_end(text, w),
-            Style::default().fg(p.dim),
-        )));
+        for _ in 0..(height / 2) {
+            lines.push(Line::from(""));
+        }
+        lines.push(
+            Line::from(Span::styled(
+                truncate_end(text, w),
+                Style::default().fg(p.dim),
+            ))
+            .alignment(Alignment::Center),
+        );
     }
 
     f.render_widget(Paragraph::new(lines), area);
@@ -502,15 +537,23 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         Kind::Background => "background",
         Kind::Interactive => "interactive",
     };
-    let status = match &sess.status {
-        Status::Busy => "busy".to_string(),
-        Status::Idle => "idle".to_string(),
-        Status::Unknown(s) if s.is_empty() => "?".to_string(),
-        Status::Unknown(s) => s.clone(),
+    // `state: "done"` rows carry no `status` key (verified: 10 of 12 live
+    // completed sessions), so the group is resolved FIRST here for the same
+    // reason `status_glyph` resolves it first — otherwise the list says
+    // "Completed" while the detail block says "?".
+    let status = if matches!(sess.state, Some(State::Done)) {
+        "done".to_string()
+    } else {
+        match &sess.status {
+            Status::Busy => "busy".to_string(),
+            Status::Idle => "idle".to_string(),
+            Status::Unknown(s) if s.is_empty() => "?".to_string(),
+            Status::Unknown(s) => s.clone(),
+        }
     };
     let pane_suffix = pane_index_for(app, &sess.session_id).map(|i| format!(" · pane {i}"));
     let body = format!("{short}  {kind}  {status}");
-    let suffix_w = pane_suffix.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+    let suffix_w = pane_suffix.as_ref().map(|s| display_width(s)).unwrap_or(0);
     let mut l2_spans = vec![
         Span::styled(" id      ", label),
         Span::styled(
@@ -534,6 +577,31 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 }
 
 // ── Footer (§6.8) ───────────────────────────────────────────────────────────
+
+/// The footer text that does NOT fit on one row, with its colour — `None` when
+/// the footer has nothing to say, when what it says fits, or when `Mode::Filter`
+/// owns the footer (§6.8 priority 1).
+fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)> {
+    if w == 0 || app.mode == Mode::Filter {
+        return None;
+    }
+    let (text, color) = match (&app.message, &app.poll_error) {
+        (Some((text, level)), _) => (
+            text.clone(),
+            match level {
+                MsgLevel::Info => p.green,
+                MsgLevel::Warn => p.yellow,
+                MsgLevel::Error => p.red,
+            },
+        ),
+        (None, Some(err)) => (format!("agents: {}", err.lines().next().unwrap_or("")), p.red),
+        (None, None) => return None,
+    };
+    if display_width(&text) <= w {
+        return None;
+    }
+    Some((text, color))
+}
 
 const HINT: &str = "j/k move  ⏎ open  o/s split  x close  S stop  n new  ? help";
 
@@ -653,9 +721,16 @@ const KEYS: &[(&str, &str)] = &[
     ("r", "force refresh"),
     ("?", "this help"),
     ("q", "quit sidebar"),
-    ("Esc", "clear filter, else quit"),
+    ("Esc", "clear filter"),
     ("Ctrl-c", "quit from any mode"),
 ];
+
+/// Number of lines the `?` overlay renders. `main.rs` copies it into
+/// `App::help_lines` each frame so `app.rs` can clamp `help_scroll` against the
+/// real content without importing `ui` (the DAG stays acyclic).
+pub fn help_line_count() -> usize {
+    KEYS.len()
+}
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     if area.width == 0 || area.height == 0 {
@@ -677,7 +752,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         .map(|(k, a)| {
             if two_col {
                 let key = truncate_end(k, key_w);
-                let pad = key_w.saturating_sub(key.chars().count());
+                let pad = key_w.saturating_sub(display_width(&key));
                 Line::from(vec![
                     Span::styled(key, Style::default().fg(p.yellow)),
                     Span::styled(" ".repeat(pad), Style::default()),
@@ -690,7 +765,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
                 Line::from(vec![
                     Span::styled((*k).to_string(), Style::default().fg(p.yellow)),
                     Span::styled(
-                        truncate_end(&format!(" {a}"), w.saturating_sub(k.chars().count())),
+                        truncate_end(&format!(" {a}"), w.saturating_sub(display_width(k))),
                         Style::default().fg(p.fg),
                     ),
                 ])
@@ -845,7 +920,7 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
             Style::default().fg(p.dim)
         };
         // prefix(2) + label + space
-        let head = prefix.chars().count() + label.chars().count() + 1;
+        let head = display_width(prefix) + display_width(label) + 1;
         let budget = w.saturating_sub(head);
 
         let mut spans = vec![
@@ -865,7 +940,7 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
             let after: String = chars.get(cursor.saturating_add(1)..).map(|s| s.iter().collect()).unwrap_or_default();
             if budget > 0 {
                 spans.push(Span::styled(truncate_end(&before, budget), value_style));
-                let left = budget.saturating_sub(before.chars().count());
+                let left = budget.saturating_sub(display_width(&before));
                 if left > 0 {
                     spans.push(Span::styled(at, value_style.add_modifier(Modifier::REVERSED)));
                     let left = left.saturating_sub(1);
@@ -947,7 +1022,7 @@ fn pane_index_for(app: &App, session_id: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::model::{Kind, Session, State, Status, build_rows};
-    use crate::tmux::{PaneEntry, PaneMap};
+    use crate::tmux::{PaneEntry, PaneId, PaneInfo, PaneMap};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::collections::BTreeMap;
@@ -986,6 +1061,8 @@ mod tests {
             scroll: 0,
             viewport: 10,
             help_scroll: 0,
+            overlay_viewport: 20,
+            help_lines: help_line_count(),
             filter: String::new(),
             show_completed: true,
             mode: Mode::Normal,
@@ -997,6 +1074,7 @@ mod tests {
             sidebar_pane: None,
             panes: Vec::new(),
             degraded: false,
+            confirm_armed_at: None,
             message: None,
             msg_deadline: None,
             poll_error: None,
@@ -1199,6 +1277,142 @@ mod tests {
         term.draw(|f| draw(f, &app)).unwrap();
         let dump = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(dump.contains('▌'), "open marker must be drawn");
+    }
+
+    /// One string per terminal row, so a test can say "the age column is on the
+    /// row" instead of grepping the whole screen.
+    fn rows_at(app: &App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test backend");
+        term.draw(|f| draw(f, app)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_wide_name_keeps_the_age_and_the_pane_badge() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        // A name Claude really produces from a Chinese conversation: 20 chars,
+        // 40 display columns — wider than the whole sidebar.
+        if let Some(s) = app.sessions.get_mut(0) {
+            s.name = "回归模型数据清洗与因子测试流水线重构任务".into();
+            s.started_at = 0;
+        }
+        app.now_ms = 3_600_000;
+        app.rows = build_rows(&app.sessions, "", true);
+        let sid = app.sessions[0].session_id.clone();
+        app.map.panes.insert(
+            "%7".into(),
+            PaneEntry {
+                session_id: sid,
+                short_id: "00000001".into(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+        app.panes = vec![PaneInfo {
+            id: PaneId::parse("%7").expect("pane id"),
+            pid: 0,
+            index: 3,
+            left: 35,
+            top: 0,
+            width: 60,
+            height: 24,
+            active: false,
+            session_name: "ccmux".into(),
+            window_index: 1,
+        }];
+
+        let rows = rows_at(&app, 34, 24);
+        let row = rows
+            .iter()
+            .find(|r| r.contains('回'))
+            .cloned()
+            .unwrap_or_default();
+        assert!(row.contains("1h"), "wide name ate the age column: {row:?}");
+        assert!(row.contains('3'), "wide name ate the pane badge: {row:?}");
+        assert!(row.contains('▌'), "wide name ate the open marker: {row:?}");
+    }
+
+    #[test]
+    fn header_count_reflects_a_hidden_group_not_only_a_filter() {
+        let mut app = app_with(many(6));
+        app.show_completed = false;
+        app.rows = build_rows(&app.sessions, "", false);
+        let rows = rows_at(&app, 40, 24);
+        assert!(
+            rows[0].contains("/6"),
+            "`a` hid rows but the header still claims all 6: {:?}",
+            rows[0]
+        );
+
+        // Nothing hidden: the bare total, not a ratio.
+        app.show_completed = true;
+        app.rows = build_rows(&app.sessions, "", true);
+        let rows = rows_at(&app, 40, 24);
+        assert!(rows[0].contains("6 sessions"), "{:?}", rows[0]);
+        assert!(!rows[0].contains("/6"), "{:?}", rows[0]);
+    }
+
+    #[test]
+    fn a_message_too_wide_for_the_footer_wraps_instead_of_clipping() {
+        let mut app = app_with(many(3));
+        // §8.5's refusal — the one message the operator must read in full.
+        app.message = Some((
+            "refusing: closing this pane would end the interactive session — exit Claude inside the pane instead".into(),
+            MsgLevel::Warn,
+        ));
+        let rows = rows_at(&app, 34, 24);
+        let tail = rows[20..].join(" ");
+        assert!(tail.contains("refusing"), "{tail:?}");
+        assert!(
+            tail.contains("exit Claude inside the pane"),
+            "the actionable half was clipped: {tail:?}"
+        );
+
+        // A message that fits leaves the detail block alone.
+        app.message = Some(("stopped af/reg".into(), MsgLevel::Info));
+        let rows = rows_at(&app, 34, 24);
+        assert!(rows[23].contains("stopped af/reg"), "{:?}", rows[23]);
+        assert!(rows[20].contains("name"), "detail block lost: {:?}", rows[20]);
+    }
+
+    #[test]
+    fn detail_block_says_done_for_a_completed_session() {
+        let app = app_with(vec![sess(
+            1,
+            Kind::Background,
+            // The live payload omits `status` on every `state: "done"` row.
+            Status::Unknown(String::new()),
+            Some(State::Done),
+        )]);
+        let rows = rows_at(&app, 40, 24);
+        let id_line = rows
+            .iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(id_line.contains("done"), "{id_line:?}");
+        assert!(!id_line.contains('?'), "{id_line:?}");
+    }
+
+    #[test]
+    fn the_empty_placeholder_is_centred_in_the_list() {
+        let app = app_with(Vec::new());
+        let rows = rows_at(&app, 34, 24);
+        let at = rows
+            .iter()
+            .position(|r| r.contains("no sessions"))
+            .expect("placeholder");
+        assert!(at > 4, "placeholder is not centred, it is on row {at}");
+        let row = &rows[at];
+        let lead = row.len() - row.trim_start().len();
+        assert!(lead > 4, "placeholder is not centred horizontally: {row:?}");
     }
 
     #[test]
