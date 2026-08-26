@@ -140,18 +140,36 @@ Exact sequence. Every step is an argv vector to `tmux` — never a shell string.
         d. tmux set-option -t <name> @ccmux_map     {"v":1,"panes":{}}
         e. tmux set-option -t <name> status off
         f. tmux set-option -t <name> mouse on
-        g. tmux resize-pane -t <pane> -x <width>
+        g. tmux set-option -w -t <pane> @ccmux_tab_sidebar <pane>   # mark tab 1
+        h. tmux resize-pane -t <pane> -x <width>
 
- 5. if exists:
-        a. sidebar = tmux::get_user_option(<name>, "@ccmux_sidebar")
-        b. if sidebar is None, or not a valid %N, or not present in
-           tmux::list_panes_in_session(<name>):
-               # sidebar was quit with `q` or crashed — heal it
-               leftmost = pane with the smallest `#{pane_left}` in <name>:cc
-               pane = tmux split-window -h -b -t <leftmost> -P -F '#{pane_id}' -d -- <SIDEBAR_CMD>
-               tmux set-option -t <name> @ccmux_sidebar <pane>
-               tmux resize-pane -t <pane> -x <width>
-        c. otherwise: tmux resize-pane -t <sidebar> -x <width>     # re-pin, harmless
+ 5. if exists — heal ONCE PER TAB (§11.5). Healing is the launcher's job
+    exclusively: a running sidebar never lays out another tab, because that
+    would be a second writer of another window's options.
+        a. tmux set-option -t <name> @ccmux_width <width>          # first, always
+        b. for each window W in tmux::list_tabs(<name>):
+             live = W's @ccmux_tab_sidebar names a pane still in W
+             i.   live                       -> tmux resize-pane -t <sidebar> -x <width>
+             ii.  W is a ccmux tab (a marker is set — the SOLE test) but the
+                  sidebar is gone — quit with `q` or crashed:
+                      leftmost = pane with the smallest `#{pane_left}` in W
+                      pane = tmux split-window -h -b -t <leftmost> -P -F '#{pane_id}' -d -- <SIDEBAR_CMD>
+                      tmux set-option -w -t <pane> @ccmux_tab_sidebar <pane>
+                      tmux resize-pane -t <pane> -x <width>
+             iii. no marker -> LEAVE THE WINDOW COMPLETELY ALONE. It is the
+                  operator's own (a bare `prefix-c` inside the ccmux session),
+                  or a tab `t` is building right now.
+        c. if NO window carried a marker, this session was written
+           by a build that had no tabs: fall back to the pre-tabs rule exactly —
+           the pane named by the session-scoped `@ccmux_sidebar` if it parses
+           and is live (adopt and re-pin it; never split a second one in beside
+           it), else the `cc`-named window, else the lowest window — then give
+           that window a proper `@ccmux_tab_sidebar` so this path cannot fire
+           twice. The marker must be read with `show-options -w -qv` or through
+           `list_tabs`'s `_tab_`-prefixed names, NEVER as a format lookup of the
+           legacy key: `#{@name}` falls back window -> session -> global, so on
+           a legacy session that would report EVERY window as marked and inject
+           a sidebar into each of the operator's own windows.
 
  6. attach:
         if tmux::inside_tmux():  tmux switch-client -t <name>
@@ -417,6 +435,24 @@ pub const WINDOW_NAME: &str = "cc";
 pub const OPT_MAP: &str = "@ccmux_map";
 pub const OPT_SIDEBAR: &str = "@ccmux_sidebar";
 pub const OPT_WIDTH: &str = "@ccmux_width";
+pub const OPT_HIDDEN: &str = "@ccmux_hidden";
+
+// Per-window (per-tab) options — see §11. New NAMES, not reused ones: a
+// `#{@name}` format lookup falls back window -> session -> global, so a legacy
+// SESSION value under a reused name would be reported as every window's value.
+pub const OPT_TAB_SIDEBAR: &str = "@ccmux_tab_sidebar";
+pub const OPT_TAB_MAP: &str = "@ccmux_tab_map";
+pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
+pub const EMPTY_MAP_JSON: &str = r#"{"v":1,"panes":{}}"#;
+
+/// A validated tmux window id in `@N` form. An IDENTITY, never a target: no
+/// function in the crate renders one into a `-t` argument (§2, §11.4).
+pub struct WindowId(String);
+impl WindowId {
+    pub fn parse(s: &str) -> Option<WindowId>;   // ^@\d+$
+    pub fn as_str(&self) -> &str;
+    pub fn num(&self) -> u64;                    // NUMERIC: "@9" < "@10"
+}
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -523,7 +559,11 @@ pub fn attach_or_switch(session: &str) -> Result<(), TmuxError>;
 /// `tmux list-panes -t <session> -s -F '<FMT>'` — session-scoped (R3), and the
 /// ONLY pane enumeration in the program. ccmux never lists the server.
 /// FMT = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t\
-///        #{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_index}"
+///        #{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_index}\t\
+///        #{window_id}"
+/// `#{window_id}` is not a duplicate of `#{window_index}`: the index shifts
+/// under `renumber-windows`, the id never does, and everything that must
+/// survive a tick is keyed by the id.
 
 /// R2 gate. Err(BadTarget) when `pane` is absent from `session`.
 pub fn assert_in_session(pane: &PaneId, session: &str) -> Result<(), TmuxError>;
@@ -625,13 +665,73 @@ impl PaneMap {
     pub fn reconcile(&mut self, live: &[PaneInfo]) -> bool;
 }
 
-/// Read `@ccmux_map` and deserialize. Any failure (unset, empty, bad JSON,
-/// `v != 1`) yields `PaneMap::new()` — never an error. A corrupt map must not
-/// stop the sidebar from starting.
+/// Read the LEGACY session-scoped `@ccmux_map`. Any failure (unset, empty, bad
+/// JSON, `v != 1`) yields `PaneMap::new()` — never an error. Only the one-time
+/// migration reads it now; the live map is `@ccmux_tab_map`, per window.
 pub fn load_map(session: &str) -> PaneMap;
 
-/// Serialize and write to `@ccmux_map`.
-pub fn save_map(session: &str, map: &PaneMap) -> Result<(), TmuxError>;
+// ── Tabs: per-window state (§11) ────────────────────────────────────────────
+
+/// Everything one tab persists, plus its identity.
+pub struct TabInfo {
+    pub window: WindowId,
+    pub index: u32,
+    pub sidebar: Option<PaneId>,
+    pub map: PaneMap,
+    pub hidden: HiddenLog,
+}
+
+/// `tmux list-windows -t '=<session>:' -F …` — the whole cross-tab picture and
+/// the session-scoped `@ccmux_width`, in ONE invocation. It REPLACES the
+/// per-tick `show-options @ccmux_width`, so the cross-tab picture is free.
+/// A window whose fields are absent, malformed, or version-mismatched yields
+/// the empty value, never an error.
+pub fn list_tabs(session: &str) -> Result<(Vec<TabInfo>, Option<u16>), TmuxError>;
+
+/// `tmux new-window -d -t '=<session>:' -n cc -P -F … -- <first_cmd>`.
+/// The target is built by `session_target` ALONE — there is no parameter
+/// through which a window target can be passed (§11.4).
+pub fn new_tab(session: &str, first_cmd: &str) -> Result<(WindowId, u32, PaneId), TmuxError>;
+
+/// Record `pane` as its own window's sidebar. R2-gated on `pane`.
+pub fn set_tab_sidebar(session: &str, pane: &PaneId) -> Result<(), TmuxError>;
+
+/// Write this window's `@ccmux_tab_map` / `@ccmux_tab_hidden`, addressed
+/// through the writing process's own sidebar pane. R2-gated, and skipped when
+/// the identical value was last written for that (option, session, window).
+pub fn save_tab_map(session: &str, pane: &PaneId, window: &WindowId, map: &PaneMap)
+    -> Result<(), TmuxError>;
+pub fn save_tab_hidden(session: &str, pane: &PaneId, window: &WindowId, log: &HiddenLog)
+    -> Result<(), TmuxError>;
+
+/// The ONE write into a window this process does not own: `t` seeds the new
+/// tab's map through the Claude pane BEFORE that tab's sidebar exists.
+/// Deliberately uncached (§11.2).
+pub fn write_tab_map_uncached(session: &str, pane: &PaneId, map: &PaneMap)
+    -> Result<(), TmuxError>;
+
+// ── The dismissal log (§11.3) ───────────────────────────────────────────────
+
+/// One dismissal (`add: true`) or restoration (`add: false`), stamped so every
+/// reader orders it identically.
+pub struct HiddenOp { pub id: String, pub add: bool, pub seq: u64, pub org: u64 }
+
+/// One window's fragment of the shared dismissal log. Schema version 2.
+pub struct HiddenLog { pub v: u32, pub ops: Vec<HiddenOp> }
+impl HiddenLog {
+    pub fn new() -> Self;
+    pub fn push(&mut self, op: HiddenOp) -> bool;   // idempotent, capped
+    pub fn max_seq(&self) -> u64;
+    pub fn forget<'a, I: IntoIterator<Item = &'a str>>(&mut self, ids: I) -> bool;
+}
+
+/// Fold every fragment into the shared dismissed set: a last-writer-wins
+/// register per id, keyed by the total order `(seq, org)`. Ordered by winning
+/// stamp ascending, which is `HiddenSet`'s existing "oldest first" contract.
+pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> HiddenSet;
+
+/// Garbage-collect one's OWN fragment against what the others already carry.
+pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool;
 
 // ── Shell quoting (§7) ──────────────────────────────────────────────────────
 
@@ -1068,6 +1168,14 @@ Values are keyed back to `model::Session::session_id` (UUID, stable), not to the
 
 ### 5.2 Persistence: a tmux session user option
 
+**AMENDED BY §11.** The live map is `@ccmux_tab_map`, a WINDOW option, one per
+tab, each written by exactly one process. The session-scoped `@ccmux_map`
+described below is still written once at session creation and re-written to the
+empty value by the one-time migration, because `main::run_launcher`'s ownership
+guard reads its presence to prove the session is ccmux's — but it is no longer
+updated after that. Everything else in this section (the shape, the `-qv` rule,
+the ~16 KB ceiling, reconciliation) applies unchanged to the per-window copies.
+
 Stored in `@ccmux_map` on the tmux session:
 
 ```
@@ -1140,8 +1248,13 @@ The section number is kept so §5.5 does not move.
 | `S` stops a session | no map change; its pane stays until the operator closes it |
 
 Double-attach is legal (PROBE-FINDINGS §3), so a session may legitimately map to
-several panes. `pane_for_session` returns the lowest-numbered one for jumps;
-`x` closes only that one.
+several panes — including one per tab. `pane_for_session` returns the one in the
+asking sidebar's OWN tab when there is one, and otherwise the lowest-numbered;
+`x` closes only that one. Own-tab-first is not a preference: the pane beside a
+sidebar is the one its badge calls "here", the one `Enter` must not travel away
+from, and the one `x` must kill. Resolving all three to whichever window
+happened to draw the lower pane id made a visible row's verbs act on another
+tab's pane while the badge said the opposite.
 
 ---
 
@@ -1401,6 +1514,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `Enter` | **open or jump** — §8.3 | no |
 | `o` | open in a **vertical** split (vim `:vsplit`, side by side, tmux `-h`) | no |
 | `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`) | no |
+| `t` | open in a **new tab** — a window with its own sidebar — and go there (§8.10) | no |
 | `x` | close the pane showing a session — the agent keeps running (§8.5) | no |
 | `S` | **stop the session** — requires confirmation | **YES** (§8.2) |
 | `n` | dispatch a new background session with a typed task | no |
@@ -1523,11 +1637,15 @@ sessions in a row without leaving the list.
 2. sel = selected_session() or return
 3. pane = app.pane_of(sel.session_id)
    none -> flash "not open" (Warn); return
-4. pane == sidebar_pane -> flash "refusing to close the sidebar" (Warn); return
-5. tmux::kill_pane(session, pane)   [R2-gated]
-6. map.remove(pane); map_dirty = true; save_map
+4. pane is ANY tab's sidebar -> flash "refusing to close the sidebar" (Warn); return
+5. tmux::kill_pane(session, pane)   [R2-gated; the session gate spans every window]
+6. if the pane was in MY tab's map: map.remove(pane); map_dirty = true; flush
+   otherwise write NOTHING — that window's option has one writer and it is not
+   this process. Its owner reconciles the entry away on its next tick, and
+   until then every process already hides it, because `open` is rebuilt as
+   `union(maps) ∩ live panes` (§11.2).
 7. tmux::pin_sidebar(...)
-8. flash "closed pane <index> — agent still running" (Info)
+8. flash "closed pane <index>[ in tab <N>] — agent still running" (Info)
 ```
 
 **`x` is unconditionally safe here, and only because of what is listed.**
@@ -1608,6 +1726,71 @@ table.
 `Ctrl-c` quits from **any** mode, immediately, without confirming and without
 touching a session — the sidebar owns no agent state, so there is nothing to
 lose. It is deliberately not routed through `Mode::Confirm`.
+
+### 8.10 `t` — open in a new tab
+
+```
+1. degraded -> flash "not inside tmux — tabs unavailable" (Warn); return
+2. sel = selected_session() or return
+3. !sel.is_attachable() -> flash "no short id — cannot open this session" (Warn); return
+4. no sidebar command -> flash "sidebar command unknown — cannot open a tab" (Error); return
+5. (win, index, claude) = tmux::new_tab(session, agents::attach_pane_cmd(short_id))
+6. tmux::write_tab_map_uncached(session, claude, {claude -> PaneEntry})   [R2-gated]
+7. sidebar = tmux::split_left_of(session, claude, <SIDEBAR_CMD>)          [R2-gated]
+   tmux::set_tab_sidebar(session, sidebar)                                [R2-gated]
+   tmux::pin_sidebar(session, sidebar, requested_width())
+8. tmux::select_pane(session, claude)                                    [R2-gated]
+9. refresh_panes; pin_sidebar; flash "opened <name> in tab <index>" (Info)
+```
+
+Guards 1-3 mirror `o`/`s` exactly, and all four refusals happen before any tmux
+command is issued.
+
+**Steps 5-7 are ordered by necessity, not by style.** The Claude pane is created
+FIRST, as the new window's only pane, and that window's `@ccmux_tab_map` is
+written through it before the sidebar exists. Create the sidebar first and its
+process is already running when the map is written, so its own next flush —
+built from the map it loaded BEFORE that write — clobbers the entry, orphaning a
+Claude pane from every map permanently and leaving it unclosable by `x`. This
+ordering makes the write provably precede the existence of any process in that
+window, which is what keeps `@ccmux_tab_map` a single-writer option (§11.1).
+
+**`t` writes `@ccmux_tab_sidebar` itself, in step 7, the moment the split
+returns.** It used to leave that to the new process, which registers itself from
+`$TMUX_PANE` on its first tick 30-40 ms later — and in that gap the window was
+identifiable as a ccmux tab (its map was already seeded) while carrying no
+marker, so a launcher run in the same instant split a SECOND sidebar into it.
+Two ccmux processes then wrote one window's `@ccmux_tab_map` and
+`@ccmux_tab_hidden`, the exact state §11.1 exists to make unrepresentable: they
+render permanently different session lists, `adopt_own_state` runs once so
+neither re-reads, and the in-process `LAST_SAVED` cache suppresses the re-write
+that might have converged them. It never self-heals.
+
+The gap is now closed from BOTH ends, and the second end closes it by
+construction: `@ccmux_tab_sidebar` is the launcher's sole test for "this window
+is a ccmux tab" (§1.2 step 5b), so at every instant of `t` the new window is
+either unidentifiable — bare, then map-seeded-but-unmarked — and skipped, or
+marked and merely re-pinned. There is no third state. Writing the marker from
+`t` is safe under §11.1's own rule for this key: nothing about the window is
+read to compute the value, which is simply the id of the pane the call just
+created for the purpose, so `t` and that process compute the same answer.
+
+The price is deliberate: a window whose `t` failed at step 7's split keeps its
+seeded map and will never be healed by a later launch. The seed stays anyway —
+it is what keeps that live, attached Claude pane visible to `Enter` and closable
+by `x` from every other tab.
+
+Step 8 moves the client, and it is the ONLY thing that does. It rides on the
+existing R2-gated `select_pane`, which has always issued `select-window -t
+<pane>` before `select-pane`, so no new capability is added. Focus lands on the
+Claude pane, matching `Enter`'s jump — with `t` the operator is leaving for the
+session they asked for, where `o`/`s` keep them driving the list.
+
+There is deliberately **no close-tab verb and no `kill-window` anywhere in the
+crate**. A tab ends when its last pane does, which tmux already handles, and
+every pane death goes through the R2-gated `kill_pane`. There is likewise no
+tab-cycling key: `Enter` on a row in another tab already switches, and tmux's
+own bindings remain.
 
 ---
 
@@ -1721,10 +1904,16 @@ the CLI omits `id`, so a **listed** row can reach it.
 | The user resizes the sidebar with tmux keys | Reverted within one tick by the unconditional `pin_sidebar`. To change it for real, restart with `--width`. |
 | `@ccmux_map` holds a pane id that no longer exists | Dropped by `reconcile` on the first tick. |
 | `@ccmux_map` is corrupt, empty, or `v != 1` | `load_map` returns `PaneMap::new()`. Never an error, never a crash. |
-| `@ccmux_sidebar` is missing or stale | §5.3 step 5 re-resolves; if it stays `None`, `pin_sidebar` no-ops and `split_anchor` falls back to `leftmost_pane`. |
+| `@ccmux_tab_sidebar` is missing or stale | The sidebar re-registers itself from `$TMUX_PANE`; if that stays `None`, `pin_sidebar` no-ops and `split_anchor` falls back to `leftmost_pane`. |
+| `list-windows` fails on the tick that first resolves identity | `refresh_panes` swallows it, so `tabs` stays empty while `own_window` resolves from the successful `list-panes`. `adopt_own_state` does NOT latch on an enumeration that does not carry my window, and no flush is issued from an un-adopted base — the dirty flags are kept, not cleared, and the write happens on the tick adoption lands. Adoption then MERGES the stored state with anything pressed in between, so neither side is lost. |
+| A tab's sidebar was quit with `q` while its Claude panes live on | That tab is sidebar-less until the next `ccmux` launch heals it (§1.2 step 5b). Its `@ccmux_tab_map` goes unreconciled meanwhile — invisible, because every reader intersects it with the live pane list. Re-running `ccmux` from INSIDE the session is still the §9.6 no-op, so healing means detaching and relaunching, or driving from another tab's sidebar in the meantime. |
+| A tab's last pane dies | tmux destroys the window and its window options with it. Its map described panes that died with it, so there is nothing to preserve; its dismissal fragment is adopted by the lowest live tab (§11.3). |
+| Every sidebar is gone when a tab closes | Nobody adopts the orphaned fragment, so the rows that tab dismissed reappear. Nothing else breaks and `d` restores them. This is the one residual hole in §11.3, and it is a deliberate ceiling on how much machinery a view filter is worth. |
+| A session is open in two tabs at once | The badge, `Enter` and `x` all name the pane in the ASKING sidebar's own tab, falling back to the lowest-numbered pane when it has none there (§5.5). So each tab's badge is blank while its own pane is on screen, and `x` never kills a pane in a window the operator is not looking at. The other pane is reachable by switching to its tab. Double-attach is legal (PROBE-FINDINGS §3). |
+| The binary is rebuilt and `t` pressed | The new tab runs the NEW build beside OLD sidebars in the existing tabs. A fragment carrying a schema version a build does not recognise reads as empty rather than being rewritten, so the two cannot flap an option between shapes. |
 | The sidebar pane is killed by the user | The ccmux window keeps its Claude panes. Re-running `ccmux` heals it via §1.2 step 5b. |
 | The window shrinks below `sidebar_width` columns | tmux clamps `resize-pane`; the sidebar renders per §6.4's `< 6` rule and does not panic. |
-| Two `ccmux sidebar` processes in one tmux session | Both poll and both write `@ccmux_map`; last write wins and `reconcile` converges them. Degraded but harmless. Not defended against in v1. |
+| Two `ccmux sidebar` processes in one tmux session | EXPECTED now, one per tab, and safe by construction: each writes only its OWN window's options (§11.1). Two in the SAME window is still pathological — the second adopts the first's marker rather than stealing it, so it pins and anchors against the real sidebar. |
 | `claude` is not on `PATH` | Every verb returns `AgentsError::NotFound`; the footer shows `agents: claude not found on PATH`. The sidebar still runs. `CCMUX_CLAUDE_BIN` overrides the path. |
 | Terminal is resized mid-modal | `Event::Resize` only sets `needs_draw`; all overlays recompute their `Rect` from `f.area()` each frame. |
 | `format_age` on a future `startedAt` | Clamps to `"0s"`. |
@@ -1824,6 +2013,216 @@ Do not build these; do not leave hooks for them.
 
 ---
 
+## 11. Tabs — per-window state and its concurrency model
+
+A **tab** is a tmux window of ccmux's own session, and **every tab carries its
+own pinned sidebar pane running its own ccmux process**. That is a deliberate
+trade: N processes each polling `claude agents --json`, bought so the session
+list is on screen wherever the operator is. No threads, no shared daemon, no
+change to the poll interval.
+
+N sidebars means N concurrent writers, and every option §5.2 described was
+session-scoped, written with `set-option -t <session>`. The in-process
+write-dedupe cache is a `static` and gives ZERO protection across processes.
+Measured on tmux 3.4: two concurrent read-modify-writes of one session option
+left `{"v":1,"ids":["A"]}` — the other writer's dismissal silently gone.
+
+### 11.1 The invariant
+
+**No option is ever read-modify-written, and no option has two writers that
+could disagree.** The key space is partitioned so a collision is not
+representable, rather than made unlikely.
+
+| option | scope | writer | readers |
+|---|---|---|---|
+| `@ccmux_tab_map` | **window** | that window's own sidebar, addressed through its own pane. One documented exception: `t`'s pre-write, provably ordered before that window has a process (§8.10). | every sidebar, as a union |
+| `@ccmux_tab_hidden` | **window** | that window's own sidebar | every sidebar, as a fold |
+| `@ccmux_tab_sidebar` | **window** | the launcher's heal, `t` (§8.10 step 7), AND that window's own sidebar — the only multi-writer key, and safely so: all three write the same function of ground truth, the pane id of the process that IS that window's sidebar. Nobody reads the value to compute the value, so there is no read-modify-write to lose and every writer converges. | every sidebar, the launcher |
+| `@ccmux_width` | session | the launcher only | every sidebar, every tick |
+| `@ccmux_map` | session | `configure_session` once, and the one-time migration | `main::run_launcher`'s ownership guard |
+| `@ccmux_hidden` | session | LEGACY — read once by the migration, then cleared to `""` | migration only |
+
+Two sidebars acting in the same tick therefore issue `set-option` against
+DIFFERENT options. The tmux server executes commands serially and each
+`set-option` is atomic, so both land.
+
+The per-tab options carry NEW names because `#{@name}` format expansion falls
+back window -> session -> global (Appendix A): a leftover session value under a
+reused name would be reported as every window's value. The same inheritance is
+what lets `@ccmux_width` ride along free in the `list_tabs` window read, which
+is why a steady tick costs exactly what it cost before tabs — the window read
+REPLACES the per-tick `show-options @ccmux_width`.
+
+### 11.2 `@ccmux_tab_map` — conflict-free by disjoint key spaces
+
+A pane belongs to exactly one window, so the union of all windows' maps is a
+disjoint union. `App::open` is rebuilt every refresh as
+`union(every tab's map) ∩ live panes`, and that intersection is what makes a
+cross-tab `x` correct in the same frame it happens: the killer writes nothing of
+the other window's option, and every process — killer, owner, and any third tab
+— already hides the entry, because the map is a cache over ground truth only
+tmux can supply, and everything derivable from tmux is re-derived every tick.
+
+A window that dies takes a map describing panes that died with it: nothing to
+preserve. A window whose sidebar was quit keeps an unreconciled map: invisible,
+by the same intersection, and cleaned by the sidebar the launcher heals in.
+
+The write-dedupe cache key gains the WINDOW (`"{key} {session} {window}"`), and
+that is load-bearing: one process can write two windows' copies of the same
+option — the `t` path — and without the window one window's value would suppress
+the other's write inside its own cache. `t`'s write is additionally uncached, so
+a one-shot foreign-window write can never seed an entry the owner would trust.
+The cache hit-check runs BEFORE the R2 gate, deliberately: a hit means no write,
+so there is nothing to gate and no tmux spawn — which is what keeps the unit
+suite's seeding seam hermetic now that writes are pane-targeted.
+
+### 11.3 `@ccmux_tab_hidden` — a shared set, still one writer per option
+
+A dismissal is about the SESSION LIST, which is the same list in every tab, so
+its effect must be session-wide. Session-wide and single-writer are reconciled
+by making each window's option an op-log FRAGMENT and the shared set a pure fold
+of every fragment.
+
+**Fold.** Group ops by id; the winner for an id is the op with the greatest
+`(seq, org)`. The hidden set is the ids whose winner has `add == true`, ordered
+by winning stamp ascending — exactly `HiddenSet`'s existing "oldest first"
+contract, so `model::build_rows` and every dismissal test are unaffected and
+`HiddenSet::undo` still pops the newest. It is a last-writer-wins register per
+id keyed by a total order: a standard convergent structure, not an ad-hoc merge.
+`org` is `WindowId::num()`, the parsed integer — not the string, because
+`"@9" > "@10"` lexicographically is the same trap `PaneId::num` documents.
+
+**Clock.** `seq = max(now_ms, seq_seen + 1)`, a Lamport clock over a wall clock
+on one host, monotonic per process even across a backward NTP step.
+
+**`d`** appends `{id, add: true, …}` to my fragment and applies it locally.
+**`u`** resolves the newest dismissal from the fold — by IDENTITY, never by
+position — and appends a tombstone `{id, add: false, …}`. Keyed removal commutes
+with another process's append, so no intent is lost and no reordering can
+misapply an undo. A tombstone's stamp is strictly greater than the dismissal it
+targets — guaranteed, not hoped: that dismissal came out of the fold `seq_seen`
+was just computed from.
+
+Both stay in memory: `d` and `u` still issue **no tmux command at all**, and the
+write is deferred to the next tick or to `shutdown`, exactly as before. This is
+a constraint, not an accident — a pane-targeted write drags `assert_in_session`'s
+`list-panes` into the keypress path, and the unit suite must never reach a tmux
+server, because the default socket is the operator's live one.
+
+The fold runs over every other tab's STORED fragment plus my own IN-MEMORY log,
+never my stored copy: I am the authority on my fragment, and folding a read
+taken before my own last write would flicker a dismissal back onto the screen.
+
+**Same-tick cases.** Different rows in different tabs: two fragments, both
+survive. The same row in both: identical effect either way. A dismisses X while
+B undoes X: the later stamp wins, and a true same-millisecond tie breaks on the
+origin window, identically for every reader. Convergence follows from the fold
+being a pure function of the multiset of ops, and every process reading every
+fragment each tick.
+
+**The one visible anomaly**, stated plainly: press `u` in tab A, switch to tab B
+and press `u` again within one poll interval, and B — which has not yet seen A's
+tombstone — undoes the same dismissal. That is idempotent on convergence (two
+tombstones for one id, the later wins, the row is restored exactly once).
+Nothing is corrupted and no dismissal is lost; press `u` again for the next one.
+
+**Adoption.** A window option dies with its window, so a closed tab would take
+every dismissal it made with it. Each sidebar keeps the previous tick's
+fragments; a window id that disappears is orphaned, and the adopter — the live
+tab with the lowest `WindowId::num()`, where LIVE means its marker names a pane
+that still exists — merges the orphan's ops into its own VERBATIM. Ops carry
+their own stamp and origin, so adoption changes only where an op is stored and
+nothing about the fold, and a race between two would-be adopters resolves to a
+byte-identical duplicate that `push` drops. If EVERY sidebar is gone when a
+window dies, nobody adopts and those rows reappear — the residual hole in §9.8.
+
+**Pruning**, each process only ever on its own fragment: compact to my
+highest-ranked op per id; drop mine when another fragment holds a strictly
+higher-ranked op on that id; drop my tombstone once no other fragment holds any
+op on that id at all, since there is then nothing left for it to suppress. A
+settled disagreement garbage-collects to empty in two ticks. The two-strike
+absence rule retires the OPS as well as the folded view — a surviving op would
+re-hide the id at the next fold — and a per-fragment cap bounds a pathological
+tab, failing in `HIDDEN_MAX`'s safe direction: the row reappears.
+
+**Migration.** A session written by a build with no tabs is imported once: the
+legacy `@ccmux_map` entries for panes in this window become this tab's map and
+`@ccmux_map` is reset to `EMPTY_MAP_JSON` — not unset, because the ownership
+guard reads its presence — and the legacy `@ccmux_hidden` ids become dismissal
+ops with tiny stamps, after which that option is cleared to `""` to mark it
+consumed.
+
+### 11.4 Blast radius (RULE R1-R4 under tabs)
+
+Tabs add three would-be capabilities, each closed off by construction:
+
+1. **`new-window`** — the target is built by `session_target` ALONE. There is no
+   parameter through which a window target can be passed, and `new-window`
+   refuses a pane target outright, so the call is structurally incapable of
+   naming a window or a session that is not ccmux's own.
+2. **Window-option writes** — addressed by an `assert_in_session`-gated `PaneId`,
+   never by a window id. `set-option -w -t %N` resolves to %N's window and a
+   stale pane fails loudly; the only thing it could otherwise reach is a pane in
+   another session, which the R2 gate has always blocked. **Window-id targets
+   are banned outright**: a bare `-t '@2'` reaches a foreign session's window and
+   a session-qualified `-t '=ccmux:@99'` silently retargets the current one, so
+   `WindowId` is an in-process identity and is never rendered into a `-t`
+   argument. A grep for `-t` next to a `WindowId` must return nothing — that is
+   the invariant a reviewer can check mechanically.
+3. **`select-window`** — no new helper. `t` and `Enter` both go through the
+   existing R2-gated `select_pane`, which issues `select-window -t <pane>` on a
+   pane already proven in-session, which proves the window it names is too.
+
+`list_panes_in_session` keeps `-s` and already spans every window of ccmux's
+session, never the server. `list_tabs` is a read and is session-targeted with
+the same exact-match form. `kill-window` never enters the crate.
+
+### 11.5 What the sidebar shows
+
+Two places, neither of which adds a row, and both needed because ccmux runs its
+session with `status off` — tmux's own window list is not on screen, so the
+sidebar is the ONLY place tab identity can appear.
+
+- **Gutter column 2** is the tab a session's pane lives in, inked only when that
+  is not the tab you are looking at: `▌ ` = open here, `▌5` = open over in tab
+  5, `  ` = not open. The badge used to be `#{pane_index}`, which is per-window
+  and so named nothing once "pane 2" existed in every tab; the actionable
+  question became "where is this", and the answer is the tab. Blank for the
+  current tab is the other half: a digit that could mean "here" would have to be
+  read against a tab number the operator must remember, whereas with this rule a
+  digit ALWAYS means "somewhere else", and a single-tab session renders exactly
+  the ink it rendered before. The exact pane index survives where it is
+  actionable — the `opened <name> in pane N` flash.
+- **A header chip `tab N`**, rendered only from two ccmux tabs up, so all tab UI
+  is invisible until there is a second tab to name. `N` is tmux's own
+  `#{window_index}`, so `prefix-3` goes exactly where a `tab 3` chip — or a `3`
+  badge — points. There is deliberately **no denominator**: a window INDEX and a
+  window COUNT agree only while the indices happen to be a contiguous `1..M`,
+  and tmux's `renumber-windows` defaults to OFF (`configure_session` never turns
+  it on), so closing a middle tab left a permanent gap and the chip rendered
+  `tab 4/2` — tab four of two. A count cannot be reconciled with an index; the
+  index is the actionable half, so the count is what went. The two-tab gate
+  counts windows carrying `@ccmux_tab_sidebar`, the same sole criterion §1.2
+  step 5b uses — not windows that merely have panes, or the operator's own bare
+  `prefix-c` window summons a chip and inflates it while heal correctly refuses
+  to treat it as a tab.
+
+**The gutter does not widen.** `GUTTER` stays 4 and the name column keeps its
+fixed left edge on column 5: at W=34 the name budget is
+`34 - 4 - (1 + 3) - 1 = 25`, unchanged. A two-column badge would push this row's
+glyph and name right while its neighbours stayed put, and the eye reads a broken
+left edge as broken far faster than a short name. A window index of ten or more
+clamps to `+`, the same rule and the same reason as before. Because
+`renumber-windows` is OFF, indices are not a contiguous `1..M`: `+` needs ten
+windows to have EXISTED at once, not ten to be alive now.
+
+A session open in two tabs shows the tab `Enter` would take you to, which is also
+the one `x` acts on — this sidebar's own tab whenever the session has a pane
+there (§5.5), so the badge is blank exactly when the pane is on screen in front
+of you. The digit therefore never lies about where the verbs go.
+
+---
+
 ## Appendix A — mechanisms empirically verified during spec authoring
 
 Everything in this table was executed against tmux 3.4 on this machine, in a
@@ -1835,6 +2234,15 @@ not spend implementation time re-deriving them.
 |---|---|
 | `show-options -v @key` on an **unset** user option exits **1** with `invalid option: @key`; `-qv` yields empty stdout and exit **0**. | `-q` is therefore mandatory in `get_user_option`. |
 | `set-option -t <sess> @ccmux_map <json>` round-trips JSON byte-for-byte through argv, including `"` and `\`. | Wrote `{"%1":{"session_id":"abc-123","name":"a b\"c"}}`, read back identical. |
+| `set-option -w -t <PANE>` writes the WINDOW option of that pane's window, and a stale pane target fails LOUDLY. | On tmux 3.4: only that pane's window received the value; `-t '%999'` gave `no such window: %999`, exit 1, nothing written. |
+| A window-id target has a silent-mistarget mode a pane target does not. | Bare `-t '@2'` wrote into a FOREIGN session's window; `-t '=ccmux:@99'` returned exit 0 and read/wrote ccmux's CURRENT window. Only a bad *index* errors. Hence: window ids are an identity in this crate, never a target. |
+| `show-options -w -qv` does NOT inherit, but `#{@name}` format expansion DOES fall back window -> session -> global. | With a value set at both levels, `list-windows -F '#{@k}'` reported the window value for the marked window and the SESSION value for the unmarked ones; `show-options -w -qv` reported empty for the unmarked ones. This is why the per-tab options carry new names, and why `@ccmux_width` rides along free in the window read. |
+| tmux never re-expands format sequences inside an option value. | A value containing `#{window_index}`, `##`, `#H`, `"` and `\` came back byte-identical through `#{@opt}`. JSON is safe to carry in a format string. |
+| Window options die with their window; window ids are never reused; `renumber-windows on` shifts window INDICES when a tab closes. | Killed a window's last pane: the window and its `@ccmux_tab_hidden` were gone, and the window above it moved from index 3 to 2 while keeping id `@4`. |
+| Two concurrent read-modify-writes of ONE session option silently lose a write; the same two writers against TWO window options both land. | Ran both pairs on a throwaway socket: the session option ended `{"ids":["B"]}` with A's value gone; the two window options held `["A"]` and `["B"]`. This experiment is the entire argument for §11. |
+| `$TMUX_PANE` is set in a pane's process, so a sidebar can identify itself with no tmux call. | A pane launched by `new-window -- …` reported `PANE=%2`. |
+| `select-window -t <PANE>` moves the session's current window. | Exit 0, and `#{window_active}` moved to that pane's window — which is what makes cross-tab `Enter` work through the existing `select_pane`. |
+| `new-window -t '=<sess>:'` is exact-match and appends. | With `probe` and `probedecoy` alive, it created only in `probe`; the decoy kept its single window. |
 | `display-message -p '#{@key}'` also reads user options and returns empty for unset. | Alternative reader; `show-options -qv` is the one specified. |
 | `has-session -t <name>` → exit 0 when present, exit 1 (`can't find session`) when absent. | Basis of §1.2 step 3. |
 | `new-session -P -F '#{pane_id}'` prints the new pane id directly. | No `list-panes \| head -1` needed. |

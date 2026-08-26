@@ -11,9 +11,14 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use std::collections::BTreeMap;
+
 use crate::agents::{self, AgentsError};
 use crate::model::{self, Group, ParseError, Row, Session};
-use crate::tmux::{self, HiddenSet, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TmuxError};
+use crate::tmux::{
+    self, HiddenLog, HiddenOp, HiddenSet, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TabInfo,
+    TmuxError, WindowId,
+};
 
 /// How long a flashed footer message stays up (SPEC §6.8 item 2).
 const MSG_TTL: Duration = Duration::from_secs(4);
@@ -103,6 +108,25 @@ pub enum Action {
     Quit,
 }
 
+/// Where a session is on screen, resolved across EVERY tab.
+///
+/// Rebuilt from scratch on every pane refresh as
+/// `union(every tab's @ccmux_tab_map) ∩ live panes`. The intersection with the
+/// live pane list is what makes a cross-tab `x` correct in the same frame it
+/// happens: a pane another tab killed is gone from every process's view at once,
+/// without anyone having to write to a window they do not own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPane {
+    /// The pane `Enter` jumps to and `x` closes: one in THIS sidebar's own tab
+    /// when the session has one there, else the lowest-numbered live one.
+    pub pane: PaneId,
+    /// `#{window_index}` of that pane's tab — what the sidebar's badge shows.
+    /// `None` before any pane inventory has been taken.
+    pub window_index: Option<u32>,
+    /// Stable identity of that pane's tab, for "is this my tab" comparisons.
+    pub window: Option<WindowId>,
+}
+
 pub struct App {
     // config
     pub tmux_session: String,
@@ -162,11 +186,47 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub logs: Option<LogsView>,
 
+    /// MY window's fragment of the shared dismissal log — the only thing this
+    /// process ever writes to `@ccmux_tab_hidden`. `hidden` above is the FOLD
+    /// of this fragment and every other tab's, recomputed each refresh.
+    pub hidden_log: HiddenLog,
+    /// Every OTHER tab's fragment as of the previous refresh, keyed by
+    /// `WindowId::num()`. Kept so a fragment orphaned by a closed tab can be
+    /// adopted rather than silently un-hiding every row that tab dismissed.
+    pub last_frags: BTreeMap<u64, HiddenLog>,
+    /// Lamport clock: the largest stamp seen in any fragment, including my own
+    /// writes. `next_seq` is `max(now_ms, seq_seen + 1)`, so a stamp is
+    /// monotonic per process even across a backward wall-clock step.
+    pub seq_seen: u64,
+
     // tmux
     pub map: PaneMap,
     pub map_dirty: bool,
     pub sidebar_pane: Option<PaneId>,
     pub panes: Vec<PaneInfo>,
+    /// This process's OWN pane, from `$TMUX_PANE`, accepted only when it
+    /// appears in `list_panes_in_session`. It is what every window-scoped write
+    /// is addressed through, so with no own pane there is no addressable target
+    /// and persistence behaves exactly as it does when degraded: in memory.
+    pub own_pane: Option<PaneId>,
+    /// The window `own_pane` lives in — this process's tab.
+    pub own_window: Option<WindowId>,
+    /// Every tab of the session, from one `list-windows` per refresh.
+    pub tabs: Vec<TabInfo>,
+    /// `session_id` -> where it is open, across every tab.
+    pub open: BTreeMap<String, OpenPane>,
+    /// `@ccmux_width`, which rides along free in the `list_tabs` read.
+    pub width_opt: Option<u16>,
+    /// The shell command that starts a sidebar, handed down by `main.rs` so
+    /// `t` can give the tab it creates its own sidebar. `app` never imports
+    /// `main`; the DAG stays acyclic.
+    pub sidebar_cmd: Option<String>,
+    /// My window's stored map and hidden fragment are adopted exactly ONCE.
+    /// After that this process is their sole author, and re-adopting the stored
+    /// copy would let a stale read undo a write it has not seen yet.
+    pub own_state_loaded: bool,
+    /// The one-time import of a session written by a build that had no tabs.
+    pub migrated: bool,
     /// True when running outside tmux: list/filter/refresh/logs work, every
     /// pane verb refuses with a message (§9.5).
     pub degraded: bool,
@@ -218,6 +278,9 @@ impl App {
             hidden: HiddenSet::new(),
             hidden_dirty: false,
             hidden_absent: std::collections::BTreeSet::new(),
+            hidden_log: HiddenLog::new(),
+            last_frags: BTreeMap::new(),
+            seq_seen: 0,
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -226,6 +289,14 @@ impl App {
             map_dirty: false,
             sidebar_pane: None,
             panes: Vec::new(),
+            own_pane: None,
+            own_window: None,
+            tabs: Vec::new(),
+            open: BTreeMap::new(),
+            width_opt: None,
+            sidebar_cmd: None,
+            own_state_loaded: false,
+            migrated: false,
             degraded,
 
             confirm_armed_at: None,
@@ -245,27 +316,26 @@ impl App {
         }
     }
 
-    /// One-time startup IO: load `@ccmux_map` and `@ccmux_hidden`, resolve
-    /// `@ccmux_sidebar`, set `degraded`. Never fails; failures degrade.
+    /// Startup state, set `degraded`. Never fails; failures degrade.
+    ///
+    /// Loading no longer happens here: with per-tab state a process cannot know
+    /// what to load until it knows which window it is in, and that answer comes
+    /// from the pane inventory. The first `tick` runs immediately (`last_poll`
+    /// is backdated), so `refresh_panes` adopts this window's stored map and
+    /// dismissal fragment before the first frame is drawn.
     pub fn init(&mut self) {
         self.degraded = !tmux::inside_target_server();
-        if self.degraded {
-            // §9.5: the map and the dismissed set are held in memory only;
-            // load/save are skipped. `d` and `u` still work — unlike the pane
-            // verbs they need nothing from tmux to be correct.
-            self.map = PaneMap::new();
-            self.hidden = HiddenSet::new();
-            self.hidden_absent.clear();
-            return;
-        }
-        self.map = tmux::load_map(&self.tmux_session);
-        self.hidden = tmux::load_hidden(&self.tmux_session);
+        // §9.5: outside tmux the map and the dismissed set are held in memory
+        // only; load/save are skipped. `d` and `u` still work — unlike the pane
+        // verbs they need nothing from tmux to be correct.
+        self.map = PaneMap::new();
+        self.hidden = HiddenSet::new();
+        self.hidden_log = HiddenLog::new();
         // A fresh process has seen no polls, so no id has a strike against it.
-        // Loading `@ccmux_hidden` must not import one either: an id dismissed
-        // in a previous run is owed the same two chances as a fresh dismissal.
+        // Adopting a stored fragment must not import one either: an id
+        // dismissed in a previous run is owed the same two chances as a fresh
+        // dismissal.
         self.hidden_absent.clear();
-        self.sidebar_pane = tmux::get_user_option(&self.tmux_session, tmux::OPT_SIDEBAR)
-            .and_then(|s| PaneId::parse(&s));
     }
 
     /// Called when `last_poll.elapsed() >= effective_interval()`.
@@ -392,7 +462,21 @@ impl App {
             .filter(|id| live.contains(id.as_str()) || !self.hidden_absent.contains(*id))
             .cloned()
             .collect();
+        let retired: Vec<String> = self
+            .hidden
+            .ids()
+            .iter()
+            .filter(|id| !spared.iter().any(|s| s == *id))
+            .cloned()
+            .collect();
         if self.hidden.reconcile(spared.iter().map(String::as_str)) {
+            self.hidden_dirty = true;
+        }
+        // Retire the OPS too, or the next fold would re-hide the id from my own
+        // fragment. Other tabs drop their ops on the same id from the same
+        // `claude agents` data; any transient disagreement concerns a session
+        // that is not in the list at all, so nothing on screen can show it.
+        if self.hidden_log.forget(retired.iter().map(String::as_str)) {
             self.hidden_dirty = true;
         }
         self.hidden_absent = absent;
@@ -493,11 +577,38 @@ impl App {
         }
     }
 
-    /// First live pane showing `session_id`, from the reconciled `map`. Every
-    /// entry in it is a pane ccmux opened inside `tmux_session`, so a `Some`
-    /// result is always safe to pass to an R2-gated mutation.
+    /// First live pane showing `session_id`, ACROSS EVERY TAB. Every entry in
+    /// `open` came from some tab's map, i.e. from a pane ccmux opened inside
+    /// `tmux_session`, so a `Some` result is always safe to pass to an R2-gated
+    /// mutation — the session gate already spans every window (`list-panes -s`).
     pub fn pane_of(&self, session_id: &str) -> Option<PaneId> {
-        self.map.pane_for_session(session_id)
+        self.open.get(session_id).map(|o| o.pane.clone())
+    }
+
+    /// True when `pane` is any tab's sidebar. `x` refuses those: with a sidebar
+    /// per tab, "the sidebar" is no longer a single pane, and closing another
+    /// tab's would leave that tab blind until the next launch.
+    fn is_any_sidebar(&self, pane: &PaneId) -> bool {
+        self.sidebar_pane.as_ref() == Some(pane)
+            || self.own_pane.as_ref() == Some(pane)
+            || self.tabs.iter().any(|t| t.sidebar.as_ref() == Some(pane))
+    }
+
+    /// " in tab N" when `pane` is in another tab, empty when it is in mine.
+    /// The pane index alone stopped naming anything once tabs existed: pane 2
+    /// exists in every window.
+    fn tab_suffix(&self, pane: &PaneId) -> String {
+        let win = self.pane_window(pane);
+        match (win, self.own_window.as_ref()) {
+            (Some(w), Some(mine)) if &w == mine => String::new(),
+            (Some(w), _) => self
+                .tabs
+                .iter()
+                .find(|t| t.window == w)
+                .map(|t| format!(" in tab {}", t.index))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     /// `#{pane_index}` of `pane`, for the sidebar's pane badge.
@@ -696,6 +807,93 @@ impl App {
         }
     }
 
+    /// `t` — open the selected session in a NEW TAB, and go there.
+    ///
+    /// A tab is a tmux window of ccmux's own session carrying its own pinned
+    /// sidebar pane, so the list is on screen wherever the operator is. The
+    /// guards mirror `act_open`'s exactly.
+    ///
+    /// THE ORDER IS FORCED, not stylistic. The Claude pane is created FIRST, as
+    /// the new window's only pane, and the window's `@ccmux_tab_map` is written
+    /// through it before the sidebar exists. Create the sidebar first and its
+    /// process is already running when the map is written, so its own next
+    /// flush — built from the map it loaded BEFORE that write — clobbers the
+    /// entry, orphaning a Claude pane from every map forever and leaving it
+    /// unclosable by `x`. This ordering makes the write provably precede the
+    /// existence of any process in that window, which is what keeps
+    /// `@ccmux_tab_map` a single-writer option.
+    pub fn act_open_tab(&mut self) {
+        if self.degraded {
+            self.flash("not inside tmux — tabs unavailable", MsgLevel::Warn);
+            return;
+        }
+        let Some(sel) = self.selected_session() else {
+            return;
+        };
+        if !sel.is_attachable() {
+            self.flash("no short id — cannot open this session", MsgLevel::Warn);
+            return;
+        }
+        let session_id = sel.session_id.clone();
+        let short_id = sel.id.clone().unwrap_or_default();
+        let name = sel.name.clone();
+        let Some(sidebar_cmd) = self.sidebar_cmd.clone() else {
+            // Only reachable when `App` was built without `main.rs` handing the
+            // command down; every real sidebar has one.
+            self.flash("sidebar command unknown — cannot open a tab", MsgLevel::Error);
+            return;
+        };
+
+        let attach = agents::attach_pane_cmd(&short_id);
+        let (_, index, claude) = match tmux::new_tab(&self.tmux_session, &attach) {
+            Ok(t) => t,
+            Err(e) => {
+                self.flash(format!("new tab failed: {}", tmux_msg(&e)), MsgLevel::Error);
+                return;
+            }
+        };
+
+        let mut seed = PaneMap::new();
+        seed.insert(
+            &claude,
+            PaneEntry {
+                session_id,
+                short_id,
+                name: model::truncate_end(&name, MAP_NAME_MAX),
+                opened_at: self.now_ms,
+            },
+        );
+        if let Err(e) = tmux::write_tab_map_uncached(&self.tmux_session, &claude, &seed) {
+            self.flash(format!("tab map not saved: {}", tmux_msg(&e)), MsgLevel::Warn);
+        }
+
+        match tmux::split_left_of(&self.tmux_session, &claude, &sidebar_cmd) {
+            Ok(sidebar) => {
+                // Mark the tab HERE, synchronously, rather than leaving it to
+                // the new process's first tick 30-40 ms later. Nothing about
+                // this window's state is read to compute the value — it is the
+                // id of the pane this call just created for the purpose — so
+                // it is the same function of ground truth every other writer
+                // of this key computes (§11.1), and the child's
+                // `sidebar_choice` adopts it instead of re-registering.
+                let _ = tmux::set_tab_sidebar(&self.tmux_session, &sidebar);
+                // Pin immediately, or the tab flashes a 50/50 split until that
+                // sidebar's first tick.
+                tmux::pin_sidebar(&self.tmux_session, &sidebar, self.requested_width())
+            }
+            Err(e) => self.flash(format!("tab sidebar failed: {}", tmux_msg(&e)), MsgLevel::Warn),
+        }
+
+        // The one thing that moves the client, and it rides on the existing
+        // R2-gated helper: `select_pane` issues `select-window -t <pane>` first.
+        if let Err(e) = tmux::select_pane(&self.tmux_session, &claude) {
+            self.flash(format!("jump failed: {}", tmux_msg(&e)), MsgLevel::Error);
+        }
+        self.refresh_panes();
+        self.pin_sidebar();
+        self.flash(format!("opened {name} in tab {index}"), MsgLevel::Info);
+    }
+
     /// `Enter` — open or jump. SPEC §8.3.
     pub fn act_enter(&mut self) {
         if self.degraded {
@@ -739,16 +937,25 @@ impl App {
             self.flash("not open", MsgLevel::Warn);
             return;
         };
-        if Some(&pane) == self.sidebar_pane.as_ref() {
+        if self.is_any_sidebar(&pane) {
             self.flash("refusing to close the sidebar", MsgLevel::Warn);
             return;
         }
-        // Read the index before the kill; afterwards the pane is gone.
+        // Read the index and the tab before the kill; afterwards the pane is
+        // gone.
         let idx = self.pane_index_of(&pane);
+        let where_ = self.tab_suffix(&pane);
         match tmux::kill_pane(&self.tmux_session, &pane) {
             Ok(()) => {
-                self.map.remove(&pane);
-                self.map_dirty = true;
+                // A pane in ANOTHER tab is not mine to unmap: that window's
+                // option has exactly one writer and it is not this process. Its
+                // owner reconciles the entry away on its next tick, and until
+                // then every process already hides it, because `open` is
+                // rebuilt as `union(maps) ∩ live panes`.
+                if self.map.get(&pane).is_some() {
+                    self.map.remove(&pane);
+                    self.map_dirty = true;
+                }
                 self.refresh_panes();
                 self.save_map_now();
                 self.pin_sidebar();
@@ -757,10 +964,13 @@ impl App {
                 // with `S`.
                 match idx {
                     Some(i) => self.flash(
-                        format!("closed pane {i} — agent still running"),
+                        format!("closed pane {i}{where_} — agent still running"),
                         MsgLevel::Info,
                     ),
-                    None => self.flash("closed pane — agent still running", MsgLevel::Info),
+                    None => self.flash(
+                        format!("closed pane{where_} — agent still running"),
+                        MsgLevel::Info,
+                    ),
                 }
             }
             Err(e) => self.flash(format!("close failed: {}", tmux_msg(&e)), MsgLevel::Error),
@@ -863,6 +1073,12 @@ impl App {
         if !self.hidden.dismiss(&id) {
             return;
         }
+        // The durable half: one op appended to MY fragment. Still no tmux
+        // command — the write is deferred to the next `tick` exactly as before,
+        // which is what keeps this keypath free of `assert_in_session`'s
+        // `list-panes` and the unit suite hermetic.
+        let (seq, org) = (self.next_seq(), self.own_org());
+        self.hidden_log.push(HiddenOp { id: id.clone(), add: true, seq, org });
         // A fresh dismissal starts with zero strikes against it. Without this
         // an id could carry a strike across `d` -> absent poll -> `u` -> `d`:
         // `reconcile_hidden` only recomputes the strike set from `hidden` on a
@@ -898,6 +1114,13 @@ impl App {
             self.flash("nothing to undo", MsgLevel::Info);
             return;
         };
+        // A tombstone, not a deletion: the dismissal it undoes may live in
+        // another tab's fragment, which this process must never write. Its
+        // stamp is strictly greater than the dismissal's — guaranteed, not
+        // hoped, because that dismissal came out of the fold `seq_seen` was
+        // just computed from.
+        let (seq, org) = (self.next_seq(), self.own_org());
+        self.hidden_log.push(HiddenOp { id: id.clone(), add: false, seq, org });
         self.hidden_dirty = true;
         self.rebuild_rows();
         let visible = self.is_visible(&id);
@@ -1053,34 +1276,366 @@ impl App {
 
     /// SPEC §5.3 steps 1-5, also run after every ccmux-issued split/kill so the
     /// fresh `#{pane_index}` is available for the confirmation message.
+    ///
+    /// Two tmux reads, both session-scoped: `list-panes -s` (every window) and
+    /// `list-windows` (every tab's options plus `@ccmux_width`). The second
+    /// REPLACES the per-tick `show-options @ccmux_width` this used to cost, so
+    /// the whole cross-tab picture is free.
     fn refresh_panes(&mut self) {
         if self.degraded {
             return;
         }
-        if let Ok(live) = tmux::list_panes_in_session(&self.tmux_session) {
-            if self.map.reconcile(&live) {
-                self.map_dirty = true;
-            }
-            self.panes = live;
-            self.resolve_sidebar_pane();
+        let Ok(live) = tmux::list_panes_in_session(&self.tmux_session) else {
+            return;
+        };
+        self.panes = live;
+        if let Ok((tabs, width)) = tmux::list_tabs(&self.tmux_session) {
+            self.tabs = tabs;
+            self.width_opt = width;
+        }
+        self.resolve_identity();
+        self.adopt_own_state();
+        self.migrate_legacy();
+        // MY window's map only — the thing I write. Entries for panes in other
+        // tabs are read from their own windows' copies, never reconciled here.
+        if self.map.reconcile(&self.panes) {
+            self.map_dirty = true;
+        }
+        self.adopt_orphan_fragments();
+        self.refold_hidden();
+        self.rebuild_open();
+    }
+
+    /// Who am I, and which pane is my window's sidebar?
+    ///
+    /// `$TMUX_PANE` answers the first question for free — no tmux call — and is
+    /// accepted only when it appears in `list_panes_in_session`, which is the
+    /// existing R2 evidence: a sidebar hand-launched inside `dev` can never
+    /// claim a pane of ccmux's session, and a pane id from another tmux server
+    /// cannot collide, because `degraded` already proved `$TMUX` and the target
+    /// socket are the same server.
+    ///
+    /// The marker is adopted rather than overwritten when it names a live pane
+    /// of MY window: a second, hand-launched `ccmux sidebar` in a window that
+    /// already has one must not steal the marker, or it would pin and anchor
+    /// against itself while the real sidebar keeps re-asserting.
+    fn resolve_identity(&mut self) {
+        if self
+            .own_pane
+            .as_ref()
+            .is_none_or(|p| !self.panes.iter().any(|i| &i.id == p))
+        {
+            let panes = &self.panes;
+            self.own_pane = std::env::var("TMUX_PANE")
+                .ok()
+                .and_then(|s| PaneId::parse(s.trim()))
+                .filter(|p| panes.iter().any(|i| &i.id == p));
+        }
+        self.own_window = self
+            .own_pane
+            .as_ref()
+            .and_then(|p| self.panes.iter().find(|i| &i.id == p))
+            .map(|i| i.window_id.clone());
+
+        let (choice, register) = self.sidebar_choice();
+        if register && let Some(me) = self.own_pane.clone() {
+            // Self-registration: the marker was unset, named a dead pane, or
+            // named a pane in some other window. One write, once per process.
+            let _ = tmux::set_tab_sidebar(&self.tmux_session, &me);
+        }
+        self.sidebar_pane = choice;
+    }
+
+    /// Which pane is MY window's sidebar, and does the marker need writing?
+    /// Pure, so the rule is testable without a tmux server.
+    pub fn sidebar_choice(&self) -> (Option<PaneId>, bool) {
+        let Some(me) = self.own_pane.clone() else {
+            // No own pane: keep whatever was resolved, but never trust a dead
+            // one. `pin_sidebar` no-ops and `split_anchor` falls back.
+            let live = self
+                .sidebar_pane
+                .clone()
+                .filter(|p| self.panes.iter().any(|i| &i.id == p));
+            return (live, false);
+        };
+        let recorded = self
+            .own_tab()
+            .and_then(|t| t.sidebar.clone())
+            .filter(|p| self.pane_window(p) == self.own_window);
+        match recorded {
+            // Adopt, do not steal: a second `ccmux sidebar` hand-launched into
+            // a window that already has one must pin and anchor against the
+            // real sidebar, not against itself.
+            Some(sb) => (Some(sb), false),
+            None => (Some(me), true),
         }
     }
 
-    /// §5.3 step 5: re-resolve `@ccmux_sidebar` when the cached id is not live.
-    /// Staying `None` is never fatal — `pin_sidebar` no-ops and `split_anchor`
-    /// falls back to `leftmost_pane`.
-    fn resolve_sidebar_pane(&mut self) {
-        let live = self
-            .sidebar_pane
-            .as_ref()
-            .is_some_and(|p| self.panes.iter().any(|i| &i.id == p));
-        if live {
+    /// This process's own `TabInfo`, if the enumeration carries it.
+    fn own_tab(&self) -> Option<&TabInfo> {
+        let win = self.own_window.as_ref()?;
+        self.tabs.iter().find(|t| &t.window == win)
+    }
+
+    fn pane_window(&self, pane: &PaneId) -> Option<WindowId> {
+        self.panes
+            .iter()
+            .find(|i| &i.id == pane)
+            .map(|i| i.window_id.clone())
+    }
+
+    /// `WindowId::num()` of my tab — the origin stamp on every op I mint.
+    fn own_org(&self) -> u64 {
+        self.own_window.as_ref().map(WindowId::num).unwrap_or(0)
+    }
+
+    /// Read my window's stored map and dismissal fragment — ONCE.
+    ///
+    /// After this, this process is their sole author. Re-adopting the stored
+    /// copy every tick would let a read taken before my own last write undo it.
+    ///
+    /// The flag latches ONLY once the enumeration actually carries my window.
+    /// It used to latch unconditionally, so a single failed `list-windows` on
+    /// the tick that first resolved identity — `refresh_panes` swallows that
+    /// error and leaves `self.tabs` untouched, while `own_window` still comes
+    /// back from the successful `list-panes` — left the sidebar running for its
+    /// whole life on an empty map and an empty dismissal fragment, and then
+    /// overwriting this window's durable `@ccmux_tab_map` / `@ccmux_tab_hidden`
+    /// with those empties: dismissals back on screen, and every pane the
+    /// previous process had opened orphaned from every map and unclosable by
+    /// `x`. `migrate_legacy` right below already had the correct shape.
+    ///
+    /// Adoption MERGES rather than replaces, so an `o` or a `d` pressed in the
+    /// ticks before the enumeration resolved is not thrown away by the
+    /// adoption that finally succeeds. In the ordinary case both sides are
+    /// empty and a merge is a replace.
+    fn adopt_own_state(&mut self) {
+        if self.own_state_loaded || self.own_window.is_none() {
             return;
         }
-        let panes = &self.panes;
-        self.sidebar_pane = tmux::get_user_option(&self.tmux_session, tmux::OPT_SIDEBAR)
-            .and_then(|s| PaneId::parse(&s))
-            .filter(|p| panes.iter().any(|i| &i.id == p));
+        let Some((map, log)) = self.own_tab().map(|t| (t.map.clone(), t.hidden.clone())) else {
+            return; // retry once the window enumeration resolves
+        };
+        // Built fresh rather than merged in place, so the adopted map always
+        // carries the CURRENT schema version whatever this process started
+        // with. Interim entries win a tie: they name a pane this process
+        // opened, and the stored copy predates it.
+        let mut merged = PaneMap::new();
+        merged.panes = map.panes;
+        merged.panes.extend(std::mem::take(&mut self.map.panes));
+        self.map = merged;
+        for op in log.ops {
+            if self.hidden_log.push(op) {
+                self.hidden_dirty = true;
+            }
+        }
+        self.own_state_loaded = true;
+    }
+
+    /// One-time import of a session written by a build that had no tabs.
+    ///
+    /// The legacy `@ccmux_map` entries for panes in MY window become my tab's
+    /// map, and `@ccmux_map` is reset to the empty value — not unset, because
+    /// `main.rs`'s ownership guard reads its presence to prove the session is
+    /// ccmux's. The legacy `@ccmux_hidden` ids become dismissal ops with tiny
+    /// stamps, so any real op outranks them, and the option is cleared to mark
+    /// it consumed (`get_user_option` already reads empty as absent).
+    fn migrate_legacy(&mut self) {
+        if self.migrated {
+            return;
+        }
+        let (Some(_), Some(_)) = (&self.own_pane, &self.own_window) else {
+            return; // retry once identity resolves
+        };
+        if !self.own_state_loaded {
+            // This consumes the legacy options as it reads them, and the
+            // imported result only reaches tmux through a flush — which is now
+            // deferred until adoption. Migrating first would let an exit in
+            // between destroy the legacy value durably with nothing written in
+            // its place.
+            return;
+        }
+        self.migrated = true;
+
+        let legacy = tmux::load_map(&self.tmux_session);
+        if !legacy.panes.is_empty() {
+            for (key, entry) in &legacy.panes {
+                let Some(pane) = PaneId::parse(key) else { continue };
+                if self.pane_window(&pane) == self.own_window && self.map.get(&pane).is_none() {
+                    self.map.insert(&pane, entry.clone());
+                    self.map_dirty = true;
+                }
+            }
+            let _ = tmux::set_user_option(&self.tmux_session, tmux::OPT_MAP, tmux::EMPTY_MAP_JSON);
+        }
+
+        let legacy_hidden = tmux::load_hidden(&self.tmux_session);
+        if !legacy_hidden.ids().is_empty() {
+            let org = self.own_org();
+            for (i, id) in legacy_hidden.ids().iter().enumerate() {
+                let seq = i as u64 + 1;
+                if self.hidden_log.push(HiddenOp { id: id.clone(), add: true, seq, org }) {
+                    self.hidden_dirty = true;
+                }
+            }
+            let _ = tmux::set_user_option(&self.tmux_session, tmux::OPT_HIDDEN, "");
+        }
+    }
+
+    /// A window option dies with its window, so a closed tab would take every
+    /// dismissal it made with it and silently un-hide those rows.
+    ///
+    /// The adopter — the live tab with the lowest `WindowId::num()`, where LIVE
+    /// means its `@ccmux_tab_sidebar` names a pane that still exists — merges an
+    /// orphaned fragment's ops into its own VERBATIM. Ops carry their own stamp
+    /// and origin, so adoption changes only WHERE an op is stored and nothing
+    /// about the fold: it is semantics-preserving by construction, and a race
+    /// between two would-be adopters resolves to a byte-identical duplicate
+    /// that `HiddenLog::push` drops.
+    pub fn adopt_orphan_fragments(&mut self) {
+        let live: std::collections::BTreeSet<u64> =
+            self.tabs.iter().map(|t| t.window.num()).collect();
+        let orphans: Vec<HiddenLog> = self
+            .last_frags
+            .iter()
+            .filter(|(num, _)| !live.contains(num))
+            .map(|(_, log)| log.clone())
+            .collect();
+        if !orphans.is_empty() && self.is_adopter() {
+            for log in orphans {
+                for op in log.ops {
+                    if self.hidden_log.push(op) {
+                        self.hidden_dirty = true;
+                    }
+                }
+            }
+        }
+        let mine = self.own_window.clone();
+        self.last_frags = self
+            .tabs
+            .iter()
+            .filter(|t| Some(&t.window) != mine.as_ref())
+            .map(|t| (t.window.num(), t.hidden.clone()))
+            .collect();
+    }
+
+    /// True when this tab is the lowest-numbered one that still has a sidebar
+    /// process. A sidebar pane exists exactly while its process does, so "its
+    /// marker names a live pane" is the liveness test.
+    fn is_adopter(&self) -> bool {
+        let Some(mine) = self.own_window.as_ref() else {
+            return false;
+        };
+        let lowest = self
+            .tabs
+            .iter()
+            .filter(|t| {
+                t.sidebar
+                    .as_ref()
+                    .is_some_and(|p| self.panes.iter().any(|i| &i.id == p))
+            })
+            .map(|t| t.window.num())
+            .min();
+        lowest == Some(mine.num())
+    }
+
+    /// Recompute the shared dismissed set, and garbage-collect my fragment.
+    ///
+    /// The fold runs over every OTHER tab's STORED fragment plus my own
+    /// IN-MEMORY log — never my stored copy. I am the authority on my fragment,
+    /// and my last `d` may not have been flushed yet; folding the stored copy
+    /// would make a dismissal flicker back onto the screen for one frame.
+    pub fn refold_hidden(&mut self) {
+        let mine = self.own_window.clone();
+        let others: Vec<&HiddenLog> = self
+            .tabs
+            .iter()
+            .filter(|t| Some(&t.window) != mine.as_ref())
+            .map(|t| &t.hidden)
+            .collect();
+        self.seq_seen = others
+            .iter()
+            .map(|l| l.max_seq())
+            .chain(std::iter::once(self.hidden_log.max_seq()))
+            .chain(std::iter::once(self.seq_seen))
+            .max()
+            .unwrap_or(0);
+        if tmux::prune_hidden_log(&mut self.hidden_log, &others) {
+            self.hidden_dirty = true;
+        }
+        self.hidden = tmux::fold_hidden(others.into_iter().chain(std::iter::once(&self.hidden_log)));
+    }
+
+    /// The next Lamport stamp. Monotonic per process even if the wall clock
+    /// steps backwards, and always strictly greater than anything this process
+    /// has observed — which is what guarantees a `u` tombstone outranks the
+    /// dismissal it targets, since that dismissal came out of the fold.
+    fn next_seq(&mut self) -> u64 {
+        let now = self.now_ms.max(0) as u64;
+        let seq = now.max(self.seq_seen.saturating_add(1));
+        self.seq_seen = seq;
+        seq
+    }
+
+    /// `union(every tab's map) ∩ live panes`, indexed by session id.
+    ///
+    /// My own in-memory map wins over the stored copy of my window, for the
+    /// same reason the fold uses my in-memory log. With no pane inventory at
+    /// all — degraded, or before the first refresh — the intersection is
+    /// skipped, so `is_open` answers exactly what it always did.
+    pub fn rebuild_open(&mut self) {
+        let mine = self.own_window.clone();
+        let mut union: BTreeMap<String, String> = BTreeMap::new();
+        for tab in &self.tabs {
+            if Some(&tab.window) == mine.as_ref() {
+                continue;
+            }
+            for (pane, entry) in &tab.map.panes {
+                union.insert(pane.clone(), entry.session_id.clone());
+            }
+        }
+        for (pane, entry) in &self.map.panes {
+            union.insert(pane.clone(), entry.session_id.clone());
+        }
+
+        let have_inventory = !self.panes.is_empty();
+        let mut open: BTreeMap<String, OpenPane> = BTreeMap::new();
+        for (key, session_id) in union {
+            let Some(pane) = PaneId::parse(&key) else { continue };
+            let info = self.panes.iter().find(|i| i.id == pane);
+            if have_inventory && info.is_none() {
+                continue; // dead, or in a window this session cannot see
+            }
+            let cand = OpenPane {
+                pane,
+                window_index: info.map(|i| i.window_index),
+                window: info.map(|i| i.window_id.clone()),
+            };
+            // MY tab wins outright; only then does §5.5's numeric tie-break
+            // decide. A session double-attached in two tabs has a pane sitting
+            // beside THIS sidebar, and that is the one `Enter` must not travel
+            // to, the one `x` must kill, and the one the badge must call
+            // "here" — resolving it to whichever window happened to draw the
+            // lower pane id made all three act on another tab's pane while the
+            // badge said otherwise. With no own window (degraded, or a fixture
+            // with no pane inventory) both sides are equally foreign and the
+            // rule collapses to exactly the numeric one.
+            let here = |o: &OpenPane| o.window.is_some() && o.window == mine;
+            match open.get(&session_id) {
+                Some(cur) => {
+                    let (cur_here, cand_here) = (here(cur), here(&cand));
+                    if (cand_here && !cur_here)
+                        || (cand_here == cur_here && cand.pane.num() < cur.pane.num())
+                    {
+                        open.insert(session_id, cand);
+                    }
+                }
+                None => {
+                    open.insert(session_id, cand);
+                }
+            }
+        }
+        self.open = open;
     }
 
     /// Width to pin to, or `None` when pinning would starve the Claude panes.
@@ -1121,10 +1676,10 @@ impl App {
         self.pinned_width_from(self.requested_width())
     }
 
-    /// `@ccmux_width` when set and sane, else this process's `--width`.
+    /// `@ccmux_width` when set and sane, else this process's `--width`. Read
+    /// from the `list_tabs` snapshot, so it costs no tmux call of its own.
     fn requested_width(&self) -> u16 {
-        tmux::get_user_option(&self.tmux_session, tmux::OPT_WIDTH)
-            .and_then(|s| s.trim().parse::<u16>().ok())
+        self.width_opt
             .map(|w| w.clamp(crate::WIDTH_MIN, crate::WIDTH_MAX))
             .unwrap_or(self.sidebar_width)
     }
@@ -1139,17 +1694,32 @@ impl App {
         tmux::pin_sidebar(&self.tmux_session, sb, cols);
     }
 
-    /// Flush `@ccmux_map`.
+    /// Flush MY window's `@ccmux_tab_map`, addressed through my own pane.
     ///
     /// `map_dirty` is cleared on FAILURE too: tmux refuses a `set-option` value
     /// over ~16 KB, and a doomed write left dirty would be reissued every tick
     /// forever with nothing on screen to say the map had stopped persisting.
     /// The next map change retries once, and the operator is told.
+    ///
+    /// With no own pane there is no addressable target, so persistence behaves
+    /// exactly as it does when degraded: in memory, dirty flag kept, nothing
+    /// attempted and nothing said.
     fn save_map_now(&mut self) {
         if self.degraded || !self.map_dirty {
             return;
         }
-        match tmux::save_map(&self.tmux_session, &self.map) {
+        // Never write from a base this process has not actually read. Until
+        // `adopt_own_state` succeeds, `self.map` is not this window's map — it
+        // is an empty one — and flushing it would destroy the stored copy.
+        // The dirty flag is KEPT, so the write happens on the tick adoption
+        // lands, which merges rather than replaces.
+        if !self.own_state_loaded {
+            return;
+        }
+        let (Some(pane), Some(win)) = (self.own_pane.clone(), self.own_window.clone()) else {
+            return;
+        };
+        match tmux::save_tab_map(&self.tmux_session, &pane, &win, &self.map) {
             Ok(()) => self.map_dirty = false,
             Err(e) => {
                 self.map_dirty = false;
@@ -1167,7 +1737,14 @@ impl App {
         if self.degraded || !self.hidden_dirty {
             return;
         }
-        match tmux::save_hidden(&self.tmux_session, &self.hidden) {
+        // Same rule as `save_map_now`: no write from an un-adopted base.
+        if !self.own_state_loaded {
+            return;
+        }
+        let (Some(pane), Some(win)) = (self.own_pane.clone(), self.own_window.clone()) else {
+            return;
+        };
+        match tmux::save_tab_hidden(&self.tmux_session, &pane, &win, &self.hidden_log) {
             Ok(()) => self.hidden_dirty = false,
             Err(e) => {
                 self.hidden_dirty = false;
@@ -1237,14 +1814,21 @@ impl App {
         }
     }
 
-    /// Move focus to a pane ccmux itself opened. The only jump left: `pane`
-    /// always comes from `pane_of`, i.e. from the reconciled `@ccmux_map`, so
+    /// Move focus to a pane ccmux itself opened, in ANY tab. The only jump
+    /// left: `pane` always comes from `pane_of`, i.e. from some tab's
+    /// `@ccmux_tab_map` intersected with the live pane list, so
     /// `select_pane`'s R2 gate can never see a foreign target.
+    ///
+    /// Crossing tabs needs no new mechanism and gets none: `tmux::select_pane`
+    /// has always issued `select-window -t <pane>` before `select-pane`, and a
+    /// pane proven in-session proves the window it names is in-session too.
+    /// Only the wording changes.
     fn jump_to_ccmux_pane(&mut self, pane: &PaneId) {
+        let where_ = self.tab_suffix(pane);
         match tmux::select_pane(&self.tmux_session, pane) {
             Ok(()) => match self.pane_index_of(pane) {
-                Some(i) => self.flash(format!("jumped to pane {i}"), MsgLevel::Info),
-                None => self.flash(format!("jumped to pane {pane}"), MsgLevel::Info),
+                Some(i) => self.flash(format!("jumped to pane {i}{where_}"), MsgLevel::Info),
+                None => self.flash(format!("jumped to pane {pane}{where_}"), MsgLevel::Info),
             },
             Err(e) => self.flash(format!("jump failed: {}", tmux_msg(&e)), MsgLevel::Error),
         }
@@ -1332,6 +1916,11 @@ impl App {
             // `s` = :split = stacked = tmux -v.
             KeyCode::Char('s') => {
                 self.act_open(SplitDir::Horizontal);
+                Action::Redraw
+            }
+            // `t` = a new TAB. Unbound until now; `c` stays deleted.
+            KeyCode::Char('t') => {
+                self.act_open_tab();
                 Action::Redraw
             }
             KeyCode::Char('x') => {
@@ -1727,6 +2316,9 @@ mod tests {
             hidden: HiddenSet::new(),
             hidden_dirty: false,
             hidden_absent: std::collections::BTreeSet::new(),
+            hidden_log: HiddenLog::new(),
+            last_frags: BTreeMap::new(),
+            seq_seen: 0,
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -1734,6 +2326,18 @@ mod tests {
             map_dirty: false,
             sidebar_pane: None,
             panes: Vec::new(),
+            // No own pane by default: a struct-literal fixture is not a tmux
+            // pane, and persistence must behave as it does when degraded rather
+            // than shelling out to the operator's live socket. The two flush
+            // tests set both explicitly.
+            own_pane: None,
+            own_window: None,
+            tabs: Vec::new(),
+            open: BTreeMap::new(),
+            width_opt: None,
+            sidebar_cmd: None,
+            own_state_loaded: true,
+            migrated: true,
             // NOT degraded: the gates under test must fire on their own merits,
             // not because the degraded check short-circuited them.
             degraded: false,
@@ -1797,11 +2401,20 @@ mod tests {
     /// serialized by the same call `save_hidden` makes, so it always matches
     /// and the spawn is always skipped.
     fn arm_hermetic_flush(a: &App) {
+        let win = a.own_window.clone().expect("a flushing app owns a window");
         crate::tmux::seed_saved_value(
             &a.tmux_session,
-            crate::tmux::OPT_HIDDEN,
-            &serde_json::to_string(&a.hidden).expect("HiddenSet serializes"),
+            crate::tmux::OPT_TAB_HIDDEN,
+            &win,
+            &serde_json::to_string(&a.hidden_log).expect("HiddenLog serializes"),
         );
+    }
+
+    /// Give an app an addressable identity, the way a real sidebar gets one
+    /// from `$TMUX_PANE`. Without it every window-scoped write is skipped.
+    fn own(a: &mut App, pane: &str, window: &str) {
+        a.own_pane = PaneId::parse(pane);
+        a.own_window = WindowId::parse(window);
     }
 
     fn load(app: &mut App, sessions: Vec<Session>) {
@@ -1820,6 +2433,7 @@ mod tests {
             height: 40,
             active,
             window_index: window,
+            window_id: WindowId::parse(&format!("@{window}")).expect("window id"),
         }
     }
 
@@ -2182,9 +2796,487 @@ mod tests {
             },
         );
 
+        a.rebuild_open();
         assert_eq!(a.pane_of("1c45d64f-uuid"), Some(bg_pane));
         assert_eq!(a.pane_of("nobody"), None);
         assert!(!a.is_open("nobody"));
+    }
+
+    // ── tabs ────────────────────────────────────────────────────────────────
+
+    fn tab(window: &str, index: u32, sidebar: Option<&str>) -> TabInfo {
+        TabInfo {
+            window: WindowId::parse(window).expect("window id"),
+            index,
+            sidebar: sidebar.and_then(PaneId::parse),
+            map: PaneMap::new(),
+            hidden: HiddenLog::new(),
+        }
+    }
+
+    /// What the tmux server holds after both sidebars have flushed: one
+    /// fragment per window, each written by exactly one process.
+    fn server(frags: &[(&str, u32, &str, &HiddenLog)]) -> Vec<TabInfo> {
+        frags
+            .iter()
+            .map(|(w, i, sb, log)| {
+                let mut t = tab(w, *i, Some(sb));
+                t.hidden = (*log).clone();
+                t
+            })
+            .collect()
+    }
+
+    fn entry(session_id: &str) -> PaneEntry {
+        PaneEntry {
+            session_id: session_id.into(),
+            short_id: session_id.chars().take(8).collect(),
+            name: "n".into(),
+            opened_at: 0,
+        }
+    }
+
+    /// `t` refuses exactly where `o`/`s` do, and refuses BEFORE issuing any
+    /// tmux command — which is what lets this run hermetically.
+    #[test]
+    fn t_refuses_a_session_with_no_short_id_and_outside_tmux() {
+        // §9.7: `claude attach` takes the 8-hex short id, so without one the
+        // new tab's first pane would have nothing to run.
+        let mut a = app();
+        a.sidebar_cmd = Some("ccmux sidebar".into());
+        let mut orphan = bg("aaaaaaaa", "no id here", State::Working);
+        orphan.id = None;
+        load(&mut a, vec![orphan]);
+        a.on_key(press('t'));
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "no short id — cannot open this session"
+        );
+        assert!(a.panes.is_empty(), "nothing was created");
+
+        let mut d = app();
+        d.degraded = true;
+        d.sidebar_cmd = Some("ccmux sidebar".into());
+        load(&mut d, four());
+        d.on_key(press('t'));
+        assert_eq!(
+            d.message.clone().unwrap_or_default_msg().0,
+            "not inside tmux — tabs unavailable"
+        );
+
+        // And with no sidebar command there is nothing to run in the new tab's
+        // sidebar, so the tab is not created half-built.
+        let mut n = app();
+        load(&mut n, four());
+        n.on_key(press('t'));
+        assert_eq!(
+            n.message.clone().unwrap_or_default_msg().0,
+            "sidebar command unknown — cannot open a tab"
+        );
+    }
+
+    /// Per-window sidebar resolution, as a pure rule.
+    #[test]
+    fn each_tab_resolves_its_own_sidebar_and_registers_only_when_it_must() {
+        let mut a = app();
+        own(&mut a, "%2", "@2");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
+
+        // Marker unset: I am the sidebar, and I must say so.
+        a.tabs = vec![tab("@1", 1, Some("%1")), tab("@2", 2, None)];
+        assert_eq!(a.sidebar_choice(), (PaneId::parse("%2"), true));
+
+        // Marker already names me: nothing to write.
+        a.tabs = vec![tab("@1", 1, Some("%1")), tab("@2", 2, Some("%2"))];
+        assert_eq!(a.sidebar_choice(), (PaneId::parse("%2"), false));
+
+        // Marker names ANOTHER tab's sidebar — the trap a single session-wide
+        // `@ccmux_sidebar` fell into. It is not mine and must not be pinned by
+        // me; I register instead.
+        a.tabs = vec![tab("@1", 1, Some("%1")), tab("@2", 2, Some("%1"))];
+        assert_eq!(a.sidebar_choice(), (PaneId::parse("%2"), true));
+
+        // Marker names a dead pane in my window: register.
+        a.tabs = vec![tab("@2", 2, Some("%99"))];
+        assert_eq!(a.sidebar_choice(), (PaneId::parse("%2"), true));
+
+        // A second sidebar hand-launched into a window that already has one
+        // ADOPTS it rather than stealing the marker.
+        let mut b = app();
+        own(&mut b, "%3", "@2");
+        b.panes = vec![
+            pane("%2", 2, 1, 0, 34, false),
+            pane("%3", 2, 2, 34, 34, false),
+        ];
+        b.tabs = vec![tab("@2", 2, Some("%2"))];
+        assert_eq!(b.sidebar_choice(), (PaneId::parse("%2"), false));
+
+        // No own pane at all: keep a live cached id, drop a dead one, never
+        // invent one.
+        let mut c = app();
+        c.panes = vec![pane("%1", 1, 1, 0, 34, false)];
+        c.sidebar_pane = PaneId::parse("%1");
+        assert_eq!(c.sidebar_choice(), (PaneId::parse("%1"), false));
+        c.sidebar_pane = PaneId::parse("%99");
+        assert_eq!(c.sidebar_choice(), (None, false));
+    }
+
+    /// Pinning follows the sidebar, so with a sidebar per window it pins THIS
+    /// window and no other. `split_anchor` already scoped itself the same way
+    /// and is verified here rather than churned.
+    #[test]
+    fn layout_stays_inside_the_tab_that_owns_the_sidebar() {
+        let mut a = app();
+        own(&mut a, "%2", "@2");
+        a.panes = vec![
+            pane("%0", 1, 1, 0, 34, false),
+            pane("%1", 1, 2, 34, 100, true),
+            pane("%2", 2, 1, 0, 34, false),
+            pane("%3", 2, 2, 34, 60, false),
+        ];
+        a.tabs = vec![tab("@1", 1, Some("%0")), tab("@2", 2, Some("%2"))];
+        a.sidebar_pane = PaneId::parse("%2");
+
+        // Tab 1's window is 134 columns wide and tab 2's is 94; pinning must
+        // measure MINE.
+        assert_eq!(a.pinned_width_from(34), Some(34));
+        assert_eq!(a.pinned_width_from(200), Some(94 - MIN_CONTENT_COLS));
+        // The anchor is a pane of my window. Unscoped, step 1 would return
+        // `%1` — the active pane of a tab the operator is not looking at.
+        assert_eq!(a.split_anchor(), PaneId::parse("%3"));
+    }
+
+    /// THE concurrency claim, through the real keypress path: two sidebars
+    /// dismissing different rows in the same tick each write their OWN window
+    /// option, so neither reverts the other.
+    #[test]
+    fn two_tabs_dismissing_in_one_tick_do_not_revert_each_other() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        load(&mut a, four());
+        let mut b = app();
+        own(&mut b, "%2", "@2");
+        load(&mut b, four());
+
+        // Neither has seen the other: both are working from the same empty
+        // shared set, which is exactly the race.
+        a.select_first();
+        let id_a = a.selected_key.clone().expect("a row");
+        a.on_key(press('d'));
+        b.select_first();
+        b.select_next();
+        let id_b = b.selected_key.clone().expect("another row");
+        b.on_key(press('d'));
+        assert_ne!(id_a, id_b);
+        // Same wall-clock millisecond, so the stamps collide and the origin
+        // window is what orders them — deterministically, for every reader.
+        assert_eq!(a.hidden_log.ops[0].seq, b.hidden_log.ops[0].seq);
+
+        // Both flush. Two different tmux options; both writes land.
+        let tabs = server(&[
+            ("@1", 1, "%1", &a.hidden_log),
+            ("@2", 2, "%2", &b.hidden_log),
+        ]);
+        for app in [&mut a, &mut b] {
+            app.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
+            app.tabs = tabs.clone();
+            app.refold_hidden();
+            app.rebuild_rows();
+        }
+
+        for (who, app) in [("tab 1", &a), ("tab 2", &b)] {
+            assert!(app.hidden.ids().contains(&id_a), "{who} lost tab 1's dismissal");
+            assert!(app.hidden.ids().contains(&id_b), "{who} lost tab 2's dismissal");
+            assert_eq!(session_rows(app).len(), 2, "{who} shows both rows hidden");
+        }
+        // Each still writes only its own fragment — nobody adopted the other's
+        // op, so there is no key with two authors.
+        assert_eq!(a.hidden_log.ops.len(), 1);
+        assert_eq!(b.hidden_log.ops.len(), 1);
+    }
+
+    /// The undo stack is shared, and `u` in either tab pops the newest
+    /// dismissal by identity — never by position, so nothing can misapply it.
+    #[test]
+    fn undo_in_one_tab_restores_the_newest_dismissal_from_either() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        load(&mut a, four());
+        let mut theirs = HiddenLog::new();
+        theirs.push(HiddenOp {
+            id: "bbbbbbbb-uuid".into(),
+            add: true,
+            seq: a.now_ms as u64 + 500,
+            org: 2,
+        });
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
+        a.tabs = server(&[("@1", 1, "%1", &a.hidden_log), ("@2", 2, "%2", &theirs)]);
+        a.refold_hidden();
+        a.rebuild_rows();
+        assert_eq!(a.hidden.ids(), ["bbbbbbbb-uuid"]);
+
+        a.on_key(press('u'));
+        assert!(a.hidden.ids().is_empty(), "the other tab's dismissal came back");
+        // Restored by a TOMBSTONE in my own fragment, not by editing theirs.
+        let mine = a.hidden_log.ops.last().expect("a tombstone");
+        assert_eq!((mine.id.as_str(), mine.add, mine.org), ("bbbbbbbb-uuid", false, 1));
+        assert!(mine.seq > a.now_ms as u64 + 500, "a tombstone always outranks its target");
+        // And it survives the fold against the fragment it undoes.
+        a.tabs = server(&[("@1", 1, "%1", &a.hidden_log), ("@2", 2, "%2", &theirs)]);
+        a.refold_hidden();
+        assert!(a.hidden.ids().is_empty());
+    }
+
+    /// A window option dies with its window. Without adoption, closing a tab
+    /// would silently un-hide every row it dismissed.
+    #[test]
+    fn an_orphaned_fragment_is_adopted_by_the_lowest_live_tab() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
+        let mut theirs = HiddenLog::new();
+        theirs.push(HiddenOp { id: "gone-tab-uuid".into(), add: true, seq: 900, org: 2 });
+        a.tabs = server(&[("@1", 1, "%1", &a.hidden_log), ("@2", 2, "%2", &theirs)]);
+        a.adopt_orphan_fragments();
+        a.refold_hidden();
+        assert_eq!(a.hidden.ids(), ["gone-tab-uuid"]);
+        assert!(a.hidden_log.ops.is_empty(), "nothing to adopt while tab 2 lives");
+
+        // Tab 2 closes: its window, and its window option, are gone.
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false)];
+        a.tabs = server(&[("@1", 1, "%1", &a.hidden_log)]);
+        a.adopt_orphan_fragments();
+        a.refold_hidden();
+        assert_eq!(a.hidden.ids(), ["gone-tab-uuid"], "the dismissal outlived the tab");
+        assert!(a.hidden_dirty, "the adopted op is owed to tmux");
+        // Adopted VERBATIM: the stamp and origin are preserved, so adoption
+        // changes where an op is stored and nothing about the fold.
+        assert_eq!(a.hidden_log.ops, vec![HiddenOp {
+            id: "gone-tab-uuid".into(),
+            add: true,
+            seq: 900,
+            org: 2
+        }]);
+
+        // Only the lowest live tab adopts, so two survivors cannot both claim
+        // it and diverge.
+        let mut b = app();
+        own(&mut b, "%2", "@2");
+        b.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
+        b.last_frags = [(3u64, theirs.clone())].into_iter().collect();
+        b.tabs = server(&[("@1", 1, "%1", &HiddenLog::new()), ("@2", 2, "%2", &b.hidden_log)]);
+        b.adopt_orphan_fragments();
+        assert!(b.hidden_log.ops.is_empty(), "tab 2 is not the adopter");
+    }
+
+    /// REGRESSION. `adopt_own_state` used to latch `own_state_loaded` even when
+    /// the window enumeration did not carry my window. `refresh_panes` swallows
+    /// a failed `list-windows` while `own_window` still resolves from the
+    /// successful `list-panes`, so ONE transient failure on the tick that first
+    /// resolved identity left the sidebar running for its whole life on an
+    /// empty map and an empty dismissal fragment — and then overwriting this
+    /// window's durable options with those empties on the next dirty flush.
+    #[test]
+    fn a_failed_window_enumeration_never_latches_an_empty_state() {
+        let mut a = app();
+        a.tmux_session = "ccmux-test-adopt".into();
+        own(&mut a, "%1", "@1");
+        // The fixture starts adopted, because most tests want the steady
+        // state; this one is about the very first tick.
+        a.own_state_loaded = false;
+        a.map.insert(&PaneId::parse("%2").expect("id"), entry("aaaaaaaa-uuid"));
+
+        // The tick `list-windows` failed on: `tabs` empty, identity resolved.
+        a.tabs.clear();
+        a.adopt_own_state();
+        assert!(!a.own_state_loaded, "an empty enumeration is not an adoption");
+
+        // Nothing may be flushed from an un-adopted base. The dedupe cache is
+        // pre-seeded with exactly the JSON an UNGUARDED flush would write, so
+        // it would succeed and clear the flag without reaching tmux — the
+        // guard is the only thing that can leave the flag standing.
+        a.map_dirty = true;
+        a.hidden_dirty = true;
+        let win = WindowId::parse("@1").expect("window id");
+        crate::tmux::seed_saved_value(
+            &a.tmux_session,
+            crate::tmux::OPT_TAB_MAP,
+            &win,
+            &serde_json::to_string(&a.map).expect("PaneMap serializes"),
+        );
+        arm_hermetic_flush(&a);
+        a.save_map_now();
+        a.save_hidden_now();
+        assert!(a.map_dirty, "the map was written from an empty base");
+        assert!(a.hidden_dirty, "the dismissal log was written from an empty base");
+
+        // The next tick's `list-windows` succeeds. Adoption MERGES: the stored
+        // state arrives, and the `o` and `d` pressed while it was failing are
+        // still there.
+        let mut stored = tab("@1", 1, Some("%1"));
+        stored.map.insert(&PaneId::parse("%7").expect("id"), entry("bbbbbbbb-uuid"));
+        let _ = stored.hidden.push(HiddenOp {
+            id: "cccccccc-uuid".into(),
+            add: true,
+            seq: 5,
+            org: 1,
+        });
+        a.tabs = vec![stored];
+        a.adopt_own_state();
+        assert!(a.own_state_loaded);
+        assert_eq!(a.map.panes.len(), 2, "stored AND interim: {:?}", a.map.panes);
+        assert!(a.map.get(&PaneId::parse("%2").expect("id")).is_some(), "the interim `o`");
+        assert!(a.map.get(&PaneId::parse("%7").expect("id")).is_some(), "the stored entry");
+        assert_eq!(a.map.v, 1, "the adopted map carries the current schema version");
+        assert_eq!(a.hidden_log.ops.len(), 1, "the stored dismissal survived");
+    }
+
+    /// `open` is the union of every tab's map intersected with the live pane
+    /// list. The intersection is what makes a cross-tab `x` correct in the same
+    /// frame it happens, without anyone writing to a window they do not own.
+    #[test]
+    fn open_spans_every_tab_and_drops_a_pane_the_moment_it_dies() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![
+            pane("%1", 1, 1, 0, 34, false),
+            pane("%5", 1, 2, 34, 60, false),
+            pane("%2", 2, 1, 0, 34, false),
+            pane("%9", 2, 2, 34, 60, false),
+        ];
+        a.map.insert(&PaneId::parse("%5").expect("id"), entry("aaaaaaaa-uuid"));
+        let mut theirs = tab("@2", 2, Some("%2"));
+        theirs.map.insert(&PaneId::parse("%9").expect("id"), entry("bbbbbbbb-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1")), theirs.clone()];
+        a.rebuild_open();
+
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+        assert_eq!(a.pane_of("bbbbbbbb-uuid"), PaneId::parse("%9"), "a pane in another tab");
+        assert_eq!(a.open["aaaaaaaa-uuid"].window_index, Some(1));
+        assert_eq!(a.open["bbbbbbbb-uuid"].window_index, Some(2));
+        // The flash names the tab only when it is not mine.
+        assert_eq!(a.tab_suffix(&PaneId::parse("%5").expect("id")), "");
+        assert_eq!(a.tab_suffix(&PaneId::parse("%9").expect("id")), " in tab 2");
+
+        // Tab 2 kills %9 and writes NOTHING of tab 1's. The next pane listing
+        // is all it takes for every process to agree it is gone.
+        a.panes.retain(|p| p.id.as_str() != "%9");
+        a.rebuild_open();
+        assert_eq!(a.pane_of("bbbbbbbb-uuid"), None);
+        assert_eq!(a.tabs[1].map.panes.len(), 1, "the stale entry was not ours to remove");
+
+        // Two panes for one session, one of them MINE: `Enter` and `x` take
+        // the one in this tab, even though the other's id is numerically
+        // lower. See `a_session_open_in_two_tabs_resolves_to_the_one_in_mine`.
+        a.panes.push(pane("%3", 2, 2, 34, 60, false));
+        theirs.map.insert(&PaneId::parse("%3").expect("id"), entry("aaaaaaaa-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1")), theirs];
+        a.rebuild_open();
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+    }
+
+    /// REGRESSION. A session double-attached in two tabs used to resolve to the
+    /// globally lowest-numbered pane, so the tab whose pane happened to carry
+    /// the higher id had its badge point AWAY from a pane sitting on its own
+    /// screen, `Enter` switch the client out of the tab that already had it,
+    /// and `x` — destructive — kill the OTHER tab's pane while leaving the
+    /// visible one alive. The badge's contract ("blank means open HERE, a digit
+    /// ALWAYS means somewhere else") said the opposite of all three.
+    #[test]
+    fn a_session_open_in_two_tabs_resolves_to_the_one_in_mine() {
+        // %2 is in tab 1, %7 in tab 2, both attached to the same session.
+        let panes = vec![
+            pane("%1", 1, 1, 0, 34, false),
+            pane("%2", 1, 2, 34, 60, false),
+            pane("%6", 2, 1, 0, 34, false),
+            pane("%7", 2, 2, 34, 60, false),
+        ];
+        let mut one = PaneMap::new();
+        one.insert(&PaneId::parse("%2").expect("id"), entry("aaaaaaaa-uuid"));
+        let mut two = PaneMap::new();
+        two.insert(&PaneId::parse("%7").expect("id"), entry("aaaaaaaa-uuid"));
+
+        // The tab holding the HIGHER pane id is the one the old rule betrayed.
+        let mut b = app();
+        own(&mut b, "%6", "@2");
+        b.panes = panes.clone();
+        b.map = two.clone();
+        let mut t1 = tab("@1", 1, Some("%1"));
+        t1.map = one.clone();
+        let mut t2 = tab("@2", 2, Some("%6"));
+        t2.map = two.clone();
+        b.tabs = vec![t1.clone(), t2.clone()];
+        b.rebuild_open();
+        assert_eq!(b.pane_of("aaaaaaaa-uuid"), PaneId::parse("%7"), "x must kill MY pane");
+        assert_eq!(b.open["aaaaaaaa-uuid"].window, WindowId::parse("@2"));
+        assert_eq!(b.tab_suffix(&PaneId::parse("%7").expect("id")), "", "no jump away");
+
+        // The other tab is symmetric — not merely lucky that its id is lower.
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = panes.clone();
+        a.map = one;
+        a.tabs = vec![t1, t2];
+        a.rebuild_open();
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%2"));
+
+        // No own window at all (degraded, or a fixture with no inventory): both
+        // panes are equally foreign and §5.5's numeric rule is all that is
+        // left, exactly as before.
+        a.own_pane = None;
+        a.own_window = None;
+        a.rebuild_open();
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%2"));
+    }
+
+    /// `x` refuses ANY tab's sidebar, not only this one's: closing another
+    /// tab's would leave it blind until the next `ccmux` launch.
+    #[test]
+    fn x_refuses_to_close_any_tabs_sidebar() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        load(&mut a, four());
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
+        a.sidebar_pane = PaneId::parse("%1");
+        a.tabs = vec![tab("@1", 1, Some("%1")), tab("@2", 2, Some("%2"))];
+        // The selected session is "open" in the OTHER tab's sidebar pane — the
+        // shape a corrupt or hand-edited map could produce.
+        a.map.insert(&PaneId::parse("%2").expect("id"), entry("aaaaaaaa-uuid"));
+        a.rebuild_open();
+        a.select_first();
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"));
+
+        a.on_key(press('x'));
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "refusing to close the sidebar"
+        );
+        assert!(a.is_any_sidebar(&PaneId::parse("%2").expect("id")));
+        assert!(!a.is_any_sidebar(&PaneId::parse("%9").expect("id")));
+    }
+
+    /// The two-strike absence rule must retire the OPS, not only the folded
+    /// view: a surviving op would re-hide the id at the next fold.
+    #[test]
+    fn reconciliation_retires_the_ops_behind_a_dismissal() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        load(&mut a, four());
+        a.select_first();
+        a.on_key(press('d'));
+        let id = "aaaaaaaa-uuid";
+        assert_eq!(a.hidden.ids(), [id]);
+
+        // Two consecutive complete polls without it — the debounce, unchanged.
+        let rest: Vec<Session> = four().into_iter().filter(|s| s.session_id != id).collect();
+        a.apply_poll(complete(rest.clone()));
+        assert_eq!(a.hidden.ids(), [id], "one absence concludes nothing");
+        a.apply_poll(complete(rest));
+        assert!(a.hidden.ids().is_empty());
+        assert!(a.hidden_log.ops.is_empty(), "the op went with the dismissal");
+        // Which is what makes it stick through the next fold.
+        a.refold_hidden();
+        assert!(a.hidden.ids().is_empty());
     }
 
     #[test]
@@ -2723,6 +3815,7 @@ mod tests {
     fn a_dismissal_reaches_tmux_when_the_sidebar_quits_before_the_next_tick() {
         let mut a = app();
         a.tmux_session = "ccmux-test-flush-d".into();
+        own(&mut a, "%3", "@1");
         load(&mut a, four());
 
         a.on_key(press('d'));
@@ -2749,6 +3842,7 @@ mod tests {
     fn an_undo_reaches_tmux_when_the_sidebar_quits_before_the_next_tick() {
         let mut a = app();
         a.tmux_session = "ccmux-test-flush-u".into();
+        own(&mut a, "%3", "@1");
         load(&mut a, four());
 
         a.on_key(press('d'));

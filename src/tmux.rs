@@ -26,6 +26,33 @@ pub const OPT_SIDEBAR: &str = "@ccmux_sidebar";
 pub const OPT_WIDTH: &str = "@ccmux_width";
 pub const OPT_HIDDEN: &str = "@ccmux_hidden";
 
+// ── Per-window (per-tab) options ────────────────────────────────────────────
+//
+// A tab is a tmux WINDOW of ccmux's own session, and every tab carries its own
+// sidebar pane running its own ccmux process. That makes N concurrent writers,
+// so the key space is partitioned instead of shared: each of these three
+// options is a WINDOW option, written only by that window's own sidebar,
+// addressed through that sidebar's own pane. Two sidebars acting in the same
+// tick therefore write two DIFFERENT tmux options and both writes land.
+//
+// VERIFIED on tmux 3.4 (socket `ccmux-tabs`), and the reason the names are new
+// rather than reused: `show-options -w -qv` does not inherit, but `#{@name}`
+// format expansion DOES fall back window -> session -> global. A leftover
+// SESSION value for `@ccmux_map` would therefore be reported as every window's
+// value by `list_tabs`. New names cannot collide with a legacy session value.
+//
+// The same inheritance is what makes `@ccmux_width` ride along free in the
+// window read: it stays session-scoped, written only by the launcher.
+pub const OPT_TAB_SIDEBAR: &str = "@ccmux_tab_sidebar";
+pub const OPT_TAB_MAP: &str = "@ccmux_tab_map";
+pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
+
+/// The empty `@ccmux_map` value. Still written once at session creation, and
+/// re-written by the legacy migration, purely so `main.rs`'s "this session is
+/// not a ccmux session — refusing to modify it" ownership guard keeps working.
+/// The LIVE map is `@ccmux_tab_map`, one per window.
+pub const EMPTY_MAP_JSON: &str = r#"{"v":1,"panes":{}}"#;
+
 /// `@ccmux_map` schema version. A different value is treated as an empty map.
 const MAP_VERSION: u32 = 1;
 /// `@ccmux_hidden` schema version. A different value is treated as empty.
@@ -37,8 +64,25 @@ const HIDDEN_VERSION: u32 = 1;
 /// of still-live agents.
 const HIDDEN_MAX: usize = 256;
 
+/// `@ccmux_tab_hidden` schema version. Deliberately 2, not 1: it is a log of
+/// operations, not the `{"v":1,"ids":[…]}` set `@ccmux_hidden` carries, and a
+/// distinct number makes a mis-read of either shape impossible to miss.
+const HIDDEN_LOG_VERSION: u32 = 2;
+/// Operations one window's `@ccmux_tab_hidden` fragment will carry. Pruning
+/// keeps a settled fragment near empty; this only bounds a pathological tab.
+/// Overflow drops the OLDEST op, which fails in the same safe direction as
+/// `HIDDEN_MAX`: the row reappears.
+const HIDDEN_OPS_MAX: usize = 128;
+
 /// `-F` format for `list_panes_in_session`. Field order is authoritative
 /// (SPEC §3.2) and mirrored by `parse_pane_line`.
+///
+/// `#{window_id}` is the ninth field and is NOT a duplicate of
+/// `#{window_index}`: the operator's tmux runs `renumber-windows on`
+/// (verified), so an index read at one tick names a different window at the
+/// next, while a window id is never reused. Everything that must survive a
+/// tick — the write-dedupe cache key, a dismissal's origin stamp, "is that pane
+/// in MY window" — is keyed by the id. The index is display-only.
 const PANE_FMT: &str = concat!(
     "#{pane_id}\t",
     "#{pane_index}\t",
@@ -47,10 +91,27 @@ const PANE_FMT: &str = concat!(
     "#{pane_width}\t",
     "#{pane_height}\t",
     "#{pane_active}\t",
-    "#{window_index}",
+    "#{window_index}\t",
+    "#{window_id}",
 );
 
-const PANE_FIELDS: usize = 8;
+const PANE_FIELDS: usize = 9;
+
+/// `-F` format for `list_tabs`. The two JSON blobs are LAST so a value that
+/// somehow contained a tab could only corrupt the final field, never shift a
+/// fixed one. JSON cannot contain a raw tab (serde_json escapes control
+/// characters) and tmux does not re-expand format sequences inside an option
+/// value — both verified on 3.4.
+const TAB_FMT: &str = concat!(
+    "#{window_id}\t",
+    "#{window_index}\t",
+    "#{@ccmux_tab_sidebar}\t",
+    "#{@ccmux_width}\t",
+    "#{@ccmux_tab_map}\t",
+    "#{@ccmux_tab_hidden}",
+);
+
+const TAB_FIELDS: usize = 6;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -118,7 +179,7 @@ impl PaneId {
     /// Numeric value of the `N` in `%N`, for "lowest-numbered pane" ordering
     /// (SPEC §5.5). `BTreeMap` key order is lexicographic, where `%10` sorts
     /// before `%9`; this is the ordering the spec actually means.
-    fn num(&self) -> u64 {
+    pub fn num(&self) -> u64 {
         pane_num(&self.0)
     }
 }
@@ -128,6 +189,55 @@ fn pane_num(raw: &str) -> u64 {
 }
 
 impl std::fmt::Display for PaneId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ── WindowId: an IDENTITY, never a target ───────────────────────────────────
+
+/// A validated tmux window id in `@N` form.
+///
+/// BLAST RADIUS (RULE R1): this type is deliberately NOT a target type, and no
+/// function in this crate ever renders one into a `-t` argument. Verified on
+/// tmux 3.4 that window-id targets have a silent-mistarget mode a pane target
+/// does not: a bare `-t '@2'` reaches a window in ANOTHER session, and even a
+/// session-qualified `-t '=ccmux:@99'` returns exit 0 while reading and writing
+/// ccmux's CURRENT window. A pane target has no such mode — a stale `%99` fails
+/// loudly with "no such window" — so every window-scoped call here is addressed
+/// by an `assert_in_session`-gated `PaneId` instead.
+///
+/// A grep for `-t` next to a `WindowId` must return nothing. That is the
+/// invariant a reviewer can check mechanically.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowId(String);
+
+impl WindowId {
+    /// Accepts `^@\d+$` only. Everything else -> None.
+    pub fn parse(s: &str) -> Option<WindowId> {
+        let digits = s.strip_prefix('@')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(WindowId(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Numeric value of the `N` in `@N`. NUMERIC, for the same reason
+    /// `PaneId::num` is: `"@9" > "@10"` lexicographically, and this value
+    /// orders the adoption rule and breaks ties in the dismissal fold.
+    pub fn num(&self) -> u64 {
+        self.0
+            .strip_prefix('@')
+            .and_then(|d| d.parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    }
+}
+
+impl std::fmt::Display for WindowId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -151,6 +261,8 @@ pub struct PaneInfo {
     pub height: u16,
     pub active: bool,
     pub window_index: u32,
+    /// Stable across `renumber-windows`, unlike `window_index`.
+    pub window_id: WindowId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -539,6 +651,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     let height: u16 = parts[5].parse().map_err(|_| bad("pane_height", parts[5]))?;
     let active = parts[6] == "1";
     let window_index: u32 = parts[7].parse().map_err(|_| bad("window_index", parts[7]))?;
+    let window_id = WindowId::parse(parts[8]).ok_or_else(|| bad("window_id", parts[8]))?;
 
     Ok(PaneInfo {
         id,
@@ -549,6 +662,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         height,
         active,
         window_index,
+        window_id,
     })
 }
 
@@ -613,6 +727,49 @@ pub fn split_left_of(
         shell_cmd,
     ])?;
     parse_pane_id_output(&out)
+}
+
+/// `tmux new-window -d -t '=<session>:' -n cc -P -F … -- <first_cmd>` — the one
+/// new mutating command tabs add. Returns (window id, window index, pane id).
+///
+/// BLAST RADIUS: there is NO parameter through which a window target can be
+/// passed. The target is built by `session_target` alone, which is tmux's
+/// exact-match form, so this call is structurally incapable of naming a window
+/// or a session that is not ccmux's own. `new-window` also refuses a pane
+/// target outright, so no other target form is even available here.
+///
+/// `-d` keeps the client where it is; `t` moves it afterwards through the
+/// already-gated `select_pane`.
+pub fn new_tab(session: &str, first_cmd: &str) -> Result<(WindowId, u32, PaneId), TmuxError> {
+    require_shell_cmd(first_cmd)?;
+    let target = session_target(session)?;
+    let out = tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        &target,
+        "-n",
+        WINDOW_NAME,
+        "-P",
+        "-F",
+        "#{window_id}\t#{window_index}\t#{pane_id}",
+        "--",
+        first_cmd,
+    ])?;
+    parse_new_tab_output(&out)
+}
+
+fn parse_new_tab_output(out: &str) -> Result<(WindowId, u32, PaneId), TmuxError> {
+    let first = out.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let parts: Vec<&str> = first.split('\t').collect();
+    let bad = || TmuxError::Parse(format!("expected `@N<TAB>N<TAB>%N` from new-window, got {first:?}"));
+    let (Some(w), Some(i), Some(p)) = (parts.first(), parts.get(1), parts.get(2)) else {
+        return Err(bad());
+    };
+    let window = WindowId::parse(w).ok_or_else(bad)?;
+    let index: u32 = i.parse().map_err(|_| bad())?;
+    let pane = PaneId::parse(p).ok_or_else(bad)?;
+    Ok((window, index, pane))
 }
 
 /// `tmux kill-pane -t <pane>`. R2-gated. SAFE with respect to Claude sessions:
@@ -734,6 +891,136 @@ pub fn set_user_option(session: &str, key: &str, value: &str) -> Result<(), Tmux
     tmux(&["set-option", "-t", &target, key, value]).map(|_| ())
 }
 
+// ── Tabs: per-window state, read in ONE call ────────────────────────────────
+
+/// Everything one tab persists, plus its identity.
+#[derive(Debug, Clone)]
+pub struct TabInfo {
+    pub window: WindowId,
+    pub index: u32,
+    /// `@ccmux_tab_sidebar` — the pane running that tab's ccmux process.
+    pub sidebar: Option<PaneId>,
+    /// `@ccmux_tab_map` — the panes THAT tab opened.
+    pub map: PaneMap,
+    /// `@ccmux_tab_hidden` — that tab's fragment of the shared dismissal log.
+    pub hidden: HiddenLog,
+}
+
+/// `tmux list-windows -t '=<session>:' -F …` — the whole cross-tab picture and
+/// the session-scoped `@ccmux_width`, in ONE invocation. Session-targeted with
+/// the exact-match form for the same reason every other read is.
+///
+/// This REPLACES the per-tick `show-options @ccmux_width` rather than adding to
+/// it: session options are visible in a window format context (verified), so
+/// the cross-tab picture costs nothing over today's tick.
+///
+/// A window whose fields are absent, malformed, or version-mismatched yields
+/// the empty value, never an error — the same policy `load_map` has always had.
+pub fn list_tabs(session: &str) -> Result<(Vec<TabInfo>, Option<u16>), TmuxError> {
+    let target = session_target(session)?;
+    let out = tmux(&["list-windows", "-t", &target, "-F", TAB_FMT])?;
+    Ok(parse_tab_lines(&out))
+}
+
+fn parse_tab_lines(out: &str) -> (Vec<TabInfo>, Option<u16>) {
+    let mut tabs = Vec::new();
+    let mut width: Option<u16> = None;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(TAB_FIELDS, '\t').collect();
+        if parts.len() < TAB_FIELDS {
+            continue;
+        }
+        let (Some(window), Ok(index)) = (WindowId::parse(parts[0]), parts[1].parse::<u32>()) else {
+            continue;
+        };
+        if width.is_none() {
+            width = parts[3].trim().parse::<u16>().ok();
+        }
+        tabs.push(TabInfo {
+            window,
+            index,
+            sidebar: PaneId::parse(parts[2]),
+            map: parse_map(parts[4]),
+            hidden: parse_hidden_log(parts[5]),
+        });
+    }
+    (tabs, width)
+}
+
+/// A window option write, addressed by a PANE of that window.
+///
+/// `set-option -w -t %N` resolves to %N's window (verified), and a stale pane
+/// target fails LOUDLY (`no such window: %99`, exit 1) rather than silently
+/// retargeting. The only thing it could otherwise reach is a pane in another
+/// session — which is exactly what `assert_in_session` has always blocked. So
+/// the R2 gate is mandatory here, without exception, like every other mutation.
+fn set_window_option_at(
+    session: &str,
+    pane: &PaneId,
+    key: &str,
+    value: &str,
+) -> Result<(), TmuxError> {
+    if !key.starts_with('@') {
+        return Err(TmuxError::BadTarget(format!("not a user option: {key:?}")));
+    }
+    assert_in_session(pane, session)?;
+    tmux(&["set-option", "-w", "-t", pane.as_str(), key, value]).map(|_| ())
+}
+
+/// Record `pane` as its own window's sidebar.
+///
+/// The one option in this design with more than one writer (the launcher's heal
+/// and the sidebar's own self-registration), and safely so: both write the same
+/// function of ground truth — the pane id of the process that IS that window's
+/// sidebar. No writer reads the value to compute the value, so there is no
+/// read-modify-write to lose and every writer converges on the same answer.
+pub fn set_tab_sidebar(session: &str, pane: &PaneId) -> Result<(), TmuxError> {
+    set_window_option_at(session, pane, OPT_TAB_SIDEBAR, pane.as_str())
+}
+
+/// Serialize and write `@ccmux_tab_map` for `pane`'s window, skipping the write
+/// when this process last wrote the identical value for that window.
+pub fn save_tab_map(
+    session: &str,
+    pane: &PaneId,
+    window: &WindowId,
+    map: &PaneMap,
+) -> Result<(), TmuxError> {
+    let json = serde_json::to_string(map)
+        .map_err(|e| TmuxError::Parse(format!("cannot serialize pane map: {e}")))?;
+    set_window_option_cached(session, pane, window, OPT_TAB_MAP, json)
+}
+
+/// Serialize and write `@ccmux_tab_hidden` for `pane`'s window.
+pub fn save_tab_hidden(
+    session: &str,
+    pane: &PaneId,
+    window: &WindowId,
+    log: &HiddenLog,
+) -> Result<(), TmuxError> {
+    let json = serde_json::to_string(log)
+        .map_err(|e| TmuxError::Parse(format!("cannot serialize hidden log: {e}")))?;
+    set_window_option_cached(session, pane, window, OPT_TAB_HIDDEN, json)
+}
+
+/// The ONE write into a window this process does not own: `t` seeds the new
+/// tab's map through the Claude pane BEFORE that tab's sidebar exists.
+///
+/// Deliberately uncached, so a one-shot foreign-window write can never seed a
+/// cache entry the owning process would later trust.
+pub fn write_tab_map_uncached(
+    session: &str,
+    pane: &PaneId,
+    map: &PaneMap,
+) -> Result<(), TmuxError> {
+    let json = serde_json::to_string(map)
+        .map_err(|e| TmuxError::Parse(format!("cannot serialize pane map: {e}")))?;
+    set_window_option_at(session, pane, OPT_TAB_MAP, &json)
+}
+
 // ── The pane map ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -820,62 +1107,81 @@ fn serialize_map(map: &PaneMap) -> String {
     serde_json::to_string(map).unwrap_or_else(|_| r#"{"v":1,"panes":{}}"#.to_string())
 }
 
-/// Read `@ccmux_map` and deserialize. Any failure (unset, empty, bad JSON,
-/// `v != 1`) yields `PaneMap::new()` — never an error. A corrupt map must not
-/// stop the sidebar from starting.
-pub fn load_map(session: &str) -> PaneMap {
-    let raw = match get_user_option(session, OPT_MAP) {
-        Some(raw) => raw,
-        None => return PaneMap::new(),
-    };
-    match serde_json::from_str::<PaneMap>(&raw) {
+fn parse_map(raw: &str) -> PaneMap {
+    match serde_json::from_str::<PaneMap>(raw) {
         Ok(map) if map.v == MAP_VERSION => map,
         _ => PaneMap::new(),
     }
 }
 
-/// Last value written per (option, session), so a steady-state tick issues no
-/// `set-option` at all (§5.2). Keyed by option too, because `@ccmux_map` and
-/// `@ccmux_hidden` share this cache and a session-only key would let one
-/// option's value suppress the other's write.
+/// Read the LEGACY session-scoped `@ccmux_map`. Any failure (unset, empty, bad
+/// JSON, `v != 1`) yields `PaneMap::new()` — never an error. Only the one-time
+/// migration reads this now; the live map is `@ccmux_tab_map`, per window.
+pub fn load_map(session: &str) -> PaneMap {
+    match get_user_option(session, OPT_MAP) {
+        Some(raw) => parse_map(&raw),
+        None => PaneMap::new(),
+    }
+}
+
+/// Last value written per (option, session, WINDOW), so a steady-state tick
+/// issues no `set-option` at all (§5.2).
+///
+/// The window is part of the key and that is load-bearing, not tidiness: a
+/// single process can write two windows' copies of the same option (the `t`
+/// path), and without the window one window's value would suppress the other's
+/// write inside this process's own cache.
+///
+/// It is an in-process `static` and therefore gives ZERO protection across
+/// processes — which is precisely why nothing in this design relies on it for
+/// correctness. Cross-process safety comes from the key space being
+/// partitioned so that two writers of one option are not representable.
 static LAST_SAVED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 fn lock_saved() -> std::sync::MutexGuard<'static, Option<HashMap<String, String>>> {
     LAST_SAVED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// `set_user_option`, skipped when the identical value was last written.
-/// `key` starts with `@` and a session name cannot contain a space, so the
-/// composed cache key is unambiguous.
-fn set_user_option_cached(session: &str, key: &str, json: String) -> Result<(), TmuxError> {
-    let cache_key = format!("{key} {session}");
-    if lock_saved().as_ref().and_then(|c| c.get(&cache_key)) == Some(&json) {
+/// `key`, `session` and a window id contain no spaces, so this is unambiguous.
+fn cache_key(key: &str, session: &str, window: &WindowId) -> String {
+    format!("{key} {session} {}", window.as_str())
+}
+
+/// `set_window_option_at`, skipped when the identical value was last written.
+///
+/// The cache hit-check runs BEFORE the R2 gate, deliberately: a hit means no
+/// write, so there is no target to gate and no tmux spawn at all. That is what
+/// keeps `seed_saved_value` a working hermetic seam now that writes are
+/// pane-targeted — gate-first would make every seeded test shell out to the
+/// operator's live default socket.
+fn set_window_option_cached(
+    session: &str,
+    pane: &PaneId,
+    window: &WindowId,
+    key: &str,
+    json: String,
+) -> Result<(), TmuxError> {
+    let ck = cache_key(key, session, window);
+    if lock_saved().as_ref().and_then(|c| c.get(&ck)) == Some(&json) {
         return Ok(());
     }
-    set_user_option(session, key, &json)?;
-    lock_saved().get_or_insert_with(HashMap::new).insert(cache_key, json);
+    set_window_option_at(session, pane, key, &json)?;
+    lock_saved().get_or_insert_with(HashMap::new).insert(ck, json);
     Ok(())
 }
 
-/// Pre-seed the write-dedupe cache so a `save_*` carrying this exact value
+/// Pre-seed the write-dedupe cache so a `save_tab_*` carrying this exact value
 /// returns `Ok(())` without spawning tmux.
 ///
 /// Tests only, and the reason is a hard rule rather than a convenience: the
 /// unit suite must never reach a tmux server, because the default socket is
 /// the operator's live one. This is the seam that lets an `app` test drive
-/// `App::shutdown` through the real `save_hidden` and stay hermetic.
+/// `App::shutdown` through the real `save_tab_hidden` and stay hermetic.
 #[cfg(test)]
-pub fn seed_saved_value(session: &str, key: &str, json: &str) {
+pub fn seed_saved_value(session: &str, key: &str, window: &WindowId, json: &str) {
     lock_saved()
         .get_or_insert_with(HashMap::new)
-        .insert(format!("{key} {session}"), json.to_string());
-}
-
-/// Serialize and write to `@ccmux_map`.
-pub fn save_map(session: &str, map: &PaneMap) -> Result<(), TmuxError> {
-    let json = serde_json::to_string(map)
-        .map_err(|e| TmuxError::Parse(format!("cannot serialize pane map: {e}")))?;
-    set_user_option_cached(session, OPT_MAP, json)
+        .insert(cache_key(key, session, window), json.to_string());
 }
 
 // ── The dismissed set (`d` / `u`) ───────────────────────────────────────────
@@ -961,11 +1267,179 @@ pub fn load_hidden(session: &str) -> HiddenSet {
     }
 }
 
-/// Serialize and write to `@ccmux_hidden`. Same dedupe cache as `save_map`.
-pub fn save_hidden(session: &str, hidden: &HiddenSet) -> Result<(), TmuxError> {
-    let json = serde_json::to_string(hidden)
-        .map_err(|e| TmuxError::Parse(format!("cannot serialize hidden set: {e}")))?;
-    set_user_option_cached(session, OPT_HIDDEN, json)
+// ── The dismissal log: one shared set, still one writer per option ──────────
+//
+// A dismissal is about the SESSION LIST, which is the same list in every tab,
+// so its effect must be session-wide. Session-wide and single-writer are
+// reconciled by making each window's option an op-log FRAGMENT and the shared
+// set a pure fold of every fragment. Nobody ever read-modify-writes a shared
+// value, so the failure this design exists to prevent — measured on tmux 3.4,
+// where two concurrent read-modify-writes of one session option left
+// `{"v":1,"ids":["A"]}` and silently dropped B's dismissal — is not
+// representable.
+
+/// One dismissal or restoration, stamped so every reader orders it identically.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HiddenOp {
+    /// `model::Session::session_id` (the stable uuid).
+    pub id: String,
+    /// true = `d` (dismiss), false = `u` (a tombstone that restores the row).
+    pub add: bool,
+    /// Lamport stamp: `max(now_ms, largest seq ever seen + 1)`.
+    pub seq: u64,
+    /// `WindowId::num()` of the tab that minted it — the deterministic
+    /// tiebreak for a true same-millisecond collision.
+    pub org: u64,
+}
+
+impl HiddenOp {
+    /// The total order every process resolves winners by. `add` is last only to
+    /// make the order total; two ops can never share a `(seq, org)` unless they
+    /// are the same op, because `seq` strictly increases per process.
+    fn rank(&self) -> (u64, u64, bool) {
+        (self.seq, self.org, self.add)
+    }
+}
+
+/// One window's fragment of the shared dismissal log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HiddenLog {
+    /// Schema version. Current = 2. A different value is treated as empty.
+    pub v: u32,
+    #[serde(default)]
+    pub ops: Vec<HiddenOp>,
+}
+
+impl Default for HiddenLog {
+    fn default() -> Self {
+        HiddenLog::new()
+    }
+}
+
+impl HiddenLog {
+    pub fn new() -> Self {
+        HiddenLog { v: HIDDEN_LOG_VERSION, ops: Vec::new() }
+    }
+
+    /// Append `op` unless byte-identical to one already held. Idempotent on
+    /// purpose: adoption of an orphaned fragment can legitimately re-offer an
+    /// op this fragment already carries, and that must be a no-op, not a
+    /// duplicate. Returns true when the log changed.
+    pub fn push(&mut self, op: HiddenOp) -> bool {
+        if op.id.is_empty() || self.ops.contains(&op) {
+            return false;
+        }
+        self.ops.push(op);
+        while self.ops.len() > HIDDEN_OPS_MAX {
+            let Some(oldest) = self
+                .ops
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, o)| o.rank())
+                .map(|(i, _)| i)
+            else {
+                break;
+            };
+            self.ops.remove(oldest);
+        }
+        true
+    }
+
+    /// Largest stamp in this fragment — one half of the Lamport clock.
+    pub fn max_seq(&self) -> u64 {
+        self.ops.iter().map(|o| o.seq).max().unwrap_or(0)
+    }
+
+    /// Drop every op naming an id in `ids`. Used by the two-strike absence rule,
+    /// which retires a dismissal whose session has left the poll for good.
+    pub fn forget<'a, I: IntoIterator<Item = &'a str>>(&mut self, ids: I) -> bool {
+        let gone: HashSet<&str> = ids.into_iter().collect();
+        let before = self.ops.len();
+        self.ops.retain(|o| !gone.contains(o.id.as_str()));
+        self.ops.len() != before
+    }
+}
+
+/// Fold every fragment into the shared dismissed set.
+///
+/// A last-writer-wins register per id, keyed by the total order `(seq, org)` —
+/// a standard convergent structure, not an ad-hoc merge. The fold is a pure
+/// function of the MULTISET of ops, and every process reads every fragment each
+/// tick, so every process computes the same set and the same undo target.
+///
+/// The result is ordered by winning stamp ASCENDING, which is exactly today's
+/// "oldest first" contract: `model::build_rows` is unaffected and
+/// `HiddenSet::undo` still pops the newest dismissal.
+pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> HiddenSet {
+    let mut winner: BTreeMap<&str, &HiddenOp> = BTreeMap::new();
+    for log in frags {
+        for op in &log.ops {
+            match winner.get(op.id.as_str()) {
+                Some(cur) if cur.rank() >= op.rank() => {}
+                _ => {
+                    winner.insert(op.id.as_str(), op);
+                }
+            }
+        }
+    }
+    let mut live: Vec<&HiddenOp> = winner.into_values().filter(|o| o.add).collect();
+    live.sort_by(|a, b| (a.seq, a.org, &a.id).cmp(&(b.seq, b.org, &b.id)));
+    let mut set = HiddenSet::new();
+    for op in live {
+        set.dismiss(&op.id);
+    }
+    set
+}
+
+/// Garbage-collect `mine` against what the other fragments already carry.
+/// Every step is a write to one's own key, so it can never race.
+///
+///   * COMPACT — keep only my highest-ranked op per id; my own older ops on
+///     that id can never win again.
+///   * P1 superseded — drop my op on X when another fragment holds a strictly
+///     higher-ranked op on X.
+///   * P2 tombstone GC — drop my `add:false` op on X once no other fragment
+///     holds any op on X at all. There is then nothing left for it to suppress,
+///     and the fold's answer for X is identical with or without it.
+///
+/// P1 then P2 settle a resolved disagreement to empty in two ticks.
+/// Returns true when `mine` changed.
+pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool {
+    let mut best: BTreeMap<&str, (u64, u64, bool)> = BTreeMap::new();
+    for log in others {
+        for op in &log.ops {
+            let r = op.rank();
+            if best.get(op.id.as_str()).is_none_or(|cur| *cur < r) {
+                best.insert(op.id.as_str(), r);
+            }
+        }
+    }
+    // COMPACT first, so P1/P2 judge one op per id.
+    let mut top: BTreeMap<String, (u64, u64, bool)> = BTreeMap::new();
+    for op in &mine.ops {
+        let r = op.rank();
+        if top.get(op.id.as_str()).is_none_or(|cur| *cur < r) {
+            top.insert(op.id.clone(), r);
+        }
+    }
+    let before = mine.ops.len();
+    mine.ops.retain(|op| {
+        if top.get(op.id.as_str()) != Some(&op.rank()) {
+            return false; // COMPACT: superseded by a later op of my own
+        }
+        match best.get(op.id.as_str()) {
+            Some(other) => *other <= op.rank(), // P1
+            None => op.add,                    // P2
+        }
+    });
+    mine.ops.len() != before
+}
+
+fn parse_hidden_log(raw: &str) -> HiddenLog {
+    match serde_json::from_str::<HiddenLog>(raw) {
+        Ok(l) if l.v == HIDDEN_LOG_VERSION => l,
+        _ => HiddenLog::new(),
+    }
 }
 
 // ── Shell quoting (§7) ──────────────────────────────────────────────────────
@@ -1004,6 +1478,10 @@ mod tests {
     use super::*;
 
     fn pane(id: &str, index: u32, left: u16) -> PaneInfo {
+        pane_in(id, index, left, 1)
+    }
+
+    fn pane_in(id: &str, index: u32, left: u16, window: u32) -> PaneInfo {
         PaneInfo {
             id: PaneId::parse(id).expect("test pane id"),
             index,
@@ -1012,8 +1490,17 @@ mod tests {
             width: 80,
             height: 24,
             active: false,
-            window_index: 1,
+            window_index: window,
+            window_id: WindowId::parse(&format!("@{window}")).expect("test window id"),
         }
+    }
+
+    fn op(id: &str, add: bool, seq: u64, org: u64) -> HiddenOp {
+        HiddenOp { id: id.into(), add, seq, org }
+    }
+
+    fn log(ops: &[HiddenOp]) -> HiddenLog {
+        HiddenLog { v: HIDDEN_LOG_VERSION, ops: ops.to_vec() }
     }
 
     fn entry(session_id: &str) -> PaneEntry {
@@ -1079,7 +1566,7 @@ mod tests {
 
     #[test]
     fn parse_pane_line_reads_every_field() {
-        let line = "%25\t2\t35\t0\t239\t76\t1\t1";
+        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0";
         let p = parse_pane_line(line).expect("parses");
         assert_eq!(p.id.as_str(), "%25");
         assert_eq!(p.index, 2);
@@ -1089,15 +1576,19 @@ mod tests {
         assert_eq!(p.height, 76);
         assert!(p.active);
         assert_eq!(p.window_index, 1);
+        assert_eq!(p.window_id.as_str(), "@0");
     }
 
     #[test]
     fn parse_pane_lines_rejects_short_and_malformed_rows() {
         assert!(parse_pane_line("%1\t1\t0").is_err());
-        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1").is_err());
-        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1").is_err());
+        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0").is_err());
+        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0").is_err());
+        // The ninth field is the window id, and a bad one is fatal like the rest.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1").is_err());
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1").is_err());
         // Blank lines are skipped, not fatal.
-        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\n\n").expect("parses");
+        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\n\n").expect("parses");
         assert_eq!(panes.len(), 1);
         assert!(parse_pane_lines("").expect("empty is fine").is_empty());
     }
@@ -1131,14 +1622,12 @@ mod tests {
     fn window_scoping_separates_per_window_coordinates() {
         // `pane_left` restarts at 0 in every window, so an unscoped `min`/`max`
         // over a session's panes mixes windows that share nothing.
-        let mut panes = vec![
+        let panes = vec![
             pane("%1", 1, 0),
             pane("%10", 2, 35),
-            pane("%11", 1, 0),
-            pane("%12", 2, 41),
+            pane_in("%11", 1, 0, 2),
+            pane_in("%12", 2, 41, 2),
         ];
-        panes[2].window_index = 2;
-        panes[3].window_index = 2;
 
         let sidebar = PaneId::parse("%1").expect("id");
         assert_eq!(window_of(&panes, &sidebar), Some(1));
@@ -1348,6 +1837,209 @@ mod tests {
         assert_ne!(future.v, HIDDEN_VERSION);
     }
 
+    // ── WindowId, tabs, and the dismissal log ───────────────────────────────
+
+    #[test]
+    fn window_id_accepts_only_at_digits_and_orders_numerically() {
+        assert_eq!(WindowId::parse("@0").map(|w| w.to_string()), Some("@0".into()));
+        for bad in ["", "@", "@a", "0", "%1", "=ccmux:@1", "@1 ", "@-1"] {
+            assert!(WindowId::parse(bad).is_none(), "{bad:?} must not parse");
+        }
+        // The `%9`/`%10` bug, again: adoption and the fold's tiebreak both rest
+        // on this being numeric, not lexicographic.
+        let nine = WindowId::parse("@9").expect("id");
+        let ten = WindowId::parse("@10").expect("id");
+        assert!(nine.num() < ten.num());
+        assert!(nine.as_str() > ten.as_str(), "the lexicographic order is the trap");
+    }
+
+    #[test]
+    fn parse_tab_lines_reads_every_window_and_the_session_width() {
+        let out = concat!(
+            "@0\t1\t%3\t34\t{\"v\":1,\"panes\":{\"%5\":{\"session_id\":\"u-a\"}}}\t",
+            "{\"v\":2,\"ops\":[{\"id\":\"u-x\",\"add\":true,\"seq\":9,\"org\":0}]}\n",
+            "@7\t2\t\t34\t\t\n",
+        );
+        let (tabs, width) = parse_tab_lines(out);
+        assert_eq!(width, Some(34), "@ccmux_width rides along in the window read");
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].window.as_str(), "@0");
+        assert_eq!(tabs[0].index, 1);
+        assert_eq!(tabs[0].sidebar, PaneId::parse("%3"));
+        assert_eq!(tabs[0].map.panes.len(), 1);
+        assert_eq!(tabs[0].hidden.ops.len(), 1);
+        // An unmarked window reads as empty everywhere, never as an error.
+        assert_eq!(tabs[1].window.as_str(), "@7");
+        assert!(tabs[1].sidebar.is_none());
+        assert!(tabs[1].map.panes.is_empty());
+        assert!(tabs[1].hidden.ops.is_empty());
+
+        // Corrupt values hide nothing and drop nothing: same policy as `load_map`.
+        let (tabs, _) = parse_tab_lines("@1\t1\tnot-a-pane\tzz\t{oops\t{\"v\":99}\n");
+        assert_eq!(tabs.len(), 1);
+        assert!(tabs[0].sidebar.is_none());
+        assert!(tabs[0].map.panes.is_empty());
+        assert!(tabs[0].hidden.ops.is_empty());
+        // A line that cannot even be identified is skipped, not fatal.
+        assert!(parse_tab_lines("garbage\n").0.is_empty());
+        assert!(parse_tab_lines("").0.is_empty());
+    }
+
+    #[test]
+    fn parse_new_tab_output_wants_all_three_fields() {
+        let ok = parse_new_tab_output("@4\t3\t%12\n").expect("parses");
+        assert_eq!((ok.0.as_str(), ok.1, ok.2.as_str()), ("@4", 3, "%12"));
+        for bad in ["", "@4\t3", "4\t3\t%12", "@4\tx\t%12", "@4\t3\t12"] {
+            assert!(parse_new_tab_output(bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn set_window_option_at_refuses_a_non_user_option() {
+        // The guard runs before the R2 gate's `list-panes`, so this asserts
+        // without reaching any tmux server.
+        let pane = PaneId::parse("%1").expect("id");
+        assert!(matches!(
+            set_window_option_at("ccmux", &pane, "status", "off"),
+            Err(TmuxError::BadTarget(_))
+        ));
+    }
+
+    /// THE concurrency claim, as a pure function: two tabs that dismiss
+    /// different rows in the same tick write two DIFFERENT options, so the fold
+    /// sees both. The measured failure this replaces — two concurrent
+    /// read-modify-writes of one session option — silently kept only one.
+    #[test]
+    fn two_tabs_dismissing_in_one_tick_both_survive_the_fold() {
+        let a = log(&[op("uuid-a", true, 100, 1)]);
+        let b = log(&[op("uuid-b", true, 100, 2)]);
+        let folded = fold_hidden([&a, &b]);
+        assert_eq!(folded.ids(), ["uuid-a", "uuid-b"], "neither dismissal is lost");
+        // Every process reads every fragment, so every process computes the
+        // same set and the same undo target regardless of read order.
+        assert_eq!(fold_hidden([&b, &a]), folded, "the fold is order-independent");
+    }
+
+    #[test]
+    fn the_fold_is_a_last_writer_wins_register_per_id() {
+        // Same row, both tabs dismiss it: the effect is identical either way.
+        let a = log(&[op("uuid-x", true, 100, 1)]);
+        let b = log(&[op("uuid-x", true, 100, 2)]);
+        assert_eq!(fold_hidden([&a, &b]).ids(), ["uuid-x"], "one row, not two");
+
+        // A dismisses X while B undoes it: the later stamp wins.
+        let dismiss = log(&[op("uuid-x", true, 100, 1)]);
+        let undo = log(&[op("uuid-x", false, 101, 2)]);
+        assert!(fold_hidden([&dismiss, &undo]).ids().is_empty());
+        // ... and a later re-dismissal outranks the tombstone again.
+        let again = log(&[op("uuid-x", true, 102, 1)]);
+        assert_eq!(fold_hidden([&dismiss, &undo, &again]).ids(), ["uuid-x"]);
+
+        // A true same-millisecond tie breaks on the origin window, identically
+        // for every reader.
+        let lo = log(&[op("uuid-x", true, 100, 1)]);
+        let hi = log(&[op("uuid-x", false, 100, 2)]);
+        assert!(fold_hidden([&lo, &hi]).ids().is_empty());
+        assert!(fold_hidden([&hi, &lo]).ids().is_empty());
+    }
+
+    #[test]
+    fn the_fold_orders_the_undo_stack_oldest_first_across_tabs() {
+        let a = log(&[op("first", true, 10, 1), op("third", true, 30, 1)]);
+        let b = log(&[op("second", true, 20, 2)]);
+        let mut folded = fold_hidden([&a, &b]);
+        assert_eq!(folded.ids(), ["first", "second", "third"], "oldest first");
+        // `u` pops the newest dismissal, whichever tab made it.
+        assert_eq!(folded.undo().as_deref(), Some("third"));
+        assert_eq!(folded.undo().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn pruning_settles_a_resolved_disagreement_to_empty() {
+        // My tombstone supersedes their dismissal, so it must be KEPT while
+        // theirs still exists — dropping it would un-hide the row.
+        let theirs = log(&[op("uuid-x", true, 10, 2)]);
+        let mut mine = log(&[op("uuid-x", false, 11, 1)]);
+        assert!(!prune_hidden_log(&mut mine, &[&theirs]));
+        assert_eq!(mine.ops.len(), 1);
+        assert!(fold_hidden([&theirs, &mine]).ids().is_empty());
+
+        // P1: they drop their superseded dismissal.
+        let mut theirs2 = theirs.clone();
+        assert!(prune_hidden_log(&mut theirs2, &[&mine]));
+        assert!(theirs2.ops.is_empty());
+
+        // P2: with nothing left to suppress, my tombstone goes too — and the
+        // fold's answer for that id is unchanged by its absence.
+        assert!(prune_hidden_log(&mut mine, &[&theirs2]));
+        assert!(mine.ops.is_empty(), "settled in two ticks, both writing only their own key");
+        assert!(fold_hidden([&mine, &theirs2]).ids().is_empty());
+    }
+
+    #[test]
+    fn pruning_compacts_my_own_history_without_resurrecting_a_row() {
+        // Dismiss, undo, dismiss again — all mine, nobody else involved.
+        let mut mine = log(&[
+            op("uuid-x", true, 10, 1),
+            op("uuid-x", false, 11, 1),
+            op("uuid-x", true, 12, 1),
+        ]);
+        assert!(prune_hidden_log(&mut mine, &[]));
+        assert_eq!(mine.ops, vec![op("uuid-x", true, 12, 1)]);
+        assert_eq!(fold_hidden([&mine]).ids(), ["uuid-x"]);
+
+        // The dangerous direction: a lone tombstone must not be dropped while
+        // an older dismissal of my own is still in the log beside it.
+        let mut mine = log(&[op("uuid-y", true, 10, 1), op("uuid-y", false, 11, 1)]);
+        prune_hidden_log(&mut mine, &[]);
+        assert!(fold_hidden([&mine]).ids().is_empty(), "the row stayed restored");
+    }
+
+    #[test]
+    fn a_hidden_log_is_bounded_and_drops_the_oldest_op() {
+        let mut l = HiddenLog::new();
+        for i in 0..HIDDEN_OPS_MAX + 5 {
+            assert!(l.push(op(&format!("uuid-{i:04}"), true, i as u64 + 1, 1)));
+        }
+        assert_eq!(l.ops.len(), HIDDEN_OPS_MAX);
+        assert_eq!(l.ops.first().map(|o| o.id.as_str()), Some("uuid-0005"));
+        assert_eq!(l.max_seq(), HIDDEN_OPS_MAX as u64 + 5);
+        // Idempotent: adoption re-offering an op it already holds is a no-op.
+        let dup = l.ops[0].clone();
+        assert!(!l.push(dup));
+        assert!(!l.push(op("", true, 1, 1)), "an empty id can never be a session id");
+    }
+
+    #[test]
+    fn a_hidden_log_round_trips_and_a_future_version_reads_empty() {
+        let l = log(&[op("uuid-a", true, 1787640000000, 3)]);
+        let json = serde_json::to_string(&l).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"v":2,"ops":[{"id":"uuid-a","add":true,"seq":1787640000000,"org":3}]}"#
+        );
+        assert_eq!(parse_hidden_log(&json), l);
+        // Unset, corrupt, or a schema this build does not know: empty, never an
+        // error — showing too much is the safe direction.
+        assert!(parse_hidden_log("").ops.is_empty());
+        assert!(parse_hidden_log("{oops").ops.is_empty());
+        assert!(parse_hidden_log(r#"{"v":99,"ops":[{"id":"x","add":true,"seq":1,"org":0}]}"#).ops.is_empty());
+        // The `@ccmux_hidden` SET shape must not be readable as a log.
+        assert!(parse_hidden_log(r#"{"v":1,"ids":["x"]}"#).ops.is_empty());
+    }
+
+    #[test]
+    fn forget_retires_every_op_naming_a_dead_session() {
+        let mut l = log(&[
+            op("uuid-a", true, 10, 1),
+            op("uuid-gone", true, 11, 1),
+            op("uuid-gone", false, 12, 1),
+        ]);
+        assert!(l.forget(["uuid-gone"]));
+        assert_eq!(l.ops, vec![op("uuid-a", true, 10, 1)]);
+        assert!(!l.forget(["uuid-nothing"]));
+    }
+
     // ── target validation (the R1/R2 guards) ────────────────────────────────
 
     #[test]
@@ -1446,16 +2138,35 @@ mod tests {
         assert_eq!((bar.left, bar.width), (0, 34), "sidebar stays leftmost at 34 cols");
         assert!(rightmost_pane_excluding(&panes, &sidebar).is_some());
 
-        // dismissed-set persistence through @ccmux_hidden
-        assert!(load_hidden(sess).ids().is_empty(), "unset option loads empty");
-        let mut hidden = HiddenSet::new();
-        assert!(hidden.dismiss("1c45d64f-9bba-4038-8de7-d5f112c92360"));
-        save_hidden(sess, &hidden).expect("save_hidden");
-        assert_eq!(load_hidden(sess), hidden, "@ccmux_hidden round-trips");
+        // per-window state, read back through the ONE `list_tabs` call
+        let win = panes
+            .iter()
+            .find(|p| p.id == sidebar)
+            .map(|p| p.window_id.clone())
+            .expect("sidebar window");
+        let (tabs, width) = list_tabs(sess).expect("list_tabs");
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(width, Some(34), "@ccmux_width rides along in the window read");
+        assert!(tabs[0].sidebar.is_none(), "unset window option reads as absent");
+        assert!(tabs[0].map.panes.is_empty());
+        assert!(tabs[0].hidden.ops.is_empty());
 
-        // map persistence through @ccmux_map
-        let mut map = load_map(sess);
-        assert!(map.panes.is_empty());
+        set_tab_sidebar(sess, &sidebar).expect("set_tab_sidebar");
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        assert_eq!(tabs[0].sidebar.as_ref(), Some(&sidebar));
+
+        // dismissal-log persistence through @ccmux_tab_hidden
+        let mut log = HiddenLog::new();
+        assert!(log.push(op("1c45d64f-9bba-4038-8de7-d5f112c92360", true, 7, 0)));
+        save_tab_hidden(sess, &sidebar, &win, &log).expect("save_tab_hidden");
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        assert_eq!(tabs[0].hidden, log, "@ccmux_tab_hidden round-trips");
+        assert_eq!(fold_hidden([&tabs[0].hidden]).ids(), [
+            "1c45d64f-9bba-4038-8de7-d5f112c92360"
+        ]);
+
+        // map persistence through @ccmux_tab_map
+        let mut map = PaneMap::new();
         map.insert(&p1, PaneEntry {
             session_id: "uuid-a".into(),
             short_id: "1c45d64f".into(),
@@ -1468,8 +2179,11 @@ mod tests {
             name: "b".into(),
             opened_at: 1787640000001,
         });
-        save_map(sess, &map).expect("save_map");
-        assert_eq!(load_map(sess), map, "JSON round-trips through argv verbatim");
+        save_tab_map(sess, &sidebar, &win, &map).expect("save_tab_map");
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        assert_eq!(tabs[0].map, map, "JSON round-trips through argv verbatim");
+        // The legacy session-scoped map is written once and never updated.
+        assert_eq!(get_user_option(sess, OPT_MAP).as_deref(), Some(EMPTY_MAP_JSON));
 
         // reconcile after a real kill
         kill_pane(sess, &p2).expect("kill_pane");
@@ -1478,12 +2192,56 @@ mod tests {
         assert_eq!(live.len(), 2);
         assert!(map.reconcile(&live), "the killed pane is dropped");
         assert_eq!(map.panes.len(), 1);
-        save_map(sess, &map).expect("save_map");
-        assert_eq!(load_map(sess).panes.len(), 1);
+        save_tab_map(sess, &sidebar, &win, &map).expect("save_tab_map");
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        assert_eq!(tabs[0].map.panes.len(), 1);
 
         // focus verbs must not error on a live pane
         select_pane(sess, &p1).expect("select_pane");
         resize_pane_width(sess, &sidebar, 34).expect("resize_pane_width");
+
+        // TABS: a second window, its own sidebar, its own option namespace
+        let (w2, idx2, claude) = new_tab(sess, &sidebar_cmd).expect("new_tab");
+        assert!(idx2 >= 2, "a tab is appended, never renumbering the first");
+        let mut seed = PaneMap::new();
+        seed.insert(&claude, PaneEntry {
+            session_id: "uuid-c".into(),
+            short_id: "77aa11bb".into(),
+            name: "c".into(),
+            opened_at: 1787640000002,
+        });
+        write_tab_map_uncached(sess, &claude, &seed).expect("seed the new tab map");
+        let bar2 = split_left_of(sess, &claude, &sidebar_cmd).expect("tab sidebar");
+        set_tab_sidebar(sess, &bar2).expect("mark tab 2");
+
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        assert_eq!(tabs.len(), 2);
+        let t2 = tabs.iter().find(|t| t.window == w2).expect("tab 2 present");
+        assert_eq!(t2.sidebar.as_ref(), Some(&bar2));
+        assert_eq!(t2.map, seed, "the tab map was seeded before its sidebar existed");
+        let t1 = tabs.iter().find(|t| t.window == win).expect("tab 1 present");
+        assert_eq!(t1.map.panes.len(), 1, "tab 1's map is untouched by tab 2");
+
+        // TWO WRITERS, ONE TICK: two windows, two options, both land. This is
+        // the whole argument for per-window state — the same pair of writers
+        // against ONE session option loses a write.
+        let mut log1 = HiddenLog::new();
+        log1.push(op("uuid-from-tab-1", true, 100, win.num()));
+        let mut log2 = HiddenLog::new();
+        log2.push(op("uuid-from-tab-2", true, 100, w2.num()));
+        save_tab_hidden(sess, &sidebar, &win, &log1).expect("tab 1 flush");
+        save_tab_hidden(sess, &bar2, &w2, &log2).expect("tab 2 flush");
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        let folded = fold_hidden(tabs.iter().map(|t| &t.hidden));
+        assert!(folded.ids().contains(&"uuid-from-tab-1".to_string()));
+        assert!(folded.ids().contains(&"uuid-from-tab-2".to_string()));
+
+        // A window option dies with its window, which is what the adoption
+        // rule in `app.rs` exists to cover.
+        kill_pane(sess, &claude).expect("kill the tab's claude pane");
+        kill_pane(sess, &bar2).expect("kill the tab's sidebar");
+        let (tabs, _) = list_tabs(sess).expect("relist tabs");
+        assert_eq!(tabs.len(), 1, "the window went with its last pane");
 
         // cleanup: only ever this socket's server
         let _ = tmux(&["kill-session", "-t", "=ccmux-test-live:"]);

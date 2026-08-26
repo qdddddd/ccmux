@@ -226,6 +226,10 @@ fn run_launcher(cli: &Cli) -> anyhow::Result<()> {
             .with_context(|| format!("cannot create tmux session '{}'", cli.session))?;
         tmux::configure_session(&cli.session, &pane, width)
             .with_context(|| format!("cannot configure tmux session '{}'", cli.session))?;
+        // Mark the first window as a ccmux tab straight away, so `heal_sidebar`
+        // recognises it on the next launch without the legacy fallback.
+        tmux::set_tab_sidebar(&cli.session, &pane)
+            .with_context(|| format!("cannot record the sidebar of '{}'", cli.session))?;
         // 4g — a no-op returning exit 0 while the sidebar is the only pane.
         tmux::pin_sidebar(&cli.session, &pane, width);
     }
@@ -236,49 +240,156 @@ fn run_launcher(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SPEC §1.2 step 5. Re-pins an intact sidebar; re-inserts one that was quit
-/// with `q` or crashed.
+/// What the launcher must do to ONE window of ccmux's session. Pure, so §1.2
+/// step 5's rule is unit-testable without a tmux server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HealAction {
+    /// The marker names a live pane of this window: re-pin it, nothing else.
+    Repin(PaneId),
+    /// An established ccmux tab whose sidebar was quit with `q` or crashed.
+    Insert,
+    /// Not a ccmux tab, or one still being built. Leave it completely alone.
+    Skip,
+}
+
+/// `@ccmux_tab_sidebar` is the SOLE test for "this window is a ccmux tab".
+///
+/// The marker is a WINDOW option, so it outlives the process it names: it is
+/// still set after a `q`, after a crash, and after the pane it named is gone.
+/// That makes it a complete test for an ESTABLISHED tab all by itself.
+///
+/// It used to also count a window whose `@ccmux_tab_map` named a live pane, so
+/// that a window `t` had just created — map seeded, sidebar not yet marked —
+/// healed too. But that is exactly the interval in which `t` is still building
+/// the tab, and healing it split a SECOND sidebar into the window: two ccmux
+/// processes writing one window's `@ccmux_tab_map` and `@ccmux_tab_hidden`,
+/// which is the one state the single-writer design exists to make unreachable,
+/// and which never converges and never self-heals. Dropping the map branch
+/// closes it BY CONSTRUCTION — at every instant of `t` the new window is either
+/// unidentifiable (skip: bare window, then map seeded but unmarked) or marked
+/// (re-pin), and never identifiable-but-unmarked. `t` now writes the marker
+/// itself the moment the split returns, so nothing waits on the child process.
+///
+/// The cost is deliberate: a window whose `t` failed at the split keeps its
+/// seeded map and gets no sidebar from a later launch. The seed stays anyway —
+/// it is what keeps that live, attached Claude pane visible to `Enter` and
+/// closable by `x` in every other tab.
+fn heal_action(tab: &tmux::TabInfo, scoped: &[tmux::PaneInfo]) -> HealAction {
+    match &tab.sidebar {
+        Some(pane) if scoped.iter().any(|q| &q.id == pane) => HealAction::Repin(pane.clone()),
+        Some(_) => HealAction::Insert,
+        None => HealAction::Skip,
+    }
+}
+
+/// SPEC §1.2 step 5, now once per TAB. Re-pins every intact sidebar and
+/// re-inserts any that was quit with `q` or crashed.
+///
+/// Healing is the launcher's job EXCLUSIVELY. A running sidebar never lays out
+/// another tab: a peer that inserted a pane into another window and wrote that
+/// window's `@ccmux_tab_sidebar` would be the second writer this whole design
+/// exists to make unrepresentable.
+///
+/// Which window gets what is decided by `heal_action`, which is pure.
 fn heal_sidebar(cli: &Cli, width: u16, sidebar_cmd: &str) -> anyhow::Result<()> {
     let panes = tmux::list_panes_in_session(&cli.session)
         .with_context(|| format!("cannot list panes of tmux session '{}'", cli.session))?;
 
-    let recorded = tmux::get_user_option(&cli.session, tmux::OPT_SIDEBAR)
-        .as_deref()
-        .and_then(PaneId::parse);
-    // Present in the option AND still alive, or it does not count.
-    let live = recorded.filter(|p| panes.iter().any(|q| &q.id == p));
-
-    // `@ccmux_width` is what the RUNNING sidebar re-pins from every tick, so a
-    // relaunch that only resized the pane would be reverted within one poll.
-    // Write it first; the pin below then agrees with the sidebar process.
+    // `@ccmux_width` is what every RUNNING sidebar re-pins from on every tick,
+    // so a relaunch that only resized the pane would be reverted within one
+    // poll. Write it first; the pins below then agree with those processes.
     tmux::set_user_option(&cli.session, tmux::OPT_WIDTH, &width.to_string())
         .with_context(|| format!("cannot record the sidebar width of '{}'", cli.session))?;
 
-    match live {
-        // 5c — harmless re-pin.
-        Some(pane) => tmux::pin_sidebar(&cli.session, &pane, width),
-        // 5b
+    let (tabs, _) = tmux::list_tabs(&cli.session)
+        .with_context(|| format!("cannot list windows of tmux session '{}'", cli.session))?;
+
+    let mut known_tab = false;
+    for tab in &tabs {
+        let scoped: Vec<tmux::PaneInfo> = panes
+            .iter()
+            .filter(|p| p.window_id == tab.window)
+            .cloned()
+            .collect();
+        if scoped.is_empty() {
+            continue;
+        }
+        match heal_action(tab, &scoped) {
+            HealAction::Skip => continue,
+            HealAction::Repin(pane) => {
+                // 5c — harmless re-pin.
+                known_tab = true;
+                tmux::pin_sidebar(&cli.session, &pane, width);
+                continue;
+            }
+            // 5b, per tab: the sidebar was quit with `q` or crashed while its
+            // Claude panes lived on.
+            HealAction::Insert => known_tab = true,
+        }
+        let leftmost = tmux::leftmost_pane(&scoped).ok_or_else(|| {
+            anyhow!("tmux session '{}' has no panes to anchor a sidebar", cli.session)
+        })?;
+        let pane = tmux::split_left_of(&cli.session, &leftmost, sidebar_cmd)
+            .context("cannot re-insert the sidebar pane")?;
+        tmux::set_tab_sidebar(&cli.session, &pane)
+            .context("cannot record the new sidebar pane")?;
+        tmux::pin_sidebar(&cli.session, &pane, width);
+    }
+
+    if !known_tab {
+        heal_legacy_session(cli, width, sidebar_cmd, &panes)?;
+    }
+    Ok(())
+}
+
+/// A session created by a build that had no tabs: no window carries a marker or
+/// a tab map, and the sidebar (if any) is named by the session-scoped
+/// `@ccmux_sidebar`. Heal exactly the one window it describes, then give that
+/// window a proper marker so this path can never fire twice.
+///
+/// The marker must be read the way `list_tabs` reads it — as a WINDOW option
+/// under a name no session value can shadow. A format lookup of the legacy
+/// `@ccmux_sidebar` would report every window as marked, because `#{@name}`
+/// falls back window -> session -> global (verified on tmux 3.4), and heal
+/// would then inject a sidebar into each of the operator's own windows.
+fn heal_legacy_session(
+    cli: &Cli,
+    width: u16,
+    sidebar_cmd: &str,
+    panes: &[tmux::PaneInfo],
+) -> anyhow::Result<()> {
+    let recorded = tmux::get_user_option(&cli.session, tmux::OPT_SIDEBAR)
+        .as_deref()
+        .and_then(PaneId::parse)
+        .filter(|p| panes.iter().any(|q| &q.id == p));
+
+    let pane = match recorded {
+        // Alive: adopt it, do not split a second one in beside it.
+        Some(pane) => {
+            tmux::pin_sidebar(&cli.session, &pane, width);
+            pane
+        }
         None => {
             // Window-scoped: `pane_left` is per-window, so the leftmost pane of
             // the whole session can live in a window that has nothing to do
             // with the ccmux layout. Prefer the window ccmux created by name.
             let window = tmux::window_index_named(&cli.session, tmux::WINDOW_NAME)
                 .filter(|w| panes.iter().any(|p| p.window_index == *w))
-                .or_else(|| tmux::lowest_window(&panes))
+                .or_else(|| tmux::lowest_window(panes))
                 .ok_or_else(|| {
                     anyhow!("tmux session '{}' has no windows to host a sidebar", cli.session)
                 })?;
-            let scoped = tmux::panes_in_window(&panes, window);
+            let scoped = tmux::panes_in_window(panes, window);
             let leftmost = tmux::leftmost_pane(&scoped).ok_or_else(|| {
                 anyhow!("tmux session '{}' has no panes to anchor a sidebar", cli.session)
             })?;
             let pane = tmux::split_left_of(&cli.session, &leftmost, sidebar_cmd)
                 .context("cannot re-insert the sidebar pane")?;
-            tmux::set_user_option(&cli.session, tmux::OPT_SIDEBAR, pane.as_str())
-                .context("cannot record the new sidebar pane")?;
             tmux::pin_sidebar(&cli.session, &pane, width);
+            pane
         }
-    }
+    };
+    tmux::set_tab_sidebar(&cli.session, &pane).context("cannot record the new sidebar pane")?;
     Ok(())
 }
 
@@ -317,6 +428,11 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     let width = cli.width.clamp(WIDTH_MIN, WIDTH_MAX);
     let interval = Duration::from_millis(interval_ms.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS));
     let mut app = app::App::new(cli.session.clone(), width, interval, resolve_dark(cli));
+    // `t` gives the tab it creates its own sidebar, and the command that starts
+    // one is built here, from the same `current_exe()` + `sh_join` builder the
+    // launcher uses. `app` never imports `main`; the string is handed down, so
+    // the module DAG stays acyclic.
+    app.sidebar_cmd = sidebar_command(cli, width).ok();
 
     install_panic_hook();
     enable_raw_mode().context("cannot enter raw mode")?;
@@ -540,6 +656,74 @@ mod tests {
             let bare = Cli::try_parse_from(["ccmux"]).expect("parse");
             assert!(!resolve_dark(&bare), "the default palette is light");
         }
+    }
+
+    fn heal_pane(id: &str, window: u32) -> tmux::PaneInfo {
+        tmux::PaneInfo {
+            id: PaneId::parse(id).expect("pane id"),
+            index: 1,
+            left: 0,
+            top: 0,
+            width: 34,
+            height: 40,
+            active: false,
+            window_index: window,
+            window_id: tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
+        }
+    }
+
+    fn heal_tab(window: u32, sidebar: Option<&str>, mapped: &[&str]) -> tmux::TabInfo {
+        let mut map = tmux::PaneMap::new();
+        for m in mapped {
+            map.insert(
+                &PaneId::parse(m).expect("pane id"),
+                tmux::PaneEntry {
+                    session_id: "aaaaaaaa-uuid".into(),
+                    short_id: "aaaaaaaa".into(),
+                    name: "n".into(),
+                    opened_at: 0,
+                },
+            );
+        }
+        tmux::TabInfo {
+            window: tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
+            index: window,
+            sidebar: sidebar.and_then(PaneId::parse),
+            map,
+            hidden: tmux::HiddenLog::new(),
+        }
+    }
+
+    /// REGRESSION. `@ccmux_tab_sidebar` is the SOLE test for "this window is a
+    /// ccmux tab". Heal used to also adopt a window whose `@ccmux_tab_map`
+    /// named a live pane — which is precisely the state `t` leaves behind while
+    /// it is still building a tab, between seeding that map and the sidebar
+    /// being marked. A launcher run in that ~30-40 ms gap split a SECOND
+    /// sidebar into the window, and the two processes then wrote one window's
+    /// `@ccmux_tab_map` and `@ccmux_tab_hidden` forever, diverging on screen
+    /// and never converging. The marker branch alone is complete, because a
+    /// window option outlives the process it names.
+    #[test]
+    fn heal_identifies_a_tab_by_its_marker_and_nothing_else() {
+        // A tab being built by `t`: map seeded through the Claude pane, marker
+        // not written yet, and — worst case — the sidebar pane already split
+        // in. Heal must not touch it.
+        let building = heal_tab(4, None, &["%9"]);
+        let panes = vec![heal_pane("%9", 4), heal_pane("%10", 4)];
+        assert_eq!(heal_action(&building, &panes), HealAction::Skip);
+
+        // The operator's own `prefix-c` window: nothing at all. Unchanged.
+        assert_eq!(heal_action(&heal_tab(7, None, &[]), &[heal_pane("%5", 7)]), HealAction::Skip);
+
+        // An established tab whose sidebar was quit with `q`: the marker
+        // survives its process and still names %1, which is gone. Heal it.
+        let quit = heal_tab(1, Some("%1"), &["%2"]);
+        assert_eq!(heal_action(&quit, &[heal_pane("%2", 1)]), HealAction::Insert);
+
+        // A tab whose sidebar is alive: re-pin, never a second split.
+        let live = heal_tab(1, Some("%1"), &["%2"]);
+        let panes = vec![heal_pane("%1", 1), heal_pane("%2", 1)];
+        assert_eq!(heal_action(&live, &panes), HealAction::Repin(PaneId::parse("%1").expect("id")));
     }
 
     /// SPEC.md is the design contract, and `src/` cites it by section number in

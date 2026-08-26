@@ -239,6 +239,44 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 // ── Header (§6.2) ───────────────────────────────────────────────────────────
 
+/// `tab N` — which tab this sidebar is in, in tmux's own `#{window_index}`.
+///
+/// It is needed because ccmux runs its session with `status off`, so tmux's own
+/// window list is not on screen: the sidebar is the ONLY place tab identity can
+/// appear. The number is tmux's own index, so `prefix-3` goes exactly where a
+/// `tab 3` chip — or a `3` badge — points.
+///
+/// **There is deliberately no denominator.** The chip used to read `tab N/M`
+/// with N a window INDEX and M a COUNT of windows, two quantities that agree
+/// only while the indices happen to be a contiguous `1..M`. tmux's
+/// `renumber-windows` defaults to OFF and `configure_session` never turns it
+/// on, so closing a middle tab leaves a permanent gap and the chip rendered
+/// impossible headers like `tab 4/2`. A count cannot be reconciled with an
+/// index — one of them had to go, and the index is the half that is
+/// actionable, so the count is what went.
+///
+/// The two-tab gate counts ccmux TABS — windows carrying `@ccmux_tab_sidebar`,
+/// the same sole criterion `heal_sidebar` uses — not windows that merely have
+/// panes. A bare `prefix-c` window of the operator's own is not a tab: it used
+/// to summon the chip and inflate its count even though heal correctly leaves
+/// it alone.
+///
+/// `None` below two tabs. With one tab there is no digit anywhere to explain,
+/// `tab 1` would be pure noise, and the header stays byte-identical to what it
+/// rendered before tabs existed — all tab UI is invisible until a second tab
+/// exists.
+fn tab_chip(app: &App) -> Option<String> {
+    if app.tabs.iter().filter(|t| t.sidebar.is_some()).count() < 2 {
+        return None;
+    }
+    let me = app
+        .own_pane
+        .as_ref()
+        .and_then(|pane| app.panes.iter().find(|i| &i.id == pane))?
+        .window_index;
+    Some(format!("tab {me}"))
+}
+
 fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let w = area.width as usize;
     let mut spans: Vec<Span> = Vec::new();
@@ -267,11 +305,29 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         } else {
             format!("{matching}/{total}")
         };
-        let text = if w >= 26 {
-            format!("  {count} session{}", if total == 1 { "" } else { "s" })
-        } else {
-            format!("  {count}")
+        let wide = format!("  {count} session{}", if total == 1 { "" } else { "s" });
+        let narrow = format!("  {count}");
+        // Three rungs, resolved against the rail's budget so no session count
+        // can push the poll dot off column W-1: chip + wide count, chip +
+        // narrow count, then no chip at all — which is today's header, byte for
+        // byte. The per-row badges still carry tab identity when the chip goes.
+        let chip = tab_chip(app).map(|c| format!("  {c}"));
+        // The dot renders only while `used < w - 2`, so content that reaches
+        // exactly `w - 2` costs the rail its dot. The budget is therefore
+        // `w - 3`: the last column the header text may occupy. (Reachable
+        // before the chip lost its denominator too — at W=22 a `tab N/M` chip
+        // plus a `  N/M` count landed exactly on `w - 2`.)
+        let budget = w.saturating_sub(3);
+        let fits = |a: &str, b: &str| used + display_width(a) + display_width(b) <= budget;
+        let (chip, text) = match &chip {
+            Some(c) if w >= 26 && fits(c, &wide) => (Some(c.clone()), wide),
+            Some(c) if fits(c, &narrow) => (Some(c.clone()), narrow),
+            _ if w >= 26 => (None, wide),
+            _ => (None, narrow),
         };
+        if let Some(c) = chip {
+            push(&mut spans, &mut used, &c, Style::default().fg(p.aqua));
+        }
         push(&mut spans, &mut used, &text, Style::default().fg(p.gray));
     }
 
@@ -493,17 +549,14 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
 
     let m = margin(w);
     let open = is_open(app, &sess.session_id);
-    let idx = if open {
-        pane_index_for(app, &sess.session_id)
-    } else {
-        None
-    };
-    // Ten or more panes in one tmux window is exactly where a per-window index
-    // stops being something you can eyeball anyway, so the badge degrades to
-    // `+` — "open, somewhere further down this window" — rather than taking a
-    // second column and shifting the row off the grid. The exact index is
-    // still stated where it is actionable: the `opened <name> in pane N` flash.
-    let badge = idx.map(|i| char::from_digit(i, 10).unwrap_or('+'));
+    // A window index of ten or more is exactly where a number stops being
+    // something you can eyeball anyway, so the badge degrades to `+` — "open,
+    // further along than you want to count" — rather than taking a second
+    // column and shifting the row off the grid. tmux's `renumber-windows`
+    // defaults to OFF and ccmux never turns it on, so indices are NOT a
+    // contiguous 1..M: `+` needs ten windows to have existed at once, not ten
+    // to be alive now.
+    let badge = tab_badge_for(app, &sess.session_id).map(|i| char::from_digit(i, 10).unwrap_or('+'));
     let (age, field) = if w >= RAIL_MIN {
         let a = format_age(sess.started_at, app.now_ms);
         let f = display_width(&a).max(NUM_W);
@@ -528,10 +581,12 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     } else {
         spans.push(Span::styled(" ".to_string(), base));
     }
-    // Column 2. An open row whose index does not resolve (no pane inventory
-    // yet) keeps the marker and leaves this column blank.
+    // Column 2. Blank means "open, and open HERE"; a digit sends you to a tab.
+    // It takes `p.aqua`, the same hue as the `▌` beside it, so `▌3` reads as
+    // one two-cell token — and adds no contrast surface, because aqua is
+    // already painted in column 1 on both grounds and on `sel_bg`.
     match badge {
-        Some(b) => spans.push(Span::styled(b.to_string(), base.fg(p.fg))),
+        Some(b) => spans.push(Span::styled(b.to_string(), base.fg(p.aqua))),
         None => spans.push(Span::styled(" ".to_string(), base)),
     }
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
@@ -770,10 +825,17 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
 /// At the default 34 columns the budget runs out after `x close` and no fourth
 /// pair renders at all, so a narrow sidebar discovers `d` through `?` and the
 /// README, exactly as it already discovers `S`.
+///
+/// `t tab` is inserted FOURTH rather than beside `o/s split`, so the 34-column
+/// footer is unchanged: `x close` is the verb that acts on what is already on
+/// screen, and evicting it to advertise a new one would be a bad trade at the
+/// default width. `t` is discovered through `?` and the README, on the same
+/// precedent `d/u hide` and `S stop` already set.
 const HINTS: &[(&str, &str)] = &[
     ("⏎", "open"),
     ("o/s", "split"),
     ("x", "close"),
+    ("t", "tab"),
     ("d/u", "hide"),
     ("S", "stop"),
     ("n", "new"),
@@ -924,6 +986,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Enter", "open or jump to pane"),
     ("o", "open in vertical split"),
     ("s", "open in horizontal split"),
+    ("t", "open in a new tab"),
     ("x", "close pane (agent lives)"),
     ("S", "stop session (confirm)"),
     ("n", "new background session"),
@@ -937,6 +1000,7 @@ const KEYS: &[(&str, &str)] = &[
     ("q", "quit sidebar"),
     ("Esc", "clear filter"),
     ("Ctrl-c", "quit from any mode"),
+    ("▌N", "open in tab N (blank: here)"),
 ];
 
 /// Number of lines the `?` overlay renders. `main.rs` copies it into
@@ -1185,35 +1249,45 @@ fn selected_session(app: &App) -> Option<&Session> {
     }
 }
 
-/// The pane id string showing `session_id`, from the reconciled `@ccmux_map`
-/// exactly as §3.5 documents. Ties break on the numeric part of `%N`.
+/// The pane id string showing `session_id`, from `App::open` — the union of
+/// every tab's `@ccmux_tab_map` intersected with the live pane list. Ties
+/// already broke on the numeric part of `%N` when `open` was built, so this
+/// module and `app.rs` can no longer disagree about which pane a row names.
+#[cfg(test)]
 fn pane_key_for(app: &App, session_id: &str) -> Option<String> {
-    let mut best: Option<(u64, &String)> = None;
-    for (pane, entry) in app.map.panes.iter() {
-        if entry.session_id != session_id {
-            continue;
-        }
-        let n = pane
-            .strip_prefix('%')
-            .and_then(|d| d.parse::<u64>().ok())
-            .unwrap_or(u64::MAX);
-        if best.map(|(bn, _)| n < bn).unwrap_or(true) {
-            best = Some((n, pane));
-        }
-    }
-    best.map(|(_, pane)| pane.clone())
+    app.open.get(session_id).map(|o| o.pane.as_str().to_string())
 }
 
 fn is_open(app: &App, session_id: &str) -> bool {
-    pane_key_for(app, session_id).is_some()
+    app.open.contains_key(session_id)
 }
 
-fn pane_index_for(app: &App, session_id: &str) -> Option<u32> {
-    let key = pane_key_for(app, session_id)?;
-    app.panes
-        .iter()
-        .find(|i| i.id.as_str() == key)
-        .map(|i| i.index)
+/// Gutter column 2: the TAB the session's pane lives in, inked only when that
+/// is not the tab you are looking at. `None` renders a blank column.
+///
+/// The badge used to be `#{pane_index}`, which is per-window: with tabs, "pane
+/// 2" exists in every one of them, so the number stopped naming anything. The
+/// question a row must answer once `t` exists is "where is this session", and
+/// the answer that lets you act is the tab — it is what `Enter` switches to and
+/// what tmux's own `prefix-N` takes. Inside a tab the pane is already on screen
+/// in front of you, and its exact index survives where it is actionable: the
+/// `opened <name> in pane N` flash.
+///
+/// Blank for the current tab is the other half of that. A digit that could mean
+/// "here" would have to be read against a tab number the operator must
+/// remember; with this rule a digit ALWAYS means "somewhere else", and the
+/// common single-tab session renders exactly the ink it rendered before —
+/// marker, blank column 2 — instead of a constant column of identical digits.
+/// The aqua `▌` in column 1 already says "this session is on screen".
+///
+/// When the sidebar cannot resolve its own window (degraded, or a no-panic
+/// fixture that sets no pane inventory) the digit is shown unconditionally.
+fn tab_badge_for(app: &App, session_id: &str) -> Option<u32> {
+    let open = app.open.get(session_id)?;
+    if open.window.is_some() && open.window == app.own_window {
+        return None;
+    }
+    open.window_index
 }
 
 // ── Tests (§10.1: the no-panic matrix) ──────────────────────────────────────
@@ -1272,6 +1346,9 @@ mod tests {
             hidden: crate::tmux::HiddenSet::new(),
             hidden_dirty: false,
             hidden_absent: std::collections::BTreeSet::new(),
+            hidden_log: crate::tmux::HiddenLog::new(),
+            last_frags: std::collections::BTreeMap::new(),
+            seq_seen: 0,
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -1279,6 +1356,17 @@ mod tests {
             map_dirty: false,
             sidebar_pane: None,
             panes: Vec::new(),
+            // No own window: these fixtures render an `App` built by struct
+            // literal, so the badge falls back to showing the tab digit for
+            // every open row — the documented degraded rendering.
+            own_pane: None,
+            own_window: None,
+            tabs: Vec::new(),
+            open: std::collections::BTreeMap::new(),
+            width_opt: None,
+            sidebar_cmd: None,
+            own_state_loaded: true,
+            migrated: true,
             degraded: false,
             confirm_armed_at: None,
             message: None,
@@ -1287,6 +1375,34 @@ mod tests {
             fail_streak: 0,
             last_poll: Instant::now(),
             should_quit: false,
+        }
+    }
+
+    /// A live pane in tab `window`. The badge reads `window_index`, so this is
+    /// what a badge fixture varies.
+    fn pane_in(id: &str, index: u32, left: u16, window: u32) -> PaneInfo {
+        PaneInfo {
+            id: PaneId::parse(id).expect("pane id"),
+            index,
+            left,
+            top: 0,
+            width: 60,
+            height: 24,
+            active: false,
+            window_index: window,
+            window_id: crate::tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
+        }
+    }
+
+    /// A ccmux tab: a window carrying `@ccmux_tab_sidebar`. `sidebar: None` is
+    /// the operator's own window — a bare `prefix-c` — which is not a tab.
+    fn win(window: u32, index: u32, sidebar: Option<&str>) -> crate::tmux::TabInfo {
+        crate::tmux::TabInfo {
+            window: crate::tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
+            index,
+            sidebar: sidebar.and_then(PaneId::parse),
+            map: PaneMap::new(),
+            hidden: crate::tmux::HiddenLog::new(),
         }
     }
 
@@ -1451,6 +1567,7 @@ mod tests {
         let sid = sessions[0].session_id.clone();
         let mut app = app_with(sessions);
         app.selected = 1;
+        app.rebuild_open();
         assert!(!is_open(&app, &sid));
 
         app.map.panes.insert(
@@ -1472,6 +1589,7 @@ mod tests {
                 opened_at: 0,
             },
         );
+        app.rebuild_open();
         assert!(is_open(&app, &sid));
         assert_eq!(pane_key_for(&app, &sid).as_deref(), Some("%7"));
 
@@ -1517,16 +1635,8 @@ mod tests {
                 opened_at: 0,
             },
         );
-        app.panes = vec![PaneInfo {
-            id: PaneId::parse("%7").expect("pane id"),
-            index: 3,
-            left: 35,
-            top: 0,
-            width: 60,
-            height: 24,
-            active: false,
-            window_index: 1,
-        }];
+        app.panes = vec![pane_in("%7", 3, 35, 3)];
+        app.rebuild_open();
 
         let rows = rows_at(&app, 34, 24);
         let row = rows
@@ -1819,17 +1929,9 @@ mod tests {
                 },
             );
             if let Some(i) = idx {
-                app.panes = vec![PaneInfo {
-                    id: PaneId::parse("%7").expect("pane id"),
-                    index: i,
-                    left: 0,
-                    top: 0,
-                    width: 60,
-                    height: 24,
-                    active: false,
-                    window_index: 1,
-                }];
+                app.panes = vec![pane_in("%7", 1, 0, i)];
             }
+            app.rebuild_open();
             for name in &names {
                 app.sessions[0].name = (*name).to_string();
                 for &age in ages {
@@ -1918,16 +2020,8 @@ mod tests {
                 opened_at: 0,
             },
         );
-        app.panes = vec![PaneInfo {
-            id: PaneId::parse("%7").expect("pane id"),
-            index: 2,
-            left: 0,
-            top: 0,
-            width: 60,
-            height: 24,
-            active: false,
-            window_index: 1,
-        }];
+        app.panes = vec![pane_in("%7", 1, 0, 2)];
+        app.rebuild_open();
 
         for w in [20usize, 28, 34, 44] {
             let cols = line_cols(&session_line(&app, &app.sessions[0], false, w, &Palette::light()));
@@ -1952,6 +2046,133 @@ mod tests {
         assert_eq!(closed_25[0], ' ', "a closed row leaves column 1 blank");
     }
 
+    /// The badge names a TAB, and says nothing when the answer is "you are
+    /// already looking at it". At the default 34 columns, with the whole grid
+    /// asserted column by column.
+    #[test]
+    fn the_tab_badge_is_blank_here_and_a_digit_elsewhere() {
+        let p = Palette::light();
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.sessions[0].name = "alpha/opt".into();
+        let sid = app.sessions[0].session_id.clone();
+        app.own_pane = PaneId::parse("%1");
+        app.own_window = crate::tmux::WindowId::parse("@2");
+        app.map.panes.insert("%7".into(), PaneEntry {
+            session_id: sid,
+            short_id: "00000001".into(),
+            name: "n".into(),
+            opened_at: 0,
+        });
+
+        // Open in MY tab: marker, blank badge — exactly the ink a single-tab
+        // sidebar rendered before tabs existed.
+        app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 2)];
+        app.rebuild_open();
+        let here = line_cols(&session_line(&app, &app.sessions[0], false, 34, &p));
+        assert_eq!(here[0..4].iter().collect::<String>(), "▌ ● ", "open, and open here");
+
+        // Open in tab 5: the digit that tells you where to go.
+        app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 5)];
+        app.rebuild_open();
+        let there = line_cols(&session_line(&app, &app.sessions[0], false, 34, &p));
+        assert_eq!(there[0..4].iter().collect::<String>(), "▌5● ", "open over in tab 5");
+
+        // The badge is the ONLY thing that differs: the name column's left
+        // edge and the whole rest of the row are byte-identical.
+        assert_eq!(
+            here[2..].iter().collect::<String>(),
+            there[2..].iter().collect::<String>(),
+            "the badge moved the rest of the row"
+        );
+        assert_eq!(line_w(&session_line(&app, &app.sessions[0], false, 34, &p)), 34);
+
+        // Not open at all: both gutter columns stay quiet.
+        app.map.panes.clear();
+        app.rebuild_open();
+        let closed = line_cols(&session_line(&app, &app.sessions[0], false, 34, &p));
+        assert_eq!(closed[0..4].iter().collect::<String>(), "  ● ");
+    }
+
+    /// `tab N` is the only wayfinding the operator gets, because ccmux runs its
+    /// session with `status off` and tmux's own window list is not on screen.
+    /// It stays out of the way until there is a second tab to name.
+    #[test]
+    fn the_header_chip_appears_only_once_a_second_tab_exists() {
+        let mut app = app_with(many(7));
+        app.own_pane = PaneId::parse("%1");
+        app.own_window = crate::tmux::WindowId::parse("@2");
+
+        // One tab: the header is byte-identical to what it rendered before.
+        app.panes = vec![pane_in("%1", 1, 0, 2)];
+        app.tabs = vec![win(2, 2, Some("%1"))];
+        let solo = rows_at(&app, 34, 24)[0].clone();
+        assert!(!solo.contains("tab"), "one tab needs no chip: {solo:?}");
+
+        // Three tabs, this sidebar in the one at index 2.
+        app.panes = vec![pane_in("%0", 1, 0, 1), pane_in("%1", 1, 0, 2), pane_in("%3", 1, 0, 5)];
+        app.tabs = vec![win(1, 1, Some("%0")), win(2, 2, Some("%1")), win(5, 5, Some("%3"))];
+        let row = rows_at(&app, 34, 24)[0].clone();
+        assert!(row.starts_with(" ccmux  tab 2  7 sessions"), "{row:?}");
+        let cols: Vec<char> = row.chars().collect();
+        assert_eq!(cols[32], '●', "the poll dot keeps the rail at column W-1");
+        assert_eq!(cols[33], ' ', "column W stays the margin");
+
+        // A count wide enough to crowd the chip degrades the COUNT, never the
+        // rail: the dot is still on column W-1.
+        app.filter = "session number 1".into();
+        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
+        for w in [20u16, 26, 34, 40] {
+            let row = rows_at(&app, w, 24)[0].clone();
+            let cols: Vec<char> = row.chars().collect();
+            assert_eq!(cols[w as usize - 2], '●', "w={w}: {row:?}");
+            assert_eq!(cols[w as usize - 1], ' ', "w={w}: {row:?}");
+        }
+    }
+
+    /// REGRESSION. The chip used to read `tab {window_index}/{window count}`,
+    /// which are only reconcilable while the indices are a contiguous `1..M`.
+    /// tmux's `renumber-windows` defaults to OFF and `configure_session` never
+    /// turns it on, so closing a middle tab left a gap and the header claimed
+    /// `tab 4/2` — tab four of two. And the count came from windows that merely
+    /// had panes, so the operator's own `prefix-c` window summoned a chip and
+    /// inflated it, while `heal_sidebar` correctly refused to treat that window
+    /// as a tab at all.
+    #[test]
+    fn the_header_chip_never_claims_a_tab_number_larger_than_the_count() {
+        let mut app = app_with(many(4));
+        app.own_pane = PaneId::parse("%9");
+        app.own_window = crate::tmux::WindowId::parse("@4");
+
+        // Two tabs left at indices 1 and 4 — the middle two were closed.
+        app.panes = vec![pane_in("%0", 1, 0, 1), pane_in("%9", 1, 0, 4)];
+        app.tabs = vec![win(1, 1, Some("%0")), win(4, 4, Some("%9"))];
+        let row = rows_at(&app, 34, 24)[0].clone();
+        assert!(row.starts_with(" ccmux  tab 4  4 sessions"), "{row:?}");
+        assert!(!row.contains('/'), "no denominator to disagree with: {row:?}");
+
+        // One ccmux tab plus a window the operator made themselves: not two
+        // tabs, so no chip at all.
+        app.panes = vec![pane_in("%9", 1, 0, 4), pane_in("%5", 1, 0, 7)];
+        app.tabs = vec![win(4, 4, Some("%9")), win(7, 7, None)];
+        let row = rows_at(&app, 34, 24)[0].clone();
+        assert!(!row.contains("tab"), "a bare prefix-c window is not a tab: {row:?}");
+    }
+
+    #[test]
+    fn the_help_overlay_and_footer_document_the_tab_key() {
+        assert!(KEYS.iter().any(|(k, a)| *k == "t" && a.contains("tab")));
+        assert!(KEYS.iter().any(|(k, _)| k.contains('▌')), "the badge is explained");
+        assert!(HINTS.iter().any(|(k, a)| *k == "t" && *a == "tab"));
+        assert!(!KEYS.iter().any(|(k, _)| *k == "c"), "`c` stays deleted");
+        assert_eq!(help_line_count(), KEYS.len());
+
+        let mut app = app_with(many(3));
+        app.mode = Mode::Help;
+        app.help_lines = help_line_count();
+        let dump = rows_at(&app, 40, 30).join("\n");
+        assert!(dump.contains("open in a new tab"), "{dump}");
+    }
+
     /// Column 1 is the marker's, not the selection's: an open row keeps its
     /// aqua `▌` even while selected, because the band, the BOLD name and the
     /// promoted age already carry the selection.
@@ -1972,6 +2193,7 @@ mod tests {
                 opened_at: 0,
             },
         );
+        app.rebuild_open();
         let l = session_line(&app, &app.sessions[0], true, 34, &p);
         assert_eq!(line_cols(&l)[0], '▌', "the open marker outranks the cap");
         // `p.dim` is 3.16:1 on the dark band, so a selected row never paints it.
@@ -2005,24 +2227,16 @@ mod tests {
                 opened_at: 0,
             },
         );
-        fn pane(app: &mut App, index: u32) {
-            app.panes = vec![PaneInfo {
-                id: PaneId::parse("%7").expect("pane id"),
-                index,
-                left: 0,
-                top: 0,
-                width: 60,
-                height: 24,
-                active: false,
-                window_index: 1,
-            }];
+        fn tab(app: &mut App, window: u32) {
+            app.panes = vec![pane_in("%7", 1, 0, window)];
+            app.rebuild_open();
         }
 
         for w in [20usize, 24, 28, 34, 44] {
-            pane(&mut app, 3);
+            tab(&mut app, 3);
             let single = line_cols(&session_line(&app, &app.sessions[0], false, w, &p));
             for index in [10u32, 12, 99, 999] {
-                pane(&mut app, index);
+                tab(&mut app, index);
                 let cols = line_cols(&session_line(&app, &app.sessions[0], false, w, &p));
                 assert_eq!(cols[0], '▌', "w={w} index={index}: the marker holds column 1");
                 assert_eq!(cols[1], '+', "w={w} index={index}: the badge clamps to one column");
@@ -2152,7 +2366,8 @@ mod tests {
     fn the_footer_fills_whole_pairs_and_pins_the_help_key() {
         let app = app_with(many(3));
         for (w, want) in [
-            (44u16, "⏎ open  o/s split  x close  d/u hide"),
+            (44u16, "⏎ open  o/s split  x close  t tab"),
+            // `t tab` sits FOURTH, so the 34-column footer is unchanged by it.
             (34, "⏎ open  o/s split  x close"),
             (28, "⏎ open  o/s split"),
             (20, "⏎ open"),

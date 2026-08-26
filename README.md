@@ -111,6 +111,7 @@ environment-variable equivalent of `--socket`.
 | `Enter` | Jump to the session's pane, or open it in a vertical split | no |
 | `o` | Open in a **vertical** split (vim geometry: side by side) | no |
 | `s` | Open in a **horizontal** split (vim geometry: stacked) | no |
+| `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
 | `S` | **Stop the session.** Asks `y`/`n` first | **yes** |
 | `n` | Dispatch a new background session with a typed task | no |
@@ -126,6 +127,10 @@ environment-variable equivalent of `--socket`.
 
 `o` and `s` are named for vim's geometry, not tmux's: `o` = vertical =
 side-by-side, `s` = horizontal = stacked.
+
+`Enter` and `x` reach across tabs: `Enter` on a session open in another tab
+switches to that window and selects its pane, and `x` closes a pane wherever it
+lives — except a sidebar, which no tab will let you close.
 
 ### Overlays and modes
 
@@ -153,7 +158,33 @@ Sessions are grouped exactly as `claude agents` groups them: **Working**,
 | `○` gray | Idle |
 | `✓` green | Completed |
 | `?` purple | A status or state this build does not recognize |
-| `▌` aqua | Open in a ccmux pane right now (column 0) |
+| `▌` aqua | Open in a ccmux pane right now (column 1) |
+| `5` aqua | Open in **tab 5** (column 2). Blank means open in the tab you are looking at; `+` means a tab number of ten or more |
+
+### Tabs
+
+`t` puts a session in its own tmux window and takes you there. Every tab gets
+its own pinned sidebar, so the list is on screen wherever you are — the cost is
+one `claude agents` poll per tab, which is the trade the layout is for.
+
+The header says `tab 2` — tmux's own window number, so `prefix-2` goes there —
+once a second tab exists, and the badge in the second gutter column says which
+tab each open session is in. Nothing is shown while there is only one tab.
+
+A session you open in two tabs is "here" in both: each tab's badge stays blank,
+`Enter` does not move you, and `x` closes the pane in the tab you are actually
+looking at.
+
+There is no close-tab key: a tab ends when its last pane does, the way tmux
+already ends windows. If you quit a tab's sidebar with `q` while its Claude
+panes are still there, that tab has no sidebar until you detach and run `ccmux`
+again, which heals every tab that is missing one. A window you made yourself
+with `prefix-c` is never touched, and neither is a tab `t` is still building.
+
+Dismissals (`d`/`u`) are shared across tabs, because the session list is the
+same list in every tab. Two tabs dismissing different rows in the same interval
+both stick: each sidebar writes only its own window's state, so neither can
+revert the other.
 
 ### Which sessions are listed
 
