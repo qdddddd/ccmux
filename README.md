@@ -111,10 +111,10 @@ environment-variable equivalent of `--socket`.
 | `Enter` | Jump to the session's pane, or open it in a vertical split | no |
 | `o` | Open in a **vertical** split (vim geometry: side by side) | no |
 | `s` | Open in a **horizontal** split (vim geometry: stacked) | no |
-| `x` | Close the pane showing a **background** session — the agent keeps running. Refused for interactive sessions, whose pane owns the process | no |
+| `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
 | `S` | **Stop the session.** Asks `y`/`n` first | **yes** |
 | `n` | Dispatch a new background session with a typed task | no |
-| `c` | New interactive session in a chosen cwd | no |
+| `c` | New interactive session in a chosen cwd. It opens in a pane but is **not listed** — see Which sessions are listed | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
 | `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
 | `u` | Undo the most recent `d` | no |
@@ -156,9 +156,18 @@ Sessions are grouped exactly as `claude agents` groups them: **Working**,
 | `?` purple | A status or state this build does not recognize |
 | `▌` aqua | Open in a ccmux pane right now (column 0) |
 
-Interactive sessions render their name in purple. They have no short id, so
-`claude attach`, `claude stop`, and `claude logs` do not apply to them; ccmux
-jumps to their existing pane instead, resolving it through `/proc` ancestry.
+### Which sessions are listed
+
+Only **background** sessions — the ones started with `claude --bg` or with `n`.
+
+Interactive sessions are never listed. There is no `claude attach` for one, so
+it cannot be opened into a split; and an interactive session hosted by Claude
+Desktop has no tmux pane to jump to either, so such a row is permanently
+un-openable. Rather than show rows that nothing can act on, ccmux excludes them
+when a poll is applied.
+
+One consequence worth knowing: `c` still starts an interactive session in a
+pane, and that session will not appear in the sidebar.
 
 ### Dismissing a row
 
@@ -195,9 +204,9 @@ that is known to have lost rows concludes nothing at all.
 
 ## Safety
 
-- Closing a pane with `x` does **not** stop the agent. Background sessions are
-  daemon-owned and outlive their pane. Interactive sessions are not, so `x`
-  refuses them.
+- Closing a pane with `x` does **not** stop the agent: background sessions are
+  daemon-owned and outlive their pane. Only background sessions are listed, so
+  `x` can never reach a process that dies with its pane.
 - `S` is the only verb that stops a session, and it always confirms first.
 - `d` removes a row from the list only. It is not a stop, not a kill, and not a
   delete — nothing outside ccmux's own view state changes, and `u` puts it back.

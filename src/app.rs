@@ -340,7 +340,28 @@ impl App {
         match res {
             Ok(payload) => {
                 let complete = payload.is_complete();
-                self.sessions = payload.sessions;
+                // Interactive sessions are NEVER listed. ccmux is a
+                // background-agent explorer: there is no `claude attach` for an
+                // interactive session, and one owned by Claude Desktop has no
+                // tmux pane to jump to either, so such a row is permanently
+                // un-openable.
+                //
+                // This is a display POLICY, so it lives here and not in
+                // `model::parse_sessions` — the parser's job is to report what
+                // the CLI actually said, and its tests assert exactly that.
+                // Filtering here also keeps `Kind` out of `build_rows`, so the
+                // view filters (`/`, `a`, `d`) never have to know about it, and
+                // the header's `total` counts what ccmux actually manages.
+                //
+                // Deliberately NOT folded into `complete`: that flag means "the
+                // payload lost rows to parse errors", which makes
+                // `reconcile_hidden` distrust the whole poll. An intentional
+                // exclusion is not a loss and must not suppress reconciliation.
+                self.sessions = payload
+                    .sessions
+                    .into_iter()
+                    .filter(|s| s.kind != model::Kind::Interactive)
+                    .collect();
                 self.poll_error = None;
                 self.fail_streak = 0;
                 self.reconcile_hidden(complete);
@@ -2726,50 +2747,66 @@ mod tests {
         assert!(session_rows(&a).contains(&"bt/reg-update".to_string()));
     }
 
-    /// The case this feature was built for: a Claude Desktop session. It is
-    /// `Kind::Interactive`, so it has NO short id; it is parented to the
-    /// desktop app rather than to a pane, so `Enter` can only ever refuse it;
-    /// and `claude` will keep returning it in every poll. It must dismiss like
-    /// any other row, keyed by the one stable thing it has — its `session_id` —
-    /// and it must STAY dismissed as those polls come in.
+    /// Interactive sessions are NEVER listed. ccmux is a background-agent
+    /// explorer: there is no `claude attach` for an interactive session, and one
+    /// owned by Claude Desktop has no tmux pane to jump to either, so such a row
+    /// was permanently un-openable.
+    ///
+    /// Replaces `a_desktop_session_with_no_short_id_dismisses_and_stays_dismissed`.
+    /// That test dismissed a Claude Desktop row; no such row can now reach the
+    /// list to be dismissed at all, which is the stronger guarantee.
     #[test]
-    fn a_desktop_session_with_no_short_id_dismisses_and_stays_dismissed() {
+    fn interactive_sessions_never_reach_the_list() {
+        let desktop = inter("9f2c1a44-1111-4038-8de7-d5f112c92360", "claude-a1");
+        let terminal = inter("5b605ed1-2222-4038-8de7-d5f112c92362", "claude-3c");
         let mut a = app();
-        let mut desktop = inter("9f2c1a44-1111-4038-8de7-d5f112c92360", "claude-a1");
-        desktop.pid = 999_999; // a live pid that is in no tmux pane
-        let other = bg("aaaaaaaa", "bt/reg-update", State::Working);
-        load(&mut a, vec![desktop.clone(), other]);
 
-        // It is the newest, so it sorts first, and it is not attachable: there
-        // is no short id for `claude stop`/`logs` and no pane to jump to.
-        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("claude-a1"));
-        assert!(!desktop.is_attachable());
-        assert!(desktop.id.is_none());
-
-        a.on_key(press('d'));
-
-        assert_eq!(a.hidden.ids(), ["9f2c1a44-1111-4038-8de7-d5f112c92360"]);
-        assert_eq!(session_rows(&a), ["bt/reg-update"]);
-        assert_eq!(
-            a.message.clone().unwrap_or_default_msg().0,
-            "hidden claude-a1 — u to undo"
-        );
-
-        // Poll after poll returns it, unchanged. It must not come back. Real
-        // polls, through `apply_poll`: this is the flow the feature exists for.
+        // Through the REAL path — `apply_poll`, not the `load` helper, which
+        // assigns `sessions` directly and would bypass the policy under test.
         for _ in 0..3 {
             a.apply_poll(complete(vec![
                 desktop.clone(),
+                terminal.clone(),
                 bg("aaaaaaaa", "bt/reg-update", State::Working),
             ]));
-            assert_eq!(a.hidden.ids(), ["9f2c1a44-1111-4038-8de7-d5f112c92360"]);
+            a.rebuild_rows();
             assert_eq!(session_rows(&a), ["bt/reg-update"]);
+            // `total` counts what ccmux manages, so the header cannot show a
+            // `matching/total` ratio for rows that were never listed.
+            assert_eq!(a.sessions.len(), 1);
         }
+        // Neither parentage matters: a terminal-hosted interactive session is
+        // excluded exactly like a Desktop-hosted one.
+        assert!(a.sessions.iter().all(|s| s.kind != Kind::Interactive));
 
-        // A session whose name the CLI left empty is still nameable in the
-        // flash: `d` falls back to the head of the uuid, never to nothing.
+        // The exclusion must NOT read as a lossy payload. `reconcile_hidden`
+        // distrusts an incomplete poll, so if excluding rows poisoned that flag
+        // a dismissed background session could never reconcile away.
         let mut b = app();
-        let mut nameless = inter("7e0b33aa-2222-4038-8de7-d5f112c92361", "");
+        b.apply_poll(complete(vec![
+            desktop.clone(),
+            bg("bbbbbbbb", "alpha/opt", State::Done),
+        ]));
+        b.rebuild_rows();
+        b.select_first();
+        b.on_key(press('d'));
+        assert_eq!(b.hidden.ids(), ["bbbbbbbb-uuid"]);
+        for _ in 0..2 {
+            b.apply_poll(complete(vec![desktop.clone()]));
+        }
+        assert!(
+            b.hidden.ids().is_empty(),
+            "excluding interactive rows must not poison poll completeness"
+        );
+    }
+
+    /// The dismiss flash names a session with an empty name by its short id
+    /// rather than rendering a bare dash. Kept from the replaced test, re-cut
+    /// onto a background session since interactive ones are no longer listed.
+    #[test]
+    fn a_nameless_session_is_still_nameable_in_the_dismiss_flash() {
+        let mut b = app();
+        let mut nameless = bg("7e0b33aa", "", State::Done);
         nameless.name = String::new();
         load(&mut b, vec![nameless]);
         b.on_key(press('d'));
