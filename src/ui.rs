@@ -764,10 +764,19 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
 /// which is what stops the footer clipping mid-word to `x cl…`. `j/k move` is
 /// deliberately absent — it is the one hint a TUI user never needs told, and
 /// dropping it is what makes three whole pairs fit at the default 34 columns.
+/// Footer hint pairs, most-wanted first: `draw_footer` fits whole pairs from
+/// the left and stops at the first one that will not fit, so the order is the
+/// priority order. `d/u hide` sits fourth — above `S stop`, which is behind a
+/// confirm modal and cannot fire by accident — because `d` is the one key here
+/// that makes a row vanish on a single press, and the pair names its own undo.
+/// At the default 34 columns the budget runs out after `x close` and no fourth
+/// pair renders at all, so a narrow sidebar discovers `d` through `?` and the
+/// README, exactly as it already discovers `S`.
 const HINTS: &[(&str, &str)] = &[
     ("⏎", "open"),
     ("o/s", "split"),
     ("x", "close"),
+    ("d/u", "hide"),
     ("S", "stop"),
     ("n", "new"),
     ("L", "logs"),
@@ -922,6 +931,8 @@ const KEYS: &[(&str, &str)] = &[
     ("n", "new background session"),
     ("c", "new interactive session"),
     ("L", "logs for this session"),
+    ("d", "hide row (pane stays)"),
+    ("u", "undo the last hide"),
     ("/", "filter"),
     ("a", "toggle Completed group"),
     ("r", "force refresh"),
@@ -1252,7 +1263,7 @@ mod tests {
     }
 
     fn app_with(sessions: Vec<Session>) -> App {
-        let rows = build_rows(&sessions, "", true);
+        let rows = build_rows(&sessions, "", true, &[]);
         App {
             tmux_session: "ccmux".into(),
             sidebar_width: 34,
@@ -1271,6 +1282,9 @@ mod tests {
             help_lines: help_line_count(),
             filter: String::new(),
             show_completed: true,
+            hidden: crate::tmux::HiddenSet::new(),
+            hidden_dirty: false,
+            hidden_absent: std::collections::BTreeSet::new(),
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -1437,10 +1451,10 @@ mod tests {
         sessions[2].started_at = 0; // exercises a stale timestamp in the age column
         let mut app = app_with(sessions);
         app.filter = "session".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true);
+        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
         render(&app);
         app.filter = "zzz-nothing-matches".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true);
+        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
         render(&app);
     }
 
@@ -1510,7 +1524,7 @@ mod tests {
             s.started_at = 0;
         }
         app.now_ms = 3_600_000;
-        app.rows = build_rows(&app.sessions, "", true);
+        app.rows = build_rows(&app.sessions, "", true, &[]);
         let sid = app.sessions[0].session_id.clone();
         app.map.panes.insert(
             "%7".into(),
@@ -1549,7 +1563,7 @@ mod tests {
     fn header_count_reflects_a_hidden_group_not_only_a_filter() {
         let mut app = app_with(many(6));
         app.show_completed = false;
-        app.rows = build_rows(&app.sessions, "", false);
+        app.rows = build_rows(&app.sessions, "", false, &[]);
         let rows = rows_at(&app, 40, 24);
         assert!(
             rows[0].contains("/6"),
@@ -1559,10 +1573,57 @@ mod tests {
 
         // Nothing hidden: the bare total, not a ratio.
         app.show_completed = true;
-        app.rows = build_rows(&app.sessions, "", true);
+        app.rows = build_rows(&app.sessions, "", true, &[]);
         let rows = rows_at(&app, 40, 24);
         assert!(rows[0].contains("6 sessions"), "{:?}", rows[0]);
         assert!(!rows[0].contains("/6"), "{:?}", rows[0]);
+    }
+
+    /// A dismissed session must stay in `total`. The count is the only thing
+    /// on screen that still says the row exists, so `5/6` is what tells the
+    /// operator that `d` hid something rather than that it ended.
+    #[test]
+    fn header_count_still_counts_a_dismissed_session_in_the_total() {
+        let mut app = app_with(many(6));
+        let victim = app
+            .sessions
+            .first()
+            .map(|s| s.session_id.clone())
+            .unwrap_or_default();
+        app.hidden = crate::tmux::HiddenSet::new();
+        app.hidden.dismiss(&victim);
+        app.rows = build_rows(&app.sessions, "", true, app.hidden.ids());
+
+        let rows = rows_at(&app, 40, 24);
+        assert!(
+            rows[0].contains("5/6"),
+            "a dismissed row must leave the total alone: {:?}",
+            rows[0]
+        );
+        assert_eq!(
+            app.rows.iter().filter(|r| matches!(r, Row::Session { .. })).count(),
+            5
+        );
+        assert_eq!(app.sessions.len(), 6, "the poll is untouched");
+    }
+
+    /// The `?` overlay is where a narrow sidebar discovers `d`, so both halves
+    /// of the pair have to be in it.
+    #[test]
+    fn the_help_overlay_documents_dismiss_and_undo() {
+        let mut app = app_with(many(3));
+        app.mode = Mode::Help;
+        app.help_lines = help_line_count();
+        let rows = rows_at(&app, 60, 40).join("\n");
+        assert!(rows.contains("hide row (pane stays)"), "{rows}");
+        assert!(rows.contains("undo the last hide"), "{rows}");
+
+        // The `d` line has to survive the narrow overlay too: at the default
+        // 34-column sidebar the action column is `w - key_w`, and losing the
+        // "(pane stays)" half is losing the only warning that `d` on a session
+        // with an open pane leaves that pane with no row to reach it from.
+        let narrow = rows_at(&app, 34, 40).join("\n");
+        assert!(narrow.contains("hide row (pane stays)"), "{narrow}");
     }
 
     #[test]
@@ -1625,7 +1686,7 @@ mod tests {
     fn header_shows_filter_ratio_and_group_titles() {
         let mut app = app_with(many(6));
         app.filter = "session number 1".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true);
+        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
         let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
         let dump = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
@@ -2090,7 +2151,7 @@ mod tests {
     fn the_footer_fills_whole_pairs_and_pins_the_help_key() {
         let app = app_with(many(3));
         for (w, want) in [
-            (44u16, "⏎ open  o/s split  x close  S stop"),
+            (44u16, "⏎ open  o/s split  x close  d/u hide"),
             (34, "⏎ open  o/s split  x close"),
             (28, "⏎ open  o/s split"),
             (20, "⏎ open"),

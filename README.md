@@ -116,6 +116,8 @@ environment-variable equivalent of `--socket`.
 | `n` | Dispatch a new background session with a typed task | no |
 | `c` | New interactive session in a chosen cwd | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
+| `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
+| `u` | Undo the most recent `d` | no |
 | `/` | Filter by name, cwd, or short id | no |
 | `a` | Toggle visibility of the Completed group | no |
 | `r` | Force refresh | no |
@@ -158,12 +160,47 @@ Interactive sessions render their name in purple. They have no short id, so
 `claude attach`, `claude stop`, and `claude logs` do not apply to them; ccmux
 jumps to their existing pane instead, resolving it through `/proc` ancestry.
 
+### Dismissing a row
+
+`claude` has no delete verb — `claude stop` parks a session, it does not remove
+it — so `d` hides a row **from this view** and nothing more. It runs no
+`claude` command, kills no pane, and the agent goes on working. `u` undoes the
+most recent `d`; the header keeps counting the hidden session in its total, so
+the list reads `5/6` while one row is dismissed.
+
+The use it was built for is a session ccmux can never open: a Claude Desktop
+session has no controlling tty and no tmux pane, so `Enter` can only tell you
+so. Dismissing it clears the row for good without touching the session.
+
+If the dismissed session has a pane ccmux opened, the footer says
+`hidden — pane open, u to undo` in yellow rather than naming the row. The pane
+is deliberately left alone, but the row was the only place `x` and `Enter`
+could be reached from, so that pane now has no affordance until `u` brings the
+row back. Its `@ccmux_map` entry is kept for exactly that reason.
+
+Dismissals are kept in the `@ccmux_hidden` tmux user option, next to
+`@ccmux_map`, for the same reason: their correct lifetime is exactly the tmux
+session's. Kill the tmux session and they are gone; quit and relaunch the
+sidebar and they are still there — the option is written on the next poll and
+again when the sidebar exits, so a `d` or a `u` in the last poll interval
+before `q` is not lost.
+
+A dismissed session that ends and leaves the poll is dropped from the set once
+**two consecutive complete polls** agree it is gone, so the set cannot grow
+without bound. Two consecutive, because one poll is not proof: `claude agents`
+can exit 0 and still under-report — a malformed row is skipped rather than
+being fatal, and a hiccup can return `[]`. Dropping an id also drops the `u`
+that would restore it, so a single bad poll must not be able to do it. A poll
+that is known to have lost rows concludes nothing at all.
+
 ## Safety
 
 - Closing a pane with `x` does **not** stop the agent. Background sessions are
   daemon-owned and outlive their pane. Interactive sessions are not, so `x`
   refuses them.
 - `S` is the only verb that stops a session, and it always confirms first.
+- `d` removes a row from the list only. It is not a stop, not a kill, and not a
+  delete — nothing outside ccmux's own view state changes, and `u` puts it back.
 - Every mutating tmux command carries a validated target and is scoped to the
   ccmux session. Panes in your other tmux sessions are never split, resized, or
   killed.
@@ -171,9 +208,9 @@ jumps to their existing pane instead, resolving it through `/proc` ancestry.
 ## Degraded mode
 
 `ccmux sidebar` outside tmux still runs: polling, grouping, filtering, `L`, `n`,
-`S`, and all navigation work; the header indicator turns yellow and the
-pane-related verbs (`Enter`, `o`, `s`, `x`, `c`) refuse with a message. The
-session→pane map is kept in memory only. This is what makes the sidebar
+`S`, `d`, `u`, and all navigation work; the header indicator turns yellow and
+the pane-related verbs (`Enter`, `o`, `s`, `x`, `c`) refuse with a message. The
+session→pane map and the dismissed set are kept in memory only. This is what makes the sidebar
 developable without a tmux server.
 
 ## Development

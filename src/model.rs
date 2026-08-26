@@ -240,11 +240,37 @@ impl RawSession {
     }
 }
 
+/// One parsed `claude agents --json` payload: the rows that survived, and how
+/// many the CLI emitted that did not.
+///
+/// `dropped > 0` means the payload was well-formed JSON but INCOMPLETE — some
+/// sessions the CLI knows about are missing from `sessions` through no fault of
+/// the CLI call, which still exited 0. Callers that reason about a session
+/// being *gone* (only `App::apply_poll`, for the dismissed set) must treat a
+/// lossy payload as no evidence at all: an absent row may simply be one of the
+/// dropped ones.
+#[derive(Debug, Clone, Default)]
+pub struct Payload {
+    pub sessions: Vec<Session>,
+    pub dropped: usize,
+}
+
+impl Payload {
+    /// True when every row the CLI emitted became a `Session`. An empty payload
+    /// is complete: `[]` means the CLI really does know of no sessions.
+    pub fn is_complete(&self) -> bool {
+        self.dropped == 0
+    }
+}
+
 /// Parse the whole `claude agents --json` payload.
 /// Rows missing `sessionId`, `name`, or `cwd` are SKIPPED, not fatal — a single
 /// malformed row must never blank the sidebar. Unknown extra keys are ignored.
 /// Returns rows in the order the CLI emitted them; ordering is imposed later.
-pub fn parse_sessions(json: &str) -> Result<Vec<Session>, ParseError> {
+///
+/// Every skipped row is COUNTED, because silently dropping rows and silently
+/// concluding those sessions ended are two different things. See `Payload`.
+pub fn parse_sessions(json: &str) -> Result<Payload, ParseError> {
     let value: serde_json::Value = serde_json::from_str(json).map_err(|e| ParseError::Json {
         msg: e.to_string(),
         excerpt: truncate_end(json.trim(), 120),
@@ -256,15 +282,15 @@ pub fn parse_sessions(json: &str) -> Result<Vec<Session>, ParseError> {
     };
 
     let mut out = Vec::with_capacity(arr.len());
+    let mut dropped = 0usize;
     for elem in arr {
         // Per-row tolerance: a type error in one row skips that row only.
-        if let Ok(raw) = serde_json::from_value::<RawSession>(elem)
-            && let Some(sess) = raw.into_session()
-        {
-            out.push(sess);
+        match serde_json::from_value::<RawSession>(elem).ok().and_then(RawSession::into_session) {
+            Some(sess) => out.push(sess),
+            None => dropped += 1,
         }
     }
-    Ok(out)
+    Ok(Payload { sessions: out, dropped })
 }
 
 // ── Rows: the display model shared by app.rs and ui.rs ──────────────────────
@@ -288,12 +314,26 @@ pub enum Row {
 /// Filtering: case-insensitive substring of `filter` against
 /// `Session::filter_haystack()`. An empty `filter` matches everything.
 /// `show_completed == false` omits the Completed group entirely.
+/// `hidden` holds `session_id`s dismissed with `d`; they are omitted too.
+///
+/// All three filters live here, in the one pure function, so they cannot
+/// disagree: `/`, `a` and `d` compose by construction and every caller —
+/// including the header's `matching/total` count, which counts the `Row`s this
+/// returns — sees the same answer. Dismissal is deliberately NOT a mutation of
+/// `sessions`: the full poll stays intact, so `total` still counts the
+/// dismissed session and reconciliation can still see that it is alive.
 ///
 /// Within a group, sessions sort by `started_at` DESCENDING (newest first),
 /// tie-broken by `session_id` ASCENDING so the order is total and stable.
-pub fn build_rows(sessions: &[Session], filter: &str, show_completed: bool) -> Vec<Row> {
+pub fn build_rows(
+    sessions: &[Session],
+    filter: &str,
+    show_completed: bool,
+    hidden: &[String],
+) -> Vec<Row> {
     let needle = filter.trim().to_lowercase();
     let matching: Vec<usize> = (0..sessions.len())
+        .filter(|&i| !hidden.iter().any(|h| h == &sessions[i].session_id))
         .filter(|&i| needle.is_empty() || sessions[i].filter_haystack().contains(&needle))
         .collect();
 
@@ -592,7 +632,7 @@ mod tests {
     ]"#;
 
     fn sample() -> Vec<Session> {
-        parse_sessions(SAMPLE).expect("sample payload parses")
+        parse_sessions(SAMPLE).expect("sample payload parses").sessions
     }
 
     fn sess(id: Option<&str>, status: Status, state: Option<State>) -> Session {
@@ -638,9 +678,13 @@ mod tests {
           {"sessionId":"c","cwd":"/tmp"},
           {"sessionId":"d","name":"no cwd"}
         ]"#;
-        let s = parse_sessions(json).unwrap();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].session_id, "a");
+        let p = parse_sessions(json).unwrap();
+        assert_eq!(p.sessions.len(), 1);
+        assert_eq!(p.sessions[0].session_id, "a");
+        // The three unusable rows are COUNTED, not silently forgotten: a poll
+        // that lost rows is not evidence that those sessions ended.
+        assert_eq!(p.dropped, 3);
+        assert!(!p.is_complete());
     }
 
     #[test]
@@ -649,22 +693,28 @@ mod tests {
           {"sessionId":"a","name":"ok","cwd":"/tmp"},
           {"sessionId":"b","name":"bad","cwd":"/tmp","startedAt":"not-a-number"}
         ]"#;
-        let s = parse_sessions(json).unwrap();
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].session_id, "a");
+        let p = parse_sessions(json).unwrap();
+        assert_eq!(p.sessions.len(), 1);
+        assert_eq!(p.sessions[0].session_id, "a");
+        assert_eq!(p.dropped, 1, "the wrong-typed row is counted");
     }
 
     #[test]
     fn unknown_keys_are_ignored() {
         let json = r#"[{"sessionId":"a","name":"n","cwd":"/tmp","brandNewKey":42}]"#;
-        assert_eq!(parse_sessions(json).unwrap().len(), 1);
+        let p = parse_sessions(json).unwrap();
+        assert_eq!(p.sessions.len(), 1);
+        assert!(p.is_complete(), "an unknown key does not make a payload lossy");
     }
 
     #[test]
     fn non_array_and_garbage_payloads() {
         assert!(matches!(parse_sessions("{}"), Err(ParseError::NotAnArray)));
         assert!(matches!(parse_sessions("oops"), Err(ParseError::Json { .. })));
-        assert_eq!(parse_sessions("[]").unwrap().len(), 0);
+        let empty = parse_sessions("[]").unwrap();
+        assert_eq!(empty.sessions.len(), 0);
+        // `[]` is COMPLETE, not lossy: the CLI really does know of no sessions.
+        assert!(empty.is_complete());
     }
 
     #[test]
@@ -715,7 +765,7 @@ mod tests {
     #[test]
     fn build_rows_groups_headers_and_order() {
         let s = sample();
-        let rows = build_rows(&s, "", true);
+        let rows = build_rows(&s, "", true, &[]);
         // Working: bt/reg-update + GNOME (both state=working)
         // Working also gets the interactive busy session.
         // Idle: none. Completed: prediction analysis.
@@ -742,7 +792,7 @@ mod tests {
     #[test]
     fn build_rows_hides_completed_when_asked() {
         let s = sample();
-        let rows = build_rows(&s, "", false);
+        let rows = build_rows(&s, "", false, &[]);
         assert!(!rows.iter().any(|r| matches!(r, Row::Header { group: Group::Completed, .. })));
         assert_eq!(rows.len(), 4);
     }
@@ -750,13 +800,13 @@ mod tests {
     #[test]
     fn build_rows_filtering() {
         let s = sample();
-        assert!(build_rows(&s, "zzz-no-such-thing", true).is_empty());
+        assert!(build_rows(&s, "zzz-no-such-thing", true, &[]).is_empty());
         // case-insensitive across name, cwd and short id
-        assert_eq!(build_rows(&s, "KERNEL", true).len(), 2); // header + row
-        assert_eq!(build_rows(&s, "kernel", true).len(), 2);
+        assert_eq!(build_rows(&s, "KERNEL", true, &[]).len(), 2); // header + row
+        assert_eq!(build_rows(&s, "kernel", true, &[]).len(), 2);
         // 2 groups, 2 rows, 1 spacer between them
-        assert_eq!(build_rows(&s, "foundation", true).len(), 5);
-        assert_eq!(build_rows(&s, "674b1d29", true).len(), 2);
+        assert_eq!(build_rows(&s, "foundation", true, &[]).len(), 5);
+        assert_eq!(build_rows(&s, "674b1d29", true, &[]).len(), 2);
     }
 
     #[test]
@@ -767,7 +817,7 @@ mod tests {
         b.session_id = "aaa".into();
         a.started_at = 100;
         b.started_at = 100;
-        let rows = build_rows(&[a, b], "", true);
+        let rows = build_rows(&[a, b], "", true, &[]);
         // equal started_at => session_id ascending: "aaa" (index 1) first
         assert_eq!(rows[1], Row::Session { idx: 1 });
         assert_eq!(rows[2], Row::Session { idx: 0 });
@@ -775,8 +825,8 @@ mod tests {
 
     #[test]
     fn build_rows_on_empty_input() {
-        assert!(build_rows(&[], "", true).is_empty());
-        assert!(build_rows(&[], "x", false).is_empty());
+        assert!(build_rows(&[], "", true, &[]).is_empty());
+        assert!(build_rows(&[], "x", false, &[]).is_empty());
     }
 
     #[test]
@@ -1002,7 +1052,7 @@ mod tests {
             "name": "halted probe",
             "state": "stopped"
         }]"#;
-        let parsed = parse_sessions(raw).expect("parse");
+        let parsed = parse_sessions(raw).expect("parse").sessions;
         assert_eq!(parsed.len(), 1);
         let s = &parsed[0];
         assert_eq!(s.state, Some(State::Stopped));

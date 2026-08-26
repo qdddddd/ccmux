@@ -3,7 +3,7 @@
 //! Everything that shells out to `claude`, plus the shell-command templates for
 //! panes. Builds strings; never runs tmux.
 //!
-//! Consumes `model::{Session, ParseError}` and `tmux::sh_quote` (the pane
+//! Consumes `model::{Payload, ParseError}` and `tmux::sh_quote` (the pane
 //! command templates are the shell boundary of RULE Q2 and must quote through
 //! the same function the launcher uses). Nothing else from `tmux`.
 //!
@@ -26,7 +26,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::model::{ParseError, Session};
+use crate::model::{ParseError, Payload};
 use crate::tmux::sh_quote;
 
 #[derive(Debug)]
@@ -196,8 +196,11 @@ fn check_status(out: &std::process::Output) -> Result<(), AgentsError> {
 /// Measured cost 0.21s (PROBE-FINDINGS §1).
 ///
 /// §9.3: an exit-0 `[]` is a **valid empty result**, not an error — it returns
-/// `Ok(vec![])` and the caller must clear `poll_error`.
-pub fn poll() -> Result<Vec<Session>, AgentsError> {
+/// an empty, COMPLETE `Payload` and the caller must clear `poll_error`.
+///
+/// Returns the whole `model::Payload`, not just its sessions, so the caller can
+/// tell a payload that lost rows from one that genuinely shrank.
+pub fn poll() -> Result<Payload, AgentsError> {
     let out = run_bounded(&["agents", "--json", "--all"], POLL_TIMEOUT)?;
     check_status(&out)?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -529,12 +532,16 @@ mod tests {
     #[test]
     #[ignore]
     fn live_poll_parses_the_real_payload() {
-        let sessions = poll().expect("claude agents --json --all");
-        for s in &sessions {
+        let payload = poll().expect("claude agents --json --all");
+        for s in &payload.sessions {
             assert!(!s.session_id.is_empty());
             assert_eq!(s.is_attachable(), s.id.is_some());
         }
-        eprintln!("live_poll: {} sessions", sessions.len());
+        eprintln!(
+            "live_poll: {} sessions, {} rows dropped",
+            payload.sessions.len(),
+            payload.dropped
+        );
     }
 
     #[test]

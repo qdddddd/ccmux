@@ -341,6 +341,11 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     // Teardown on BOTH the Ok and the Err path — an error return that leaves
     // the alternate screen up hides its own message.
     restore_terminal();
+    // The deferred `@ccmux_map` / `@ccmux_hidden` writes have no next `tick` to
+    // land in. This is the one place every exit path passes through — `q`,
+    // `Ctrl-c` and an error return alike — so it is where they get written.
+    // After `restore_terminal` so anything tmux prints lands on a real screen.
+    app.shutdown();
     result
 }
 

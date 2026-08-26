@@ -21,9 +21,18 @@ pub const WINDOW_NAME: &str = "cc";
 pub const OPT_MAP: &str = "@ccmux_map";
 pub const OPT_SIDEBAR: &str = "@ccmux_sidebar";
 pub const OPT_WIDTH: &str = "@ccmux_width";
+pub const OPT_HIDDEN: &str = "@ccmux_hidden";
 
 /// `@ccmux_map` schema version. A different value is treated as an empty map.
 const MAP_VERSION: u32 = 1;
+/// `@ccmux_hidden` schema version. A different value is treated as empty.
+const HIDDEN_VERSION: u32 = 1;
+/// Most dismissals `@ccmux_hidden` will carry. tmux refuses a `set-option`
+/// value over ~16 KB and a 36-char uuid costs 39 bytes serialized, so 256 sits
+/// an order of magnitude under the wall. `reconcile` normally keeps the set far
+/// smaller; the cap only bounds a pathological session that dismisses hundreds
+/// of still-live agents.
+const HIDDEN_MAX: usize = 256;
 
 /// Depth cap for the /proc ppid walk (SPEC §3.2).
 const ANCESTRY_MAX_DEPTH: usize = 32;
@@ -879,26 +888,138 @@ pub fn load_map(session: &str) -> PaneMap {
     }
 }
 
-/// Last value written per session, so a steady-state tick issues no
-/// `set-option` at all (§5.2). `BTreeMap` makes the comparison byte-stable.
+/// Last value written per (option, session), so a steady-state tick issues no
+/// `set-option` at all (§5.2). Keyed by option too, because `@ccmux_map` and
+/// `@ccmux_hidden` share this cache and a session-only key would let one
+/// option's value suppress the other's write.
 static LAST_SAVED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 fn lock_saved() -> std::sync::MutexGuard<'static, Option<HashMap<String, String>>> {
     LAST_SAVED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// `set_user_option`, skipped when the identical value was last written.
+/// `key` starts with `@` and a session name cannot contain a space, so the
+/// composed cache key is unambiguous.
+fn set_user_option_cached(session: &str, key: &str, json: String) -> Result<(), TmuxError> {
+    let cache_key = format!("{key} {session}");
+    if lock_saved().as_ref().and_then(|c| c.get(&cache_key)) == Some(&json) {
+        return Ok(());
+    }
+    set_user_option(session, key, &json)?;
+    lock_saved().get_or_insert_with(HashMap::new).insert(cache_key, json);
+    Ok(())
+}
+
+/// Pre-seed the write-dedupe cache so a `save_*` carrying this exact value
+/// returns `Ok(())` without spawning tmux.
+///
+/// Tests only, and the reason is a hard rule rather than a convenience: the
+/// unit suite must never reach a tmux server, because the default socket is
+/// the operator's live one. This is the seam that lets an `app` test drive
+/// `App::shutdown` through the real `save_hidden` and stay hermetic.
+#[cfg(test)]
+pub fn seed_saved_value(session: &str, key: &str, json: &str) {
+    lock_saved()
+        .get_or_insert_with(HashMap::new)
+        .insert(format!("{key} {session}"), json.to_string());
+}
+
 /// Serialize and write to `@ccmux_map`.
 pub fn save_map(session: &str, map: &PaneMap) -> Result<(), TmuxError> {
     let json = serde_json::to_string(map)
         .map_err(|e| TmuxError::Parse(format!("cannot serialize pane map: {e}")))?;
+    set_user_option_cached(session, OPT_MAP, json)
+}
 
-    if lock_saved().as_ref().and_then(|c| c.get(session)) == Some(&json) {
-        return Ok(());
+// ── The dismissed set (`d` / `u`) ───────────────────────────────────────────
+
+/// Sessions dismissed from the sidebar's list with `d`, oldest first.
+///
+/// A `Vec`, not a `Set`: the order IS the undo stack, so `u` pops the back.
+/// De-duplicated on insert, so it is still a set by content.
+///
+/// Ids are `model::Session::session_id` (the stable uuid). A name is not
+/// unique, a pid is recycled, and an interactive session has no short id — a
+/// dismissal keyed by any of those would follow the wrong row, or no row.
+///
+/// Purely a VIEW filter. Nothing here stops, kills, or attaches anything: the
+/// agent goes on running and `claude` never hears about it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HiddenSet {
+    /// Schema version. Current = 1. A different value is treated as empty.
+    pub v: u32,
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+impl HiddenSet {
+    /// v = 1, empty.
+    pub fn new() -> Self {
+        HiddenSet { v: HIDDEN_VERSION, ids: Vec::new() }
     }
 
-    set_user_option(session, OPT_MAP, &json)?;
-    lock_saved().get_or_insert_with(HashMap::new).insert(session.to_string(), json);
-    Ok(())
+    /// The dismissed ids, oldest first. What `model::build_rows` filters on.
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+
+    /// Dismiss `id`. False when it was already hidden (nothing changed).
+    ///
+    /// At `HIDDEN_MAX` the OLDEST dismissal is dropped, never the newest: the
+    /// back of the vec is what `u` needs, and the dropped id simply reappears
+    /// in the list, which is the safe direction to fail in.
+    pub fn dismiss(&mut self, id: &str) -> bool {
+        if id.is_empty() || self.ids.iter().any(|h| h == id) {
+            return false;
+        }
+        self.ids.push(id.to_string());
+        while self.ids.len() > HIDDEN_MAX {
+            self.ids.remove(0);
+        }
+        true
+    }
+
+    /// Undo the most recent dismissal, returning the id it restored.
+    pub fn undo(&mut self) -> Option<String> {
+        self.ids.pop()
+    }
+
+    /// Drop ids that no longer appear in `live`, so the set cannot grow without
+    /// bound as sessions come and go. True when anything was dropped.
+    ///
+    /// `retain` preserves order, so removing from the middle of the stack
+    /// leaves `undo` pointing at the same newest dismissal it did before.
+    ///
+    /// The caller must only pass a poll it actually got: reconciling against an
+    /// empty list because `claude agents` failed would erase every dismissal.
+    pub fn reconcile<'a, I: IntoIterator<Item = &'a str>>(&mut self, live: I) -> bool {
+        let alive: HashSet<&str> = live.into_iter().collect();
+        let before = self.ids.len();
+        self.ids.retain(|id| alive.contains(id.as_str()));
+        self.ids.len() != before
+    }
+}
+
+/// Read `@ccmux_hidden`. Any failure (unset, empty, bad JSON, `v != 1`) yields
+/// an empty set — a corrupt option must never hide rows at random, and showing
+/// too much is the safe direction.
+pub fn load_hidden(session: &str) -> HiddenSet {
+    let raw = match get_user_option(session, OPT_HIDDEN) {
+        Some(raw) => raw,
+        None => return HiddenSet::new(),
+    };
+    match serde_json::from_str::<HiddenSet>(&raw) {
+        Ok(h) if h.v == HIDDEN_VERSION => h,
+        _ => HiddenSet::new(),
+    }
+}
+
+/// Serialize and write to `@ccmux_hidden`. Same dedupe cache as `save_map`.
+pub fn save_hidden(session: &str, hidden: &HiddenSet) -> Result<(), TmuxError> {
+    let json = serde_json::to_string(hidden)
+        .map_err(|e| TmuxError::Parse(format!("cannot serialize hidden set: {e}")))?;
+    set_user_option_cached(session, OPT_HIDDEN, json)
 }
 
 // ── Shell quoting (§7) ──────────────────────────────────────────────────────
@@ -1338,6 +1459,89 @@ mod tests {
         assert_eq!(serialize_map(&PaneMap::new()), r#"{"v":1,"panes":{}}"#);
     }
 
+    // ── the dismissed set (`@ccmux_hidden`) ─────────────────────────────────
+
+    #[test]
+    fn hidden_set_is_an_undo_stack() {
+        let mut h = HiddenSet::new();
+        assert!(h.dismiss("uuid-a"));
+        assert!(h.dismiss("uuid-b"));
+        // Already hidden: no duplicate, and nothing changed.
+        assert!(!h.dismiss("uuid-a"));
+        assert_eq!(h.ids(), ["uuid-a", "uuid-b"]);
+        // An empty id can never be a session_id, and must not become an entry
+        // that hides nothing and can never reconcile away.
+        assert!(!h.dismiss(""));
+
+        // Newest out first.
+        assert_eq!(h.undo().as_deref(), Some("uuid-b"));
+        assert_eq!(h.undo().as_deref(), Some("uuid-a"));
+        assert_eq!(h.undo(), None, "empty is a no-op, not a panic");
+    }
+
+    #[test]
+    fn hidden_set_reconciles_out_a_session_that_left_the_poll() {
+        let mut h = HiddenSet::new();
+        h.dismiss("uuid-a");
+        h.dismiss("uuid-gone");
+        h.dismiss("uuid-b");
+
+        assert!(h.reconcile(["uuid-a", "uuid-b"]));
+        assert_eq!(h.ids(), ["uuid-a", "uuid-b"], "order survives a mid-stack drop");
+        // `undo` still points at the newest SURVIVING dismissal.
+        assert_eq!(h.undo().as_deref(), Some("uuid-b"));
+
+        // Idempotent: a second pass over the same poll changes nothing.
+        let mut h2 = HiddenSet::new();
+        h2.dismiss("uuid-a");
+        assert!(!h2.reconcile(["uuid-a"]));
+    }
+
+    #[test]
+    fn hidden_set_is_size_bounded_and_drops_the_oldest() {
+        let mut h = HiddenSet::new();
+        for i in 0..HIDDEN_MAX + 10 {
+            assert!(h.dismiss(&format!("uuid-{i:04}")));
+        }
+        assert_eq!(h.ids().len(), HIDDEN_MAX);
+        // The oldest went; the newest — the one `u` needs — stayed.
+        assert_eq!(h.ids().first().map(String::as_str), Some("uuid-0010"));
+        assert_eq!(h.undo().as_deref(), Some(&format!("uuid-{:04}", HIDDEN_MAX + 9)[..]));
+        // Comfortably inside tmux's ~16 KB set-option ceiling with real uuids.
+        let mut real = HiddenSet::new();
+        for i in 0..HIDDEN_MAX {
+            real.dismiss(&format!("1c45d64f-9bba-4038-8de7-d5f112c9{i:04}"));
+        }
+        let json = serde_json::to_string(&real).expect("serializes");
+        assert!(json.len() < 16_000, "{} bytes", json.len());
+    }
+
+    #[test]
+    fn hidden_set_round_trips_and_a_bad_option_value_hides_nothing() {
+        let mut h = HiddenSet::new();
+        h.dismiss("1c45d64f-9bba-4038-8de7-d5f112c92360");
+        h.dismiss("674b1d29-2222-4038-8de7-d5f112c92362");
+
+        let first = serde_json::to_string(&h).expect("serializes");
+        assert_eq!(
+            first,
+            r#"{"v":1,"ids":["1c45d64f-9bba-4038-8de7-d5f112c92360","674b1d29-2222-4038-8de7-d5f112c92362"]}"#
+        );
+        let back: HiddenSet = serde_json::from_str(&first).expect("deserializes");
+        assert_eq!(back, h, "order is part of the value: it is the undo stack");
+        assert_eq!(serde_json::to_string(&back).expect("re-serializes"), first);
+
+        // An empty set is the shape `load_hidden` falls back to.
+        assert_eq!(serde_json::to_string(&HiddenSet::new()).expect("ok"), r#"{"v":1,"ids":[]}"#);
+        // Tolerates a value written by a version that had no `ids` yet.
+        let sparse: HiddenSet = serde_json::from_str(r#"{"v":1}"#).expect("defaults fill in");
+        assert!(sparse.ids().is_empty());
+        // A future schema is not readable as this one; showing too much is the
+        // safe direction, so `load_hidden` treats it as empty.
+        let future: HiddenSet = serde_json::from_str(r#"{"v":2,"ids":["x"]}"#).expect("parses");
+        assert_ne!(future.v, HIDDEN_VERSION);
+    }
+
     // ── target validation (the R1/R2 guards) ────────────────────────────────
 
     #[test]
@@ -1445,6 +1649,13 @@ mod tests {
         let bar = panes.iter().find(|p| p.id == sidebar).expect("sidebar present");
         assert_eq!((bar.left, bar.width), (0, 34), "sidebar stays leftmost at 34 cols");
         assert!(rightmost_pane_excluding(&panes, &sidebar).is_some());
+
+        // dismissed-set persistence through @ccmux_hidden
+        assert!(load_hidden(sess).ids().is_empty(), "unset option loads empty");
+        let mut hidden = HiddenSet::new();
+        assert!(hidden.dismiss("1c45d64f-9bba-4038-8de7-d5f112c92360"));
+        save_hidden(sess, &hidden).expect("save_hidden");
+        assert_eq!(load_hidden(sess), hidden, "@ccmux_hidden round-trips");
 
         // map persistence through @ccmux_map
         let mut map = load_map(sess);

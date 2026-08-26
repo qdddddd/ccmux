@@ -13,7 +13,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::agents::{self, AgentsError};
 use crate::model::{self, Group, Kind, ParseError, Row, Session};
-use crate::tmux::{self, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TmuxError};
+use crate::tmux::{self, HiddenSet, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TmuxError};
 
 /// How long a flashed footer message stays up (SPEC §6.8 item 2).
 const MSG_TTL: Duration = Duration::from_secs(4);
@@ -39,6 +39,10 @@ const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(250);
 const MAP_NAME_MAX: usize = 80;
 /// Columns left for the Claude panes when the sidebar is pinned (§1.3).
 const MIN_CONTENT_COLS: u16 = 20;
+/// Columns a session name may take in a flashed message. The `d` flash has to
+/// fit `hidden <name> — u to undo` into a 34-column footer, and the part that
+/// must survive is the part that says how to get the row back.
+const LABEL_MAX: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgLevel {
@@ -141,6 +145,21 @@ pub struct App {
     // view state
     pub filter: String,
     pub show_completed: bool,
+    /// Sessions dismissed with `d`, oldest first — the newest is what `u`
+    /// restores. A VIEW filter only: it is passed to `model::build_rows`
+    /// alongside `filter` and `show_completed` and touches nothing else. The
+    /// agents keep running and `claude` is never told.
+    pub hidden: HiddenSet,
+    /// Set by `d`, `u` and reconciliation; flushed to `@ccmux_hidden` by the
+    /// next `tick`, and by `shutdown` when there is no next tick. Never written
+    /// from the keypress itself, so `d` issues no tmux command at all.
+    pub hidden_dirty: bool,
+    /// Dismissed ids that were missing from the PREVIOUS complete poll — the
+    /// first strike of `reconcile_hidden`'s two. In memory only, deliberately:
+    /// it is a debounce, not state worth outliving the process, and keeping it
+    /// out of `HiddenSet` keeps `@ccmux_hidden` the `{"v":1,"ids":[…]}` it
+    /// round-trips today.
+    pub hidden_absent: std::collections::BTreeSet<String>,
     pub mode: Mode,
     pub prompt: Option<Prompt>,
     pub logs: Option<LogsView>,
@@ -205,6 +224,9 @@ impl App {
 
             filter: String::new(),
             show_completed: true,
+            hidden: HiddenSet::new(),
+            hidden_dirty: false,
+            hidden_absent: std::collections::BTreeSet::new(),
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -233,16 +255,25 @@ impl App {
         }
     }
 
-    /// One-time startup IO: load `@ccmux_map`, resolve `@ccmux_sidebar`,
-    /// set `degraded`. Never fails; failures degrade.
+    /// One-time startup IO: load `@ccmux_map` and `@ccmux_hidden`, resolve
+    /// `@ccmux_sidebar`, set `degraded`. Never fails; failures degrade.
     pub fn init(&mut self) {
         self.degraded = !tmux::inside_target_server();
         if self.degraded {
-            // §9.5: the map is held in memory only; load/save are skipped.
+            // §9.5: the map and the dismissed set are held in memory only;
+            // load/save are skipped. `d` and `u` still work — unlike the pane
+            // verbs they need nothing from tmux to be correct.
             self.map = PaneMap::new();
+            self.hidden = HiddenSet::new();
+            self.hidden_absent.clear();
             return;
         }
         self.map = tmux::load_map(&self.tmux_session);
+        self.hidden = tmux::load_hidden(&self.tmux_session);
+        // A fresh process has seen no polls, so no id has a strike against it.
+        // Loading `@ccmux_hidden` must not import one either: an id dismissed
+        // in a previous run is owed the same two chances as a fresh dismissal.
+        self.hidden_absent.clear();
         self.sidebar_pane = tmux::get_user_option(&self.tmux_session, tmux::OPT_SIDEBAR)
             .and_then(|s| PaneId::parse(&s));
     }
@@ -253,11 +284,14 @@ impl App {
     ///   2. panes = list_panes_in_session(tmux_session)   [skipped when degraded]
     ///   3. map.reconcile(&panes) -> map_dirty |= changed
     ///   4. agents::poll() -> sessions (on Err: keep last good, bump fail_streak)
+    ///      4b. on Ok ONLY: reconcile the dismissed set against the fresh poll
+    ///      — 4 and 4b are `apply_poll`, which is where their whole policy
+    ///      lives so it can be tested without shelling out to `claude`
     ///   5. rebuild `interactive_panes`: for every session with
     ///      `kind == Interactive`, tmux::resolve_pane_for_pid(pid, &panes)
     ///      [skipped when degraded; cleared and rebuilt, never merged]
     ///   6. rebuild rows, re-anchor selection by selected_key
-    ///   7. flush the map if map_dirty
+    ///   7. flush the map if map_dirty, and the dismissed set if hidden_dirty
     ///   8. pin_sidebar (unconditional, §1.3)
     ///   9. last_poll = Instant::now()
     pub fn tick(&mut self) {
@@ -267,19 +301,8 @@ impl App {
         // 2 + 3 (+ §5.3 step 5)
         self.refresh_panes();
 
-        // 4 — §9.1/§9.3: an Err keeps the last good list on screen; `[]` is a
-        // valid empty result, not an error.
-        match agents::poll() {
-            Ok(sessions) => {
-                self.sessions = sessions;
-                self.poll_error = None;
-                self.fail_streak = 0;
-            }
-            Err(e) => {
-                self.fail_streak = self.fail_streak.saturating_add(1);
-                self.poll_error = Some(model::truncate_end(&agents_msg(&e), POLL_ERR_MAX));
-            }
-        }
+        // 4 + 4b
+        self.apply_poll(agents::poll());
 
         // 5 — cleared and rebuilt wholesale, never merged, so it cannot go stale.
         self.interactive_panes.clear();
@@ -297,12 +320,85 @@ impl App {
 
         // 7
         self.save_map_now();
+        self.save_hidden_now();
 
         // 8 — unconditional (§1.3); this is what heals a manual resize.
         self.pin_sidebar();
 
         // 9
         self.last_poll = Instant::now();
+    }
+
+    /// Steps 4 and 4b of `tick`, split out from the IO that produces the
+    /// argument so the whole policy is reachable from a test. `tick` is now a
+    /// thin shell around `agents::poll()`; everything it decides, it decides
+    /// here.
+    ///
+    /// §9.1/§9.3: an `Err` keeps the last good list on screen; an exit-0 `[]`
+    /// is a valid empty result, not an error, and clears `poll_error`.
+    pub fn apply_poll(&mut self, res: Result<model::Payload, agents::AgentsError>) {
+        match res {
+            Ok(payload) => {
+                let complete = payload.is_complete();
+                self.sessions = payload.sessions;
+                self.poll_error = None;
+                self.fail_streak = 0;
+                self.reconcile_hidden(complete);
+            }
+            Err(e) => {
+                self.fail_streak = self.fail_streak.saturating_add(1);
+                self.poll_error = Some(model::truncate_end(&agents_msg(&e), POLL_ERR_MAX));
+            }
+        }
+    }
+
+    /// 4b — drop dismissals for sessions that are gone, WITHOUT a hair trigger.
+    ///
+    /// Reconciliation is tidiness, not safety: `HIDDEN_MAX` already bounds the
+    /// set, so nothing here has to be eager. Being eager is expensive, because
+    /// dropping an id also drops the `u` that would bring the row back, and
+    /// that is not recoverable by any keypress.
+    ///
+    /// Two things make a SUCCESSFUL poll under-report:
+    ///   * `model::parse_sessions` skips individual malformed rows. That is
+    ///     detected exactly — `Payload::dropped` counts them — and a lossy
+    ///     payload is no evidence about any missing id, so it concludes
+    ///     nothing: it neither drops an id nor lets one off.
+    ///   * `claude` exits 0 with `[]` mid-hiccup, which parses perfectly and
+    ///     cannot be detected at all. So absence is debounced instead: an id
+    ///     is dropped only when TWO consecutive complete polls agree it is
+    ///     gone. One bad poll can no longer erase a dismissal, let alone the
+    ///     whole set.
+    ///
+    /// An `Err` poll never reaches here: nothing is concluded from a poll we
+    /// did not get.
+    fn reconcile_hidden(&mut self, complete: bool) {
+        if !complete {
+            return;
+        }
+        let live: std::collections::HashSet<&str> =
+            self.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        let absent: std::collections::BTreeSet<String> = self
+            .hidden
+            .ids()
+            .iter()
+            .filter(|id| !live.contains(id.as_str()))
+            .cloned()
+            .collect();
+        // Survivors: alive right now, or absent for the first time. Passing the
+        // union to `reconcile` keeps the "is it gone" question in one place —
+        // `HiddenSet` still just retains what the caller says is live.
+        let spared: Vec<String> = self
+            .hidden
+            .ids()
+            .iter()
+            .filter(|id| live.contains(id.as_str()) || !self.hidden_absent.contains(*id))
+            .cloned()
+            .collect();
+        if self.hidden.reconcile(spared.iter().map(String::as_str)) {
+            self.hidden_dirty = true;
+        }
+        self.hidden_absent = absent;
     }
 
     /// Poll interval in force: `interval`, or 10s once `fail_streak >= 3`.
@@ -740,6 +836,105 @@ impl App {
         }
     }
 
+    /// `d` — dismiss the selected session FROM THE LIST.
+    ///
+    /// Non-destructive by construction: it adds one uuid to `hidden` and
+    /// rebuilds the rows. No `claude stop`, no `kill-pane`, no `set-option` —
+    /// the persistence write is deferred to the next `tick`, so the keypress
+    /// path issues no tmux command whatsoever. The agent runs on, its pane (if
+    /// any) stays open, and `total` in the header still counts it.
+    ///
+    /// No confirm modal on purpose: `CONFIRM_ARM_DELAY` and the `y`/`n` gate
+    /// exist for `S`, the one verb that ends a running agent. Guarding a change
+    /// of what is on screen the same way would teach the operator to dismiss
+    /// the modal reflexively, which is exactly how a real `S` gets confirmed by
+    /// accident. `u` is the safety net instead, and the flash names it.
+    pub fn act_dismiss(&mut self) {
+        let Some(sel) = self.selected_session() else {
+            self.flash("no session selected", MsgLevel::Warn);
+            return;
+        };
+        let id = sel.session_id.clone();
+        let label = session_label(sel);
+        // The row is the ONLY place `x` and `Enter` can be reached from, so
+        // hiding a session ccmux opened a pane for leaves that pane on screen
+        // with no affordance left to close or jump to it. Not killing it is
+        // correct — `d` touches nothing outside this view — but saying nothing
+        // is not, so this variant spends the name to buy the warning and stays
+        // inside a 34-column footer. `@ccmux_map` keeps its entry on purpose:
+        // the pane is live, and `u` + `x` is the recovery.
+        let owns_pane = self.map.pane_for_session(&id).is_some();
+        // Where the cursor lands, decided BEFORE the row goes away: the next
+        // session below, else the one above. `reanchor_selection` re-finds it
+        // by key, so it is right even though the rebuild renumbers every row —
+        // and when there is no neighbour at all, `selected_key = None` parks
+        // `selected` at `rows.len()` per the field contract.
+        let neighbour = self.neighbour_key(self.selected);
+        if !self.hidden.dismiss(&id) {
+            return;
+        }
+        // A fresh dismissal starts with zero strikes against it. Without this
+        // an id could carry a strike across `d` -> absent poll -> `u` -> `d`:
+        // `reconcile_hidden` only recomputes the strike set from `hidden` on a
+        // COMPLETE poll, so one lossy poll in between leaves the old strike
+        // standing and the re-dismissed id would be dropped after a single
+        // absence rather than two.
+        self.hidden_absent.remove(&id);
+        self.selected_key = neighbour;
+        self.hidden_dirty = true;
+        self.rebuild_rows();
+        if owns_pane {
+            self.flash("hidden — pane open, u to undo", MsgLevel::Warn);
+        } else {
+            self.flash(format!("hidden {label} — u to undo"), MsgLevel::Info);
+        }
+    }
+
+    /// `u` — undo the most recent dismissal.
+    ///
+    /// Mandatory, not a nicety: `d` is one keypress and makes a row vanish.
+    /// The cursor follows the restored session WHEN IT IS ON SCREEN, so the
+    /// undo is visible even when polls re-sorted the list in between.
+    ///
+    /// When `/` or `a` still hides the restored row there is nothing to follow,
+    /// and pointing `selected_key` at a key `reanchor_selection` cannot find
+    /// would hand the cursor to `reanchor_selection`'s nearest-index fallback —
+    /// i.e. park it on an unrelated session, and leave it there after the
+    /// filter is cleared. So the rebuild runs on the CURRENT key first (undo
+    /// only ADDS rows, so that key is always still there), and the cursor moves
+    /// only once the restored row is known to exist.
+    pub fn act_undo_dismiss(&mut self) {
+        let Some(id) = self.hidden.undo() else {
+            self.flash("nothing to undo", MsgLevel::Info);
+            return;
+        };
+        self.hidden_dirty = true;
+        self.rebuild_rows();
+        let visible = self.is_visible(&id);
+        if visible {
+            self.selected_key = Some(id.clone());
+            self.reanchor_selection();
+        }
+
+        let label = self
+            .sessions
+            .iter()
+            .find(|s| s.session_id == id)
+            .map(session_label)
+            // Dismissed, then it ended and left the poll. Un-hiding is still
+            // right (the next reconcile drops the id), but the name is no
+            // longer ours to state, so name it by its id head instead.
+            .unwrap_or_else(|| short_id_of(&id));
+        // `/` or `a` may have changed since the dismissal, in which case the
+        // row is back in the model but still off screen. Saying so is the
+        // difference between "undo worked" and "u does nothing".
+        if visible {
+            self.flash(format!("restored {label}"), MsgLevel::Info);
+        } else {
+            self.flash(format!("restored {label} — filtered out"), MsgLevel::Warn);
+        }
+    }
+
     /// `L` — the on-demand, ANSI-stripped logs overlay. SPEC §6.7.
     pub fn act_open_logs(&mut self) {
         let Some(sel) = self.selected_session() else {
@@ -864,6 +1059,24 @@ impl App {
         }
     }
 
+    /// Key of the session row after `from`, else the one before it. `None`
+    /// when `from` is the only session row on screen.
+    fn neighbour_key(&self, from: usize) -> Option<String> {
+        let after = (from.saturating_add(1)..self.rows.len()).find(|&i| self.is_session_row(i));
+        let before = || (0..from.min(self.rows.len())).rev().find(|&i| self.is_session_row(i));
+        after.or_else(before).and_then(|i| self.key_at(i))
+    }
+
+    /// True when `session_id` currently has a row — i.e. no filter is hiding it.
+    fn is_visible(&self, session_id: &str) -> bool {
+        self.rows.iter().any(|r| match r {
+            Row::Session { idx } => {
+                self.sessions.get(*idx).map(|s| s.session_id.as_str()) == Some(session_id)
+            }
+            _ => false,
+        })
+    }
+
     fn set_selected(&mut self, i: usize) {
         self.selected = i;
         self.selected_key = self.key_at(i);
@@ -871,7 +1084,12 @@ impl App {
     }
 
     fn rebuild_rows(&mut self) {
-        self.rows = model::build_rows(&self.sessions, &self.filter, self.show_completed);
+        self.rows = model::build_rows(
+            &self.sessions,
+            &self.filter,
+            self.show_completed,
+            self.hidden.ids(),
+        );
         self.reanchor_selection();
     }
 
@@ -980,6 +1198,45 @@ impl App {
                 self.flash(format!("pane map not saved: {}", tmux_msg(&e)), MsgLevel::Warn);
             }
         }
+    }
+
+    /// Flush `@ccmux_hidden`. Same contract as `save_map_now`, for the same
+    /// reason: a value tmux refuses is not worth reissuing every tick, so the
+    /// dirty flag is cleared on failure too and the operator is told once. The
+    /// dismissal itself already took effect on screen — persistence failing
+    /// costs it only its survival across a sidebar restart.
+    fn save_hidden_now(&mut self) {
+        if self.degraded || !self.hidden_dirty {
+            return;
+        }
+        match tmux::save_hidden(&self.tmux_session, &self.hidden) {
+            Ok(()) => self.hidden_dirty = false,
+            Err(e) => {
+                self.hidden_dirty = false;
+                self.flash(
+                    format!("hidden list not saved: {}", tmux_msg(&e)),
+                    MsgLevel::Warn,
+                );
+            }
+        }
+    }
+
+    /// Everything deferred that must still reach tmux before the process ends.
+    ///
+    /// `tick` is the only other flush site, which is exactly the problem this
+    /// solves: a `d` or a `u` in the last poll interval before the operator
+    /// quits has no next tick to be written by, and would silently revert on
+    /// the next launch. The `u` direction is the one that stings — an undo the
+    /// operator watched take effect on screen, gone, with the row hidden again
+    /// and no message.
+    ///
+    /// Called from `main::run_sidebar` AFTER the event loop returns, so it
+    /// covers `q`, `Ctrl-c` and an error return alike — no exit path can skip
+    /// it by leaving the loop a different way. Deliberately NOT called from
+    /// `act_quit`: the keypress path must stay free of tmux commands.
+    pub fn shutdown(&mut self) {
+        self.save_map_now();
+        self.save_hidden_now();
     }
 
     /// `#{window_index}` of the window the sidebar lives in — the only window
@@ -1191,6 +1448,16 @@ impl App {
             KeyCode::Char('a') => {
                 self.show_completed = !self.show_completed;
                 self.rebuild_rows();
+                Action::Redraw
+            }
+            // Reachable only without Ctrl: the `Ctrl-d`/`Ctrl-u` arms above
+            // match first, so half-page scrolling is untouched.
+            KeyCode::Char('d') => {
+                self.act_dismiss();
+                Action::Redraw
+            }
+            KeyCode::Char('u') => {
+                self.act_undo_dismiss();
                 Action::Redraw
             }
             KeyCode::Char('r') => {
@@ -1461,6 +1728,23 @@ fn remove_char_at(s: &mut String, char_idx: usize) {
     }
 }
 
+/// Footer label for a session: its name, or an id when the CLI handed us an
+/// empty one. Bounded so `hidden <label> — u to undo` still fits a 34-column
+/// footer with the part that says how to undo intact.
+fn session_label(sess: &Session) -> String {
+    let raw = match (sess.name.trim().is_empty(), sess.id.as_deref()) {
+        (false, _) => sess.name.trim().to_string(),
+        (true, Some(short)) => short.to_string(),
+        (true, None) => short_id_of(&sess.session_id),
+    };
+    model::truncate_end(&raw, LABEL_MAX)
+}
+
+/// First 8 chars of a uuid — the short form `claude` itself prints.
+fn short_id_of(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
+}
+
 fn byte_of(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -1529,6 +1813,9 @@ mod tests {
             help_lines: 21,
             filter: String::new(),
             show_completed: true,
+            hidden: HiddenSet::new(),
+            hidden_dirty: false,
+            hidden_absent: std::collections::BTreeSet::new(),
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -1583,6 +1870,30 @@ mod tests {
 
     fn press(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    /// A successful, COMPLETE poll — what `agents::poll` returns when nothing
+    /// went wrong. Tests that want an under-reporting poll build the `Payload`
+    /// themselves with `dropped > 0`.
+    fn complete(sessions: Vec<Session>) -> Result<model::Payload, agents::AgentsError> {
+        Ok(model::Payload { sessions, dropped: 0 })
+    }
+
+    /// Make the NEXT `save_hidden` for this app a no-op that still returns
+    /// `Ok(())`, by pre-seeding `tmux`'s write-dedupe cache with the exact JSON
+    /// it is about to serialize.
+    ///
+    /// This is how `shutdown` is tested without a tmux server, and the reason
+    /// is a hard rule, not tidiness: `cargo test` must never reach tmux,
+    /// because the default socket is the operator's live one. The value is
+    /// serialized by the same call `save_hidden` makes, so it always matches
+    /// and the spawn is always skipped.
+    fn arm_hermetic_flush(a: &App) {
+        crate::tmux::seed_saved_value(
+            &a.tmux_session,
+            crate::tmux::OPT_HIDDEN,
+            &serde_json::to_string(&a.hidden).expect("HiddenSet serializes"),
+        );
     }
 
     fn load(app: &mut App, sessions: Vec<Session>) {
@@ -2139,6 +2450,663 @@ mod tests {
         assert_eq!(a.effective_interval(), Duration::from_secs(10));
         a.fail_streak = 0;
         assert_eq!(a.effective_interval(), Duration::from_millis(2500));
+    }
+
+    // ── `d` / `u`: dismissal is a VIEW filter ───────────────────────────────
+
+    /// Three Working sessions and one Completed, in the order `build_rows`
+    /// emits them: Working newest-first, then a Spacer, then Completed.
+    fn four() -> Vec<Session> {
+        let mut a = bg("aaaaaaaa", "bt/reg-update", State::Working);
+        let mut b = bg("bbbbbbbb", "kernel bugs", State::Working);
+        let mut c = bg("cccccccc", "ccmux scaffold", State::Working);
+        let mut d = bg("dddddddd", "prediction run", State::Done);
+        a.started_at = 300;
+        b.started_at = 200;
+        c.started_at = 100;
+        d.started_at = 50;
+        vec![a, b, c, d]
+    }
+
+    fn session_rows(a: &App) -> Vec<String> {
+        a.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Session { idx } => a.sessions.get(*idx).map(|s| s.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dismiss_removes_exactly_one_row_and_undo_puts_it_back() {
+        let mut a = app();
+        load(&mut a, four());
+        let before = a.rows.len();
+        let names_before = session_rows(&a);
+        assert_eq!(names_before[0], "bt/reg-update");
+
+        let act = a.on_key(press('d'));
+
+        assert_eq!(act, Action::Redraw);
+        assert_eq!(a.rows.len(), before - 1, "exactly one row goes");
+        assert_eq!(
+            session_rows(&a),
+            ["kernel bugs", "ccmux scaffold", "prediction run"]
+        );
+        // The poll is untouched: the header's `total` still counts it, which is
+        // what makes the count read 3/4 while one row is hidden.
+        assert_eq!(a.sessions.len(), 4);
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "hidden bt/reg-update — u to undo");
+        assert_eq!(level, MsgLevel::Info, "hiding a row is not a warning");
+
+        a.on_key(press('u'));
+
+        assert_eq!(a.rows.len(), before);
+        assert_eq!(session_rows(&a), names_before);
+        assert!(a.hidden.ids().is_empty());
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "restored bt/reg-update"
+        );
+        // Undo leaves the cursor ON the row it brought back.
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"));
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("bt/reg-update"));
+    }
+
+    /// Task item 4, as a test rather than as a claim.
+    ///
+    /// `d` may not stop, kill, detach or attach anything, and may not issue a
+    /// tmux command at all — the `@ccmux_hidden` write is DEFERRED to the next
+    /// `tick`, which is what `hidden_dirty` records. This test also runs with
+    /// `degraded: false`, so a stray `set-option` here would shell out to a
+    /// real tmux server; the whole suite staying hermetic is part of the proof.
+    #[test]
+    fn dismiss_never_touches_the_agent_or_tmux() {
+        let mut a = app();
+        load(&mut a, four());
+        let ids_before: Vec<String> = a.sessions.iter().map(|s| s.session_id.clone()).collect();
+        let map_before = a.map.clone();
+
+        a.on_key(press('d'));
+
+        let ids_after: Vec<String> = a.sessions.iter().map(|s| s.session_id.clone()).collect();
+        assert_eq!(ids_after, ids_before, "the poll is not mutated");
+        assert_eq!(a.map, map_before, "no pane map entry is added or removed");
+        assert!(!a.map_dirty, "no tmux pane work was queued");
+        assert_eq!(a.mode, Mode::Normal, "no confirm modal: this is not destructive");
+        assert!(a.hidden_dirty, "the option write is queued for the next tick");
+        assert!(!a.should_quit);
+
+        // And it works with no tmux at all, unlike every pane verb.
+        let mut d = app();
+        d.degraded = true;
+        load(&mut d, four());
+        d.on_key(press('d'));
+        assert_eq!(d.hidden.ids().len(), 1);
+        assert!(
+            d.message.clone().unwrap_or_default_msg().0.starts_with("hidden "),
+            "degraded mode must not refuse a view filter"
+        );
+    }
+
+    #[test]
+    fn dismiss_and_undo_compose_with_an_active_filter() {
+        let mut a = app();
+        load(&mut a, four());
+        // "n" hits "kernel bugs" (Working) and "prediction run" (Completed)
+        // and nothing else — not the shared cwd, not a short id.
+        a.filter = "n".into();
+        a.rebuild_rows();
+        a.select_first();
+        assert_eq!(session_rows(&a), ["kernel bugs", "prediction run"]);
+
+        a.on_key(press('d'));
+        assert_eq!(session_rows(&a), ["prediction run"], "the filter still applies");
+        assert_eq!(a.hidden.ids(), ["bbbbbbbb-uuid"]);
+        // The Working group emptied under the filter, so its header went too.
+        assert!(!a.rows.iter().any(|r| matches!(r, Row::Header { group: Group::Working, .. })));
+
+        a.on_key(press('u'));
+        assert_eq!(session_rows(&a), ["kernel bugs", "prediction run"]);
+        assert!(a.hidden.ids().is_empty());
+        assert_eq!(a.filter, "n", "undo must not clear the filter");
+    }
+
+    #[test]
+    fn dismiss_and_undo_compose_with_the_completed_group_hidden() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('a')); // hide Completed
+        assert!(!a.show_completed);
+        assert_eq!(
+            session_rows(&a),
+            ["bt/reg-update", "kernel bugs", "ccmux scaffold"]
+        );
+
+        a.on_key(press('d'));
+        assert_eq!(session_rows(&a), ["kernel bugs", "ccmux scaffold"]);
+        // `a` hides a GROUP, `d` hides a SESSION: the Completed row is still
+        // filtered out and is not the row that was dismissed.
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+
+        a.on_key(press('u'));
+        assert_eq!(
+            session_rows(&a),
+            ["bt/reg-update", "kernel bugs", "ccmux scaffold"]
+        );
+        assert!(!a.show_completed, "undo must not re-show the Completed group");
+    }
+
+    /// The sharpest edge in the feature: the row under the cursor is the one
+    /// that disappears, so `reanchor_selection` cannot find `selected_key`.
+    #[test]
+    fn dismissing_the_cursor_row_lands_on_the_next_session() {
+        let mut a = app();
+        load(&mut a, four());
+
+        // Top of the list: the cursor falls to the session BELOW.
+        a.on_key(press('d'));
+        assert!(matches!(a.rows.get(a.selected), Some(Row::Session { .. })));
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("kernel bugs"));
+
+        // Bottom of the list: there is nothing below, so it rises to the one
+        // ABOVE — never onto the Header or the Spacer that precede it.
+        a.select_last();
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("prediction run"));
+        a.on_key(press('d'));
+        assert!(
+            matches!(a.rows.get(a.selected), Some(Row::Session { .. })),
+            "never a Header or a Spacer"
+        );
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("ccmux scaffold"));
+        assert!(a.selected < a.rows.len(), "never past the end");
+        // The Completed group emptied, so its header and spacer went with it.
+        assert!(!a.rows.iter().any(|r| matches!(r, Row::Header { group: Group::Completed, .. })));
+        assert!(!a.rows.iter().any(|r| matches!(r, Row::Spacer)));
+    }
+
+    #[test]
+    fn dismissing_the_last_visible_session_leaves_a_coherent_empty_list() {
+        let mut a = app();
+        load(&mut a, vec![bg("aaaaaaaa", "bt/reg-update", State::Working)]);
+
+        a.on_key(press('d'));
+
+        assert!(a.rows.is_empty(), "the header goes with its last row");
+        assert_eq!(a.selected, a.rows.len(), "parked per the field contract");
+        assert_eq!(a.selected_key, None);
+        assert_eq!(a.scroll, 0);
+        assert!(a.selected_session().is_none());
+        // Every movement key is a no-op on an empty list, not a panic.
+        for c in ['j', 'k', 'g', 'G'] {
+            a.on_key(press(c));
+            assert_eq!(a.selected, a.rows.len());
+        }
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.selected, 0);
+
+        a.on_key(press('u'));
+        assert_eq!(session_rows(&a), ["bt/reg-update"]);
+        assert!(matches!(a.rows.get(a.selected), Some(Row::Session { .. })));
+    }
+
+    #[test]
+    fn undo_with_nothing_dismissed_says_so_and_changes_nothing() {
+        let mut a = app();
+        load(&mut a, four());
+        let rows_before = a.rows.clone();
+        let selected_before = a.selected;
+
+        let act = a.on_key(press('u'));
+
+        assert_eq!(act, Action::Redraw);
+        assert_eq!(a.rows, rows_before);
+        assert_eq!(a.selected, selected_before);
+        assert!(!a.hidden_dirty, "a no-op must not queue an option write");
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "nothing to undo");
+        assert_eq!(level, MsgLevel::Info);
+    }
+
+    /// A dismissal outlives polls (that is the whole point for a permanently
+    /// dead row like a Claude Desktop session), but must be reconciled away
+    /// once the session leaves the poll, so the set cannot grow without bound.
+    #[test]
+    fn a_dismissal_survives_polls_and_reconciles_away_when_the_session_ends() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d'));
+        a.hidden_dirty = false;
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+
+        // A fresh poll returning the same four sessions: still hidden. Driven
+        // through `apply_poll`, which is the whole of what `tick` decides —
+        // calling `hidden.reconcile` by hand here would only re-test
+        // `HiddenSet`, which `tmux.rs` already covers.
+        a.apply_poll(complete(four()));
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+        assert!(!session_rows(&a).contains(&"bt/reg-update".to_string()));
+
+        // Now the session ends and leaves the poll entirely. ONE poll is not
+        // enough — a single under-reporting poll must never cost a dismissal.
+        let gone: Vec<Session> = four().into_iter().filter(|s| s.name != "bt/reg-update").collect();
+        a.apply_poll(complete(gone.clone()));
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"], "one absence is a strike, not a verdict");
+
+        // The second poll agrees, and only now is the id dropped.
+        a.apply_poll(complete(gone));
+        assert!(a.hidden.ids().is_empty(), "two agreeing polls drop the vanished id");
+        assert!(a.hidden_dirty, "and the shrunken set is queued for the option");
+        assert!(matches!(a.rows.get(a.selected), Some(Row::Session { .. })));
+    }
+
+    /// `u` must un-hide even when the row it restores is still off screen for
+    /// an unrelated reason — and must say so, or it looks like it did nothing.
+    #[test]
+    fn undo_after_the_filter_changed_restores_and_says_it_is_filtered_out() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d')); // hides bt/reg-update
+
+        a.filter = "kernel".into();
+        a.rebuild_rows();
+        a.on_key(press('u'));
+
+        assert!(a.hidden.ids().is_empty(), "the dismissal is undone regardless");
+        assert_eq!(session_rows(&a), ["kernel bugs"], "the filter still rules the view");
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "restored bt/reg-update — filtered out");
+        assert_eq!(level, MsgLevel::Warn);
+
+        // Clearing the filter shows it again, with no second `u`.
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(session_rows(&a).contains(&"bt/reg-update".to_string()));
+    }
+
+    /// The case this feature was built for: a Claude Desktop session. It is
+    /// `Kind::Interactive`, so it has NO short id; it is parented to the
+    /// desktop app rather than to a pane, so `Enter` can only ever refuse it;
+    /// and `claude` will keep returning it in every poll. It must dismiss like
+    /// any other row, keyed by the one stable thing it has — its `session_id` —
+    /// and it must STAY dismissed as those polls come in.
+    #[test]
+    fn a_desktop_session_with_no_short_id_dismisses_and_stays_dismissed() {
+        let mut a = app();
+        let mut desktop = inter("9f2c1a44-1111-4038-8de7-d5f112c92360", "claude-a1");
+        desktop.pid = 999_999; // a live pid that is in no tmux pane
+        let other = bg("aaaaaaaa", "bt/reg-update", State::Working);
+        load(&mut a, vec![desktop.clone(), other]);
+
+        // It is the newest, so it sorts first, and it is not attachable: there
+        // is no short id for `claude stop`/`logs` and no pane to jump to.
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("claude-a1"));
+        assert!(!desktop.is_attachable());
+        assert!(desktop.id.is_none());
+
+        a.on_key(press('d'));
+
+        assert_eq!(a.hidden.ids(), ["9f2c1a44-1111-4038-8de7-d5f112c92360"]);
+        assert_eq!(session_rows(&a), ["bt/reg-update"]);
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "hidden claude-a1 — u to undo"
+        );
+
+        // Poll after poll returns it, unchanged. It must not come back. Real
+        // polls, through `apply_poll`: this is the flow the feature exists for.
+        for _ in 0..3 {
+            a.apply_poll(complete(vec![
+                desktop.clone(),
+                bg("aaaaaaaa", "bt/reg-update", State::Working),
+            ]));
+            assert_eq!(a.hidden.ids(), ["9f2c1a44-1111-4038-8de7-d5f112c92360"]);
+            assert_eq!(session_rows(&a), ["bt/reg-update"]);
+        }
+
+        // A session whose name the CLI left empty is still nameable in the
+        // flash: `d` falls back to the head of the uuid, never to nothing.
+        let mut b = app();
+        let mut nameless = inter("7e0b33aa-2222-4038-8de7-d5f112c92361", "");
+        nameless.name = String::new();
+        load(&mut b, vec![nameless]);
+        b.on_key(press('d'));
+        assert_eq!(
+            b.message.clone().unwrap_or_default_msg().0,
+            "hidden 7e0b33aa — u to undo"
+        );
+    }
+
+    // ── the flush: `tick` is not the only way out of the event loop ─────────
+
+    /// REGRESSION. Persistence used to happen ONLY in `tick`, so a `d` inside
+    /// one poll interval of `q` was never written: `@ccmux_hidden` stayed
+    /// unset and the relaunched sidebar showed the row again. At the default
+    /// 2500ms interval that is most of the motivating flow — hide the
+    /// permanently dead Claude Desktop row, quit — and it falsified the
+    /// README's own "quit and relaunch and they are still there".
+    #[test]
+    fn a_dismissal_reaches_tmux_when_the_sidebar_quits_before_the_next_tick() {
+        let mut a = app();
+        a.tmux_session = "ccmux-test-flush-d".into();
+        load(&mut a, four());
+
+        a.on_key(press('d'));
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+        assert!(a.hidden_dirty, "the keypress queues the write, it does not issue it");
+
+        arm_hermetic_flush(&a);
+        assert_eq!(a.on_key(press('q')), Action::Quit);
+        a.shutdown();
+
+        assert!(!a.hidden_dirty, "quitting inside one poll interval must not drop the write");
+        assert!(
+            !a.message.clone().unwrap_or_default_msg().0.contains("not saved"),
+            "the flush must have succeeded, not been swallowed: {:?}",
+            a.message
+        );
+    }
+
+    /// REGRESSION, and the harmful direction of the same defect: an `u` the
+    /// operator watched take effect could be thrown away by quitting, leaving
+    /// the row hidden again on relaunch with nothing said. The value that must
+    /// reach `@ccmux_hidden` is the EMPTY set, not the stale one.
+    #[test]
+    fn an_undo_reaches_tmux_when_the_sidebar_quits_before_the_next_tick() {
+        let mut a = app();
+        a.tmux_session = "ccmux-test-flush-u".into();
+        load(&mut a, four());
+
+        a.on_key(press('d'));
+        arm_hermetic_flush(&a);
+        a.shutdown(); // stands in for the tick that persisted the dismissal
+        assert!(!a.hidden_dirty);
+
+        a.on_key(press('u'));
+        assert!(a.hidden.ids().is_empty());
+        assert!(a.hidden_dirty, "the undo is queued too");
+        assert_eq!(
+            serde_json::to_string(&a.hidden).expect("serialize"),
+            r#"{"v":1,"ids":[]}"#,
+            "the value the flush owes tmux is the empty set"
+        );
+
+        arm_hermetic_flush(&a);
+        assert_eq!(a.on_key(press('q')), Action::Quit);
+        a.shutdown();
+        assert!(!a.hidden_dirty, "the undo must not be reverted by quitting");
+    }
+
+    /// `shutdown` is the only flush site outside `tick`, so it must also be a
+    /// no-op when there is nothing owed — and must never fire in degraded mode,
+    /// where the set is memory-only by design.
+    #[test]
+    fn shutdown_is_a_no_op_with_nothing_owed_and_in_degraded_mode() {
+        let mut a = app();
+        a.shutdown();
+        assert!(a.message.is_none(), "a clean exit says nothing");
+
+        let mut d = app();
+        d.degraded = true;
+        load(&mut d, four());
+        d.on_key(press('d'));
+        d.shutdown(); // must not reach tmux at all
+        assert!(d.hidden_dirty, "degraded mode never writes the option");
+        assert_eq!(d.hidden.ids(), ["aaaaaaaa-uuid"], "but the row still hides");
+    }
+
+    // ── reconciliation: a poll that under-reports is not a death notice ─────
+
+    /// REGRESSION. `parse_sessions` drops individual malformed rows on purpose,
+    /// so a poll can exit 0, parse, and still be missing sessions that are very
+    /// much alive. Reconciling against it used to erase those dismissals AND
+    /// the `u` that would undo them — unrecoverably, and with no message.
+    #[test]
+    fn a_lossy_poll_concludes_nothing_about_a_dismissed_session() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d'));
+        a.hidden_dirty = false;
+
+        // `claude agents` exits 0, the payload parses, but the dismissed row is
+        // one of the ones `into_session` had to skip.
+        let survivors: Vec<Session> =
+            four().into_iter().filter(|s| s.name != "bt/reg-update").collect();
+        a.apply_poll(Ok(model::Payload { sessions: survivors.clone(), dropped: 1 }));
+
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"], "a lossy poll is not evidence");
+        assert!(!a.hidden_dirty, "and nothing was written");
+        assert!(a.hidden_absent.is_empty(), "it does not even count as a strike");
+
+        // It never becomes evidence, either: repeat it and the dismissal holds.
+        for _ in 0..5 {
+            a.apply_poll(Ok(model::Payload { sessions: survivors.clone(), dropped: 1 }));
+        }
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+
+        // Undo still works, which is the point — the row is recoverable.
+        a.on_key(press('u'));
+        assert!(a.hidden.ids().is_empty());
+    }
+
+    /// A strike must not outlive the dismissal that earned it. `d` -> absent
+    /// complete poll (strike) -> `u` -> a LOSSY poll (which recomputes nothing)
+    /// -> `d` again used to leave the old strike standing, so the re-dismissed
+    /// id would be dropped after ONE absence instead of two.
+    #[test]
+    fn a_fresh_dismissal_starts_with_no_strike_against_it() {
+        let mut a = app();
+        load(&mut a, four());
+        let without: Vec<Session> =
+            four().into_iter().filter(|s| s.name != "bt/reg-update").collect();
+
+        a.on_key(press('d'));
+        a.apply_poll(complete(without.clone()));
+        assert_eq!(a.hidden_absent.len(), 1, "one strike is on the books");
+
+        a.on_key(press('u'));
+        // A lossy poll that DOES carry the session: reconciliation is skipped
+        // wholesale, so nothing recomputes the strike set.
+        a.apply_poll(Ok(model::Payload { sessions: four(), dropped: 1 }));
+        assert_eq!(a.hidden_absent.len(), 1, "the stale strike is still there");
+
+        a.on_key(press('d'));
+        a.apply_poll(complete(without));
+        assert_eq!(
+            a.hidden.ids(),
+            ["aaaaaaaa-uuid"],
+            "the re-dismissal is owed two absences of its own, not one"
+        );
+    }
+
+    /// REGRESSION, degenerate case: `claude` hiccups and exits 0 with `[]`.
+    /// That parses perfectly and cannot be told from a real empty list, so it
+    /// is debounced instead — one such poll used to wipe the entire set and the
+    /// whole undo stack in a single tick.
+    #[test]
+    fn one_empty_poll_never_erases_the_dismissed_set_but_two_do() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d')); // bt/reg-update
+        a.on_key(press('d')); // kernel bugs
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid", "bbbbbbbb-uuid"]);
+        a.hidden_dirty = false;
+
+        a.apply_poll(complete(Vec::new()));
+        assert_eq!(
+            a.hidden.ids(),
+            ["aaaaaaaa-uuid", "bbbbbbbb-uuid"],
+            "one empty-but-successful poll must not wipe the set"
+        );
+        assert!(!a.hidden_dirty, "nor persist a wiped set");
+
+        // Two consecutive polls agreeing is the bar, and `[]` really can mean
+        // the sessions are gone — so the second one does drop them.
+        a.apply_poll(complete(Vec::new()));
+        assert!(a.hidden.ids().is_empty());
+        assert!(a.hidden_dirty);
+    }
+
+    /// A session that misses ONE poll and comes back keeps its dismissal
+    /// forever: the strike has to be consecutive, or a flaky CLI would erase
+    /// dismissals a poll at a time.
+    #[test]
+    fn a_session_that_blinks_out_of_one_poll_keeps_its_dismissal() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d'));
+
+        let without: Vec<Session> =
+            four().into_iter().filter(|s| s.name != "bt/reg-update").collect();
+        for _ in 0..4 {
+            a.apply_poll(complete(without.clone())); // strike
+            a.apply_poll(complete(four())); // and it is back: strike cleared
+            assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+        }
+        assert!(!session_rows(&a).contains(&"bt/reg-update".to_string()));
+    }
+
+    /// An `Err` poll keeps the last good list on screen, so it must conclude
+    /// nothing at all — including nothing about the dismissed set.
+    #[test]
+    fn a_failed_poll_leaves_the_dismissed_set_and_the_last_good_list_alone() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d'));
+        a.hidden_dirty = false;
+
+        for _ in 0..3 {
+            a.apply_poll(Err(agents::AgentsError::Cmd {
+                code: 1,
+                stderr: "claude: connection refused".into(),
+            }));
+        }
+
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+        assert!(!a.hidden_dirty);
+        assert_eq!(a.sessions.len(), 4, "the last good list stays");
+        assert_eq!(a.fail_streak, 3);
+        assert!(a.poll_error.is_some());
+    }
+
+    // ── the cursor after `u` ────────────────────────────────────────────────
+
+    /// INVARIANT PIN, not a regression: `u` on a row `/` still hides must leave
+    /// the cursor exactly where it was.
+    ///
+    /// This held before `act_undo_dismiss` was reworked, but only by
+    /// coincidence. `build_rows` returns byte-identical rows when the restored
+    /// row stays filtered out, so `reanchor_selection`'s nearest-index fallback
+    /// resolved to `abs_diff(target, target) == 0` — the row the cursor was
+    /// already on. `act_undo_dismiss` now states the condition instead of
+    /// leaning on that coincidence, and this test is what stops either half
+    /// drifting.
+    #[test]
+    fn undo_of_a_filtered_out_row_leaves_the_cursor_where_it_was() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d')); // hides bt/reg-update
+
+        // A filter that excludes the dismissed row, and a cursor deliberately
+        // parked on a row that is NOT the nearest index to the restored one.
+        a.filter = "n".into(); // kernel bugs, prediction run — never bt/reg-update
+        a.rebuild_rows();
+        a.select_last();
+        let before = a.selected_key.clone();
+        assert!(before.is_some(), "the cursor is on a real row to begin with");
+
+        a.on_key(press('u'));
+
+        assert!(a.hidden.ids().is_empty(), "the undo happened");
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "restored bt/reg-update — filtered out");
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(a.selected_key, before, "an invisible row is not worth moving the cursor for");
+
+        // And it is still there once the filter is gone: the restored row is
+        // back at the top, unselected, and the cursor has not been handed to
+        // anything it was not already on.
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(a.selected_key, before);
+        assert!(session_rows(&a).contains(&"bt/reg-update".to_string()));
+    }
+
+    // ── `d` on a row that owns a pane ───────────────────────────────────────
+
+    /// REGRESSION. The row is the only place `x` and `Enter` can be reached
+    /// from, so dismissing a session ccmux opened a pane for leaves that pane
+    /// on screen with no way to close or jump to it. Not killing it is correct;
+    /// saying nothing was not. The `@ccmux_map` entry stays on purpose — the
+    /// pane is live, and `u` then `x` is the recovery it makes possible.
+    #[test]
+    fn dismissing_a_session_with_an_open_pane_warns_and_keeps_the_map_entry() {
+        let mut a = app();
+        load(&mut a, four());
+        let pane = PaneId::parse("%7").expect("valid pane id");
+        a.map.insert(
+            &pane,
+            PaneEntry {
+                session_id: "aaaaaaaa-uuid".into(),
+                short_id: "aaaaaaaa".into(),
+                name: "bt/reg-update".into(),
+                opened_at: 0,
+            },
+        );
+
+        a.on_key(press('d'));
+
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "hidden — pane open, u to undo");
+        assert_eq!(level, MsgLevel::Warn, "yellow, because a pane is now unreachable");
+        assert!(text.contains("u to undo"), "the recovery must survive every variant");
+        assert!(
+            model::display_width(&text) <= 34,
+            "the warning still has to fit the narrowest sidebar: {text:?}"
+        );
+        assert_eq!(
+            a.map.pane_for_session("aaaaaaaa-uuid"),
+            Some(pane),
+            "the map entry is what `u` then `x` needs; dismissal must not touch it"
+        );
+
+        // A row with no ccmux pane keeps the plain, named flash.
+        a.on_key(press('u'));
+        a.map.remove(&PaneId::parse("%7").expect("valid pane id"));
+        a.on_key(press('d'));
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "hidden bt/reg-update — u to undo"
+        );
+
+        // An interactive session's own pane is NOT a ccmux pane: `x` refuses it
+        // anyway, so there is nothing to warn about and nothing to orphan.
+        let mut b = app();
+        let desktop = inter("9f2c1a44-1111-4038-8de7-d5f112c92360", "claude-a1");
+        load(&mut b, vec![desktop]);
+        b.interactive_panes
+            .insert("9f2c1a44-1111-4038-8de7-d5f112c92360".into(), PaneId::parse("%9").expect("id"));
+        b.on_key(press('d'));
+        assert_eq!(
+            b.message.clone().unwrap_or_default_msg().0,
+            "hidden claude-a1 — u to undo"
+        );
+    }
+
+    /// `Ctrl-d` / `Ctrl-u` must keep scrolling: the ctrl arms are matched first.
+    #[test]
+    fn ctrl_d_and_ctrl_u_still_scroll_and_never_dismiss() {
+        let mut a = app();
+        load(&mut a, four());
+        a.viewport = 4;
+
+        a.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(a.hidden.ids().is_empty(), "Ctrl-d is half-page down, not dismiss");
+        assert_ne!(a.selected, 1, "it moved the cursor");
+        a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(a.hidden.ids().is_empty());
+        assert!(a.message.is_none(), "no 'nothing to undo' from Ctrl-u");
     }
 
     /// Small ergonomic shim so assertions read cleanly without `unwrap`.
