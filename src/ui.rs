@@ -14,8 +14,8 @@
 //! 1. This module resolves the selected session, the "is open" flag, and the
 //!    pane badge from `App`'s **public fields** rather than through
 //!    `App::selected_session` / `is_open` / `pane_of` / `pane_index_of`. The
-//!    logic mirrors §3.5's documented behaviour exactly (map first, then the
-//!    transient `interactive_panes` cache). Reading fields keeps `ui::draw`
+//!    logic mirrors §3.5's documented behaviour exactly (the reconciled
+//!    `@ccmux_map`). Reading fields keeps `ui::draw`
 //!    testable — §10.1 mandates a no-panic matrix for this module, and that
 //!    matrix cannot run while the accessors are `todo!()` in another lane.
 //!    Swapping these private helpers for the accessors after integration is a
@@ -198,8 +198,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     // §6.8 AMENDMENT: a message wider than the sidebar takes over the detail
     // block and wraps, instead of losing its tail to a one-line truncation.
-    // §8.5's refusal and "agent still running" wordings do not fit 34 columns,
-    // and they are the two the operator most needs to read in full.
+    // §8.5's "closed pane N — agent still running" (35 columns) and §9.7's
+    // "no short id — cannot stop this session" (38) do not fit a 34-column
+    // sidebar, and they are the ones the operator most needs to read in full.
     match (s.detail, s.footer, overflow_message(app, area.width as usize, &p)) {
         (Some(d), Some(ft), Some((text, color))) => {
             let rect = Rect {
@@ -343,11 +344,8 @@ fn margin(w: usize) -> usize {
 /// Group -> name weight. The ladder `palette_contrast_is_readable` already
 /// guarantees (fg > gray > dim), spent on the one axis the list is sorted by,
 /// so the weight still names the group when its header has scrolled off the
-/// top. Interactive sessions keep their hue: a kind is not a tier.
+/// top.
 fn name_tier(sess: &Session, p: &Palette) -> Color {
-    if sess.kind == Kind::Interactive {
-        return p.purple;
-    }
     match sess.group() {
         Group::Working => p.fg,
         Group::Idle => p.gray,
@@ -929,7 +927,6 @@ const KEYS: &[(&str, &str)] = &[
     ("x", "close pane (agent lives)"),
     ("S", "stop session (confirm)"),
     ("n", "new background session"),
-    ("c", "new interactive session"),
     ("L", "logs for this session"),
     ("d", "hide row (pane stays)"),
     ("u", "undo the last hide"),
@@ -1101,11 +1098,9 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
     }
     let title = match kind {
         PromptKind::NewBackground => " new background session ",
-        PromptKind::NewInteractive => " new interactive session ",
     };
     let labels: &[&str] = match kind {
         PromptKind::NewBackground => &["cwd ", "task"],
-        PromptKind::NewInteractive => &["cwd "],
     };
 
     let want_h = (labels.len() as u16).saturating_add(5);
@@ -1190,9 +1185,8 @@ fn selected_session(app: &App) -> Option<&Session> {
     }
 }
 
-/// The pane id string showing `session_id`, mirroring §3.5's documented order:
-/// the reconciled `@ccmux_map` first, then the transient `interactive_panes`
-/// cache. Ties inside the map break on the numeric part of `%N`.
+/// The pane id string showing `session_id`, from the reconciled `@ccmux_map`
+/// exactly as §3.5 documents. Ties break on the numeric part of `%N`.
 fn pane_key_for(app: &App, session_id: &str) -> Option<String> {
     let mut best: Option<(u64, &String)> = None;
     for (pane, entry) in app.map.panes.iter() {
@@ -1207,12 +1201,7 @@ fn pane_key_for(app: &App, session_id: &str) -> Option<String> {
             best = Some((n, pane));
         }
     }
-    if let Some((_, pane)) = best {
-        return Some(pane.clone());
-    }
-    app.interactive_panes
-        .get(session_id)
-        .map(|p| p.as_str().to_string())
+    best.map(|(_, pane)| pane.clone())
 }
 
 fn is_open(app: &App, session_id: &str) -> bool {
@@ -1242,12 +1231,10 @@ mod tests {
     use crate::tmux::{PaneEntry, PaneId, PaneInfo, PaneMap};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
     fn sess(n: usize, kind: Kind, status: Status, state: Option<State>) -> Session {
         Session {
-            pid: 1000 + n as i32,
             id: match kind {
                 Kind::Background => Some(format!("{n:08x}")),
                 Kind::Interactive => None,
@@ -1290,7 +1277,6 @@ mod tests {
             logs: None,
             map: PaneMap::default(),
             map_dirty: false,
-            interactive_panes: BTreeMap::new(),
             sidebar_pane: None,
             panes: Vec::new(),
             degraded: false,
@@ -1313,8 +1299,14 @@ mod tests {
                     2 => (Status::Idle, Some(State::Done)),
                     _ => (Status::Unknown("weird".into()), None),
                 };
-                let kind = if i % 5 == 0 { Kind::Interactive } else { Kind::Background };
-                sess(i, kind, status, state)
+                let mut s = sess(i, Kind::Background, status, state);
+                // Every fifth row has no short id. `parse_sessions` honours an
+                // explicit `kind: "background"` even when the CLI omits `id`,
+                // so the `—` fallback in the detail block is still reachable.
+                if i % 5 == 0 {
+                    s.id = None;
+                }
+                s
             })
             .collect()
     }
@@ -1355,7 +1347,6 @@ mod tests {
                 name: "bt/reg-update".into(),
             }),
             Mode::Prompt(PromptKind::NewBackground),
-            Mode::Prompt(PromptKind::NewInteractive),
         ] {
             base.mode = mode.clone();
             base.prompt = match &mode {
@@ -1367,12 +1358,6 @@ mod tests {
                     ],
                     focus: 1,
                     cursor: 11,
-                }),
-                Mode::Prompt(PromptKind::NewInteractive) => Some(Prompt {
-                    kind: PromptKind::NewInteractive,
-                    fields: vec!["/home/dev".into()],
-                    focus: 0,
-                    cursor: 0,
                 }),
                 _ => None,
             };
@@ -1426,7 +1411,7 @@ mod tests {
         app.message = Some(("stop failed: no such session".into(), MsgLevel::Error));
         app.dark = false;
         render(&app);
-        app.message = Some(("cannot stop an interactive session".into(), MsgLevel::Warn));
+        app.message = Some(("no short id — cannot stop this session".into(), MsgLevel::Warn));
         render(&app);
     }
 
@@ -1458,11 +1443,8 @@ mod tests {
         render(&app);
     }
 
-    /// The open marker and the pane badge for a BACKGROUND session, driven by
-    /// `@ccmux_map`. Interactive sessions resolve through `interactive_panes`,
-    /// whose values need a `PaneId` — not constructible while `PaneId::parse`
-    /// is another lane's `todo!()` — so that path is covered only by the
-    /// no-panic matrix for now.
+    /// The open marker and the pane badge, driven by `@ccmux_map` — now the
+    /// only thing that resolves a session to a pane.
     #[test]
     fn open_marker_renders_for_a_mapped_background_session() {
         let sessions = vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))];
@@ -1537,14 +1519,12 @@ mod tests {
         );
         app.panes = vec![PaneInfo {
             id: PaneId::parse("%7").expect("pane id"),
-            pid: 0,
             index: 3,
             left: 35,
             top: 0,
             width: 60,
             height: 24,
             active: false,
-            session_name: "ccmux".into(),
             window_index: 1,
         }];
 
@@ -1629,17 +1609,24 @@ mod tests {
     #[test]
     fn a_message_too_wide_for_the_footer_wraps_instead_of_clipping() {
         let mut app = app_with(many(3));
-        // §8.5's refusal — the one message the operator must read in full.
-        app.message = Some((
-            "refusing: closing this pane would end the interactive session — exit Claude inside the pane instead".into(),
-            MsgLevel::Warn,
-        ));
+        // Quoted verbatim from `App::act_request_stop` — a refusal is the class
+        // of message the operator must read in full, and this one is 38 display
+        // columns, so a 34-column sidebar cannot show it without wrapping.
+        const REFUSAL: &str = "no short id — cannot stop this session";
+        assert!(
+            display_width(REFUSAL) > 34,
+            "fixture is no longer over-width, so it proves nothing: {REFUSAL:?}"
+        );
+        app.message = Some((REFUSAL.into(), MsgLevel::Warn));
         let rows = rows_at(&app, 34, 24);
         let tail = rows[20..].join(" ");
-        assert!(tail.contains("refusing"), "{tail:?}");
+        // Whitespace-normalised, because the wrap lands mid-sentence and each
+        // row is padded to the full width. Every word must survive the wrap.
+        let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("no short id"), "{tail:?}");
         assert!(
-            tail.contains("exit Claude inside the pane"),
-            "the actionable half was clipped: {tail:?}"
+            flat.contains(REFUSAL),
+            "the message was clipped instead of wrapped: {tail:?}"
         );
 
         // A message that fits leaves the detail block alone.
@@ -1666,6 +1653,28 @@ mod tests {
             .unwrap_or_default();
         assert!(id_line.contains("done"), "{id_line:?}");
         assert!(!id_line.contains('?'), "{id_line:?}");
+    }
+
+    /// `draw_detail`'s `Kind` match is kept TOTAL on purpose, and this is the
+    /// test that keeps the `Interactive` arm honest. `Kind::Interactive`
+    /// survives in `model`, `parse_sessions` still emits it, and the arm is
+    /// what a change to §3.5's listing policy would land on — but nothing
+    /// reachable through `apply_poll` renders one, so the row is built here
+    /// directly. That is the point, not a shortcut: delete this test only if
+    /// the arm itself goes.
+    #[test]
+    fn the_detail_block_still_names_an_interactive_kind() {
+        let app = app_with(vec![sess(1, Kind::Interactive, Status::Busy, None)]);
+        let rows = rows_at(&app, 40, 24);
+        let id_line = rows
+            .iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(id_line.contains("interactive"), "{id_line:?}");
+        assert!(!id_line.contains("background"), "{id_line:?}");
+        // No short id, so the id column falls back to the em dash.
+        assert!(id_line.contains('\u{2014}'), "{id_line:?}");
     }
 
     #[test]
@@ -1709,13 +1718,13 @@ mod tests {
         assert_eq!(status_glyph(&busy, &p), ("●", p.orange));
         let waiting = sess(3, Kind::Background, Status::Idle, Some(State::Working));
         assert_eq!(status_glyph(&waiting, &p), ("◐", p.blue));
-        let idle_interactive = sess(4, Kind::Interactive, Status::Idle, None);
-        assert_eq!(status_glyph(&idle_interactive, &p), ("○", p.gray));
+        let idle_no_state = sess(4, Kind::Background, Status::Idle, None);
+        assert_eq!(status_glyph(&idle_no_state, &p), ("○", p.gray));
 
         // `?` still means "this build does not recognize the value".
         let odd_state = sess(5, Kind::Background, Status::Idle, Some(State::Unknown("stopped".into())));
         assert_eq!(status_glyph(&odd_state, &p), ("?", p.purple));
-        let odd_status = sess(6, Kind::Interactive, Status::Unknown("thinking".into()), None);
+        let odd_status = sess(6, Kind::Background, Status::Unknown("thinking".into()), None);
         assert_eq!(status_glyph(&odd_status, &p), ("?", p.purple));
     }
 
@@ -1812,14 +1821,12 @@ mod tests {
             if let Some(i) = idx {
                 app.panes = vec![PaneInfo {
                     id: PaneId::parse("%7").expect("pane id"),
-                    pid: 0,
                     index: i,
                     left: 0,
                     top: 0,
                     width: 60,
                     height: 24,
                     active: false,
-                    session_name: "ccmux".into(),
                     window_index: 1,
                 }];
             }
@@ -1913,14 +1920,12 @@ mod tests {
         );
         app.panes = vec![PaneInfo {
             id: PaneId::parse("%7").expect("pane id"),
-            pid: 0,
             index: 2,
             left: 0,
             top: 0,
             width: 60,
             height: 24,
             active: false,
-            session_name: "ccmux".into(),
             window_index: 1,
         }];
 
@@ -2003,14 +2008,12 @@ mod tests {
         fn pane(app: &mut App, index: u32) {
             app.panes = vec![PaneInfo {
                 id: PaneId::parse("%7").expect("pane id"),
-                pid: 0,
                 index,
                 left: 0,
                 top: 0,
                 width: 60,
                 height: 24,
                 active: false,
-                session_name: "ccmux".into(),
                 window_index: 1,
             }];
         }
@@ -2099,11 +2102,9 @@ mod tests {
         let working = sess(1, Kind::Background, Status::Busy, Some(State::Working));
         let idle = sess(2, Kind::Background, Status::Idle, None);
         let done = sess(3, Kind::Background, Status::Unknown(String::new()), Some(State::Done));
-        let interactive = sess(4, Kind::Interactive, Status::Idle, None);
         assert_eq!(name_tier(&working, &p), p.fg);
         assert_eq!(name_tier(&idle, &p), p.gray);
         assert_eq!(name_tier(&done, &p), p.dim);
-        assert_eq!(name_tier(&interactive, &p), p.purple, "kind is a hue, not a tier");
     }
 
     /// The id line's two facts, and which one loses. The status word is

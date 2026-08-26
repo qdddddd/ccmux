@@ -231,12 +231,13 @@ or `respawn-pane`, the target pane must be confirmed to belong to `cli.session`.
 helper calls it. A pane in `agents`, `dev`, or any other session is never
 mutated.
 
-**R3 — pane enumeration for reconciliation uses `-s`, never `-a`.**
+**R3 — pane enumeration uses `-s`, never `-a`.**
 `tmux list-panes -t <session> -s -F ...` lists only that session's panes.
 `list-panes -a` lists the whole server, including the user's own work. `-a` is
-permitted in exactly one place: the **read-only** discovery walk that locates an
-interactive Claude session living outside ccmux (§5.4). It never feeds
-reconciliation and never feeds a mutating call.
+permitted **nowhere**: `list_panes_in_session` is the only pane enumeration in
+the program, so ccmux never so much as sees a pane outside its own session. The
+one read-only exception this rule used to carve out — the discovery walk that
+located an interactive Claude session living outside ccmux — went with §5.4.
 
 **R4 — ccmux never issues `claude stop`/`kill` without passing §8.2's
 confirmation gate**, and never issues them at all for a session it did not
@@ -298,11 +299,11 @@ impl Group {
 // ── Session ─────────────────────────────────────────────────────────────────
 
 /// One row from `claude agents --json`. Field names mirror the CLI's JSON
-/// exactly; `pid` is UNSTABLE across attach/detach and is used ONLY for the
-/// /proc ancestry walk, never as an identity key. Identity is `session_id`.
+/// exactly. Identity is `session_id` and nothing else: the CLI's `pid` is
+/// UNSTABLE across attach/detach, and with the /proc ancestry walk gone
+/// nothing reads it, so it is no longer carried.
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub pid: i32,
     /// 8-hex short id. `None` for `kind == Interactive`.
     pub id: Option<String>,
     /// UUID. Stable. THE primary key everywhere in ccmux.
@@ -404,8 +405,7 @@ pub fn truncate_end(s: &str, max: usize) -> String;
 
 ### 3.2 `src/tmux.rs` — owner: Tmux
 
-Every tmux interaction in the program, plus /proc ancestry resolution. No
-ratatui, no `claude`, no knowledge of `model::Session`. The pane map stores
+Every tmux interaction in the program. No ratatui, no `claude`, no knowledge of `model::Session`. The pane map stores
 session ids as opaque strings so this module stays decoupled.
 
 **Exports:**
@@ -455,15 +455,12 @@ impl std::fmt::Display for PaneId {}
 #[derive(Debug, Clone)]
 pub struct PaneInfo {
     pub id: PaneId,
-    /// `#{pane_pid}` — the pane's shell. Match target for the ancestry walk.
-    pub pid: i32,
     pub index: u32,
     pub left: u16,
     pub top: u16,
     pub width: u16,
     pub height: u16,
     pub active: bool,
-    pub session_name: String,
     pub window_index: u32,
 }
 
@@ -523,14 +520,10 @@ pub fn attach_or_switch(session: &str) -> Result<(), TmuxError>;
 
 // ── Pane enumeration and mutation ───────────────────────────────────────────
 
-/// `tmux list-panes -t <session> -s -F '<FMT>'` — session-scoped (R3).
-/// FMT = "#{pane_id}\t#{pane_pid}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t\
-///        #{pane_width}\t#{pane_height}\t#{pane_active}\t#{session_name}\t#{window_index}"
-pub fn list_panes_in_session(session: &str) -> Result<Vec<PaneInfo>, TmuxError>;
-
-/// READ-ONLY server-wide enumeration. Permitted ONLY for interactive-session
-/// discovery (§5.4). Never feeds reconciliation, never feeds a mutation.
-pub fn list_panes_all() -> Result<Vec<PaneInfo>, TmuxError>;
+/// `tmux list-panes -t <session> -s -F '<FMT>'` — session-scoped (R3), and the
+/// ONLY pane enumeration in the program. ccmux never lists the server.
+/// FMT = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t\
+///        #{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_index}"
 
 /// R2 gate. Err(BadTarget) when `pane` is absent from `session`.
 pub fn assert_in_session(pane: &PaneId, session: &str) -> Result<(), TmuxError>;
@@ -575,12 +568,6 @@ pub fn leftmost_pane(panes: &[PaneInfo]) -> Option<PaneId>;
 /// is alone in the window.
 pub fn rightmost_pane_excluding(panes: &[PaneInfo], sidebar: &PaneId) -> Option<PaneId>;
 
-/// `tmux switch-client -t <session>` then `select-pane -t <pane>`. Used to jump
-/// to an interactive session living in a foreign tmux session (§5.4). This is
-/// the one mutation permitted outside `cli.session`, and it only moves the
-/// client's focus — it creates, kills, and resizes nothing.
-pub fn focus_foreign_pane(session_name: &str, pane: &PaneId) -> Result<(), TmuxError>;
-
 // ── User options (map persistence) ──────────────────────────────────────────
 
 /// `tmux show-options -t <session> -qv <key>`.
@@ -599,7 +586,7 @@ pub fn set_user_option(session: &str, key: &str, value: &str) -> Result<(), Tmux
 pub struct PaneEntry {
     /// `model::Session::session_id` (UUID). Opaque to this module.
     pub session_id: String,
-    /// 8-hex short id when known; empty for interactive sessions.
+    /// 8-hex short id when known; empty when the session had none.
     #[serde(default)]
     pub short_id: String,
     /// Name at open time, for display when the session has vanished from polls.
@@ -655,24 +642,6 @@ pub fn sh_quote(s: &str) -> String;
 /// with a single space.
 pub fn sh_join(parts: &[&str]) -> String;
 
-// ── /proc ancestry (§5.4) ───────────────────────────────────────────────────
-
-/// Parse `/proc/<pid>/stat`.
-/// PARSE RULE: `comm` (field 2) is parenthesized and MAY CONTAIN SPACES AND
-/// PARENTHESES. Find the LAST b')' in the line; the remainder splits on
-/// whitespace as [state, ppid, ...]; ppid is index 1. Never `split_whitespace`
-/// the whole line. Returns None on any IO or parse failure.
-pub fn ppid_of(pid: i32) -> Option<i32>;
-
-/// Walk `ppid_of` upward from `pid`, inclusive of `pid`, stopping at pid <= 1,
-/// at a repeated pid, or after `max_depth` steps (use 32).
-pub fn ancestry(pid: i32, max_depth: usize) -> Vec<i32>;
-
-/// Walk up from `pid` and return the first pane whose `PaneInfo::pid` appears
-/// in the ancestry chain. This is how an interactive Claude session is mapped
-/// to the pane that hosts it (PROBE-FINDINGS §4). Background sessions are
-/// daemon-owned and will always return None here — that is expected, not an error.
-pub fn resolve_pane_for_pid(pid: i32, panes: &[PaneInfo]) -> Option<PaneInfo>;
 ```
 
 **Consumes:** nothing in-crate (`serde` derives only).
@@ -718,8 +687,8 @@ pub fn poll() -> Result<Vec<Session>, AgentsError>;
 // ── Verbs ───────────────────────────────────────────────────────────────────
 
 /// `claude stop <id>` — DESTRUCTIVE. Callers MUST have passed §8.2's
-/// confirmation gate. `id` is the 8-hex short id; interactive sessions have
-/// none, so `Session::is_attachable()` must be checked first.
+/// confirmation gate. `id` is the 8-hex short id; a session without one cannot
+/// be stopped, so `Session::is_attachable()` must be checked first.
 pub fn stop(id: &str) -> Result<(), AgentsError>;
 
 /// `claude logs <id>`. Output is a RAW ANSI/PTY DUMP including alt-screen setup
@@ -743,14 +712,6 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
 ///
 /// with `<claude>` and `<id>` passed through `sh_quote`.
 pub fn attach_pane_cmd(id: &str) -> String;
-
-/// Shell command for a pane running a NEW interactive session in `cwd`.
-///
-/// Produces exactly:
-///   cd <cwd> || { printf '[ccmux] cannot cd to %s\n' <cwd>; read _; exit 1; }; <claude>; rc=$?; printf '\n[ccmux] claude exited (rc=%s). press enter to close pane.\n' "$rc"; read _
-///
-/// with `<cwd>` and `<claude>` passed through `sh_quote`.
-pub fn interactive_pane_cmd(cwd: &str) -> String;
 
 // ── ANSI ────────────────────────────────────────────────────────────────────
 
@@ -837,16 +798,15 @@ pub enum Confirm {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
-    /// `n` — two fields: 0 = cwd, 1 = task text.
+    /// `n` — two fields: 0 = cwd, 1 = task text. The only prompt: `c` and its
+    /// `NewInteractive` variant are gone (§8.7).
     NewBackground,
-    /// `c` — one field: cwd.
-    NewInteractive,
 }
 
 #[derive(Debug, Clone)]
 pub struct Prompt {
     pub kind: PromptKind,
-    /// `NewBackground`: ["<cwd>", "<task>"]. `NewInteractive`: ["<cwd>"].
+    /// `NewBackground`: ["<cwd>", "<task>"].
     pub fields: Vec<String>,
     pub focus: usize,
     pub cursor: usize,
@@ -913,13 +873,6 @@ pub struct App {
     // tmux
     pub map: PaneMap,
     pub map_dirty: bool,
-    /// TRANSIENT resolution cache for interactive sessions, rebuilt from /proc
-    /// every tick and NEVER persisted to `@ccmux_map`.
-    /// session_id -> the ccmux pane hosting it (§5.4 first pass).
-    /// Interactive sessions get no map entry (§5.5) because they have no
-    /// session_id at open time; this cache is what makes their open marker,
-    /// their `Enter` jump, and §8.5's refusal check work.
-    pub interactive_panes: std::collections::BTreeMap<String, PaneId>,
     pub sidebar_pane: Option<PaneId>,
     pub panes: Vec<PaneInfo>,
     /// True when running outside tmux: list/filter/refresh/logs work, every
@@ -949,14 +902,13 @@ impl App {
     ///   1. now_ms = Utc::now().timestamp_millis()
     ///   2. panes = list_panes_in_session(tmux_session)   [skipped when degraded]
     ///   3. map.reconcile(&panes) -> map_dirty |= changed
-    ///   4. agents::poll() -> sessions (on Err: keep last good, bump fail_streak)
-    ///   5. rebuild `interactive_panes`: for every session with
-    ///      `kind == Interactive`, tmux::resolve_pane_for_pid(pid, &panes)
-    ///      [skipped when degraded; cleared and rebuilt, never merged]
-    ///   6. rebuild rows, re-anchor selection by selected_key
-    ///   7. flush the map if map_dirty
-    ///   8. pin_sidebar (unconditional, §1.3)
-    ///   9. last_poll = Instant::now()
+    ///   4. agents::poll() -> sessions, MINUS every `kind == Interactive` row
+    ///      (on Err: keep last good, bump fail_streak). The exclusion is a
+    ///      display policy and lives in `apply_poll`, not in the parser.
+    ///   5. rebuild rows, re-anchor selection by selected_key
+    ///   6. flush the map if map_dirty
+    ///   7. pin_sidebar (unconditional, §1.3)
+    ///   8. last_poll = Instant::now()
     pub fn tick(&mut self);
 
     /// Poll interval in force: `interval`, or 10s once `fail_streak >= 3`.
@@ -971,14 +923,13 @@ impl App {
 
     // ── read-only accessors used by ui.rs ────────────────────────────────────
     pub fn selected_session(&self) -> Option<&Session>;
-    /// First live pane showing `session_id`: the reconciled `map` first, then
-    /// the transient `interactive_panes` cache. Both are ccmux-scoped, so a
-    /// `Some` result is always safe to pass to an R2-gated mutation.
+    /// First live pane showing `session_id`, from the reconciled `map` and
+    /// nothing else. The map is ccmux-scoped, so a `Some` result is always
+    /// safe to pass to an R2-gated mutation.
     pub fn pane_of(&self, session_id: &str) -> Option<PaneId>;
     /// `#{pane_index}` of `pane`, for the sidebar's pane badge.
     pub fn pane_index_of(&self, pane: &PaneId) -> Option<u32>;
-    /// `pane_of(session_id).is_some()`. Drives the §6.4 open marker for both
-    /// background (map) and interactive (/proc cache) sessions.
+    /// `pane_of(session_id).is_some()`. Drives the §6.4 open marker.
     pub fn is_open(&self, session_id: &str) -> bool;
 
     // ── selection ────────────────────────────────────────────────────────────
@@ -1153,8 +1104,6 @@ at exactly two tmux calls (`list-panes`, `resize-pane`).
       //   and the operator must still be able to close it with `x`.
 3. app.map_dirty |= changed
 4. app.panes = live
-   // `interactive_panes` is NOT reconciled here: tick() step 5 clears and
-   // rebuilds it wholesale from /proc, so it cannot go stale.
 5. if app.sidebar_pane is absent from `live`:
       app.sidebar_pane = tmux::get_user_option(session, "@ccmux_sidebar")
                             .and_then(|s| PaneId::parse(&s))
@@ -1171,47 +1120,21 @@ retargeted.
 
 ### 5.4 Resolving interactive sessions via /proc
 
-Background sessions are daemon-owned: their pid is not a descendant of any pane,
-so `resolve_pane_for_pid` returns `None` for them and that is correct, not an
-error. They are reached only through `claude attach <id>`.
+**Removed.** ccmux lists only background sessions (§3.5, `apply_poll`), so no
+interactive row can be selected and there is nothing to resolve. Gone with it:
+the /proc ancestry walk (`ppid_of`, `ancestry`, `resolve_pane_for_pid`), the
+server-wide `list-panes -a` enumeration (`list_panes_all`), and
+`focus_foreign_pane`. Background sessions are daemon-owned — their pid is not a
+descendant of any pane — so the walk had no second use, and its removal is what
+lets R2 hold without exception and R3 forbid `-a` outright.
 
-Interactive sessions **are** descendants of their pane's process. Resolution:
-
-```
-1. chain = tmux::ancestry(sess.pid, 32)
-       read /proc/<pid>/stat, take ppid, repeat until pid <= 1 / repeat / depth
-2. first pass:  match `chain` against PaneInfo::pid over app.panes  (ccmux only)
-                -> found: the session is open inside ccmux. This pass runs for
-                   EVERY interactive session on EVERY tick (`tick()` step 5) and
-                   populates `App::interactive_panes`, which is what
-                   `is_open()` / `pane_of()` consult for interactive rows.
-                   `Enter` then becomes select-pane.
-                Cost: one `/proc/<pid>/stat` read per ancestry hop, only for
-                interactive sessions (typically 1-2 of them), depth-capped at 32.
-                Cheap enough to run unconditionally; do not cache across ticks,
-                because a pid's pane can change when the operator moves it.
-3. second pass: only when the first fails AND the operator pressed a jump key.
-                match `chain` against tmux::list_panes_all()   [READ-ONLY, R3]
-                -> found in a foreign tmux session S:
-                     Enter => tmux::focus_foreign_pane(S, pane)
-                              flash "jumped to <S>:<w>.<p> (outside ccmux)"
-                -> not found: flash "interactive session is not in a tmux pane"
-```
-
-`/proc/<pid>/stat` parse rule, restated because getting it wrong is a silent
-bug: field 2 is `comm`, wrapped in parentheses, and it **may contain spaces and
-parentheses** (a process named `foo bar) baz`). Split on the **last** `)` in the
-line; the tail splits on whitespace as `[state, ppid, ...]`; `ppid` is index 1.
-Verified: `/proc/<pid>/stat` for a zsh under an interactive Claude session
-yielded `comm=(zsh) state=S ppid=2936154`, and 2936154 is exactly the
-`kind:"interactive"` pid reported by `claude agents --json`.
+The section number is kept so §5.5 does not move.
 
 ### 5.5 Map mutations
 
 | Event | Map change |
 |---|---|
 | `o` / `s` / `Enter`-opens a background session | insert `{new_pane -> entry}`; `map_dirty = true` |
-| `c` creates an interactive session | **no entry** in `@ccmux_map` — there is no `session_id` yet. The next tick's step 5 resolves it by /proc into the transient `interactive_panes` cache. |
 | `x` closes a pane | `map.remove(pane)`; `map_dirty = true` |
 | pane disappears (user killed it, or `claude attach` exited and the pane closed) | dropped by `reconcile` |
 | `S` stops a session | no map change; its pane stays until the operator closes it |
@@ -1315,9 +1238,6 @@ pane" required by the brief:
 | Completed | `✓` | `p.green` | done |
 | `Status::Unknown` / `State::Unknown` | `?` | `p.purple` | forward-compat |
 
-Interactive sessions additionally render their **name** in `p.purple` instead of
-`p.fg`, so the two kinds are separable at a glance without a second glyph column.
-
 **Pane badge** — the tmux `#{pane_index}` of the pane showing this session,
 right-aligned immediately left of the age, in `p.aqua`, formatted `%N` (e.g.
 `2`). Shown only when the session is open and `W >= 34`.
@@ -1352,7 +1272,7 @@ Three lines describing the **selected** session, all `p.gray` except values:
 ```
 
 - `cwd` uses `model::shorten_cwd(cwd, app.home.as_deref(), W - 9)`.
-- For interactive sessions line 2 reads `id      —  interactive  busy`.
+- A session with no short id reads `id      —  background  busy` (§9.7).
 - When a session is open, append ` · pane 2` to line 2 in `p.aqua`.
 - Empty selection (no sessions, or all filtered out) renders three blank lines.
 
@@ -1377,8 +1297,8 @@ Claude pane.
 - **Confirm (`S`)** — `Mode::Confirm`. Centred block, `p.red` border, titled
   ` stop session `, body = the session name and short id, footer =
   `y: stop    n/Esc: cancel`. Detail in §8.2.
-- **Prompt (`n`, `c`)** — `Mode::Prompt`. Block titled ` new background session `
-  or ` new interactive session `. One line per field, the focused field prefixed
+- **Prompt (`n`)** — `Mode::Prompt`. Block titled ` new background session `.
+  One line per field, the focused field prefixed
   `> ` and carrying a reverse-video cursor cell at `prompt.cursor`; unfocused
   fields dim. Footer = `Tab: field   Enter: run   Esc: cancel`.
 - **Filter (`/`)** — no block; the footer becomes the input line: `/` + buffer +
@@ -1412,8 +1332,8 @@ text, ids: all are argv elements. This makes them immune to spaces, quotes,
 tmux's `shell-command` argument (the trailing argument of `new-session` and
 `split-window`) is executed by tmux via `/bin/sh -c`. That is the only string in
 the program that a shell will parse. It is built solely by
-`agents::attach_pane_cmd`, `agents::interactive_pane_cmd`, and the launcher's
-sidebar command, and every interpolated value passes through `tmux::sh_quote`.
+`agents::attach_pane_cmd` and the launcher's sidebar command, and every
+interpolated value passes through `tmux::sh_quote`.
 
 ```rust
 /// POSIX-safe single-quoting.
@@ -1481,10 +1401,9 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `Enter` | **open or jump** — §8.3 | no |
 | `o` | open in a **vertical** split (vim `:vsplit`, side by side, tmux `-h`) | no |
 | `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`) | no |
-| `x` | close the pane showing a **background** session — agent keeps running. **Refused for interactive sessions** (§8.5) | no |
+| `x` | close the pane showing a session — the agent keeps running (§8.5) | no |
 | `S` | **stop the session** — requires confirmation | **YES** (§8.2) |
 | `n` | dispatch a new background session with a typed task | no |
-| `c` | new interactive session in a chosen cwd | no |
 | `L` | show `claude logs` for this session (ANSI-stripped) | no |
 | `/` | enter filter mode | no |
 | `a` | toggle visibility of the Completed group | no |
@@ -1505,9 +1424,9 @@ anywhere else.
 
 Pressing `S`:
 
-1. If the selected session is interactive (`id.is_none()`):
-   flash `cannot stop an interactive session` (`MsgLevel::Warn`) and stop. No
-   modal. `claude stop` requires a short id and interactive sessions have none.
+1. If the selected session has no short id (`id.is_none()`):
+   flash `no short id — cannot stop this session` (`MsgLevel::Warn`) and stop.
+   No modal. `claude stop` requires a short id (§9.7).
 2. If the selected session is already in `Group::Completed`:
    flash `session already completed` (Warn) and stop.
 3. Otherwise enter `Mode::Confirm(Confirm::StopSession { .. })` and render:
@@ -1546,24 +1465,21 @@ Confirmation rules, all mandatory:
 
 Every other verb is non-destructive by construction and takes no confirmation:
 `x` is proven safe (PROBE-FINDINGS §3: killing the pane leaves the agent
-running), `q` only exits the sidebar process, `n`/`c` only create.
+running), `q` only exits the sidebar process, `n` only creates.
 
 ### 8.3 `Enter` semantics
 
 ```
 sel = selected_session() or return
 
-if sel.is_attachable():                       # background, has short id
-    if let Some(pane) = app.pane_of(sel.session_id):
-        tmux::select_pane(session, pane)      # jump to the existing pane
-        flash "jumped to pane <index>"
-    else:
-        act_open(SplitDir::Vertical)          # identical to `o`
-else:                                          # interactive, no short id
-    §5.4 resolution:
-      found in a ccmux pane   -> select_pane, flash "jumped to pane <index>"
-      found in a foreign pane -> focus_foreign_pane, flash "jumped to <sess>:<w>.<p> (outside ccmux)"
-      not found               -> flash "interactive session is not in a tmux pane" (Warn)
+if not sel.is_attachable():                   # no short id (§9.7)
+    flash "no short id — cannot open this session" (Warn); return
+
+if let Some(pane) = app.pane_of(sel.session_id):
+    tmux::select_pane(session, pane)          # jump to the existing pane
+    flash "jumped to pane <index>"
+else:
+    act_open(SplitDir::Vertical)              # identical to `o`
 ```
 
 Jumping rather than re-splitting is a UX preference, not a correctness
@@ -1576,7 +1492,7 @@ a second view of the same session, `o` and `s` always split unconditionally.
 act_open(dir):
   1. degraded          -> flash "not inside tmux — open unavailable" (Warn); return
   2. sel = selected_session() or return
-  3. !sel.is_attachable() -> delegate to the interactive branch of §8.3; return
+  3. !sel.is_attachable() -> flash "no short id — cannot open this session" (Warn); return
   4. anchor = split_anchor()
   5. cmd  = agents::attach_pane_cmd(sel.id)
   6. pane = tmux::split(session, anchor, dir, cmd)?
@@ -1605,33 +1521,26 @@ sessions in a row without leaving the list.
 ```
 1. degraded -> flash "not inside tmux — close unavailable" (Warn); return
 2. sel = selected_session() or return
-3. sel.kind == Interactive
-       -> flash "refusing: closing this pane would end the interactive
-                 session — exit Claude inside the pane instead" (Warn)
-          return
-4. pane = app.pane_of(sel.session_id)
+3. pane = app.pane_of(sel.session_id)
    none -> flash "not open" (Warn); return
-5. pane == sidebar_pane -> flash "refusing to close the sidebar" (Warn); return
-6. tmux::kill_pane(session, pane)   [R2-gated]
-7. map.remove(pane); map_dirty = true; save_map
-8. tmux::pin_sidebar(...)
-9. flash "closed pane <index> — agent still running" (Info)
+4. pane == sidebar_pane -> flash "refusing to close the sidebar" (Warn); return
+5. tmux::kill_pane(session, pane)   [R2-gated]
+6. map.remove(pane); map_dirty = true; save_map
+7. tmux::pin_sidebar(...)
+8. flash "closed pane <index> — agent still running" (Info)
 ```
 
-**Step 3 is a correctness gate, not politeness.** PROBE-FINDINGS §3 verified
-that killing a pane leaves the agent running — *for background sessions*, which
-are daemon-owned and whose pid is not a descendant of any pane (§4 of the same
-document). Interactive sessions are the opposite: they **are** descendants of
-their pane's process, so `kill-pane` SIGHUPs the Claude process and ends the
-session. Applying the background result to an interactive row would silently
-destroy work while telling the operator "agent still running".
+**`x` is unconditionally safe here, and only because of what is listed.**
+PROBE-FINDINGS §3 verified that killing a pane leaves the agent running — *for
+background sessions*, which are daemon-owned and whose pid is not a descendant
+of any pane (§4 of the same document). Interactive sessions are the opposite:
+they **are** descendants of their pane's process, so `kill-pane` would SIGHUP
+Claude and end the session. Earlier drafts carried a refusal step for that case.
+It is now **gone, not relaxed**: §3.5's `apply_poll` excludes interactive rows,
+so no such row can ever be selected, and the refusal had nothing left to fire
+on. This keeps `S` the only destructive binding in v1 (§8.2).
 
-So `x` is refused for interactive sessions rather than routed through a
-confirmation. This keeps `S` the only destructive binding in v1 (§8.2), and the
-operator's route to ending an interactive session is the one Claude already
-gives them: exit it inside its own pane.
-
-Step 9's wording matters: it is the operator-facing statement of
+Step 8's wording matters: it is the operator-facing statement of
 PROBE-FINDINGS §3, shown every time, so nobody ever confuses `x` with `S`.
 
 ### 8.6 `n` — dispatch a new background session
@@ -1662,18 +1571,13 @@ PROBE-FINDINGS §3, shown every time, so nobody ever confuses `x` with `S`.
 
 ### 8.7 `c` — new interactive session in a chosen cwd
 
-`Mode::Prompt(NewInteractive)`, one field (`cwd`), prefilled from the selected
-session's cwd or `$PWD`.
+**Removed.** The `c` binding, `Mode::Prompt(NewInteractive)`, and
+`agents::interactive_pane_cmd` are gone. ccmux does not start interactive
+sessions because it does not list them (§3.5, `apply_poll`): `c` would have
+opened a pane and then had no row to show for it. Start interactive Claude in a
+tmux pane the ordinary way.
 
-- `Enter`: validate `is_dir`, then
-  `tmux::split(session, split_anchor(), SplitDir::Vertical, agents::interactive_pane_cmd(cwd))`,
-  then `pin_sidebar`.
-- **No `@ccmux_map` entry is written** — the session has no `session_id` until
-  Claude starts. The next poll surfaces it as `kind: interactive`, and `tick()`
-  step 5's /proc walk binds it to the pane in `App::interactive_panes`, which is
-  what renders its open marker. Expect a 1-tick delay before the marker appears;
-  that is correct behaviour, not a bug to paper over.
-- Flash `started interactive session in <shortened cwd>` (Info).
+The section number is kept so §8.8 and §8.9 do not move.
 
 ### 8.8 Filter mode (`/`)
 
@@ -1746,8 +1650,8 @@ Two shapes, both non-fatal:
   state.
 - `claude agents --json` errors or hangs → §9.1.
 
-`n` and `c` remain available with an empty list (both fall back to `$PWD`), so
-the operator can bootstrap from zero sessions.
+`n` remains available with an empty list (it falls back to `$PWD`), so the
+operator can bootstrap from zero sessions.
 
 ### 9.4 A session vanishes between poll and open
 
@@ -1778,7 +1682,7 @@ Unavoidable: the poll is up to 2.5 s stale.
   - Works: polling, list, grouping, `/`, `a`, `r`, `L`, `?`, `j/k/g/G/Tab`, `n`
     (dispatch is pure `claude --bg`, no tmux involved), `S` (pure `claude stop`).
   - Refuses with `flash("not inside tmux — <verb> unavailable", Warn)`:
-    `Enter`, `o`, `s`, `x`, `c`.
+    `Enter`, `o`, `s`, `x`.
   - `PaneMap` is held in memory only; `load_map`/`save_map` are skipped.
   - Header indicator is a yellow `○`.
   This is what makes `ccmux sidebar` runnable standalone for development without
@@ -1792,19 +1696,22 @@ emphatically not a second `new-session`: re-running `ccmux` inside `ccmux` must
 be a no-op, never a duplicate. Launched from a *different* tmux session →
 `switch-client -t ccmux` (§1.2 step 6).
 
-### 9.7 Sessions with `id` absent (interactive)
+### 9.7 Sessions with `id` absent
 
-`Session::is_attachable()` is `false` and gates everything that needs a short id:
+`Session::is_attachable()` is `false` and gates every verb that needs the 8-hex
+short id. Interactive sessions never have one — but they are never listed
+(§3.5, `apply_poll`), so they are not what this gate is for any more. It is
+still live: `parse_sessions` honours an explicit `kind: "background"` even when
+the CLI omits `id`, so a **listed** row can reach it.
 
-| Verb | Interactive behaviour |
+| Verb | Behaviour with no short id |
 |---|---|
-| `Enter` | §5.4 /proc resolution → jump, or `interactive session is not in a tmux pane` |
-| `o` / `s` | same as `Enter` — there is no `claude attach` for them, so a split would have nothing to run |
-| `x` | **refused** — the pane owns the process, so killing it ends the session (§8.5 step 3) |
-| `S` | refused: `cannot stop an interactive session` (§8.2 step 1) |
-| `L` | refused: `no logs for an interactive session` |
-| grouping | never `Completed` (no `state` field); Busy → Working, Idle → Idle |
-| rendering | name in `p.purple`; detail block shows `id —  interactive` |
+| `Enter` / `o` / `s` | refused: `no short id — cannot open this session`. There is no `claude attach` without one, so a split would have nothing to run |
+| `x` | unaffected — it targets the *pane*, and `pane_of` is keyed on `session_id`, not on the short id |
+| `S` | refused: `no short id — cannot stop this session` (§8.2 step 1) |
+| `L` | refused: `no short id — no logs for this session` |
+| grouping | unchanged: `group()` reads `state`/`status`, never `id` |
+| rendering | detail block line 2 reads `id      —  background  <status>` (§6.5) |
 
 ### 9.8 Other edges, each with a pinned answer
 
@@ -1852,15 +1759,12 @@ be a no-op, never a duplicate. Launched from a *different* tmux session →
 - `PaneId::parse`: `"%25"` → Some; `""`, `"25"`, `"%"`, `"%2a"`,
   `"agents:2.1"` → None.
 - `sh_quote` — the full §7 table.
-- `ppid_of` on a `/proc/<pid>/stat` fixture whose `comm` is `(a b) c)` returns
-  the correct ppid (this is the last-`)` rule).
 - `PaneMap::reconcile` drops absent panes, keeps present ones, returns the right
   `changed` flag; round-trips through serde byte-identically.
 - `SplitDir::Vertical.tmux_flag() == "-h"`, `Horizontal → "-v"`.
 
 **agents.rs (Agents)**
 - `attach_pane_cmd("1c45d64f")` equals the §3.3 template exactly.
-- `interactive_pane_cmd("/home/dev/my projects")` single-quotes the cwd.
 - `strip_ansi` removes CSI/OSC/two-char escapes and keeps `\n`; a raw
   alt-screen preamble (`\x1b[?1049h\x1b[H\x1b[2J`) strips to empty.
 
@@ -1870,14 +1774,14 @@ be a no-op, never a duplicate. Launched from a *different* tmux session →
 - `list_viewport_rows(0..=12)` matches the §6.1 table.
 
 **app.rs (Integrator)**
-- `on_key('S')` on an interactive row leaves `mode == Normal` and sets a Warn
-  message.
-- `on_key('x')` on an interactive row calls **no** tmux mutation and sets a Warn
-  message — this is the §8.5 step 3 gate, and it is the test that stops someone
-  "simplifying" the interactive branch back into the background path.
-- `pane_of` resolves a background session through `map` and an interactive
-  session through `interactive_panes`, and returns `None` for a session in
-  neither.
+- `apply_poll` on a payload containing a `kind: "interactive"` row leaves that
+  row out of `app.sessions` — the §3.5 listing policy, and the test that stops
+  someone "simplifying" the filter away.
+- `on_key('S')` on a row with no short id leaves `mode == Normal` and sets a
+  Warn message.
+- `on_key('c')` is inert: no mode change, no prompt, no message (§8.7).
+- `pane_of` resolves a session through `map` and returns `None` for one that is
+  not in it.
 - `on_key('S')` then `on_key('n')` leaves `mode == Normal` and calls nothing.
 - The confirm modal captures the short id: mutate `app.sessions` between `S` and
   `y`, and the captured id is still the one used.
@@ -1940,7 +1844,7 @@ not spend implementation time re-deriving them.
 | `split-window -h -b -t <leftmost>` inserts a pane to the **left** and it becomes `pane_index 1`. | Basis of sidebar healing, §1.2 step 5b. |
 | `--` is accepted before the shell-command by both `new-session` and `split-window`, and guards a command starting with `-`. | Basis of RULE Q3. |
 | `set-option -t <sess> status off` works per-session. | §1.2 step 4e. |
-| `/proc/<pid>/stat` gives `comm` parenthesized in field 2; ppid is the 2nd whitespace token after the **last** `)`. | Confirmed on a live shell whose ppid was the `kind:"interactive"` pid reported by `claude agents --json`. |
+| `/proc/<pid>/stat` gives `comm` parenthesized in field 2; ppid is the 2nd whitespace token after the **last** `)`. | Confirmed on a live shell whose ppid was the `kind:"interactive"` pid reported by `claude agents --json`. **Nothing consumes this any more** — §5.4 and the whole /proc walk were removed. |
 | `claude agents --json` output matches PROBE-FINDINGS §1 exactly on the current build (2.1.245), including `id`/`state` absent for `kind:"interactive"`. | Re-read during authoring. |
 | `claude --bg, --background` takes the prompt as a **positional** argument. | `claude --help`. Basis of RULE Q4. |
 
@@ -1974,7 +1878,7 @@ behaviour, the pin is superseded by this appendix.
 | §4.2 | `agents::poll()` is synchronous and unbounded. | Still synchronous and thread-free, now bounded by `POLL_TIMEOUT = 5s`; the child is killed and reaped on expiry and the timeout surfaces as §9.1's red indicator plus `agents: timed out after 5s`. A `tick()` slower than 1 s also drains buffered input, so keys typed at a frozen UI are not replayed against it. |
 | §6.6 | Row budgets count chars; the overflow is "cosmetic". | Budgets count display columns (`model::display_width`). A CJK session name was deleting the age column, the pane badge and the selection bar, not merely overflowing. |
 | §8.9 | `help_scroll` caps at 64; the logs scroll caps at `len - 1`. | Both clamp to `len - overlay_viewport`, written by `main.rs` each frame, so `k` after `G` always moves the view. |
-| §6.8 | The footer truncates to one line. | A message wider than the sidebar takes over the detail block and wraps. §8.5's interactive refusal and its "agent still running" wording do not fit 34 columns. |
+| §6.8 | The footer truncates to one line. | A message wider than the sidebar takes over the detail block and wraps. §8.5's "agent still running" wording and §9.7's `no short id — …` refusals do not fit 34 columns. |
 | §8.8, §8.1 | `Esc` in Normal quits when no filter is set. | `Esc` clears the filter and is otherwise inert; `q` and `Ctrl-c` remain the quit keys. |
 | §6.2 | The header shows `matching/total` only while `/` is active. | It shows the ratio whenever fewer than all sessions are listed, so `a` (hide Completed) cannot leave the header contradicting the list. |
 | §6.5 | The detail block renders `Status::Unknown("")` as `?`. | A `state: "done"` session renders `done`, matching `status_glyph`. The live payload omits `status` on almost every completed row. |

@@ -542,4 +542,58 @@ mod tests {
         }
     }
 
+    /// SPEC.md is the design contract, and `src/` cites it by section number in
+    /// ~20 comments. When the interactive machinery was deleted the spec was
+    /// briefly left declaring nine functions and four struct fields that no
+    /// longer exist, which silently turned those citations into lies. This
+    /// pins the half a test can actually check: no removed item may reappear
+    /// as a DECLARATION. Prose that says a thing is gone is fine and expected
+    /// — the tombstoned §5.4 and §8.7 are full of it — so every needle below
+    /// is a signature or a field, never a bare name.
+    #[test]
+    fn the_spec_declares_nothing_the_crate_no_longer_has() {
+        const SPEC: &str = include_str!("../SPEC.md");
+        for needle in [
+            // tmux.rs: the /proc ppid walk and the server-wide enumeration
+            "pub fn ppid_of",
+            "pub fn ancestry",
+            "pub fn resolve_pane_for_pid",
+            "pub fn list_panes_all",
+            // tmux.rs: the one call that ever targeted a foreign session
+            "pub fn focus_foreign_pane",
+            // agents.rs: the `c` binding's command template
+            "pub fn interactive_pane_cmd",
+            // struct fields
+            "pub interactive_panes",
+            "pub pid: i32",
+            "pub session_name: String",
+            // the `NewInteractive` prompt variant, as a variant and not as prose
+            "    NewInteractive,",
+        ] {
+            assert!(
+                !SPEC.contains(needle),
+                "SPEC.md still declares {needle:?}, which the crate does not have"
+            );
+        }
+        // The `c` row of the §8.1 keymap table, and the `-a` enumeration R3
+        // used to permit. Both are behaviour the spec would be promising.
+        assert!(!SPEC.contains("| `c` |"), "SPEC.md still lists a `c` keybinding");
+        assert!(
+            !SPEC.contains("permitted in exactly one place"),
+            "R3 still carves out an exception for `list-panes -a`"
+        );
+    }
+
+    /// The same rule for the README, which is what an operator reads before the
+    /// spec: it must not promise a key the build does not bind.
+    #[test]
+    fn the_readme_documents_no_c_keybinding() {
+        const README: &str = include_str!("../README.md");
+        assert!(!README.contains("| `c` |"), "README lists a `c` keybinding");
+        assert!(
+            !README.contains("`n`, `c`"),
+            "README still pairs `c` with `n` in the mode table"
+        );
+    }
+
 }

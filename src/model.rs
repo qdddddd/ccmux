@@ -79,11 +79,11 @@ impl Group {
 // ── Session ─────────────────────────────────────────────────────────────────
 
 /// One row from `claude agents --json`. Field names mirror the CLI's JSON
-/// exactly; `pid` is UNSTABLE across attach/detach and is used ONLY for the
-/// /proc ancestry walk, never as an identity key. Identity is `session_id`.
+/// exactly. Identity is `session_id` and nothing else: the CLI's `pid` is
+/// UNSTABLE across attach/detach, and with the /proc ancestry walk gone
+/// nothing reads it, so it is no longer carried.
 #[derive(Debug, Clone)]
 pub struct Session {
-    pub pid: i32,
     /// 8-hex short id. `None` for `kind == Interactive`.
     pub id: Option<String>,
     /// UUID. Stable. THE primary key everywhere in ccmux.
@@ -175,7 +175,6 @@ impl std::error::Error for ParseError {}
 /// (PROBE-FINDINGS §1), which is why they map to `Option` in `Session` too.
 #[derive(Debug, Deserialize)]
 struct RawSession {
-    pid: Option<i64>,
     id: Option<String>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
@@ -193,8 +192,6 @@ impl RawSession {
     ///
     /// Defaults for the remaining absent fields (the CLI always emits them
     /// today; these exist so a future version cannot blank the sidebar):
-    ///   pid        -> 0        (only ever used for the /proc walk, which fails
-    ///                           closed on pid 0)
     ///   startedAt  -> 0        (renders as a very old age, never panics)
     ///   kind       -> inferred from `id` presence: an `id` means background
     ///   status     -> Status::Unknown("") -> the `?` glyph, groups as Idle
@@ -227,7 +224,6 @@ impl RawSession {
         });
 
         Some(Session {
-            pid: self.pid.unwrap_or(0).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
             id,
             session_id,
             cwd,
@@ -637,7 +633,6 @@ mod tests {
 
     fn sess(id: Option<&str>, status: Status, state: Option<State>) -> Session {
         Session {
-            pid: 1,
             id: id.map(str::to_string),
             session_id: format!("uuid-{}", id.unwrap_or("interactive")),
             cwd: "/tmp".into(),
@@ -659,7 +654,6 @@ mod tests {
         assert_eq!(s[0].status, Status::Busy);
         assert_eq!(s[0].state, Some(State::Working));
         assert_eq!(s[0].started_at, 1787626475282);
-        assert_eq!(s[0].pid, 2877291);
         assert!(s[0].is_attachable());
 
         let interactive = &s[3];

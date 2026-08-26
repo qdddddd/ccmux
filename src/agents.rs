@@ -18,9 +18,8 @@
 //!
 //! SPEC NOTE (RULE Q1): every function here builds an argv via
 //! `Command::new(prog).args([..])`. Nothing in this module spawns `sh -c`. The
-//! only shell strings produced are `attach_pane_cmd` / `interactive_pane_cmd`,
-//! which are handed to tmux (RULE Q2) and quote every interpolation through
-//! `tmux::sh_quote`.
+//! only shell string produced is `attach_pane_cmd`, which is handed to tmux
+//! (RULE Q2) and quotes every interpolation through `tmux::sh_quote`.
 
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -60,7 +59,7 @@ impl std::fmt::Display for AgentsError {
             },
             AgentsError::Parse(ParseError::Json { excerpt, .. }) => write!(f, "bad json: {excerpt}"),
             AgentsError::Parse(ParseError::NotAnArray) => write!(f, "bad json: not a JSON array"),
-            AgentsError::NotAttachable => write!(f, "session has no short id (interactive)"),
+            AgentsError::NotAttachable => write!(f, "session has no short id"),
         }
     }
 }
@@ -210,8 +209,8 @@ pub fn poll() -> Result<Payload, AgentsError> {
 // ── Verbs ───────────────────────────────────────────────────────────────────
 
 /// `claude stop <id>` — DESTRUCTIVE. Callers MUST have passed §8.2's
-/// confirmation gate. `id` is the 8-hex short id; interactive sessions have
-/// none, so `Session::is_attachable()` must be checked first.
+/// confirmation gate. `id` is the 8-hex short id; a session without one cannot
+/// be stopped, so `Session::is_attachable()` must be checked first.
 pub fn stop(id: &str) -> Result<(), AgentsError> {
     // Fail closed rather than invoking `claude stop ''`: an empty id is what an
     // unchecked `Option<String>` collapses to, and this is the destructive verb
@@ -305,23 +304,6 @@ pub fn attach_pane_cmd(id: &str) -> String {
     )
 }
 
-/// Shell command for a pane running a NEW interactive session in `cwd`.
-///
-/// Produces exactly:
-///   cd <cwd> || { printf '[ccmux] cannot cd to %s\n' <cwd>; read _; exit 1; }; <claude>; rc=$?; printf '\n[ccmux] claude exited (rc=%s). press enter to close pane.\n' "$rc"; read _
-///
-/// with `<cwd>` and `<claude>` passed through `sh_quote`.
-pub fn interactive_pane_cmd(cwd: &str) -> String {
-    let q = sh_quote(cwd);
-    format!(
-        "cd {q} || {{ printf '[ccmux] cannot cd to %s\\n' {q}; read _; exit 1; }}; \
-         {}; rc=$?; \
-         printf '\\n[ccmux] claude exited (rc=%s). press enter to close pane.\\n' \"$rc\"; \
-         read _",
-        sh_quote(&claude_bin())
-    )
-}
-
 // ── ANSI ────────────────────────────────────────────────────────────────────
 
 /// Strip CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL | ESC \`), and two-char
@@ -402,20 +384,6 @@ mod tests {
             attach_pane_cmd("1c45d64f"),
             "claude attach 1c45d64f; rc=$?; printf '\\n[ccmux] session exited (rc=%s). press enter to close pane.\\n' \"$rc\"; read _"
         );
-    }
-
-    #[test]
-    fn interactive_pane_cmd_single_quotes_the_cwd() {
-        assert_eq!(
-            interactive_pane_cmd("/home/dev/my projects"),
-            "cd '/home/dev/my projects' || { printf '[ccmux] cannot cd to %s\\n' '/home/dev/my projects'; read _; exit 1; }; claude; rc=$?; printf '\\n[ccmux] claude exited (rc=%s). press enter to close pane.\\n' \"$rc\"; read _"
-        );
-    }
-
-    #[test]
-    fn interactive_pane_cmd_leaves_a_plain_cwd_unquoted() {
-        let cmd = interactive_pane_cmd("/home/dev/projects/af");
-        assert!(cmd.starts_with("cd /home/dev/projects/af || {"), "{cmd}");
     }
 
     #[test]

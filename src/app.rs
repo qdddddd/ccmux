@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::agents::{self, AgentsError};
-use crate::model::{self, Group, Kind, ParseError, Row, Session};
+use crate::model::{self, Group, ParseError, Row, Session};
 use crate::tmux::{self, HiddenSet, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TmuxError};
 
 /// How long a flashed footer message stays up (SPEC §6.8 item 2).
@@ -65,14 +65,12 @@ pub enum Confirm {
 pub enum PromptKind {
     /// `n` — two fields: 0 = cwd, 1 = task text.
     NewBackground,
-    /// `c` — one field: cwd.
-    NewInteractive,
 }
 
 #[derive(Debug, Clone)]
 pub struct Prompt {
     pub kind: PromptKind,
-    /// `NewBackground`: ["<cwd>", "<task>"]. `NewInteractive`: ["<cwd>"].
+    /// `NewBackground`: ["<cwd>", "<task>"].
     pub fields: Vec<String>,
     pub focus: usize,
     pub cursor: usize,
@@ -167,13 +165,6 @@ pub struct App {
     // tmux
     pub map: PaneMap,
     pub map_dirty: bool,
-    /// TRANSIENT resolution cache for interactive sessions, rebuilt from /proc
-    /// every tick and NEVER persisted to `@ccmux_map`.
-    /// session_id -> the ccmux pane hosting it (§5.4 first pass).
-    /// Interactive sessions get no map entry (§5.5) because they have no
-    /// session_id at open time; this cache is what makes their open marker,
-    /// their `Enter` jump, and §8.5's refusal check work.
-    pub interactive_panes: std::collections::BTreeMap<String, PaneId>,
     pub sidebar_pane: Option<PaneId>,
     pub panes: Vec<PaneInfo>,
     /// True when running outside tmux: list/filter/refresh/logs work, every
@@ -233,7 +224,6 @@ impl App {
 
             map: PaneMap::new(),
             map_dirty: false,
-            interactive_panes: std::collections::BTreeMap::new(),
             sidebar_pane: None,
             panes: Vec::new(),
             degraded,
@@ -287,13 +277,10 @@ impl App {
     ///      4b. on Ok ONLY: reconcile the dismissed set against the fresh poll
     ///      — 4 and 4b are `apply_poll`, which is where their whole policy
     ///      lives so it can be tested without shelling out to `claude`
-    ///   5. rebuild `interactive_panes`: for every session with
-    ///      `kind == Interactive`, tmux::resolve_pane_for_pid(pid, &panes)
-    ///      [skipped when degraded; cleared and rebuilt, never merged]
-    ///   6. rebuild rows, re-anchor selection by selected_key
-    ///   7. flush the map if map_dirty, and the dismissed set if hidden_dirty
-    ///   8. pin_sidebar (unconditional, §1.3)
-    ///   9. last_poll = Instant::now()
+    ///   5. rebuild rows, re-anchor selection by selected_key
+    ///   6. flush the map if map_dirty, and the dismissed set if hidden_dirty
+    ///   7. pin_sidebar (unconditional, §1.3)
+    ///   8. last_poll = Instant::now()
     pub fn tick(&mut self) {
         // 1
         self.now_ms = chrono::Utc::now().timestamp_millis();
@@ -304,28 +291,17 @@ impl App {
         // 4 + 4b
         self.apply_poll(agents::poll());
 
-        // 5 — cleared and rebuilt wholesale, never merged, so it cannot go stale.
-        self.interactive_panes.clear();
-        if !self.degraded {
-            for s in &self.sessions {
-                if s.kind == Kind::Interactive && s.pid > 0
-                    && let Some(info) = tmux::resolve_pane_for_pid(s.pid, &self.panes) {
-                        self.interactive_panes.insert(s.session_id.clone(), info.id);
-                    }
-            }
-        }
-
-        // 6
+        // 5
         self.rebuild_rows();
 
-        // 7
+        // 6
         self.save_map_now();
         self.save_hidden_now();
 
-        // 8 — unconditional (§1.3); this is what heals a manual resize.
+        // 7 — unconditional (§1.3); this is what heals a manual resize.
         self.pin_sidebar();
 
-        // 9
+        // 8
         self.last_poll = Instant::now();
     }
 
@@ -517,13 +493,11 @@ impl App {
         }
     }
 
-    /// First live pane showing `session_id`: the reconciled `map` first, then
-    /// the transient `interactive_panes` cache. Both are ccmux-scoped, so a
-    /// `Some` result is always safe to pass to an R2-gated mutation.
+    /// First live pane showing `session_id`, from the reconciled `map`. Every
+    /// entry in it is a pane ccmux opened inside `tmux_session`, so a `Some`
+    /// result is always safe to pass to an R2-gated mutation.
     pub fn pane_of(&self, session_id: &str) -> Option<PaneId> {
-        self.map
-            .pane_for_session(session_id)
-            .or_else(|| self.interactive_panes.get(session_id).cloned())
+        self.map.pane_for_session(session_id)
     }
 
     /// `#{pane_index}` of `pane`, for the sidebar's pane badge.
@@ -531,8 +505,7 @@ impl App {
         self.panes.iter().find(|p| &p.id == pane).map(|p| p.index)
     }
 
-    /// `pane_of(session_id).is_some()`. Drives the §6.4 open marker for both
-    /// background (map) and interactive (/proc cache) sessions.
+    /// `pane_of(session_id).is_some()`. Drives the §6.4 open marker.
     ///
     /// SPEC §3.5 surface. `ui.rs` resolves the marker through its own private,
     /// field-only helper so its no-panic matrix can render an `App` built by
@@ -678,9 +651,11 @@ impl App {
             return;
         };
         if !sel.is_attachable() {
-            // §9.7: there is no `claude attach` for an interactive session, so a
-            // split would have nothing to run. Delegate to the §5.4 jump.
-            self.act_jump_interactive();
+            // §9.7: `claude attach` takes the 8-hex short id, so without one a
+            // split would have nothing to run. Rare but reachable on a listed
+            // row: `parse_sessions` honours an explicit `kind: "background"`
+            // even when the CLI omitted `id`.
+            self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
         let session_id = sel.session_id.clone();
@@ -731,7 +706,7 @@ impl App {
             return;
         };
         if !sel.is_attachable() {
-            self.act_jump_interactive();
+            self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
         let session_id = sel.session_id.clone();
@@ -752,19 +727,13 @@ impl App {
         let Some(sel) = self.selected_session() else {
             return;
         };
-        // STEP 3 IS A CORRECTNESS GATE, NOT POLITENESS (SPEC §8.5).
-        // PROBE-FINDINGS §3 proves `kill-pane` leaves the agent running only for
-        // BACKGROUND sessions, which are daemon-owned. An interactive session IS
-        // a descendant of its pane's pid (PROBE §4), so killing the pane would
-        // SIGHUP Claude and destroy in-flight work while we told the operator
-        // "agent still running". Refuse before any tmux call is issued.
-        if sel.kind == Kind::Interactive {
-            self.flash(
-                "refusing: closing this pane would end the interactive session — exit Claude inside the pane instead",
-                MsgLevel::Warn,
-            );
-            return;
-        }
+        // §8.5's interactive refusal is GONE, not relaxed — the spec no
+        // longer carries the step at all.
+        // PROBE-FINDINGS §3 proves `kill-pane` leaves the agent running for
+        // BACKGROUND sessions, which are daemon-owned — and `apply_poll` now
+        // lists nothing else, so the refusal had no row left to fire on. An
+        // interactive session, which IS a descendant of its pane's pid
+        // (PROBE §4), can no longer be selected here at all.
         let session_id = sel.session_id.clone();
         let Some(pane) = self.pane_of(&session_id) else {
             self.flash("not open", MsgLevel::Warn);
@@ -783,7 +752,7 @@ impl App {
                 self.refresh_panes();
                 self.save_map_now();
                 self.pin_sidebar();
-                // §8.5 step 9: this wording is the operator-facing statement of
+                // §8.5's last step: this wording is the operator-facing statement of
                 // PROBE-FINDINGS §3, shown every time, so nobody confuses `x`
                 // with `S`.
                 match idx {
@@ -804,7 +773,7 @@ impl App {
             return;
         };
         if !sel.is_attachable() {
-            self.flash("cannot stop an interactive session", MsgLevel::Warn);
+            self.flash("no short id — cannot stop this session", MsgLevel::Warn);
             return;
         }
         if sel.group() == Group::Completed {
@@ -962,7 +931,7 @@ impl App {
             return;
         };
         let Some(id) = sel.id.clone() else {
-            self.flash("no logs for an interactive session", MsgLevel::Warn);
+            self.flash("no short id — no logs for this session", MsgLevel::Warn);
             return;
         };
         let title = sel.name.clone();
@@ -987,7 +956,8 @@ impl App {
             .unwrap_or_else(Instant::now);
     }
 
-    /// `Enter` inside a prompt. SPEC §8.6 / §8.7.
+    /// `Enter` inside a prompt. SPEC §8.6 (§8.7, the interactive prompt, is
+    /// gone along with its `c` binding).
     pub fn act_submit_prompt(&mut self) {
         let Some(p) = self.prompt.clone() else {
             self.mode = Mode::Normal;
@@ -1018,39 +988,6 @@ impl App {
                     }
                     Err(e) => {
                         self.flash(format!("dispatch failed: {}", agents_msg(&e)), MsgLevel::Error)
-                    }
-                }
-            }
-            PromptKind::NewInteractive => {
-                if self.degraded {
-                    self.flash("not inside tmux — new session unavailable", MsgLevel::Warn);
-                    return;
-                }
-                if !Path::new(&cwd).is_dir() {
-                    self.flash(format!("no such directory: {cwd}"), MsgLevel::Warn);
-                    return;
-                }
-                let Some(anchor) = self.split_anchor() else {
-                    self.flash("no pane to split — sidebar unmapped", MsgLevel::Error);
-                    return;
-                };
-                let cmd = agents::interactive_pane_cmd(&cwd);
-                match tmux::split(&self.tmux_session, &anchor, SplitDir::Vertical, &cmd) {
-                    Ok(_pane) => {
-                        // §8.7: NO `@ccmux_map` entry — there is no session_id
-                        // yet. tick() step 5's /proc walk binds it next poll.
-                        self.refresh_panes();
-                        self.pin_sidebar();
-                        self.prompt = None;
-                        self.mode = Mode::Normal;
-                        let shown = model::shorten_cwd(&cwd, self.home.as_deref(), 24);
-                        self.flash(
-                            format!("started interactive session in {shown}"),
-                            MsgLevel::Info,
-                        );
-                    }
-                    Err(e) => {
-                        self.flash(format!("split failed: {}", tmux_msg(&e)), MsgLevel::Error)
                     }
                 }
             }
@@ -1300,52 +1237,15 @@ impl App {
         }
     }
 
+    /// Move focus to a pane ccmux itself opened. The only jump left: `pane`
+    /// always comes from `pane_of`, i.e. from the reconciled `@ccmux_map`, so
+    /// `select_pane`'s R2 gate can never see a foreign target.
     fn jump_to_ccmux_pane(&mut self, pane: &PaneId) {
         match tmux::select_pane(&self.tmux_session, pane) {
             Ok(()) => match self.pane_index_of(pane) {
                 Some(i) => self.flash(format!("jumped to pane {i}"), MsgLevel::Info),
                 None => self.flash(format!("jumped to pane {pane}"), MsgLevel::Info),
             },
-            Err(e) => self.flash(format!("jump failed: {}", tmux_msg(&e)), MsgLevel::Error),
-        }
-    }
-
-    /// SPEC §5.4 / §8.3 interactive branch. First pass is the per-tick
-    /// `interactive_panes` cache; the second, server-wide READ-ONLY pass runs
-    /// only here, only on an explicit jump key (R3).
-    fn act_jump_interactive(&mut self) {
-        if self.degraded {
-            self.flash("not inside tmux — jump unavailable", MsgLevel::Warn);
-            return;
-        }
-        let Some(sel) = self.selected_session() else {
-            return;
-        };
-        let session_id = sel.session_id.clone();
-        let pid = sel.pid;
-
-        if let Some(pane) = self.interactive_panes.get(&session_id).cloned() {
-            self.jump_to_ccmux_pane(&pane);
-            return;
-        }
-        let Ok(all) = tmux::list_panes_all() else {
-            self.flash("interactive session is not in a tmux pane", MsgLevel::Warn);
-            return;
-        };
-        let Some(info) = tmux::resolve_pane_for_pid(pid, &all) else {
-            self.flash("interactive session is not in a tmux pane", MsgLevel::Warn);
-            return;
-        };
-        // The one focus move permitted outside `cli.session`: it creates,
-        // kills and resizes nothing.
-        match tmux::focus_foreign_pane(&info.session_name, &info.id) {
-            Ok(()) => self.flash(
-                format!(
-                    "jumped to {}:{}.{} (outside ccmux)",
-                    info.session_name, info.window_index, info.index
-                ),
-                MsgLevel::Info,
-            ),
             Err(e) => self.flash(format!("jump failed: {}", tmux_msg(&e)), MsgLevel::Error),
         }
     }
@@ -1362,12 +1262,10 @@ impl App {
             .unwrap_or_default();
         let fields = match kind {
             PromptKind::NewBackground => vec![cwd, String::new()],
-            PromptKind::NewInteractive => vec![cwd],
         };
         // §8.6: the task field starts empty and is focused.
-        let focus = match kind {
+        let focus: usize = match kind {
             PromptKind::NewBackground => 1,
-            PromptKind::NewInteractive => 0,
         };
         let cursor = fields.get(focus).map(|s| s.chars().count()).unwrap_or(0);
         self.prompt = Some(Prompt {
@@ -1446,14 +1344,6 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.open_prompt(PromptKind::NewBackground);
-                Action::Redraw
-            }
-            KeyCode::Char('c') => {
-                if self.degraded {
-                    self.flash("not inside tmux — new session unavailable", MsgLevel::Warn);
-                } else {
-                    self.open_prompt(PromptKind::NewInteractive);
-                }
                 Action::Redraw
             }
             KeyCode::Char('L') => {
@@ -1842,7 +1732,6 @@ mod tests {
             logs: None,
             map: PaneMap::default(),
             map_dirty: false,
-            interactive_panes: std::collections::BTreeMap::new(),
             sidebar_pane: None,
             panes: Vec::new(),
             // NOT degraded: the gates under test must fire on their own merits,
@@ -1863,7 +1752,6 @@ mod tests {
 
     fn bg(short: &str, name: &str, state: State) -> Session {
         Session {
-            pid: 0,
             id: Some(short.to_string()),
             session_id: format!("{short}-uuid"),
             cwd: "/home/dev/projects".into(),
@@ -1877,7 +1765,6 @@ mod tests {
 
     fn inter(uuid: &str, name: &str) -> Session {
         Session {
-            pid: 4242,
             id: None,
             session_id: uuid.to_string(),
             cwd: "/home/dev/projects".into(),
@@ -1926,14 +1813,12 @@ mod tests {
     fn pane(id: &str, window: u32, index: u32, left: u16, width: u16, active: bool) -> PaneInfo {
         PaneInfo {
             id: PaneId::parse(id).expect("pane id"),
-            pid: 0,
             index,
             left,
             top: 0,
             width,
             height: 40,
             active,
-            session_name: "ccmux-test".into(),
             window_index: window,
         }
     }
@@ -2195,41 +2080,35 @@ mod tests {
         assert_eq!(a.mode, Mode::Normal);
     }
 
+    /// `is_attachable` is a LIVE gate, not a leftover of the interactive era:
+    /// `parse_sessions` honours an explicit `kind: "background"` even when the
+    /// CLI omits `id`, so such a row is listed and has no id to hand `claude`.
+    /// `S`, `Enter` and `o` must all refuse it without shelling out.
     #[test]
-    fn stop_on_interactive_row_warns_and_stays_normal() {
+    fn a_listed_row_with_no_short_id_refuses_every_id_verb() {
         let mut a = app();
-        load(&mut a, vec![inter("uuid-i", "scratch")]);
+        let mut no_id = bg("11111111", "half-parsed", State::Working);
+        no_id.id = None;
+        load(&mut a, vec![no_id]);
+
         // Uppercase arrives with SHIFT set — the keymap must not require
         // empty modifiers for char bindings.
         let act = a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
         assert_eq!(act, Action::Redraw);
-        assert_eq!(a.mode, Mode::Normal);
-        assert_eq!(
-            a.message.as_ref().map(|m| m.1),
-            Some(MsgLevel::Warn),
-            "S on an interactive row must warn, not open the modal"
-        );
-    }
+        assert_eq!(a.mode, Mode::Normal, "S must warn, not open the modal");
+        assert_eq!(a.message.as_ref().map(|m| m.1), Some(MsgLevel::Warn));
 
-    #[test]
-    fn close_pane_on_interactive_row_issues_no_tmux_call() {
-        let mut a = app();
-        load(&mut a, vec![inter("uuid-i", "scratch")]);
-        // SPEC §8.5 step 3. If the interactive branch is ever "simplified" back
-        // into the background path, `pane_of` -> `kill_pane` would run against a
-        // live tmux server here and destroy work. The absence of a map entry and
-        // of any pane is what keeps this test honest: the refusal must come
-        // BEFORE any lookup, and the flash must be the refusal wording.
-        let act = a.on_key(press('x'));
-        assert_eq!(act, Action::Redraw);
-        let (text, level) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!(level, MsgLevel::Warn);
-        assert!(
-            text.starts_with("refusing:"),
-            "expected the §8.5 refusal, got {text:?}"
-        );
+        // `Enter` and `o` refuse BEFORE any tmux call: there is no map entry
+        // and no pane, so a fallthrough would shell out at `split`.
+        for k in [KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), press('o')] {
+            a.message = None;
+            assert_eq!(a.on_key(k), Action::Redraw);
+            let (text, level) = a.message.clone().unwrap_or_default_msg();
+            assert_eq!(level, MsgLevel::Warn);
+            assert_eq!(text, "no short id — cannot open this session");
+        }
         assert!(a.map.panes.is_empty());
-        assert!(!a.map_dirty, "a refused `x` must not dirty the map");
+        assert!(!a.map_dirty, "a refused verb must not dirty the map");
     }
 
     #[test]
@@ -2289,10 +2168,9 @@ mod tests {
     }
 
     #[test]
-    fn pane_of_resolves_through_map_then_interactive_cache() {
+    fn pane_of_resolves_through_the_map_only() {
         let mut a = app();
         let bg_pane = PaneId::parse("%25").expect("valid pane id");
-        let int_pane = PaneId::parse("%26").expect("valid pane id");
 
         a.map.insert(
             &bg_pane,
@@ -2303,11 +2181,8 @@ mod tests {
                 opened_at: 0,
             },
         );
-        a.interactive_panes
-            .insert("uuid-i".into(), int_pane.clone());
 
         assert_eq!(a.pane_of("1c45d64f-uuid"), Some(bg_pane));
-        assert_eq!(a.pane_of("uuid-i"), Some(int_pane));
         assert_eq!(a.pane_of("nobody"), None);
         assert!(!a.is_open("nobody"));
     }
@@ -2315,14 +2190,14 @@ mod tests {
     #[test]
     fn navigation_never_lands_on_a_header_and_survives_an_empty_list() {
         let mut a = app();
-        let mut idle_interactive = inter("uuid-i", "three");
-        idle_interactive.status = Status::Idle;
+        let mut idle = bg("cccccccc", "three", State::Unknown("parked".into()));
+        idle.status = Status::Idle;
         load(
             &mut a,
             vec![
                 bg("aaaaaaaa", "one", State::Working),
                 bg("bbbbbbbb", "two", State::Done),
-                idle_interactive,
+                idle,
             ],
         );
         // Working(one) + Idle(three) + Completed(two) => 3 headers, 3 sessions,
@@ -2414,6 +2289,26 @@ mod tests {
             let act = a.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
             assert_eq!(act, Action::Quit);
             assert!(a.should_quit);
+        }
+    }
+
+    /// SPEC §8.7 is a tombstone: `c` used to open the interactive prompt and
+    /// now binds nothing. "Nothing" is the assertion — no mode change, no
+    /// prompt, no flash — because a key that merely stopped opening a pane but
+    /// still flashed or still armed a mode would be a different bug. `Ctrl-c`
+    /// is unaffected and keeps quitting; that is `ctrl_c_quits_from_every_mode`.
+    #[test]
+    fn the_c_key_is_inert_in_normal_mode() {
+        for c in ['c', 'C'] {
+            let mut a = app();
+            load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+            let before = a.selected;
+            assert_eq!(a.on_key(press(c)), Action::None, "{c:?} did something");
+            assert_eq!(a.mode, Mode::Normal, "{c:?} changed mode");
+            assert!(a.prompt.is_none(), "{c:?} opened a prompt");
+            assert!(a.message.is_none(), "{c:?} flashed a message");
+            assert!(!a.should_quit, "{c:?} quit");
+            assert_eq!(a.selected, before, "{c:?} moved the selection");
         }
     }
 
@@ -3115,19 +3010,6 @@ mod tests {
         assert_eq!(
             a.message.clone().unwrap_or_default_msg().0,
             "hidden bt/reg-update — u to undo"
-        );
-
-        // An interactive session's own pane is NOT a ccmux pane: `x` refuses it
-        // anyway, so there is nothing to warn about and nothing to orphan.
-        let mut b = app();
-        let desktop = inter("9f2c1a44-1111-4038-8de7-d5f112c92360", "claude-a1");
-        load(&mut b, vec![desktop]);
-        b.interactive_panes
-            .insert("9f2c1a44-1111-4038-8de7-d5f112c92360".into(), PaneId::parse("%9").expect("id"));
-        b.on_key(press('d'));
-        assert_eq!(
-            b.message.clone().unwrap_or_default_msg().0,
-            "hidden claude-a1 — u to undo"
         );
     }
 

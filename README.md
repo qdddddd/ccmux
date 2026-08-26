@@ -114,7 +114,6 @@ environment-variable equivalent of `--socket`.
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
 | `S` | **Stop the session.** Asks `y`/`n` first | **yes** |
 | `n` | Dispatch a new background session with a typed task | no |
-| `c` | New interactive session in a chosen cwd. It opens in a pane but is **not listed** — see Which sessions are listed | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
 | `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
 | `u` | Undo the most recent `d` | no |
@@ -134,7 +133,7 @@ side-by-side, `s` = horizontal = stacked.
 |---|---|
 | Filter (`/`) | Type to filter live · `Ctrl-w` word · `Ctrl-u` clear · `Enter` commit · `Esc` clear and leave |
 | Confirm (`S`) | `y` stop · `n`, `Esc`, `Enter`, anything else cancels. A `y` within 250 ms of the modal opening is treated as type-ahead and cancels |
-| Prompt (`n`, `c`) | `Tab` next field · `Enter` run · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
+| Prompt (`n`) | `Tab` next field · `Enter` run · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
 | Help (`?`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · any other key closes |
 | Logs (`L`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · `q`/`Esc` close |
 
@@ -166,8 +165,8 @@ Desktop has no tmux pane to jump to either, so such a row is permanently
 un-openable. Rather than show rows that nothing can act on, ccmux excludes them
 when a poll is applied.
 
-One consequence worth knowing: `c` still starts an interactive session in a
-pane, and that session will not appear in the sidebar.
+ccmux has no verb for starting one either: start interactive Claude in a tmux
+pane yourself, the ordinary way.
 
 ### Dismissing a row
 
@@ -177,9 +176,10 @@ it — so `d` hides a row **from this view** and nothing more. It runs no
 most recent `d`; the header keeps counting the hidden session in its total, so
 the list reads `5/6` while one row is dismissed.
 
-The use it was built for is a session ccmux can never open: a Claude Desktop
-session has no controlling tty and no tmux pane, so `Enter` can only tell you
-so. Dismissing it clears the row for good without touching the session.
+The use it was built for is the row you are finished with but `claude` will not
+stop reporting. A completed or stopped session keeps coming back in every poll,
+and `a` only hides the whole Completed group at once. `d` takes out the one row
+you named.
 
 If the dismissed session has a pane ccmux opened, the footer says
 `hidden — pane open, u to undo` in yellow rather than naming the row. The pane
@@ -210,15 +210,16 @@ that is known to have lost rows concludes nothing at all.
 - `S` is the only verb that stops a session, and it always confirms first.
 - `d` removes a row from the list only. It is not a stop, not a kill, and not a
   delete — nothing outside ccmux's own view state changes, and `u` puts it back.
-- Every mutating tmux command carries a validated target and is scoped to the
-  ccmux session. Panes in your other tmux sessions are never split, resized, or
-  killed.
+- Every tmux command that names a pane carries a validated target and is scoped
+  to the ccmux session, without exception. Panes in your other tmux sessions are
+  never split, resized, killed — or even focused. ccmux does not enumerate the
+  tmux server at all; it lists only its own session's panes.
 
 ## Degraded mode
 
 `ccmux sidebar` outside tmux still runs: polling, grouping, filtering, `L`, `n`,
 `S`, `d`, `u`, and all navigation work; the header indicator turns yellow and
-the pane-related verbs (`Enter`, `o`, `s`, `x`, `c`) refuse with a message. The
+the pane-related verbs (`Enter`, `o`, `s`, `x`) refuse with a message. The
 session→pane map and the dismissed set are kept in memory only. This is what makes the sidebar
 developable without a tmux server.
 

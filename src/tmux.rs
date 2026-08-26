@@ -1,4 +1,4 @@
-//! Every tmux interaction in the program, plus /proc ancestry resolution.
+//! Every tmux interaction in the program.
 //!
 //! SPEC §3.2. No ratatui, no `claude`, no knowledge of `model::Session`. The
 //! pane map stores session ids as opaque strings so this module stays
@@ -10,8 +10,11 @@
 //!   * Every session name is re-validated here even though clap already
 //!     validated it, and is addressed with tmux's EXACT-match target form.
 //!   * `full_argv` refuses to run any tmux command whose `-t` value is empty.
-//!   * Every mutating helper calls `assert_in_session` first, so a pane in
-//!     `agents` or `dev` is never split, killed, resized, or respawned.
+//!   * Every mutating helper calls `assert_in_session` first, WITHOUT
+//!     EXCEPTION, so a pane in `agents` or `dev` is never split, killed,
+//!     resized, respawned, or even focused. The one command that deliberately
+//!     targeted a foreign session — `focus_foreign_pane`, for the §5.4 jump to
+//!     an interactive session — is gone along with the jump itself.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::{Command, Stdio};
@@ -34,25 +37,20 @@ const HIDDEN_VERSION: u32 = 1;
 /// of still-live agents.
 const HIDDEN_MAX: usize = 256;
 
-/// Depth cap for the /proc ppid walk (SPEC §3.2).
-const ANCESTRY_MAX_DEPTH: usize = 32;
-
-/// `-F` format shared by `list_panes_in_session` and `list_panes_all`.
-/// Field order is authoritative (SPEC §3.2) and mirrored by `parse_pane_line`.
+/// `-F` format for `list_panes_in_session`. Field order is authoritative
+/// (SPEC §3.2) and mirrored by `parse_pane_line`.
 const PANE_FMT: &str = concat!(
     "#{pane_id}\t",
-    "#{pane_pid}\t",
     "#{pane_index}\t",
     "#{pane_left}\t",
     "#{pane_top}\t",
     "#{pane_width}\t",
     "#{pane_height}\t",
     "#{pane_active}\t",
-    "#{session_name}\t",
     "#{window_index}",
 );
 
-const PANE_FIELDS: usize = 10;
+const PANE_FIELDS: usize = 8;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -146,15 +144,12 @@ impl std::fmt::Display for PaneId {
 #[allow(dead_code)]
 pub struct PaneInfo {
     pub id: PaneId,
-    /// `#{pane_pid}` — the pane's shell. Match target for the ancestry walk.
-    pub pid: i32,
     pub index: u32,
     pub left: u16,
     pub top: u16,
     pub width: u16,
     pub height: u16,
     pub active: bool,
-    pub session_name: String,
     pub window_index: u32,
 }
 
@@ -244,23 +239,6 @@ fn session_target(session: &str) -> Result<String, TmuxError> {
     if !valid_session_name(session) {
         return Err(TmuxError::BadTarget(format!(
             "session name must match [A-Za-z0-9_-]{{1,64}}, got {session:?}"
-        )));
-    }
-    Ok(format!("={session}:"))
-}
-
-/// Exact-match target for a session ccmux does NOT own (§5.4's foreign-pane
-/// jump). Foreign names are the user's, so only the characters tmux itself
-/// forbids in a session name are rejected.
-fn foreign_session_target(session: &str) -> Result<String, TmuxError> {
-    if session.is_empty()
-        || session.len() > 256
-        || session.contains(':')
-        || session.contains('.')
-        || session.chars().any(char::is_control)
-    {
-        return Err(TmuxError::BadTarget(format!(
-            "not addressable as a tmux session: {session:?}"
         )));
     }
     Ok(format!("={session}:"))
@@ -517,17 +495,11 @@ pub fn attach_or_switch(session: &str) -> Result<(), TmuxError> {
 
 // ── Pane enumeration and mutation ───────────────────────────────────────────
 
-/// `tmux list-panes -t <session> -s -F '<FMT>'` — session-scoped (R3).
+/// `tmux list-panes -t <session> -s -F '<FMT>'` — session-scoped (R3), and
+/// the ONLY pane enumeration in the program. ccmux never lists the server.
 pub fn list_panes_in_session(session: &str) -> Result<Vec<PaneInfo>, TmuxError> {
     let target = session_target(session)?;
     let out = tmux(&["list-panes", "-t", &target, "-s", "-F", PANE_FMT])?;
-    parse_pane_lines(&out)
-}
-
-/// READ-ONLY server-wide enumeration. Permitted ONLY for interactive-session
-/// discovery (§5.4). Never feeds reconciliation, never feeds a mutation.
-pub fn list_panes_all() -> Result<Vec<PaneInfo>, TmuxError> {
-    let out = tmux(&["list-panes", "-a", "-F", PANE_FMT])?;
     parse_pane_lines(&out)
 }
 
@@ -560,30 +532,22 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     let bad = |what: &str, v: &str| TmuxError::Parse(format!("bad {what} {v:?} in {line:?}"));
 
     let id = PaneId::parse(parts[0]).ok_or_else(|| bad("pane_id", parts[0]))?;
-    let pid: i32 = parts[1].parse().map_err(|_| bad("pane_pid", parts[1]))?;
-    let index: u32 = parts[2].parse().map_err(|_| bad("pane_index", parts[2]))?;
-    let left: u16 = parts[3].parse().map_err(|_| bad("pane_left", parts[3]))?;
-    let top: u16 = parts[4].parse().map_err(|_| bad("pane_top", parts[4]))?;
-    let width: u16 = parts[5].parse().map_err(|_| bad("pane_width", parts[5]))?;
-    let height: u16 = parts[6].parse().map_err(|_| bad("pane_height", parts[6]))?;
-    let active = parts[7] == "1";
-
-    // A foreign session name could itself contain a tab; window_index is always
-    // the LAST field, so everything between field 8 and it is the name.
-    let last = parts.len() - 1;
-    let session_name = parts[8..last].join("\t");
-    let window_index: u32 = parts[last].parse().map_err(|_| bad("window_index", parts[last]))?;
+    let index: u32 = parts[1].parse().map_err(|_| bad("pane_index", parts[1]))?;
+    let left: u16 = parts[2].parse().map_err(|_| bad("pane_left", parts[2]))?;
+    let top: u16 = parts[3].parse().map_err(|_| bad("pane_top", parts[3]))?;
+    let width: u16 = parts[4].parse().map_err(|_| bad("pane_width", parts[4]))?;
+    let height: u16 = parts[5].parse().map_err(|_| bad("pane_height", parts[5]))?;
+    let active = parts[6] == "1";
+    let window_index: u32 = parts[7].parse().map_err(|_| bad("window_index", parts[7]))?;
 
     Ok(PaneInfo {
         id,
-        pid,
         index,
         left,
         top,
         width,
         height,
         active,
-        session_name,
         window_index,
     })
 }
@@ -652,9 +616,8 @@ pub fn split_left_of(
 }
 
 /// `tmux kill-pane -t <pane>`. R2-gated. SAFE with respect to Claude sessions:
-/// PROBE-FINDINGS §3 proves the agent survives — FOR BACKGROUND SESSIONS. The
-/// interactive refusal lives in `app::act_close_pane` (§8.5 step 3), because
-/// this module does not know a pane's session kind.
+/// PROBE-FINDINGS §3 proves the agent survives, because every session ccmux
+/// lists is a daemon-owned background one.
 pub fn kill_pane(session: &str, pane: &PaneId) -> Result<(), TmuxError> {
     assert_in_session(pane, session)?;
     tmux(&["kill-pane", "-t", pane.as_str()]).map(|_| ())
@@ -748,25 +711,6 @@ pub fn rightmost_pane_excluding(panes: &[PaneInfo], sidebar: &PaneId) -> Option<
         .map(|p| p.id.clone())
 }
 
-/// `tmux switch-client -t <session>` then `select-pane -t <pane>`. Used to jump
-/// to an interactive session living in a foreign tmux session (§5.4). This is
-/// the one mutation permitted outside `cli.session`, and it only moves the
-/// client's focus — it creates, kills, and resizes nothing.
-///
-/// SPEC NOTE: `select-window -t <pane>` is issued between the two spec'd calls.
-/// Without it the client lands on whatever window the foreign session last had
-/// active, not the one holding `pane`, and the jump silently misses. Verified
-/// on tmux 3.4 that a `%N` pane id is an accepted `select-window` target. Still
-/// focus-only, so the doc comment's promise holds.
-pub fn focus_foreign_pane(session_name: &str, pane: &PaneId) -> Result<(), TmuxError> {
-    // Deliberately NOT R2-gated: the whole point is a pane outside cli.session.
-    // Safe because every command here only moves the client's focus.
-    let target = foreign_session_target(session_name)?;
-    tmux(&["switch-client", "-t", &target])?;
-    tmux(&["select-window", "-t", pane.as_str()])?;
-    tmux(&["select-pane", "-t", pane.as_str()]).map(|_| ())
-}
-
 // ── User options (map persistence) ──────────────────────────────────────────
 
 /// `tmux show-options -t <session> -qv <key>`.
@@ -796,7 +740,9 @@ pub fn set_user_option(session: &str, key: &str, value: &str) -> Result<(), Tmux
 pub struct PaneEntry {
     /// `model::Session::session_id` (UUID). Opaque to this module.
     pub session_id: String,
-    /// 8-hex short id when known; empty for interactive sessions.
+    /// 8-hex short id. Empty only when read back from a `@ccmux_map` written
+    /// before the field existed (`#[serde(default)]`); every entry ccmux writes
+    /// has one, because `act_open` refuses a session without it.
     #[serde(default)]
     pub short_id: String,
     /// Name at open time, for display when the session has vanished from polls.
@@ -940,8 +886,8 @@ pub fn save_map(session: &str, map: &PaneMap) -> Result<(), TmuxError> {
 /// De-duplicated on insert, so it is still a set by content.
 ///
 /// Ids are `model::Session::session_id` (the stable uuid). A name is not
-/// unique, a pid is recycled, and an interactive session has no short id — a
-/// dismissal keyed by any of those would follow the wrong row, or no row.
+/// unique and a short id can be absent — a dismissal keyed by either would
+/// follow the wrong row, or no row.
 ///
 /// Purely a VIEW filter. Nothing here stops, kills, or attaches anything: the
 /// agent goes on running and `claude` never hears about it.
@@ -1051,84 +997,21 @@ pub fn sh_join(parts: &[&str]) -> String {
     parts.iter().map(|p| sh_quote(p)).collect::<Vec<String>>().join(" ")
 }
 
-// ── /proc ancestry (§5.4) ───────────────────────────────────────────────────
-
-/// PARSE RULE: `comm` (field 2) is parenthesized and MAY CONTAIN SPACES AND
-/// PARENTHESES. Find the LAST b')' in the line; the remainder splits on
-/// whitespace as [state, ppid, ...]; ppid is index 1. Split out from
-/// `ppid_of` so the §10.1 `(a b) c)` fixture is testable without /proc.
-fn parse_stat_ppid(stat: &str) -> Option<i32> {
-    let close = stat.rfind(')')?;
-    let mut tail = stat.get(close + 1..)?.split_whitespace();
-    let _state = tail.next()?;
-    tail.next()?.parse::<i32>().ok()
-}
-
-/// Parse `/proc/<pid>/stat`. Returns None on any IO or parse failure.
-pub fn ppid_of(pid: i32) -> Option<i32> {
-    if pid <= 0 {
-        return None;
-    }
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat_ppid(&stat)
-}
-
-/// Walk `ppid_of` upward from `pid`, inclusive of `pid`, stopping at pid <= 1,
-/// at a repeated pid, or after `max_depth` steps (use 32).
-pub fn ancestry(pid: i32, max_depth: usize) -> Vec<i32> {
-    let mut chain: Vec<i32> = Vec::new();
-    if pid <= 1 || max_depth == 0 {
-        return chain;
-    }
-    let mut cur = pid;
-    loop {
-        if chain.contains(&cur) {
-            break;
-        }
-        chain.push(cur);
-        if chain.len() >= max_depth {
-            break;
-        }
-        match ppid_of(cur) {
-            Some(parent) if parent > 1 => cur = parent,
-            _ => break,
-        }
-    }
-    chain
-}
-
-/// Walk up from `pid` and return the first pane whose `PaneInfo::pid` appears
-/// in the ancestry chain. This is how an interactive Claude session is mapped
-/// to the pane that hosts it (PROBE-FINDINGS §4). Background sessions are
-/// daemon-owned and will always return None here — that is expected, not an error.
-pub fn resolve_pane_for_pid(pid: i32, panes: &[PaneInfo]) -> Option<PaneInfo> {
-    // Chain order is nearest-ancestor-first, so the first hit is the innermost
-    // pane hosting the process.
-    for ancestor in ancestry(pid, ANCESTRY_MAX_DEPTH) {
-        if let Some(pane) = panes.iter().find(|p| p.pid == ancestor) {
-            return Some(pane.clone());
-        }
-    }
-    None
-}
-
 // ── Tests (pure; no tmux server, no `claude`) ───────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pane(id: &str, pid: i32, index: u32, left: u16) -> PaneInfo {
+    fn pane(id: &str, index: u32, left: u16) -> PaneInfo {
         PaneInfo {
             id: PaneId::parse(id).expect("test pane id"),
-            pid,
             index,
             left,
             top: 0,
             width: 80,
             height: 24,
             active: false,
-            session_name: "ccmux".into(),
             window_index: 1,
         }
     }
@@ -1192,106 +1075,29 @@ mod tests {
         assert_eq!(sh_join(&["", "x"]), "'' x");
     }
 
-    // ── /proc parsing ───────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_stat_ppid_uses_the_last_close_paren() {
-        // comm itself contains spaces AND parentheses: `(a b) c)`.
-        let stat = "4242 ((a b) c)) S 2936154 4242 4242 0 -1 4194304 496 1199 0 0";
-        assert_eq!(parse_stat_ppid(stat), Some(2936154));
-    }
-
-    #[test]
-    fn parse_stat_ppid_handles_the_ordinary_shape() {
-        let stat = "3020476 (zsh) S 2936154 3020476 3020476 0 -1 4194304 496 1199 0 0 0 0\n";
-        assert_eq!(parse_stat_ppid(stat), Some(2936154));
-    }
-
-    #[test]
-    fn parse_stat_ppid_rejects_garbage() {
-        assert_eq!(parse_stat_ppid(""), None);
-        assert_eq!(parse_stat_ppid("no parens here"), None);
-        assert_eq!(parse_stat_ppid("1 (x) S"), None);
-        assert_eq!(parse_stat_ppid("1 (x) S notanumber"), None);
-    }
-
-    #[test]
-    fn ppid_of_resolves_this_process() {
-        // Linux-only, and this crate targets Linux (/proc is the whole point).
-        let me = std::process::id() as i32;
-        assert!(ppid_of(me).is_some());
-        assert_eq!(ppid_of(0), None);
-        assert_eq!(ppid_of(-1), None);
-    }
-
-    #[test]
-    fn ancestry_is_inclusive_bounded_and_stops_at_init() {
-        let me = std::process::id() as i32;
-        let chain = ancestry(me, ANCESTRY_MAX_DEPTH);
-        assert_eq!(chain.first().copied(), Some(me));
-        assert!(chain.len() <= ANCESTRY_MAX_DEPTH);
-        assert!(chain.iter().all(|&p| p > 1));
-
-        assert_eq!(ancestry(me, 1), vec![me]);
-        assert!(ancestry(me, 0).is_empty());
-        assert!(ancestry(1, 32).is_empty());
-        assert!(ancestry(0, 32).is_empty());
-    }
-
-    #[test]
-    fn resolve_pane_for_pid_prefers_the_nearest_ancestor() {
-        let me = std::process::id() as i32;
-        let chain = ancestry(me, ANCESTRY_MAX_DEPTH);
-
-        // Pretend our own process is a pane's shell.
-        let panes = vec![pane("%3", me, 1, 0)];
-        assert_eq!(resolve_pane_for_pid(me, &panes).map(|p| p.id), PaneId::parse("%3"));
-
-        // A daemon-owned pid whose chain touches no pane resolves to None —
-        // the expected outcome for every background session.
-        assert!(resolve_pane_for_pid(me, &[pane("%3", 999_999_999, 1, 0)]).is_none());
-
-        if chain.len() >= 2 {
-            let parent = chain[1];
-            let panes = vec![pane("%1", parent, 1, 0), pane("%2", me, 2, 40)];
-            // %2 holds the pid itself, so it beats the further-up ancestor %1.
-            assert_eq!(resolve_pane_for_pid(me, &panes).map(|p| p.id), PaneId::parse("%2"));
-        }
-    }
-
     // ── pane line parsing ───────────────────────────────────────────────────
 
     #[test]
     fn parse_pane_line_reads_every_field() {
-        let line = "%25\t3020315\t2\t35\t0\t239\t76\t1\tccmux\t1";
+        let line = "%25\t2\t35\t0\t239\t76\t1\t1";
         let p = parse_pane_line(line).expect("parses");
         assert_eq!(p.id.as_str(), "%25");
-        assert_eq!(p.pid, 3020315);
         assert_eq!(p.index, 2);
         assert_eq!(p.left, 35);
         assert_eq!(p.top, 0);
         assert_eq!(p.width, 239);
         assert_eq!(p.height, 76);
         assert!(p.active);
-        assert_eq!(p.session_name, "ccmux");
         assert_eq!(p.window_index, 1);
     }
 
     #[test]
-    fn parse_pane_line_tolerates_a_tab_in_a_foreign_session_name() {
-        let line = "%1\t10\t1\t0\t0\t80\t24\t0\ta\tb\t3";
-        let p = parse_pane_line(line).expect("parses");
-        assert_eq!(p.session_name, "a\tb");
-        assert_eq!(p.window_index, 3);
-    }
-
-    #[test]
     fn parse_pane_lines_rejects_short_and_malformed_rows() {
-        assert!(parse_pane_line("%1\t10\t1").is_err());
-        assert!(parse_pane_line("nope\t10\t1\t0\t0\t80\t24\t0\ts\t1").is_err());
-        assert!(parse_pane_line("%1\tx\t1\t0\t0\t80\t24\t0\ts\t1").is_err());
+        assert!(parse_pane_line("%1\t1\t0").is_err());
+        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1").is_err());
+        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1").is_err());
         // Blank lines are skipped, not fatal.
-        let panes = parse_pane_lines("%1\t10\t1\t0\t0\t80\t24\t1\ts\t1\n\n").expect("parses");
+        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\n\n").expect("parses");
         assert_eq!(panes.len(), 1);
         assert!(parse_pane_lines("").expect("empty is fine").is_empty());
     }
@@ -1307,7 +1113,7 @@ mod tests {
 
     #[test]
     fn leftmost_and_rightmost_pick_the_right_panes() {
-        let panes = vec![pane("%24", 1, 1, 0), pane("%25", 2, 2, 35), pane("%26", 3, 3, 155)];
+        let panes = vec![pane("%24", 1, 0), pane("%25", 2, 35), pane("%26", 3, 155)];
         let sidebar = PaneId::parse("%24").expect("id");
         assert_eq!(leftmost_pane(&panes), Some(sidebar.clone()));
         assert_eq!(rightmost_pane_excluding(&panes, &sidebar), PaneId::parse("%26"));
@@ -1317,7 +1123,7 @@ mod tests {
         assert_eq!(leftmost_pane(&[]), None);
 
         // Stacked panes share `left`; the lower pane_index wins for leftmost.
-        let stacked = vec![pane("%9", 1, 2, 35), pane("%8", 2, 1, 35)];
+        let stacked = vec![pane("%9", 2, 35), pane("%8", 1, 35)];
         assert_eq!(leftmost_pane(&stacked), PaneId::parse("%8"));
     }
 
@@ -1326,10 +1132,10 @@ mod tests {
         // `pane_left` restarts at 0 in every window, so an unscoped `min`/`max`
         // over a session's panes mixes windows that share nothing.
         let mut panes = vec![
-            pane("%1", 1, 1, 0),
-            pane("%10", 2, 2, 35),
-            pane("%11", 3, 1, 0),
-            pane("%12", 4, 2, 41),
+            pane("%1", 1, 0),
+            pane("%10", 2, 35),
+            pane("%11", 1, 0),
+            pane("%12", 2, 41),
         ];
         panes[2].window_index = 2;
         panes[3].window_index = 2;
@@ -1400,7 +1206,7 @@ mod tests {
         m.insert(&PaneId::parse("%25").expect("id"), entry("uuid-a"));
         m.insert(&PaneId::parse("%26").expect("id"), entry("uuid-b"));
 
-        let live = vec![pane("%24", 1, 1, 0), pane("%25", 2, 2, 35)];
+        let live = vec![pane("%24", 1, 0), pane("%25", 2, 35)];
         assert!(m.reconcile(&live), "dropping %26 is a change");
         assert_eq!(m.panes.len(), 1);
         assert!(m.get(&PaneId::parse("%25").expect("id")).is_some());
@@ -1416,7 +1222,7 @@ mod tests {
     fn reconcile_drops_corrupt_keys() {
         let mut m = PaneMap::new();
         m.panes.insert("agents:2.1".into(), entry("uuid-a"));
-        assert!(m.reconcile(&[pane("%1", 1, 1, 0)]));
+        assert!(m.reconcile(&[pane("%1", 1, 0)]));
         assert!(m.panes.is_empty());
     }
 
@@ -1426,7 +1232,7 @@ mod tests {
         // screen showing "[ccmux] session exited"; `x` must still close it.
         let mut m = PaneMap::new();
         m.insert(&PaneId::parse("%25").expect("id"), entry("uuid-gone"));
-        assert!(!m.reconcile(&[pane("%25", 7, 2, 35)]));
+        assert!(!m.reconcile(&[pane("%25", 2, 35)]));
         assert_eq!(m.panes.len(), 1);
     }
 
@@ -1555,15 +1361,6 @@ mod tests {
     }
 
     #[test]
-    fn foreign_session_target_allows_user_names_but_not_separators() {
-        assert_eq!(foreign_session_target("agents").expect("valid"), "=agents:");
-        assert_eq!(foreign_session_target("my work").expect("valid"), "=my work:");
-        for bad in ["", "a:b", "a.b", "a\nb"] {
-            assert!(foreign_session_target(bad).is_err(), "{bad:?} must be rejected");
-        }
-    }
-
-    #[test]
     fn full_argv_refuses_an_empty_or_missing_target() {
         // Appendix A.1: this is the bug that created stray panes in a live
         // session. It must be unreachable, not merely unlikely.
@@ -1629,7 +1426,6 @@ mod tests {
         let panes = list_panes_in_session(sess).expect("list_panes_in_session");
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].id, sidebar);
-        assert_eq!(panes[0].session_name, sess);
         assert_eq!(leftmost_pane(&panes), Some(sidebar.clone()));
         assert_eq!(rightmost_pane_excluding(&panes, &sidebar), None);
 
@@ -1688,11 +1484,6 @@ mod tests {
         // focus verbs must not error on a live pane
         select_pane(sess, &p1).expect("select_pane");
         resize_pane_width(sess, &sidebar, 34).expect("resize_pane_width");
-
-        // /proc: the pane's own shell resolves back to its pane
-        let all = list_panes_all().expect("list_panes_all");
-        let shell_pid = live.iter().find(|p| p.id == p1).expect("p1").pid;
-        assert_eq!(resolve_pane_for_pid(shell_pid, &all).map(|p| p.id), Some(p1.clone()));
 
         // cleanup: only ever this socket's server
         let _ = tmux(&["kill-session", "-t", "=ccmux-test-live:"]);
