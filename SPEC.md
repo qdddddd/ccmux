@@ -994,7 +994,8 @@ pub enum MsgLevel { Info, Warn, Error }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
-    /// `S` — the only destructive confirmation in v1.
+    /// The confirm mechanism. DORMANT since stop moved to `Ctrl+X` (§8.2):
+    /// no key path reaches it. Kept for the next verb that needs a modal.
     StopSession { session_id: String, short_id: String, name: String },
 }
 
@@ -1347,7 +1348,8 @@ The section number is kept so §5.5 does not move.
 | `o` / `s` / `Enter`-opens a background session | insert `{new_pane -> entry}`; `map_dirty = true` |
 | `x` closes a pane | `map.remove(pane)`; `map_dirty = true` |
 | pane disappears (user killed it, or `claude attach` exited and the pane closed) | dropped by `reconcile` |
-| `S` stops a session | no map change; its pane stays until the operator closes it |
+| `Ctrl+X` stops a session | no map change; its pane stays until the operator closes it |
+| `Ctrl+X` deletes a session (second press) | no map change; the pane stays and its trailer reports the exit |
 
 Double-attach is legal (PROBE-FINDINGS §3), so a session may legitimately map to
 several panes — including one per tab. `pane_for_session` returns the one in the
@@ -1509,9 +1511,10 @@ Claude pane.
   table one binding per line, two columns (`key`, `action`) when `W >= 30`,
   otherwise `key action` on one line each. Scrolls with `j`/`k` when it
   overflows.
-- **Confirm (`S`)** — `Mode::Confirm`. Centred block, `p.red` border, titled
+- **Confirm** — `Mode::Confirm`. Centred block, `p.red` border, titled
   ` stop session `, body = the session name and short id, footer =
-  `y: stop    n/Esc: cancel`. Detail in §8.2.
+  `y: stop    n/Esc: cancel`. **No key opens it** since stop moved to `Ctrl+X`
+  (§8.2); it is retained, unreached, for the next verb that needs a modal.
 - **Prompt (`n`)** — `Mode::Prompt`. Block titled ` new background session `.
   One line per field, the focused field prefixed
   `> ` and carrying a reverse-video cursor cell at `prompt.cursor`; unfocused
@@ -1526,11 +1529,19 @@ Claude pane.
 Priority order — the first applicable wins:
 
 1. `Mode::Filter` → `/<buffer>▏`, `p.yellow`
-2. `app.message` present → the text, coloured by `MsgLevel`
+2. `Ctrl+X`'s delete window is open → the §8.2 warning in `p.red`. Above the
+   message on purpose: it is the line that says what the NEXT keypress does, and
+   an unrelated flash must not be able to take it off screen while the verb is
+   loaded.
+3. `app.message` present → the text, coloured by `MsgLevel`
    (Info `p.green`, Warn `p.yellow`, Error `p.red`), auto-clearing after 4 s
-3. `poll_error` present → `agents: <msg>` in `p.red` (truncated to width)
-4. otherwise → the hint line in `p.dim`, truncated from the right as needed:
-   `j/k move  ⏎ open  o/s split  x close  S stop  n new  ? help`
+4. `poll_error` present → `agents: <msg>` in `p.red` (truncated to width)
+5. otherwise → the hint line in `p.dim`, truncated from the right as needed:
+   `⏎ open  o/s split  x close  t tab  d/u hide  C-x stop  n new  ? help`
+
+2–4 share one source (`ui::footer_message`), so the wrap of §6.8's amendment
+applies to all three: a line wider than the sidebar takes over the detail block
+and wraps rather than clipping.
 
 ---
 
@@ -1618,7 +1629,8 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`) | no |
 | `t` | open in a **new tab** — a window with its own sidebar — and go there (§8.10) | no |
 | `x` | close the pane showing a session — the agent keeps running (§8.5) | no |
-| `S` | **stop the session** — requires confirmation | **YES** (§8.2) |
+| `Ctrl-x` | **stop the session**, immediately; again within 2 s **deletes** it and its worktree (§8.2) | **YES** (§8.2) |
+| `S` | unbound as a verb — flashes `stop is Ctrl+X now` and does nothing else | no |
 | `n` | dispatch a new background session with a typed task | no |
 | `L` | show `claude logs` for this session (ANSI-stripped) | no |
 | `/` | enter filter mode | no |
@@ -1633,55 +1645,181 @@ the vim→tmux word inversion is resolved exactly once. `o` = vertical =
 side-by-side = `-h`. `s` = horizontal = stacked = `-v`. Do not re-derive this
 anywhere else.
 
-### 8.2 Destructive actions and their confirmation UX
+### 8.2 Destructive actions and their UX
 
-`S` is the **only** destructive binding in v1. There is no "kill pane group", no
-"stop all", no bulk verb.
+`Ctrl+X` is the **only** destructive binding in v1. There is no "kill pane
+group", no "stop all", no bulk verb. It carries two verbs, one recoverable and
+one not:
 
-Pressing `S`:
+> `Ctrl+X` — Stop the session; press again within two seconds to delete it.
 
-1. If the selected session has no short id (`id.is_none()`):
-   flash `no short id — cannot stop this session` (`MsgLevel::Warn`) and stop.
-   No modal. `claude stop` requires a short id (§9.7).
-2. If the selected session is already in `Group::Completed`:
-   flash `session already completed` (Warn) and stop.
-3. Otherwise enter `Mode::Confirm(Confirm::StopSession { .. })` and render:
+which is Claude Code's own agent-view shortcut, adopted verbatim. `stop` keeps
+the conversation (`Enter` resumes it); `claude rm` deletes the session **and its
+git worktree** and cannot be undone (PROBE-FINDINGS §2).
 
-```
-   ┌─ stop session ─────────────┐
-   │                            │
-   │  bt/reg-update             │
-   │  1c45d64f                  │
-   │                            │
-   │  Stops the agent. The      │
-   │  conversation is kept;     │
-   │  resume with Enter later.  │
-   │                            │
-   │  y: stop     n/Esc: cancel │
-   └────────────────────────────┘
-```
+`S` used to be this binding. It is now unbound as a verb: it flashes
+`stop is Ctrl+X now` (Info) and does nothing else. It is answered rather than
+ignored because it was the stop key for the whole life of the previous build.
 
-Confirmation rules, all mandatory:
+**Placement, mandatory:** the `Ctrl+X` arm MUST sit above `key_normal`'s
+`_ if ctrl => Action::None` catch-all. Below it the arm compiles, reads
+correctly, and never fires. The unit suite drives the binding through `on_key`,
+not through the inner function, for exactly this reason.
 
-- **No default-affirmative.** There is no highlighted "Yes"; `Enter` alone does
-  **not** confirm. Only the literal key `y` (lowercase, no modifiers) confirms.
-- `n`, `Esc`, `q`, `Enter`, and any other key cancel and return to
-  `Mode::Normal` with no side effect.
-- The modal captures the session's `short_id` **at the moment `S` was pressed**
-  and `act_confirm_stop` uses that captured id, not the live cursor. A poll
-  landing between `S` and `y` can reorder the list; without capture, `y` would
-  stop whatever slid under the cursor. This is the single most important detail
-  in the keymap.
-- Before calling `agents::stop`, re-check that `short_id` still appears in
-  `app.sessions`. If it does not, cancel and flash
-  `session <id> is gone — not stopped` (Warn).
-- On success: flash `stopped <name>` (Info) and force a refresh. The pane, if
-  any, is **left open** — closing it is the operator's separate `x`.
-- On `AgentsError`: flash `stop failed: <stderr first line>` (Error).
+#### First press
+
+1. No selection → flash `no session selected` (Warn). No window.
+2. No short id (`id.is_none()`) → flash `no short id — cannot stop this session`
+   (Warn). No window: a session `claude` cannot be told to stop is one it cannot
+   be told to delete either (§9.7).
+3. Already in `Group::Completed` → nothing to stop. Flash `<label> is already
+   stopped` (Info) and open the window anyway: `claude rm` is documented to work
+   on already-exited sessions, and the session the PREVIOUS press stopped is
+   Completed by the time the window lapses. Refusing here would make the
+   just-stopped session undeletable.
+4. Otherwise `claude stop <short_id>`.
+   - Ok → force a refresh, open the window, flash `stopped <label>` (Info). The
+     pane, if any, is **left open** — closing it is the operator's separate `x`.
+   - Err → flash `stop failed: <stderr first line>` (Error) and open **no**
+     window. The escalation is only ever an escalation of a stop that happened.
+
+Opening the window CAPTURES `session_id`, `short_id` and `name`, and stamps
+`at` **after** `claude stop` returns — the operator's two seconds must not be
+spent inside the shell-out.
+
+#### Second press, inside `CX_WINDOW` (2 s)
+
+- The cursor must still be on the captured `session_id`. This is the only check
+  that reads the live selection, and it reads it to REFUSE, never to retarget:
+  what would be deleted is always the capture. If the cursor has moved, the
+  window closes, nothing is stopped, nothing is deleted, and the flash names
+  which of the two things happened: `moved off <label> — nothing deleted` (Warn)
+  when the captured row is still on screen, and `<label> left the list —
+  nothing deleted` (Warn) when it is not. Re-arming on the new row was
+  rejected: with the Completed group hidden (`a`), a stopped row leaves the list
+  and the cursor falls to a neighbour, so re-arming would stop an innocent agent
+  on two deliberate presses.
+
+  Two things make the row leave the list under a still cursor, and the operator
+  can act on both once the flash distinguishes them: `a` hiding the Completed
+  group, and a `/` filter that matches the WORKTREE path — `claude stop` reverts
+  a session's reported `cwd` from `.claude/worktrees/<name>` to the parent
+  directory, so the forced refresh behind the first press drops the row out of a
+  filter written against the worktree. The escalation is then unreachable in one
+  gesture, by design and failing safe. The capability is not lost: clear the
+  filter (or press `a`) and press `Ctrl+X` twice on the stopped row — a first
+  press on a Completed row arms without stopping anything (§8.2, below).
+- The press SCHEDULES the delete; it does not run it (see the settle below).
+- Before `claude rm`, the CAPTURED short id is re-validated against
+  `app.sessions`. Absent → flash `session <id> is gone — not deleted` (Warn).
+- Ok → flash `deleted <label> + worktree` (Warn) and force a refresh.
+- Err → flash `delete failed: <first line>` (Error). The line comes from stderr,
+  or from **stdout when stderr is blank**: `claude rm` refuses to delete a
+  worktree holding unpushed commits or uncommitted changes, and it prints that
+  refusal on stdout while exiting 1 (PROBE-FINDINGS §2). Reading stderr alone
+  renders `delete failed: exit 1` and drops the sentence that says the work is
+  safe. This is the ONE case where a failure is good news, so it must be
+  legible.
+
+A press after the window has lapsed is a FIRST press again: it stops, it never
+deletes.
+
+#### Mis-fire defence
+
+Moving off `S` removed the paste and prose exposure — no run of text produces a
+Ctrl chord, and Normal mode discards pastes (§8.9). Two ways the chord can still
+arrive without a human meaning it twice remain, and both are closed:
+
+- **A buffered burst.** Every press stamps `cx_last_press` — on ENTRY, and
+  AGAIN when the handler returns — and a press within `CX_MIN_GAP` (750 ms) of
+  that stamp acts on nothing. A burst of any length therefore performs exactly
+  one stop.
+
+  The re-stamp on the way out is load-bearing, not belt-and-braces. A first
+  press shells out to `claude stop` (~0.66 s) and then to `claude agents --json`
+  (~0.19 s), and the UI is frozen for all of it. Stamping only on entry measured
+  the gap between the times two presses were DEQUEUED, not between the
+  keystrokes: two `Ctrl+X` events ~100 ms apart were read ~1.1 s apart, cleared
+  the bar, and deleted a session and its worktree before the warning had ever
+  been drawn. `run_delete` re-stamps for the same reason — `claude rm` plus its
+  refresh blocks just as long, from the event-loop tick where no keypress
+  stamped anything, and a press buffered through THAT freeze used to read as a
+  fresh first press and stop whichever row the cursor fell to. `main.rs` also
+  drains the tty after any keypress that blocked longer than `SLOW_KEY`
+  (300 ms), which drops the rest of the replay too — the keys that are not
+  `Ctrl+X`.
+- **A held key.** With `KeyEventKind::Press`-only events there is no release to
+  observe, so "press, wait 660 ms, press, release" and "hold for 665 ms" are
+  the SAME event stream. Nothing downstream of the gap can separate them, so
+  the gap itself has to exclude the auto-repeat delay: `CX_MIN_GAP` is 750 ms,
+  clear of GNOME's 500 ms, KDE's 600 ms and X11 `xset`'s 660 ms. At any stock
+  setting a hold's first repeat does not qualify, so no delete is ever
+  scheduled and the release timing cannot matter. Holding `Ctrl+X` down stops
+  one session and deletes nothing.
+
+  Behind that, a qualifying second press still does not delete on the spot: it
+  is SETTLED for `CX_SETTLE` (180 ms) and executed from the event-loop tick, and
+  a further `Ctrl+X` inside that beat cancels it. That covers a repeat delay
+  configured ABOVE `CX_MIN_GAP`, where the first repeat does qualify: the next
+  repeat is 25–40 ms behind it and lands inside the settle.
+
+  Stated residual: a repeat delay configured above 750 ms AND a release inside
+  the first repeat interval (or a repeat rate below ~5.6 Hz, so the next repeat
+  misses the settle). Both conditions must hold, and no stock configuration
+  meets the first. The layers behind it still hold — the delete targets only the
+  captured id, only while the cursor is still on it, only after re-validation
+  against the current poll, and `claude rm` itself refuses a worktree with
+  unpushed work (§8.2, above).
+
+A press suppressed by `CX_MIN_GAP` is not silent: it flashes
+`too fast — press Ctrl+X again` and asks for a redraw. Silence there was
+indistinguishable from a wedged sidebar, because the press acted on nothing and
+left whatever stale line was already on screen. While the window is open the
+warning outranks the flash, so this is read exactly when there is no warning to
+displace. The window is NOT consumed — a press inside the bar costs the operator
+one keystroke, never the escalation.
+
+#### The window on screen
+
+While it is open the footer says
+`Ctrl+X again: delete <label> and its worktree — cannot be undone`, in `p.red`.
+It **outranks the flashed message and the poll error**, so nothing can push the
+warning off screen while the verb is loaded, and it inherits §6.8's overflow
+wrap, so at 34 columns it wraps rather than clipping. It is 70 columns — the
+longest line ccmux produces, and the only one whose TAIL carries the
+consequence — so the wrap has to work at every height, not only where there is
+a detail block to wrap into. §6.8 AMENDMENT: below height 12, where `slots`
+allocates no detail block, the wrapped message is carved out of the bottom of
+the LIST instead (`overflow_rect`), capped so the header and at least one
+session row always survive; the carve is transient and changes nothing about
+`list_viewport_rows`, so the row-index-to-screen-line mapping underneath it is
+untouched. Only a sidebar under 5 rows tall still loses the tail, which is
+below the height at which the list itself is usable. It names the session
+because the cursor is free to move while it is open. `u` undoes a dismissal
+(§8.1), never a delete; the footer says so because there is no other way to
+learn it in time.
+
+#### The window closes on
+
+two seconds passing (expired from the event-loop tick, so it closes with no key
+pressed), `Esc`, `q`/`Ctrl-c`, a second press (whether it deleted or refused),
+and any departure from `Mode::Normal` — `/`, `n`, `?`, `L`. The last is enforced
+in one place, at the end of `on_key`, so no handler can forget it.
+
+#### The confirm modal
+
+`Mode::Confirm`, `Confirm::StopSession`, `CONFIRM_ARM_DELAY`, `key_confirm`,
+`act_confirm_stop` and `draw_confirm` still exist and still behave exactly as
+they always did — no default-affirmative, only a literal `y` confirms, a `y`
+inside `CONFIRM_ARM_DELAY` is type-ahead and cancels, the modal captures the
+short id at open. **No key path reaches any of it.** `act_request_stop` is its
+only entry point and nothing calls it. It is retained deliberately for the next
+verb that needs a modal; whether it is deleted is a separate decision.
 
 Every other verb is non-destructive by construction and takes no confirmation:
 `x` is proven safe (PROBE-FINDINGS §3: killing the pane leaves the agent
-running), `q` only exits the sidebar process, `n` only creates.
+running), `q` only exits the sidebar process, `n` only creates, `d` only hides
+and `u` puts it back.
 
 ### 8.3 `Enter` semantics
 
@@ -1758,10 +1896,10 @@ they **are** descendants of their pane's process, so `kill-pane` would SIGHUP
 Claude and end the session. Earlier drafts carried a refusal step for that case.
 It is now **gone, not relaxed**: §3.5's `apply_poll` excludes interactive rows,
 so no such row can ever be selected, and the refusal had nothing left to fire
-on. This keeps `S` the only destructive binding in v1 (§8.2).
+on. This keeps `Ctrl+X` the only destructive binding in v1 (§8.2).
 
 Step 8's wording matters: it is the operator-facing statement of
-PROBE-FINDINGS §3, shown every time, so nobody ever confuses `x` with `S`.
+PROBE-FINDINGS §3, shown every time, so nobody ever confuses `x` with `Ctrl+X`.
 
 ### 8.6 `n` — dispatch a new background session
 
@@ -1912,9 +2050,10 @@ degrades to a message in the footer over the last known-good list. `unwrap()`,
 - Footer shows `agents: <msg>` in red; header indicator turns red.
 - `fail_streak >= 3` → interval widens to 10 s (§4.2).
 - Any success clears `poll_error` and resets `fail_streak`.
-- Verbs that need fresh data (`Enter`, `o`, `s`, `S`) still act on the stale
-  list. `S` re-validates against `app.sessions` (§8.2), so a stale entry fails
-  closed with `session is gone — not stopped`.
+- Verbs that need fresh data (`Enter`, `o`, `s`, `Ctrl-x`) still act on the
+  stale list. `Ctrl-x`'s delete re-validates the CAPTURED short id against
+  `app.sessions` (§8.2), so a stale entry fails closed with
+  `session <id> is gone — not deleted`.
 
 ### 9.2 Invalid JSON
 
@@ -1949,8 +2088,11 @@ Unavoidable: the poll is up to 2.5 s stale.
   The map entry stays (§5.3) so `x` still closes it. ccmux does not pre-validate
   by polling again — the race is unclosable and the readable pane is the
   correct handling.
-- **`S`** — re-validated against `app.sessions` before the call, then `claude
-  stop` may still fail; its stderr surfaces via `stop failed: <msg>`.
+- **`Ctrl-x`** — the first press may find the session already gone; `claude
+  stop` fails and its stderr surfaces via `stop failed: <msg>`, and a failed
+  stop does **not** open the delete window. The second press re-validates the
+  captured id against `app.sessions` before `claude rm` and fails closed with
+  `session <id> is gone — not deleted`.
 - **`x`** — targets a pane, not a session, so a vanished session is irrelevant.
   A vanished *pane* is caught by `assert_in_session` returning `BadTarget`, and
   `reconcile` drops the entry on the next tick.
@@ -1965,7 +2107,8 @@ Unavoidable: the poll is up to 2.5 s stale.
 - **`ccmux sidebar` outside tmux** (`$TMUX` unset) → **degraded mode**, not an
   error. `app.degraded = true`.
   - Works: polling, list, grouping, `/`, `a`, `r`, `L`, `?`, `j/k/g/G/Tab`, `n`
-    (dispatch is pure `claude --bg`, no tmux involved), `S` (pure `claude stop`).
+    (dispatch is pure `claude --bg`, no tmux involved), `Ctrl-x` (pure
+    `claude stop` / `claude rm`).
   - Refuses with `flash("not inside tmux — <verb> unavailable", Warn)`:
     `Enter`, `o`, `s`, `x`.
   - `PaneMap` is held in memory only; `load_map`/`save_map` are skipped.
@@ -1993,7 +2136,7 @@ the CLI omits `id`, so a **listed** row can reach it.
 |---|---|
 | `Enter` / `o` / `s` | refused: `no short id — cannot open this session`. There is no `claude attach` without one, so a split would have nothing to run |
 | `x` | unaffected — it targets the *pane*, and `pane_of` is keyed on `session_id`, not on the short id |
-| `S` | refused: `no short id — cannot stop this session` (§8.2 step 1) |
+| `Ctrl-x` | refused: `no short id — cannot stop this session` (§8.2 step 1). No window opens, so the delete is unreachable too |
 | `L` | refused: `no short id — no logs for this session` |
 | grouping | unchanged: `group()` reads `state`/`status`, never `id` |
 | rendering | detail block line 2 reads `id      —  background  <status>` (§6.5) |
@@ -2068,14 +2211,19 @@ the CLI omits `id`, so a **listed** row can reach it.
 - `apply_poll` on a payload containing a `kind: "interactive"` row leaves that
   row out of `app.sessions` — the §3.5 listing policy, and the test that stops
   someone "simplifying" the filter away.
-- `on_key('S')` on a row with no short id leaves `mode == Normal` and sets a
-  Warn message.
+- `Ctrl-x` on a row with no short id leaves `mode == Normal`, sets a Warn
+  message, opens no delete window, and spawns nothing.
 - `on_key('c')` is inert: no mode change, no prompt, no message (§8.7).
 - `pane_of` resolves a session through `map` and returns `None` for one that is
   not in it.
-- `on_key('S')` then `on_key('n')` leaves `mode == Normal` and calls nothing.
-- The confirm modal captures the short id: mutate `app.sessions` between `S` and
-  `y`, and the captured id is still the one used.
+- `Ctrl-x` is reached through `on_key` — proving it sits ABOVE `key_normal`'s
+  `_ if ctrl => Action::None` catch-all, below which any Ctrl arm is dead.
+- `Ctrl-x` captures the short id: mutate `app.sessions` between the two presses
+  and the captured id is still the one deleted.
+- A burst of `Ctrl-x` in one instant stops once and deletes nothing; a held key
+  (a qualifying press followed by a repeat stream) deletes nothing.
+- The delete window does not survive `/`, `n`, `?`, `q`, `Esc`, a moved cursor,
+  or two seconds passing.
 - `j`/`k` never land on a `Row::Header`; `G` on an empty list does not panic.
 
 ### 10.2 Integration checks (manual, against a throwaway session)
@@ -2377,7 +2525,12 @@ behaviour, the pin is superseded by this appendix.
 
 | Amends | Was | Is |
 |---|---|---|
-| §8.2 | `y` confirms whenever the modal is open. | `y` is ignored for 250 ms after the modal opens (`CONFIRM_ARM_DELAY`), and the event loop drains queued input the instant the modal is drawn. Type-ahead — a paste, or `Sync` typed without `/` — cannot stop an agent. |
+| §8.2 | `y` confirms whenever the modal is open. | `y` is ignored for 250 ms after the modal opens (`CONFIRM_ARM_DELAY`), and the event loop drains queued input the instant the modal is drawn. Type-ahead — a paste, or `Sync` typed without `/` — cannot stop an agent. Now dormant: no key opens the modal. |
+| §8.2 | `S` stops the selected session behind a `y`/`n` modal, and there is no way to delete one. | `Ctrl+X` stops it immediately with no modal, and a second `Ctrl+X` within two seconds deletes it and its worktree via `claude rm` (PROBE-FINDINGS §2). `S` is unbound as a verb and only says where stop went. The modal is gone from the key paths, not from the crate. |
+| §8.2 | `CX_MIN_GAP` is 250 ms and every press stamps it on entry, so "a buffered burst of any length performs exactly one stop" and "holding `Ctrl+X` down deletes nothing". | Both were falsified live. The entry-only stamp measured DEQUEUE time, so the ~0.85 s the first press spent blocked inside `claude stop` plus the forced refresh became the gap: two `Ctrl+X` events ~100 ms apart deleted a session and its worktree. Presses now re-stamp when the handler returns, `run_delete` re-stamps after its own shell-out, and `main.rs` drains the tty after any keypress that blocked over `SLOW_KEY` (300 ms). And 250 ms was under every stock auto-repeat delay, so a hold released inside its first repeat interval deleted; `CX_MIN_GAP` is now 750 ms, clear of GNOME 500 / KDE 600 / X11 660. |
+| §8.2 | A press suppressed by `CX_MIN_GAP` returns `Action::None` and draws nothing. | It flashes `too fast — press Ctrl+X again` and asks for a redraw. Silence was indistinguishable from a wedged sidebar: the press acted on nothing and left the previous line on screen. The window is not consumed. |
+| §8.2 | A refused second press always flashes `moved off <label> — nothing deleted`. | It says `<label> left the list — nothing deleted` when the captured row is no longer in the list at all — `a` hiding Completed, or a `/` filter written against the worktree path that `claude stop` reverts. The refusal is unchanged and still fails safe; only the cause it names is. |
+| §6.8, §8.2 | The overflow wrap needs the detail block, which exists only at height >= 12. | Below 12 the wrapped message is carved out of the bottom of the list (`overflow_rect`), capped so the header and one session row survive. `Ctrl+X`'s armed warning is 70 columns and the only line whose tail carries the consequence; a 34x10 sidebar was clipping it to `Ctrl+X again: delete rv burst tas…`. |
 | §8.9 | Paste arrives as key events and runs the keymap. | Bracketed paste is enabled for the sidebar's lifetime. `Normal` discards a paste; `Filter` and `Prompt` take it as literal text with control characters stripped. |
 | §1.2 step 5 | Any tmux session with the configured name is healed. | Healing requires `@ccmux_map` to be set, which only `configure_session` writes. A foreign session with a colliding name is refused, never split or resized. |
 | §8.4 | The split anchor is chosen from the session-wide pane list. | Anchor selection is scoped to the sidebar's `#{window_index}`. `pane_left`, `pane_index` and `pane_active` are per-window, so the unscoped choice could open Claude in a window the operator is not looking at. `list_panes_in_session` stays session-scoped for `PaneMap::reconcile`. |

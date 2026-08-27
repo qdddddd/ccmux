@@ -41,10 +41,35 @@ Grouping used by the stock fleet view (mirror it): **Working** (state=working),
 | `claude logs <id>` | Prints recent terminal output as a **raw ANSI/PTY dump** (includes alt-screen setup, cursor moves). Needs VT stripping before it can be shown in a sidebar preview. | YES |
 | `claude stop <id>` | Stops the session; conversation kept; resume later with `claude attach <id>`. | YES |
 | `claude kill <id>` | Alias of `stop`. | YES |
+| `claude rm <id>` | `claude rm --help`, verbatim: "Delete a background session and its worktree. Unlike `stop`, works on already-exited sessions." **IRREVERSIBLE** — it removes the git worktree, so uncommitted work in it is gone. Verified on 2.1.246. | YES |
 
 `claude resume` and `claude list` are **NOT** subcommands — they fall through to the
 generic help (verified against a `bogus123` control). Only `attach`, `logs`, `stop`,
-`kill` are real.
+`kill`, `rm` are real.
+
+**`rm` REFUSES rather than destroying unpushed work, and it explains itself on
+STDOUT.** Verified on 2.1.246: against a worktree holding commits that are not
+pushed anywhere, or uncommitted changes, `claude rm <id>` prints
+
+```
+kept 35f940dd — worktree has commits that are not pushed anywhere
+  worktree kept at /home/dev/.local/tmp/ccmux-cx-live/.claude/worktrees/haiku-notes-a
+  resolve that (commit/push, or remove the worktree), then run 'claude rm 35f940dd' again
+```
+
+on **stdout**, leaves **stderr empty**, and exits **1**. Anything that surfaces a
+failed `rm` by reading stderr alone therefore renders `exit 1` and drops the only
+sentence that says the work is safe. Read stdout when stderr is blank. A `rm`
+whose worktree is clean (or which has none) deletes the session and removes the
+worktree from `git worktree list`, verified both ways.
+
+`rm` is hidden from `claude --help`'s Commands list exactly as the other four are.
+It was added to this table on 2026-08-27, after four implementers had already built
+against a version of §2 that listed only `attach`/`logs`/`stop`/`kill`: that list was
+INCOMPLETE, not exhaustive. `stop` and `rm` are not interchangeable — `stop` is the
+recoverable verb (the conversation survives, `claude attach <id>` resumes it) and `rm`
+is the one that cannot be undone. Anything that offers both must make which is which
+unmistakable at the moment of the keypress.
 
 ## 3. Safety properties (both verified — these make the design safe)
 

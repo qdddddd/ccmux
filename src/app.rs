@@ -38,6 +38,51 @@ const POLL_ERR_MAX: usize = 120;
 /// read the prompt. `claude stop` is the one verb that ends a running agent, so
 /// it must be answered by a keystroke made AFTER the question was visible.
 const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(250);
+/// How long the second `Ctrl+X` has to arrive for it to mean DELETE
+/// (SPEC §8.2). Agent view's own shortcut table words it "press again within
+/// two seconds to delete it", and this is that two seconds.
+const CX_WINDOW: Duration = Duration::from_secs(2);
+/// Minimum gap between two `Ctrl+X` presses for the second one to count.
+///
+/// Moving the binding off `S` removed the paste and prose exposure — no run of
+/// text can produce a Ctrl chord, and Normal mode discards pastes anyway — but
+/// it did not remove the two ways the same chord can arrive without a human
+/// meaning it twice: a burst the tty had already buffered while the UI was
+/// blocked, and a held key auto-repeating. EVERY press stamps the clock — on
+/// entry AND again after the shell-out it may have blocked in — so neither
+/// stream can ever accumulate a gap: a burst of any length performs exactly one
+/// stop, and a repeat stream performs exactly one stop no matter how long the
+/// key is held.
+///
+/// It is 750 ms rather than `CONFIRM_ARM_DELAY`'s 250 ms because of the held
+/// key. With `KeyEventKind::Press`-only events there is no release to observe,
+/// so "press, wait 660 ms, press, release" and "hold for 665 ms" are the SAME
+/// event stream — no settle can separate them after the fact, and at 250 ms
+/// every stock auto-repeat delay (GNOME 500 ms, KDE 600 ms, X11 `xset` default
+/// 660 ms) cleared the bar, so a hold released just after its first repeat
+/// deleted a session. 750 ms clears all of them with margin. It also serves
+/// `CONFIRM_ARM_DELAY`'s own stated reason better than 250 ms ever did: the
+/// warning this press answers is 60 characters of "delete <name> and its
+/// worktree — cannot be undone", and 250 ms is not time enough to read it.
+/// A press inside the bar is not lost — it says so in the footer and the
+/// window stays open (`act_ctrl_x`).
+const CX_MIN_GAP: Duration = Duration::from_millis(750);
+/// How long a qualifying second press waits before the delete actually runs.
+///
+/// `CX_MIN_GAP` alone cannot stop a held key whose auto-repeat DELAY was
+/// configured above it, so the delete is also SETTLED: it is scheduled, and a
+/// further `Ctrl+X` inside this window — the signature of a repeat stream,
+/// whose next event is 25–40 ms away — cancels it. A deliberate double press
+/// has no third event and the delete fires. The cost is one event-loop beat of
+/// latency on the one action in ccmux that cannot be undone.
+const CX_SETTLE: Duration = Duration::from_millis(180);
+/// LOAD-BEARING, so it is pinned at compile time: the settle must be shorter
+/// than the gap guard. That is what makes a settling delete and another
+/// qualifying press mutually exclusive — any press early enough to catch a
+/// pending delete is by definition inside `CX_MIN_GAP`, so it cancels rather
+/// than schedules. Retuning either constant past the other would silently
+/// reopen that overlap.
+const _: () = assert!(CX_SETTLE.as_millis() < CX_MIN_GAP.as_millis());
 /// Names stored in `@ccmux_map`, truncated. tmux rejects a `set-option` value
 /// over ~16 KB (measured: ok at 16323 bytes, "command too long" at 16324), and
 /// `name` is the only unbounded field in a `PaneEntry`.
@@ -64,6 +109,30 @@ pub enum Confirm {
         short_id: String,
         name: String,
     },
+}
+
+/// The session the FIRST `Ctrl+X` press acted on, and when the window opened.
+///
+/// Every field is CAPTURED at that first press. The second press hands
+/// `short_id` to `claude rm` and never re-reads the cursor, so a poll that
+/// re-sorts the list — or a row that slides under the cursor — cannot change
+/// what gets deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopArm {
+    pub session_id: String,
+    pub short_id: String,
+    pub name: String,
+    /// Stamped AFTER `claude stop` returned, so the shell-out does not eat the
+    /// window the operator is told they have.
+    pub at: Instant,
+}
+
+/// A delete that qualified and is waiting out `CX_SETTLE`. Holds its own copy
+/// of the capture: once scheduled it is answerable to nothing on screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDelete {
+    pub target: StopArm,
+    pub at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,10 +301,20 @@ pub struct App {
     pub degraded: bool,
 
     // messaging + health
-    /// When the `S` modal went up. `key_confirm` refuses a `y` that arrives
+    /// When the confirm modal went up. `key_confirm` refuses a `y` that arrives
     /// within `CONFIRM_ARM_DELAY` of it, and `None` means "not armed" — both
     /// fail closed.
     pub confirm_armed_at: Option<Instant>,
+
+    /// `Ctrl+X`'s delete window: `Some` for `CX_WINDOW` after a press that
+    /// stopped (or found already stopped) a session. `None` is "the next press
+    /// is a first press", which is the recoverable verb — fail closed.
+    pub stop_arm: Option<StopArm>,
+    /// When the LAST `Ctrl+X` arrived, acted on or not. The burst / auto-repeat
+    /// guard; see `CX_MIN_GAP`.
+    pub cx_last_press: Option<Instant>,
+    /// A qualifying second press, waiting out `CX_SETTLE`; see the constant.
+    pub pending_delete: Option<PendingDelete>,
 
     pub message: Option<(String, MsgLevel)>,
     pub msg_deadline: Option<Instant>,
@@ -300,6 +379,9 @@ impl App {
             degraded,
 
             confirm_armed_at: None,
+            stop_arm: None,
+            cx_last_press: None,
+            pending_delete: None,
 
             message: None,
             msg_deadline: None,
@@ -511,19 +593,29 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
         {
+            self.disarm_ctrl_x();
             self.should_quit = true;
             return Action::Quit;
         }
 
         // §8.9: dispatch on mode FIRST; only Normal sees the §8.1 table.
-        match self.mode.clone() {
+        let action = match self.mode.clone() {
             Mode::Normal => self.key_normal(key),
             Mode::Filter => self.key_filter(key),
             Mode::Confirm(_) => self.key_confirm(key),
             Mode::Prompt(_) => self.key_prompt(key),
             Mode::Help => self.key_help(key),
             Mode::Logs => self.key_logs(key),
+        };
+        // §8.2: `Ctrl+X`'s window belongs to the list in Normal mode. Anything
+        // that leaves Normal — `/`, `n`, `?`, `L` — or quits closes it, because
+        // the footer that carries the warning is no longer the thing on screen
+        // and the operator's attention has moved with it. One place, so no
+        // handler can forget.
+        if self.mode != Mode::Normal || self.should_quit {
+            self.disarm_ctrl_x();
         }
+        action
     }
 
     /// One bracketed-paste event's text.
@@ -994,7 +1086,16 @@ impl App {
         }
     }
 
-    /// `S` — enter the confirmation modal. Never calls `agents::stop`. SPEC §8.2.
+    /// The confirmation modal's entry point. Never calls `agents::stop`.
+    ///
+    /// UNREACHABLE FROM ANY KEY PATH since stop moved to `Ctrl+X` (SPEC §8.2):
+    /// `S` no longer calls it and nothing else ever did, so `Mode::Confirm`,
+    /// `CONFIRM_ARM_DELAY`, `key_confirm`, `act_confirm_stop` and `draw_confirm`
+    /// are now reachable only through this function and through tests. Kept,
+    /// not deleted: it is the whole confirm mechanism for the next verb that
+    /// needs one, it costs one `allow` to keep compiling, and whether dead code
+    /// goes is the owner's call, not this change's.
+    #[allow(dead_code)]
     pub fn act_request_stop(&mut self) {
         let Some(sel) = self.selected_session() else {
             return;
@@ -1051,6 +1152,253 @@ impl App {
             }
             Err(e) => self.flash(format!("stop failed: {}", agents_msg(&e)), MsgLevel::Error),
         }
+    }
+
+    // ── `Ctrl+X` — stop, and again inside the window to delete (§8.2) ───────
+
+    /// THE `Ctrl+X` entry point. First press stops the selected session with no
+    /// modal; a second press inside `CX_WINDOW` deletes it and its worktree.
+    ///
+    /// Every press stamps `cx_last_press` before anything else can return, so
+    /// the burst / auto-repeat guard can never be skipped by an early exit —
+    /// and the press stamps it AGAIN on the way out, which is the half that
+    /// makes the guard measure what it claims to. See the re-stamp below.
+    pub fn act_ctrl_x(&mut self) -> Action {
+        let now = Instant::now();
+        let gap = self
+            .cx_last_press
+            .map(|t| now.saturating_duration_since(t))
+            .unwrap_or(CX_MIN_GAP);
+        self.cx_last_press = Some(now);
+
+        if gap < CX_MIN_GAP {
+            // Buffered burst, or auto-repeat. It acts on nothing, and it
+            // CANCELS a settling delete: a second chord this soon after the one
+            // that scheduled it is a repeat stream, not a human pressing twice.
+            // The arm itself survives, so a human who merely tapped too fast
+            // still has their window.
+            self.pending_delete = None;
+            // Say so. Silence here is indistinguishable from a wedged sidebar:
+            // the press acts on nothing and — before this — asked for no redraw
+            // either, so the screen kept whatever stale line was on it. While
+            // the window is open `arm_hint` outranks this in the footer, so the
+            // warning is never displaced; it is read exactly when there is no
+            // warning to read, which is the case that looked broken.
+            self.flash("too fast — press Ctrl+X again", MsgLevel::Warn);
+            return Action::Redraw;
+        }
+
+        // A lapsed arm is dropped before anything can read it, so the press
+        // below is a first press again — "stops it again", never "deletes it".
+        if self
+            .stop_arm
+            .as_ref()
+            .is_some_and(|a| now.saturating_duration_since(a.at) > CX_WINDOW)
+        {
+            self.stop_arm = None;
+        }
+
+        match self.stop_arm.take() {
+            Some(arm) => self.arm_second_press(arm),
+            None => self.stop_and_arm(),
+        }
+        // LOAD-BEARING. `stop_and_arm` shells out to `claude stop` and then to
+        // `claude agents --json`, and that blocks the whole UI for the better
+        // part of a second — measured 0.66 s + 0.19 s. Stamping only on entry
+        // measured the gap between the times two presses were DEQUEUED, not
+        // between the keystrokes: a second `Ctrl+X` pressed during the freeze,
+        // before any frame carrying the warning had ever been drawn, was read
+        // with a gap of ~1.1 s, sailed past `CX_MIN_GAP` and deleted the
+        // session and its worktree. Re-stamping here restarts the clock when
+        // the UI became responsive again, so anything the tty buffered while
+        // it was frozen reads as the burst it is.
+        self.cx_last_press = Some(Instant::now());
+        Action::Redraw
+    }
+
+    /// First press: stop the selection and open the delete window.
+    fn stop_and_arm(&mut self) {
+        let Some(sel) = self.selected_session() else {
+            self.flash("no session selected", MsgLevel::Warn);
+            return;
+        };
+        if !sel.is_attachable() {
+            // §9.7's wording, unchanged by the move off `S`.
+            self.flash("no short id — cannot stop this session", MsgLevel::Warn);
+            return;
+        }
+        let session_id = sel.session_id.clone();
+        let short_id = sel.id.clone().unwrap_or_default();
+        let name = sel.name.clone();
+        let label = session_label(sel);
+        let done = sel.group() == Group::Completed;
+
+        if done {
+            // Nothing to stop — and refusing here would strand the session that
+            // the PREVIOUS press stopped, which is Completed by the time the
+            // window lapses. `claude rm` is documented to work on already-exited
+            // sessions (PROBE-FINDINGS §2); this is the press that offers it.
+            self.flash(format!("{label} is already stopped"), MsgLevel::Info);
+            self.stop_arm = Some(StopArm {
+                session_id,
+                short_id,
+                name,
+                at: Instant::now(),
+            });
+            return;
+        }
+
+        match agents::stop(&short_id) {
+            Ok(()) => {
+                self.act_force_refresh();
+                // Stamped AFTER the shell-out: the window the footer promises
+                // must be two seconds of the operator's time, not two seconds
+                // minus however long `claude stop` took.
+                self.stop_arm = Some(StopArm {
+                    session_id,
+                    short_id,
+                    name,
+                    at: Instant::now(),
+                });
+                // The pane, if any, is left open — closing it is a separate `x`.
+                self.flash(format!("stopped {label}"), MsgLevel::Info);
+            }
+            // A stop that failed must NOT arm: the escalation is only ever an
+            // escalation of a stop that happened.
+            Err(e) => self.flash(format!("stop failed: {}", agents_msg(&e)), MsgLevel::Error),
+        }
+    }
+
+    /// Second press inside the window. Schedules the delete; it does not run it.
+    fn arm_second_press(&mut self, arm: StopArm) {
+        // The cursor must still be on the row the first press stopped. It is
+        // the only check that reads the live selection at all — and it reads it
+        // to REFUSE, never to retarget: what would be deleted is `arm`.
+        //
+        // Moving off the row cancels the window rather than re-arming on the
+        // new row. Re-arming would stop whatever is now selected, and the row
+        // most likely to be selected is the neighbour the cursor fell to when
+        // the just-stopped session moved into Completed and `a` had that group
+        // hidden. Two deliberate presses would then stop an innocent agent.
+        // Cancelling costs one keypress and can stop nothing.
+        let same = self
+            .selected_session()
+            .is_some_and(|s| s.session_id == arm.session_id);
+        if !same {
+            let label = model::truncate_end(&arm.name, LABEL_MAX);
+            // Two different things bring us here and the operator can only act
+            // on one of them. Either the cursor MOVED off a row that is still
+            // on screen — `k`, or `Tab` — or the row itself LEFT the list while
+            // the cursor stood still: `a` hides Completed, or a `/` filter
+            // matches the worktree path that `claude stop` just reverted to the
+            // parent directory, and the forced refresh drops the row. Saying
+            // "moved off" for the second case blames the operator for something
+            // the list did, and hides the recovery, which is to clear the
+            // filter (or press `a`) and press `Ctrl+X` twice on the stopped
+            // row — a first press there arms without stopping anything.
+            let msg = if self.is_visible(&arm.session_id) {
+                format!("moved off {label} — nothing deleted")
+            } else {
+                format!("{label} left the list — nothing deleted")
+            };
+            self.flash(msg, MsgLevel::Warn);
+            return;
+        }
+        self.pending_delete = Some(PendingDelete {
+            target: arm,
+            at: Instant::now(),
+        });
+    }
+
+    /// Expire a lapsed window and run a settled delete. Called from the event
+    /// loop every iteration, next to `check_message_timeout`; returns true when
+    /// the caller should redraw.
+    ///
+    /// The delete runs HERE and not in the keypress so that a repeat stream has
+    /// its chance to cancel it (`CX_SETTLE`), and so the footer stops promising
+    /// a window that has closed even when no key is ever pressed again.
+    pub fn tick_stop_arm(&mut self) -> bool {
+        let mut redraw = false;
+        if self
+            .stop_arm
+            .as_ref()
+            .is_some_and(|a| a.at.elapsed() > CX_WINDOW)
+        {
+            self.stop_arm = None;
+            redraw = true;
+        }
+        if self
+            .pending_delete
+            .as_ref()
+            .is_some_and(|p| p.at.elapsed() >= CX_SETTLE)
+        {
+            if let Some(p) = self.pending_delete.take() {
+                self.run_delete(p.target);
+            }
+            redraw = true;
+        }
+        redraw
+    }
+
+    /// The ONLY caller of `agents::delete`. SPEC §8.2.
+    fn run_delete(&mut self, arm: StopArm) {
+        // Nothing settled may fire into a mode that is not the one it was
+        // scheduled from, or into a process on its way out.
+        if self.mode != Mode::Normal || self.should_quit {
+            return;
+        }
+        let label = model::truncate_end(&arm.name, LABEL_MAX);
+        // Fail closed: re-validate the CAPTURED id against the current poll. A
+        // poll can land between the press and the settle.
+        let still_there = self
+            .sessions
+            .iter()
+            .any(|s| s.id.as_deref() == Some(arm.short_id.as_str()));
+        if !still_there {
+            self.flash(
+                format!("session {} is gone — not deleted", arm.short_id),
+                MsgLevel::Warn,
+            );
+            return;
+        }
+        match agents::delete(&arm.short_id) {
+            Ok(()) => {
+                self.flash(format!("deleted {label} + worktree"), MsgLevel::Warn);
+                self.act_force_refresh();
+            }
+            Err(e) => self.flash(
+                format!("delete failed: {}", agents_msg(&e)),
+                MsgLevel::Error,
+            ),
+        }
+        // Same re-stamp, same reason as `act_ctrl_x`'s, for the other blocking
+        // shell-out on this path: `claude rm` plus the forced refresh freezes
+        // the UI for about as long as `claude stop` does, and this one runs
+        // from the event-loop tick where no keypress stamped anything at all.
+        // Without it a `Ctrl+X` buffered during the freeze dequeues with a
+        // stale gap, reads as a fresh FIRST press, and stops whatever row the
+        // cursor fell to when the deleted session left the list.
+        self.cx_last_press = Some(Instant::now());
+    }
+
+    /// Close the delete window and drop anything settling in it. Called on
+    /// every departure from Normal mode, on `q`, and on `Esc`.
+    pub fn disarm_ctrl_x(&mut self) {
+        self.stop_arm = None;
+        self.pending_delete = None;
+    }
+
+    /// The footer line while the window is open — `None` when it is not.
+    ///
+    /// It names the session because the cursor is free to move while the window
+    /// is open, and it says what delete TAKES because nothing undoes it: `u`
+    /// undoes a dismissal, never this.
+    pub fn arm_hint(&self) -> Option<String> {
+        let arm = self.stop_arm.as_ref()?;
+        let label = model::truncate_end(&arm.name, LABEL_MAX);
+        Some(format!(
+            "Ctrl+X again: delete {label} and its worktree — cannot be undone"
+        ))
     }
 
     /// `d` — dismiss the selected session FROM THE LIST.
@@ -1926,6 +2274,12 @@ impl App {
                 self.select_half_page(false);
                 Action::Redraw
             }
+            // MUST stay above the `_ if ctrl` catch-all on the next line: this
+            // arm is matched top-down, and anything Ctrl placed below it is
+            // silently dead. `'X'` is accepted beside `'x'` on the same
+            // precedent `Ctrl-c`/`Ctrl-C` already set in `on_key` — a terminal
+            // that reports the chord shifted must not find the key inert.
+            KeyCode::Char('x') | KeyCode::Char('X') if ctrl => self.act_ctrl_x(),
             _ if ctrl => Action::None,
 
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1977,10 +2331,6 @@ impl App {
                 self.act_close_pane();
                 Action::Redraw
             }
-            KeyCode::Char('S') => {
-                self.act_request_stop();
-                Action::Redraw
-            }
             KeyCode::Char('n') => {
                 self.open_prompt(PromptKind::NewBackground);
                 Action::Redraw
@@ -2029,7 +2379,13 @@ impl App {
             // overlays do — one reflex keypress tore the explorer out of the
             // window. `q` and `Ctrl-c` remain the quit keys.
             KeyCode::Esc => {
-                if self.filter.is_empty() {
+                // Esc means cancel, and the most cancellable thing on screen is
+                // an open delete window. It takes precedence over the filter:
+                // one is a view, the other is a loaded verb.
+                if self.stop_arm.is_some() || self.pending_delete.is_some() {
+                    self.disarm_ctrl_x();
+                    self.flash("delete window closed", MsgLevel::Info);
+                } else if self.filter.is_empty() {
                     self.flash("press q to quit", MsgLevel::Info);
                 } else {
                     self.filter.clear();
@@ -2105,7 +2461,7 @@ impl App {
             } else {
                 self.mode = Mode::Normal;
                 self.confirm_armed_at = None;
-                self.flash("ignored buffered 'y' — press S again", MsgLevel::Warn);
+                self.flash("ignored buffered 'y' — cancelled", MsgLevel::Warn);
             }
         } else {
             self.mode = Mode::Normal;
@@ -2395,6 +2751,9 @@ mod tests {
             // human cannot, and `CONFIRM_ARM_DELAY` exists to reject exactly
             // that. `confirm_gate_ignores_type_ahead` covers the delay itself.
             confirm_armed_at: Instant::now().checked_sub(Duration::from_secs(1)),
+            stop_arm: None,
+            cx_last_press: None,
+            pending_delete: None,
             message: None,
             msg_deadline: None,
             poll_error: None,
@@ -2668,6 +3027,10 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     /// A successful, COMPLETE poll — what `agents::poll` returns when nothing
     /// went wrong. Tests that want an under-reporting poll build the `Payload`
     /// themselves with `dropped > 0`.
@@ -2721,13 +3084,580 @@ mod tests {
         }
     }
 
+    // ── `Ctrl+X` — stop, and again to delete (§8.2) ─────────────────────────
+
+    /// Age the burst guard's clock so the NEXT press reads as a deliberate one.
+    /// No test sleeps: they backdate, exactly as the confirm tests backdate
+    /// `confirm_armed_at`.
+    fn after(a: &mut App, gap: Duration) {
+        a.cx_last_press = a.cx_last_press.and_then(|t| t.checked_sub(gap));
+    }
+
+    /// Age a settling delete past `CX_SETTLE` and run the event loop's tick.
+    fn settle(a: &mut App) -> bool {
+        if let Some(p) = a.pending_delete.as_mut() {
+            p.at = p.at.checked_sub(CX_SETTLE).unwrap_or(p.at);
+        }
+        a.tick_stop_arm()
+    }
+
+    /// A DELIBERATE second press: clear of `CX_MIN_GAP` (750 ms), inside
+    /// `CX_WINDOW` (2 s). The usable band is exactly that, and this sits in it.
+    const BEAT: Duration = Duration::from_millis(1000);
+    const _: () = assert!(BEAT.as_millis() > CX_MIN_GAP.as_millis());
+    const _: () = assert!(BEAT.as_millis() < CX_WINDOW.as_millis());
+
+    /// THE placement test. `key_normal` matches top-down and ends its Ctrl
+    /// block with `_ if ctrl => Action::None`; a `Ctrl+X` arm below that line
+    /// compiles, reads correctly, and never fires. Only a press driven through
+    /// `on_key` — the real entry point, mode dispatch and all — proves it.
+    #[test]
+    fn ctrl_x_reaches_the_keymap_and_is_not_swallowed_by_the_ctrl_catch_all() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        assert_eq!(a.on_key(ctrl('x')), Action::Redraw, "the catch-all swallowed it");
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+        assert_eq!(a.mode, Mode::Normal, "no modal: §8.2 stops immediately now");
+
+        // The window is open, and the footer says what the next press does and
+        // what it takes.
+        let arm = a.stop_arm.clone().expect("the first press must arm");
+        assert_eq!(arm.short_id, "1c45d64f");
+        let hint = a.arm_hint().expect("armed");
+        assert!(hint.contains("Ctrl+X again"), "{hint}");
+        assert!(hint.contains("worktree"), "{hint}");
+        assert!(hint.contains("cannot be undone"), "{hint}");
+
+        // The Ctrl arms that already existed still work, above and below.
+        a.disarm_ctrl_x();
+        assert_eq!(a.on_key(ctrl('d')), Action::Redraw);
+        assert_eq!(a.on_key(ctrl('u')), Action::Redraw);
+        assert_eq!(a.on_key(ctrl('z')), Action::None, "unbound Ctrl chords stay inert");
+    }
+
+    #[test]
+    fn a_second_ctrl_x_inside_the_window_deletes_the_captured_session() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        a.on_key(ctrl('x'));
+        after(&mut a, BEAT);
+        assert_eq!(a.on_key(ctrl('x')), Action::Redraw);
+
+        // The press SCHEDULES; it does not delete. Nothing has reached the
+        // boundary yet, and the window is consumed either way.
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+        assert!(a.stop_arm.is_none(), "the window closes on the second press");
+        assert_eq!(
+            a.pending_delete.as_ref().map(|p| p.target.short_id.clone()),
+            Some("1c45d64f".to_string())
+        );
+
+        assert!(settle(&mut a), "the settled delete must ask for a redraw");
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(text, "deleted bt/reg-update + worktree");
+        assert!(a.pending_delete.is_none());
+    }
+
+    /// "Press again within two seconds" — after that it is a first press again,
+    /// and a first press stops. It must never delete on the strength of a
+    /// window that has closed.
+    #[test]
+    fn a_press_after_the_window_lapses_only_stops_again() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        a.on_key(ctrl('x'));
+        let armed_at = a.stop_arm.as_ref().map(|arm| arm.at).expect("armed");
+        // Three seconds later: past `CX_WINDOW`, and a clear gap.
+        if let Some(arm) = a.stop_arm.as_mut() {
+            arm.at = armed_at.checked_sub(Duration::from_secs(3)).unwrap_or(armed_at);
+        }
+        after(&mut a, Duration::from_secs(3));
+
+        a.on_key(ctrl('x'));
+        assert!(a.pending_delete.is_none(), "a lapsed window must not delete");
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "stop 1c45d64f"]);
+        assert!(a.stop_arm.is_some(), "and it opens a fresh window");
+        settle(&mut a);
+        assert!(!agents::test_spawn::joined().iter().any(|c| c.starts_with("rm ")));
+    }
+
+    /// The window expires on its own, with no key pressed — the footer must
+    /// stop promising a verb that is no longer loaded.
+    #[test]
+    fn the_window_expires_on_the_event_loop_tick() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        a.on_key(ctrl('x'));
+        assert!(a.arm_hint().is_some());
+
+        assert!(!a.tick_stop_arm(), "a live window is not expired");
+        if let Some(arm) = a.stop_arm.as_mut() {
+            arm.at = arm.at.checked_sub(Duration::from_secs(3)).unwrap_or(arm.at);
+        }
+        assert!(a.tick_stop_arm(), "an expired window must ask for a redraw");
+        assert!(a.stop_arm.is_none());
+        assert!(a.arm_hint().is_none());
+    }
+
+    /// Moving the cursor between the presses. The second press deletes nothing
+    /// AND stops nothing: re-arming on the new row would stop an innocent agent
+    /// on two deliberate presses whenever the just-stopped row moved out from
+    /// under the cursor.
+    #[test]
+    fn a_second_ctrl_x_on_another_row_deletes_nothing_and_stops_nothing() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(
+            &mut a,
+            vec![
+                bg("1c45d64f", "bt/reg-update", State::Working),
+                bg("629da7fc", "kernel bugs", State::Working),
+            ],
+        );
+
+        a.on_key(ctrl('x'));
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+        a.on_key(press('j'));
+        assert_eq!(
+            a.selected_session().map(|s| s.name.clone()),
+            Some("kernel bugs".to_string())
+        );
+
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(a.pending_delete.is_none());
+        assert!(a.stop_arm.is_none(), "the window closes rather than moving");
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop 1c45d64f"],
+            "the neighbour must not be stopped, and nothing deleted"
+        );
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(text, "moved off bt/reg-update — nothing deleted");
+    }
+
+    /// A poll landing between the presses re-sorts the list. The cursor follows
+    /// the session by key, and the delete runs against the id CAPTURED at the
+    /// first press — never against whatever the cursor now indexes.
+    #[test]
+    fn a_poll_that_re_sorts_the_list_between_presses_still_deletes_the_captured_id() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        let target = bg("1c45d64f", "bt/reg-update", State::Working);
+        let other = bg("629da7fc", "kernel bugs", State::Working);
+        load(&mut a, vec![target.clone(), other.clone()]);
+        assert_eq!(a.selected, 1, "row 0 is the group header");
+
+        a.on_key(ctrl('x'));
+        // The poll comes back with the rows the other way round.
+        a.sessions = vec![other, target];
+        a.rebuild_rows();
+        assert_eq!(
+            a.selected_session().map(|s| s.id.clone().unwrap_or_default()),
+            Some("1c45d64f".to_string()),
+            "the cursor follows the session by key"
+        );
+
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        settle(&mut a);
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
+    }
+
+    /// The session goes away between the qualifying press and the settle. The
+    /// captured id is re-validated against the current poll and the delete is
+    /// abandoned — `claude rm` is never built.
+    #[test]
+    fn a_session_that_vanishes_before_the_settle_is_not_deleted() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        a.on_key(ctrl('x'));
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(a.pending_delete.is_some());
+
+        a.sessions.clear();
+        a.rebuild_rows();
+        settle(&mut a);
+
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(text, "session 1c45d64f is gone — not deleted");
+    }
+
+    /// A burst the tty had already buffered arrives as N events in the same
+    /// instant. Exactly one stop comes out, and no delete — whatever N is.
+    #[test]
+    fn a_burst_of_buffered_ctrl_x_stops_once_and_deletes_nothing() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(
+            &mut a,
+            vec![
+                bg("1c45d64f", "bt/reg-update", State::Working),
+                bg("629da7fc", "kernel bugs", State::Working),
+            ],
+        );
+
+        for _ in 0..8 {
+            a.on_key(ctrl('x'));
+        }
+        settle(&mut a);
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+        assert!(a.pending_delete.is_none());
+        // The window the first press opened survives the burst, so a human who
+        // merely typed too fast still has it.
+        assert!(a.stop_arm.is_some());
+    }
+
+    /// A held key, RELEASED just after its first auto-repeat — the stream a
+    /// hold makes when the finger comes off inside the first repeat interval.
+    /// There is no third event to cancel a settling delete, so `CX_SETTLE`
+    /// cannot save this one and `CX_MIN_GAP` is the whole defence. At every
+    /// stock auto-repeat delay the repeat must therefore not even QUALIFY.
+    ///
+    /// This is the shape that deleted a live session and its worktree while
+    /// `CX_MIN_GAP` was 250 ms: `KeyEventKind::Press`-only events make "press,
+    /// wait 660 ms, press, release" and "hold for 665 ms" the same stream, so
+    /// nothing downstream of the gap can separate them.
+    #[test]
+    fn a_held_ctrl_x_released_after_its_first_repeat_deletes_nothing() {
+        // GNOME's default, KDE's, and X11 `xset`'s.
+        for delay in [500u64, 600, 660] {
+            agents::test_spawn::reset();
+            let mut a = app();
+            load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+            a.on_key(ctrl('x'));
+            after(&mut a, Duration::from_millis(delay));
+            a.on_key(ctrl('x'));
+            assert!(
+                a.pending_delete.is_none(),
+                "a {delay} ms repeat delay must not qualify as a second press"
+            );
+            // The key comes up here: nothing else ever arrives.
+            settle(&mut a);
+            a.tick_stop_arm();
+            assert_eq!(
+                agents::test_spawn::joined(),
+                vec!["stop 1c45d64f"],
+                "a hold at a {delay} ms repeat delay must stop once and delete nothing"
+            );
+            // And the window is still open, so the operator who really did mean
+            // to press twice has not lost it.
+            assert!(a.stop_arm.is_some());
+        }
+    }
+
+    /// A held key whose repeat delay was configured ABOVE `CX_MIN_GAP` — past
+    /// what any stock setting does. The first repeat qualifies there, so the
+    /// stream itself has to cancel it: that is what `CX_SETTLE` is for, and it
+    /// is why the delete does not run inside the keypress.
+    #[test]
+    fn a_held_ctrl_x_stops_once_and_never_deletes() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        a.on_key(ctrl('x'));
+        after(&mut a, Duration::from_millis(900));
+        a.on_key(ctrl('x'));
+        assert!(a.pending_delete.is_some(), "a 900 ms repeat delay does qualify");
+
+        // The rest of the stream, 25–40 ms apart. The first one kills it.
+        a.on_key(ctrl('x'));
+        assert!(a.pending_delete.is_none(), "a repeat stream must cancel the settle");
+        for _ in 0..40 {
+            assert_eq!(a.on_key(ctrl('x')), Action::Redraw);
+        }
+        settle(&mut a);
+        a.tick_stop_arm();
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+    }
+
+    /// REGRESSION. Two `Ctrl+X` keystrokes ~100 ms apart deleted a live session
+    /// and its git worktree, because the first press BLOCKED the UI inside
+    /// `claude stop` (0.66 s) plus the forced refresh (0.19 s) while the burst
+    /// guard's clock ran. The second press was dequeued ~0.85 s after the first
+    /// was stamped, read a gap wider than `CX_MIN_GAP`, and qualified as the
+    /// deliberate second press — before any frame carrying the warning had ever
+    /// been drawn.
+    ///
+    /// This is the ONE test here that blocks for real: the whole bug is that
+    /// the gap came from the shell-out rather than from the operator, and a
+    /// backdated clock cannot express that. `slow_next` blocks for longer than
+    /// `CX_MIN_GAP`, which is the worst case for the guard.
+    #[test]
+    fn a_burst_across_a_blocking_stop_deletes_nothing() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        // Press 1 lands, and `claude stop` freezes the UI for longer than the
+        // guard's whole bar. Press 2 was already in the tty buffer.
+        agents::test_spawn::slow_next(CX_MIN_GAP + Duration::from_millis(50));
+        a.on_key(ctrl('x'));
+        a.on_key(ctrl('x'));
+
+        assert!(
+            a.pending_delete.is_none(),
+            "the buffered press must not qualify: it answered no warning"
+        );
+        settle(&mut a);
+        a.tick_stop_arm();
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop 1c45d64f"],
+            "a burst across a blocking stop performs exactly one stop"
+        );
+        assert!(a.stop_arm.is_some(), "and the window is still the operator's");
+    }
+
+    /// REGRESSION, same class, the other blocking shell-out. `run_delete` runs
+    /// `claude rm` plus a forced refresh from the event-loop TICK, where no
+    /// keypress stamped anything. A `Ctrl+X` buffered during that freeze used
+    /// to dequeue with a stale gap, read as a fresh FIRST press, and stop
+    /// whatever row the cursor fell to when the deleted session left the list.
+    #[test]
+    fn a_ctrl_x_buffered_during_the_delete_stops_nothing() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(
+            &mut a,
+            vec![
+                bg("1c45d64f", "bt/reg-update", State::Working),
+                bg("629da7fc", "kernel bugs", State::Working),
+            ],
+        );
+
+        a.on_key(ctrl('x'));
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+
+        // The delete blocks; the session it removed leaves the list, and the
+        // cursor falls to the neighbour.
+        agents::test_spawn::slow_next(CX_MIN_GAP + Duration::from_millis(50));
+        settle(&mut a);
+        a.sessions.retain(|s| s.id.as_deref() != Some("1c45d64f"));
+        a.rebuild_rows();
+        assert_eq!(
+            a.selected_session().map(|s| s.name.clone()),
+            Some("kernel bugs".to_string())
+        );
+
+        // The press the operator made at a frozen screen.
+        a.on_key(ctrl('x'));
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop 1c45d64f", "rm 1c45d64f"],
+            "the neighbour must not be stopped by a press aimed at a frozen UI"
+        );
+        assert!(a.stop_arm.is_none());
+    }
+
+    /// A suppressed press must SAY it was suppressed. Before this it returned
+    /// `Action::None`, so not even a redraw happened and the stale line from
+    /// the press before it stayed on screen — the sidebar read as wedged.
+    #[test]
+    fn a_press_inside_the_burst_guard_says_so_instead_of_going_silent() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        // Arm, then close the window by moving off and pressing again.
+        a.on_key(ctrl('x'));
+        a.on_key(press('j'));
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(a.stop_arm.is_none(), "the window is closed");
+
+        // A press right behind it: suppressed, but not silent.
+        assert_eq!(
+            a.on_key(ctrl('x')),
+            Action::Redraw,
+            "a suppressed press must still ask for a redraw"
+        );
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "too fast — press Ctrl+X again");
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop 1c45d64f"],
+            "and it still acts on nothing"
+        );
+        // While the window IS open the footer keeps the warning: the flash is
+        // outranked, so it can never displace what the next press will do.
+        a.on_key(ctrl('x'));
+        assert!(a.arm_hint().is_none(), "nothing is armed here");
+    }
+
+    /// The refusal has to name the right cause. A row that LEFT the list — `a`
+    /// hiding Completed, or a `/` filter matching the worktree path that
+    /// `claude stop` reverts — is not the operator moving the cursor, and the
+    /// recovery is different.
+    #[test]
+    fn a_row_that_leaves_the_list_refuses_differently_from_a_cursor_move() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(
+            &mut a,
+            vec![
+                bg("1c45d64f", "bt/reg-update", State::Working),
+                bg("629da7fc", "kernel bugs", State::Working),
+            ],
+        );
+
+        a.on_key(ctrl('x'));
+        // The row leaves the list under a standing filter, cursor untouched.
+        a.filter = "kernel".to_string();
+        a.rebuild_rows();
+        assert!(!a.is_visible(
+            &a.sessions
+                .iter()
+                .find(|s| s.id.as_deref() == Some("1c45d64f"))
+                .map(|s| s.session_id.clone())
+                .expect("target")
+        ));
+
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "bt/reg-update left the list — nothing deleted");
+        assert_eq!(level, MsgLevel::Warn);
+        settle(&mut a);
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop 1c45d64f"],
+            "it still refuses: nothing stopped, nothing deleted"
+        );
+    }
+
+    /// The window belongs to the list in Normal mode. Anything that leaves it
+    /// closes the window, and so does quitting.
+    #[test]
+    fn the_delete_window_does_not_survive_a_mode_change_or_q() {
+        for leave in [press('/'), press('n'), press('?'), press('q')] {
+            agents::test_spawn::reset();
+            let mut a = app();
+            load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+            a.on_key(ctrl('x'));
+            assert!(a.stop_arm.is_some());
+
+            a.on_key(leave);
+            assert!(a.stop_arm.is_none(), "{leave:?} must close the window");
+            assert!(a.pending_delete.is_none());
+
+            // And a Ctrl+X arriving after that is a FIRST press, never a delete.
+            a.mode = Mode::Normal;
+            a.should_quit = false;
+            after(&mut a, BEAT);
+            a.on_key(ctrl('x'));
+            settle(&mut a);
+            assert!(!agents::test_spawn::joined().iter().any(|c| c.starts_with("rm ")));
+        }
+
+        // Ctrl-c quits from any mode and takes the window with it.
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        a.on_key(ctrl('x'));
+        assert_eq!(a.on_key(ctrl('c')), Action::Quit);
+        assert!(a.stop_arm.is_none());
+    }
+
+    #[test]
+    fn esc_closes_the_delete_window() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        a.on_key(ctrl('x'));
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.stop_arm.is_none());
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "delete window closed");
+    }
+
+    /// A stop that failed must not open a delete window: the escalation is only
+    /// ever an escalation of a stop that happened.
+    #[test]
+    fn a_failed_stop_does_not_open_the_delete_window() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        agents::test_spawn::fail_next("daemon is not running");
+
+        a.on_key(ctrl('x'));
+        assert!(a.stop_arm.is_none());
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Error);
+        assert_eq!(text, "stop failed: daemon is not running");
+    }
+
+    /// A row already in Completed has nothing to stop — and refusing there
+    /// would strand the session the PREVIOUS press stopped, which is Completed
+    /// by the time the window lapses. `claude rm` works on already-exited
+    /// sessions, so the press arms without shelling out.
+    #[test]
+    fn ctrl_x_on_a_completed_row_arms_for_delete_without_stopping() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Stopped)]);
+        assert_eq!(a.selected_session().map(|s| s.group()), Some(Group::Completed));
+
+        a.on_key(ctrl('x'));
+        assert!(agents::test_spawn::calls().is_empty(), "nothing to stop");
+        assert!(a.stop_arm.is_some());
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "bt/reg-update is already stopped");
+
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        settle(&mut a);
+        assert_eq!(agents::test_spawn::joined(), vec!["rm 1c45d64f"]);
+    }
+
+    /// `S` is REMOVED, not redirected. Stop lives on `Ctrl+X` and `S` is an
+    /// unbound key like any other letter: no modal, no capture, no `claude`
+    /// call, and no message — pressing it must not even redraw, or it would
+    /// still read as a key that means something.
+    #[test]
+    fn s_is_completely_unbound() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+
+        // Uppercase arrives with SHIFT set — asserted so a future keymap change
+        // cannot make `S` inert only because the modifier check is wrong.
+        assert_eq!(
+            a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT)),
+            Action::None
+        );
+        assert_eq!(a.mode, Mode::Normal, "no modal");
+        assert!(a.stop_arm.is_none(), "no window");
+        assert!(agents::test_spawn::calls().is_empty(), "no claude call");
+        assert!(a.message.is_none(), "unbound keys say nothing");
+    }
+
     #[test]
     fn confirm_gate_ignores_type_ahead() {
         let mut a = app();
         load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
 
         // `S` immediately followed by a `y` that was already in the tty buffer.
-        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        a.act_request_stop();
         assert!(matches!(a.mode, Mode::Confirm(_)));
         let act = a.on_key(press('y'));
 
@@ -2736,7 +3666,7 @@ mod tests {
         assert!(a.confirm_armed_at.is_none());
         let (text, level) = a.message.clone().unwrap_or_default_msg();
         assert_eq!(level, MsgLevel::Warn);
-        assert_eq!(text, "ignored buffered 'y' — press S again");
+        assert_eq!(text, "ignored buffered 'y' — cancelled");
 
         // The session is untouched and still selectable.
         assert_eq!(a.sessions.len(), 1);
@@ -2744,7 +3674,7 @@ mod tests {
         // Once the modal has been on screen long enough, `y` is honoured. The
         // session is gone from the poll, so the fail-closed path proves the
         // gate was passed without `claude stop` ever being spawned.
-        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        a.act_request_stop();
         a.confirm_armed_at = Instant::now().checked_sub(Duration::from_secs(1));
         a.sessions.clear();
         a.rebuild_rows();
@@ -2758,7 +3688,7 @@ mod tests {
         for key in [press('n'), press('q'), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)] {
             let mut a = app();
             load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
-            a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+            a.act_request_stop();
             a.on_key(key);
             assert_eq!(a.mode, Mode::Normal);
             assert!(a.confirm_armed_at.is_none(), "cancel must disarm");
@@ -2989,12 +3919,16 @@ mod tests {
         no_id.id = None;
         load(&mut a, vec![no_id]);
 
-        // Uppercase arrives with SHIFT set — the keymap must not require
-        // empty modifiers for char bindings.
-        let act = a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        let act = a.on_key(ctrl('x'));
         assert_eq!(act, Action::Redraw);
-        assert_eq!(a.mode, Mode::Normal, "S must warn, not open the modal");
-        assert_eq!(a.message.as_ref().map(|m| m.1), Some(MsgLevel::Warn));
+        assert_eq!(a.mode, Mode::Normal);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert_eq!(text, "no short id — cannot stop this session");
+        // Refused BEFORE the boundary, and with no window opened: a session
+        // `claude` cannot be told to stop is one it cannot be told to delete.
+        assert!(a.stop_arm.is_none(), "a refused verb must not arm");
+        assert!(agents::test_spawn::calls().is_empty());
 
         // `Enter` and `o` refuse BEFORE any tmux call: there is no map entry
         // and no pane, so a fallthrough would shell out at `split`.
@@ -3016,7 +3950,7 @@ mod tests {
             &mut a,
             vec![bg("1c45d64f", "bt/reg-update", State::Working)],
         );
-        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        a.act_request_stop();
         match &a.mode {
             Mode::Confirm(Confirm::StopSession { short_id, name, .. }) => {
                 assert_eq!(short_id, "1c45d64f");
@@ -3049,7 +3983,7 @@ mod tests {
             &mut a,
             vec![bg("1c45d64f", "bt/reg-update", State::Working)],
         );
-        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        a.act_request_stop();
         assert!(matches!(a.mode, Mode::Confirm(_)));
 
         // `n` is a Normal-mode binding; inside the modal it must only cancel.
@@ -3059,7 +3993,7 @@ mod tests {
         assert!(a.message.is_none(), "cancelling has no side effect");
 
         // Enter is explicitly NOT a default-affirmative.
-        a.on_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT));
+        a.act_request_stop();
         a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(a.mode, Mode::Normal);
         assert!(a.message.is_none());

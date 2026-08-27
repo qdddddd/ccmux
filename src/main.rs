@@ -113,6 +113,12 @@ const TICK_MS: u64 = 120;
 /// A `tick()` at least this slow is treated as a freeze: input typed during it
 /// is discarded rather than replayed. Normal ticks cost ~0.21s.
 const SLOW_TICK: Duration = Duration::from_secs(1);
+/// A keypress that blocked for longer than this froze the UI, so whatever the
+/// tty buffered during it is type-ahead aimed at a screen that was never drawn.
+/// `SLOW_TICK`'s rule, at the shorter threshold a single blocking `claude` call
+/// needs: a `claude stop` plus the forced refresh behind `Ctrl+X` measures
+/// ~0.85 s, comfortably under `SLOW_TICK` and comfortably over this.
+const SLOW_KEY: Duration = Duration::from_millis(300);
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -473,6 +479,13 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
         if app.check_message_timeout() {
             needs_draw = true;
         }
+        // §8.2: expires `Ctrl+X`'s delete window, and runs a delete that has
+        // settled. It lives here rather than in the keypress so a held key's
+        // repeat stream gets its chance to cancel one, and so the footer stops
+        // promising a window that has closed even if no key is pressed again.
+        if app.tick_stop_arm() {
+            needs_draw = true;
+        }
 
         if app.last_poll.elapsed() >= app.effective_interval() {
             let started = std::time::Instant::now();
@@ -507,7 +520,19 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                 // that reports key repeat/release doubles every keystroke.
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     let was_confirm = matches!(app.mode, Mode::Confirm(_));
+                    let started = std::time::Instant::now();
                     let action = app.on_key(k);
+                    // Same rule as the slow tick below, for the other place the
+                    // UI can freeze: `Ctrl+X`'s first press shells out to
+                    // `claude stop` and then to `claude agents --json`, ~0.85 s
+                    // in which every keystroke is buffered and then replayed
+                    // against a screen the operator never saw. `act_ctrl_x`
+                    // re-stamps its own clock so a replayed `Ctrl+X` reads as
+                    // the burst it is; this drops the whole replay, including
+                    // the keys that are not `Ctrl+X`.
+                    if started.elapsed() >= SLOW_KEY {
+                        drain_pending_input()?;
+                    }
                     // A confirmation must be answered by a keystroke made AFTER
                     // it was drawn. Anything already sitting in the tty buffer
                     // when `S` opened the modal is type-ahead aimed at the list,
@@ -762,6 +787,15 @@ mod tests {
         // The `c` row of the §8.1 keymap table, and the `-a` enumeration R3
         // used to permit. Both are behaviour the spec would be promising.
         assert!(!SPEC.contains("| `c` |"), "SPEC.md still lists a `c` keybinding");
+        // `S` stops nothing now (§8.2). The spec must not promise that it does.
+        assert!(
+            !SPEC.contains("| `S` | **stop the session**"),
+            "SPEC.md still binds stop to `S`"
+        );
+        assert!(
+            SPEC.contains("| `Ctrl-x` | **stop the session**"),
+            "SPEC.md does not document the `Ctrl-x` binding"
+        );
         assert!(
             !SPEC.contains("permitted in exactly one place"),
             "R3 still carves out an exception for `list-panes -a`"
@@ -777,6 +811,44 @@ mod tests {
         assert!(
             !README.contains("`n`, `c`"),
             "README still pairs `c` with `n` in the mode table"
+        );
+    }
+
+    /// The same rule for the binding that moved: the README must not promise a
+    /// stop on `S`, and must document both halves of `Ctrl-x` — including what
+    /// the second press takes, which is the half that cannot be undone.
+    #[test]
+    fn the_docs_bind_stop_to_ctrl_x_and_not_to_s() {
+        const README: &str = include_str!("../README.md");
+        const SPEC: &str = include_str!("../SPEC.md");
+        assert!(
+            !README.contains("| `S` | **Stop the session.**"),
+            "README still binds stop to `S`"
+        );
+        for (doc, name) in [(README, "README.md"), (SPEC, "SPEC.md")] {
+            assert!(doc.contains("Ctrl-x"), "{name} does not mention Ctrl-x");
+            assert!(
+                doc.contains("worktree"),
+                "{name} does not say what the second press takes"
+            );
+            assert!(
+                doc.contains("claude rm"),
+                "{name} does not name the verb the second press runs"
+            );
+        }
+        // The Safety section used to close the delete window on a cursor move.
+        // It does not: `arm_hint` names the captured row precisely BECAUSE the
+        // cursor is free to move while the window is open, and the move is
+        // answered at the next press, which refuses. SPEC had this right and
+        // the README did not, which made the README the only doc misstating
+        // the lifetime of the one irreversible verb.
+        assert!(
+            README.contains("Moving the cursor does **not** close it"),
+            "README does not say the delete window survives a cursor move"
+        );
+        assert!(
+            !README.contains("`q`, moving the cursor\n  to another row"),
+            "README still closes the delete window on a cursor move"
         );
     }
 

@@ -208,9 +208,122 @@ pub fn poll() -> Result<Payload, AgentsError> {
 
 // ── Verbs ───────────────────────────────────────────────────────────────────
 
-/// `claude stop <id>` — DESTRUCTIVE. Callers MUST have passed §8.2's
-/// confirmation gate. `id` is the 8-hex short id; a session without one cannot
-/// be stopped, so `Session::is_attachable()` must be checked first.
+/// `run`, with stdout discarded and a non-zero exit turned into `Cmd`. The one
+/// entry point for the two verbs that change a session's existence.
+///
+/// SAFETY SEAM: under `cfg(test)` this NEVER spawns. It records the argv and
+/// returns a canned result instead. That is not a convenience — `delete` runs
+/// `claude rm`, which removes a real worktree, and the unit suite runs on the
+/// same machine as the operator's real sessions. A test that drives the `Ctrl+X`
+/// keymap must not be one collision away from destroying work, so the process
+/// boundary is closed in test builds by construction. `logs` and `poll` keep
+/// spawning: they are read-only.
+#[cfg(not(test))]
+fn run_checked(args: &[&str]) -> Result<(), AgentsError> {
+    let out = run(args)?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(AgentsError::Cmd {
+        code: out.status.code().unwrap_or(-1),
+        stderr: failure_text(
+            &String::from_utf8_lossy(&out.stderr),
+            &String::from_utf8_lossy(&out.stdout),
+        ),
+    })
+}
+
+/// Which stream carries the explanation of a failed verb.
+///
+/// `check_status` reads stderr, which is right for every verb but one:
+/// `claude rm` REFUSES to delete a worktree holding unpushed commits or
+/// uncommitted changes, and it prints that refusal on **stdout** with stderr
+/// left empty, exiting 1 (PROBE-FINDINGS §2, verified 2.1.246). A stderr-only
+/// reading renders the footer as `delete failed: exit 1` and drops the one
+/// sentence that says the work is safe and what to do about it. stderr still
+/// wins whenever it has anything to say.
+fn failure_text(stderr: &str, stdout: &str) -> String {
+    let e = stderr.trim();
+    if !e.is_empty() {
+        return e.to_string();
+    }
+    stdout.trim().to_string()
+}
+
+#[cfg(test)]
+fn run_checked(args: &[&str]) -> Result<(), AgentsError> {
+    test_spawn::intercept(args)
+}
+
+/// The `cfg(test)` stand-in for `run_checked`'s process boundary, and the
+/// assertion surface the keymap tests use to prove WHICH argv a keypress built.
+///
+/// Thread-local: the test harness gives every `#[test]` its own thread, so each
+/// test starts with an empty recorder and parallel tests cannot see each other.
+#[cfg(test)]
+pub mod test_spawn {
+    use super::AgentsError;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Every argv `run_checked` was asked to spawn, in order.
+        static CALLS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+        /// A failure queued for the NEXT intercepted call.
+        static FAIL_NEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+        /// A REAL block queued for the NEXT intercepted call; see `slow_next`.
+        static SLOW_NEXT: RefCell<Option<std::time::Duration>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn intercept(args: &[&str]) -> Result<(), AgentsError> {
+        CALLS.with(|c| c.borrow_mut().push(args.iter().map(|s| (*s).to_string()).collect()));
+        if let Some(d) = SLOW_NEXT.with(|c| c.borrow_mut().take()) {
+            std::thread::sleep(d);
+        }
+        match FAIL_NEXT.with(|c| c.borrow_mut().take()) {
+            Some(stderr) => Err(AgentsError::Cmd { code: 1, stderr }),
+            None => Ok(()),
+        }
+    }
+
+    /// The argv of every state-changing `claude` call this test would have made.
+    pub fn calls() -> Vec<Vec<String>> {
+        CALLS.with(|c| c.borrow().clone())
+    }
+
+    /// `calls()` flattened to `"stop 1c45d64f"` form, for terse assertions.
+    pub fn joined() -> Vec<String> {
+        calls().into_iter().map(|c| c.join(" ")).collect()
+    }
+
+    pub fn reset() {
+        CALLS.with(|c| c.borrow_mut().clear());
+        FAIL_NEXT.with(|c| *c.borrow_mut() = None);
+        SLOW_NEXT.with(|c| *c.borrow_mut() = None);
+    }
+
+    /// Make the next intercepted call fail with `stderr`.
+    pub fn fail_next(stderr: &str) {
+        FAIL_NEXT.with(|c| *c.borrow_mut() = Some(stderr.to_string()));
+    }
+
+    /// Make the next intercepted call BLOCK for `d`, the way the real process
+    /// boundary does — `claude stop` measures ~0.66 s and `claude rm` ~0.71 s
+    /// against a live fleet.
+    ///
+    /// This is the one thing the interceptor cannot fake with a backdated
+    /// clock: `Ctrl+X`'s burst guard reads a real `Instant`, and the bug it
+    /// exists to stop is one where the SHELL-OUT, not the operator, supplied
+    /// the gap between two presses. A test that never blocks cannot see it.
+    /// Callers keep the sleep as short as the guard allows.
+    pub fn slow_next(d: std::time::Duration) {
+        SLOW_NEXT.with(|c| *c.borrow_mut() = Some(d));
+    }
+}
+
+/// `claude stop <id>` — DESTRUCTIVE, but RECOVERABLE: the conversation is kept
+/// and `claude attach <id>` resumes it (PROBE-FINDINGS §2). `id` is the 8-hex
+/// short id; a session without one cannot be stopped, so
+/// `Session::is_attachable()` must be checked first.
 pub fn stop(id: &str) -> Result<(), AgentsError> {
     // Fail closed rather than invoking `claude stop ''`: an empty id is what an
     // unchecked `Option<String>` collapses to, and this is the destructive verb
@@ -218,9 +331,25 @@ pub fn stop(id: &str) -> Result<(), AgentsError> {
     if id.is_empty() {
         return Err(AgentsError::NotAttachable);
     }
-    let out = run(&["stop", id])?;
-    check_status(&out)?;
-    Ok(())
+    run_checked(&["stop", id])
+}
+
+/// `claude rm <id>` — IRREVERSIBLE. PROBE-FINDINGS §2, verbatim from
+/// `claude rm --help` on 2.1.246: "Delete a background session and its
+/// worktree. Unlike `stop`, works on already-exited sessions."
+///
+/// It takes the git worktree with it, so uncommitted work in that worktree is
+/// gone. `stop` is the recoverable verb; this one is not, and `u` undoes a
+/// dismissal, never this. The ONLY caller is the second `Ctrl+X` press inside
+/// its window (§8.2).
+///
+/// Same fail-closed empty-id guard as `stop`, for the same reason: `claude rm ''`
+/// must never be built.
+pub fn delete(id: &str) -> Result<(), AgentsError> {
+    if id.is_empty() {
+        return Err(AgentsError::NotAttachable);
+    }
+    run_checked(&["rm", id])
 }
 
 /// `claude logs <id>`. Output is a RAW ANSI/PTY DUMP including alt-screen setup
@@ -513,9 +642,39 @@ mod tests {
     }
 
     #[test]
-    fn stop_and_logs_refuse_an_empty_id_without_spawning() {
-        // Fail-closed guard: never `claude stop ''`.
+    fn stop_delete_and_logs_refuse_an_empty_id_without_spawning() {
+        // Fail-closed guard: never `claude stop ''`, never `claude rm ''`.
         assert!(matches!(stop(""), Err(AgentsError::NotAttachable)));
+        assert!(matches!(delete(""), Err(AgentsError::NotAttachable)));
         assert!(matches!(logs("", 10), Err(AgentsError::NotAttachable)));
+        assert!(test_spawn::calls().is_empty(), "an empty id must not reach the boundary");
+    }
+
+    /// PROBE-FINDINGS §2: a refused `claude rm` exits 1, says why on STDOUT,
+    /// and leaves stderr empty. Reading stderr alone renders `exit 1`.
+    #[test]
+    fn a_failure_that_explains_itself_on_stdout_is_still_readable() {
+        assert_eq!(
+            failure_text("", "kept 35f940dd — worktree has commits that are not pushed anywhere\n  worktree kept at /tmp/x"),
+            "kept 35f940dd — worktree has commits that are not pushed anywhere\n  worktree kept at /tmp/x"
+        );
+        // stderr still wins whenever it has anything to say.
+        assert_eq!(failure_text(" boom \n", "noise"), "boom");
+        assert_eq!(failure_text("   ", "   "), "");
+    }
+
+    #[test]
+    fn the_two_verbs_are_pure_argv_and_name_the_documented_subcommands() {
+        test_spawn::reset();
+        assert!(stop("1c45d64f").is_ok());
+        assert!(delete("1c45d64f").is_ok());
+        // RULE Q4: positional argv, no shell, no flags invented on the side.
+        assert_eq!(test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
+
+        // A non-zero exit surfaces through the same footer-ready Display both
+        // verbs already share.
+        test_spawn::fail_next("no such session: 1c45d64f");
+        let err = delete("1c45d64f").expect_err("queued failure");
+        assert_eq!(err.to_string(), "no such session: 1c45d64f");
     }
 }

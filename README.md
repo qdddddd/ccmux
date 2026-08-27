@@ -113,7 +113,7 @@ environment-variable equivalent of `--socket`.
 | `s` | Open in a **horizontal** split (vim geometry: stacked), then spread the panes evenly down the height | no |
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
-| `S` | **Stop the session.** Asks `y`/`n` first | **yes** |
+| `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
 | `n` | Dispatch a new background session with a typed task | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
 | `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
@@ -123,7 +123,7 @@ environment-variable equivalent of `--socket`.
 | `r` | Force refresh | no |
 | `?` | Help overlay | no |
 | `q` | Quit the sidebar. Sessions and panes are untouched | no |
-| `Esc` | Clear the filter if one is active; otherwise does nothing | no |
+| `Esc` | Close an open delete window if there is one; else clear the filter if one is active; otherwise does nothing | no |
 
 `o` and `s` are named for vim's geometry, not tmux's: `o` = vertical =
 side-by-side, `s` = horizontal = stacked.
@@ -149,7 +149,6 @@ lives — except a sidebar, which no tab will let you close.
 | Mode | Keys |
 |---|---|
 | Filter (`/`) | Type to filter live · `Ctrl-w` word · `Ctrl-u` clear · `Enter` commit · `Esc` clear and leave |
-| Confirm (`S`) | `y` stop · `n`, `Esc`, `Enter`, anything else cancels. A `y` within 250 ms of the modal opening is treated as type-ahead and cancels |
 | Prompt (`n`) | `Tab` next field · `Enter` run · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
 | Help (`?`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · any other key closes |
 | Logs (`L`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · `q`/`Esc` close |
@@ -250,7 +249,50 @@ that is known to have lost rows concludes nothing at all.
 - Closing a pane with `x` does **not** stop the agent: background sessions are
   daemon-owned and outlive their pane. Only background sessions are listed, so
   `x` can never reach a process that dies with its pane.
-- `S` is the only verb that stops a session, and it always confirms first.
+- `Ctrl-x` is the only verb that stops a session, and the only one that can
+  delete one. The first press **stops** — recoverable: the conversation is kept
+  and `Enter` resumes it. Only a **second press within two seconds** deletes: it
+  runs `claude rm <id>`, which removes the session **and its git worktree**, so
+  uncommitted work in that worktree goes with it. Nothing undoes that; `u`
+  undoes a dismissal, never a delete.
+- `claude rm` refuses rather than destroying unpushed work: a worktree holding
+  unpushed commits or uncommitted changes is **kept**, and ccmux shows the
+  refusal in full. That is a backstop, not the safety model — a worktree with
+  nothing outstanding is deleted without further question.
+- While that two-second window is open the footer says so, names the session,
+  and says what delete takes. It outranks every other footer message, so the
+  warning cannot be pushed off screen while the verb is loaded.
+- The window is closed by: two seconds passing, `Esc`, `q`, a second press
+  (whether it deleted or refused), or anything that leaves the list (`/`, `n`,
+  `?`, `L`). Moving the cursor does **not** close it — the warning keeps naming
+  the session it is loaded against, and the next press refuses.
+- The second press deletes **only** the session the first press stopped. The id
+  is captured at the first press and never re-read, so a poll that re-sorts the
+  list in between cannot change the target — and if the cursor has moved to a
+  different row, the second press deletes nothing and stops nothing.
+- Mis-fire is defended in three layers. Pasted text is discarded in Normal mode
+  and cannot produce a Ctrl chord anyway. A `Ctrl-x` arriving within 750 ms of
+  the previous one is ignored — it says `too fast — press Ctrl+X again` and
+  leaves the window open — and every press restarts that clock, including when
+  it returns from the `claude stop` it blocked in, so a buffered burst of any
+  length performs exactly one stop. And a qualifying second press does not
+  delete on the spot: it settles for a beat first, and a further `Ctrl-x` inside
+  that beat cancels it.
+- 750 ms rather than something snappier because of the held key. A terminal
+  reports key presses but not releases, so a hold's first auto-repeat is
+  indistinguishable from a deliberate second press — and every stock auto-repeat
+  delay (GNOME 500 ms, KDE 600 ms, X11 660 ms) is under 750 ms, so at any of
+  them a hold never even schedules a delete. Holding `Ctrl-x` down stops one
+  session and deletes nothing. The deliberate second press has the rest of the
+  two seconds; it is meant to be a press you made after reading the warning.
+- With the Completed group hidden (`a`), the row you just stopped leaves the
+  list and the cursor falls to its neighbour. The second press then refuses —
+  `<name> left the list — nothing deleted` — because the cursor is no longer on
+  the session it stopped. This is deliberate: the alternative would stop the
+  neighbour. The same happens under a `/` filter written against the worktree
+  path, because `claude stop` moves a session's reported directory back to the
+  parent. Clear the filter (or press `a`) and press `Ctrl-x` twice on the
+  stopped row: on an already-stopped session the first press only arms.
 - `d` removes a row from the list only. It is not a stop, not a kill, and not a
   delete — nothing outside ccmux's own view state changes, and `u` puts it back.
 - Every tmux command that names a pane carries a validated target and is scoped
@@ -261,7 +303,7 @@ that is known to have lost rows concludes nothing at all.
 ## Degraded mode
 
 `ccmux sidebar` outside tmux still runs: polling, grouping, filtering, `L`, `n`,
-`S`, `d`, `u`, and all navigation work; the header indicator turns yellow and
+`Ctrl-x`, `d`, `u`, and all navigation work; the header indicator turns yellow and
 the pane-related verbs (`Enter`, `o`, `s`, `x`) refuse with a message. The
 session→pane map and the dismissed set are kept in memory only. This is what makes the sidebar
 developable without a tmux server.

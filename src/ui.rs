@@ -168,6 +168,47 @@ fn slots(area: Rect) -> Slots {
     s
 }
 
+/// The rect an over-wide footer message wraps into, or `None` when the sidebar
+/// is too short to give it more than the footer row it already has.
+///
+/// With a detail block it is exactly that block plus the footer, which is what
+/// §6.8's amendment always described. WITHOUT one — every height below 12 — it
+/// used to be nothing at all, so the message fell back to `draw_footer`'s
+/// one-line `truncate_end`. That is survivable for a flash; it is not
+/// survivable for `Ctrl+X`'s armed warning, the longest line ccmux produces and
+/// the only one whose TAIL carries the consequence ("and its worktree — cannot
+/// be undone"). Below 12 rows the block is carved out of the bottom of the
+/// list instead, capped so the header and at least one session row always
+/// survive. The carve is transient — it stands only while a message is too wide
+/// to fit, which for the armed warning is at most `CX_WINDOW` — and it changes
+/// nothing about `list_viewport_rows`, so the row-index-to-screen-line mapping
+/// underneath it is untouched.
+fn overflow_rect(area: Rect, s: &Slots) -> Option<Rect> {
+    let ft = s.footer?;
+    let bottom = ft.y.saturating_add(ft.height);
+    if let Some(d) = s.detail {
+        return Some(Rect {
+            x: d.x,
+            y: d.y,
+            width: d.width,
+            height: bottom.saturating_sub(d.y),
+        });
+    }
+    // Header + one list row are never carved away. h == 3 leaves height 1,
+    // which is the footer alone and no better than truncating, so it declines.
+    let max_h = area.height.saturating_sub(2);
+    if max_h < 2 {
+        return None;
+    }
+    let height = max_h.min(4);
+    Some(Rect {
+        x: area.x,
+        y: bottom.saturating_sub(height),
+        width: area.width,
+        height,
+    })
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 /// THE entry point. Everything else in this module is private.
@@ -201,14 +242,15 @@ pub fn draw(f: &mut Frame, app: &App) {
     // §8.5's "closed pane N — agent still running" (35 columns) and §9.7's
     // "no short id — cannot stop this session" (38) do not fit a 34-column
     // sidebar, and they are the ones the operator most needs to read in full.
-    match (s.detail, s.footer, overflow_message(app, area.width as usize, &p)) {
-        (Some(d), Some(ft), Some((text, color))) => {
-            let rect = Rect {
-                x: d.x,
-                y: d.y,
-                width: d.width,
-                height: ft.y.saturating_add(ft.height).saturating_sub(d.y),
-            };
+    match (
+        s.footer,
+        overflow_message(app, area.width as usize, &p),
+        overflow_rect(area, &s),
+    ) {
+        (Some(_), Some((text, color)), Some(rect)) => {
+            // The carved rect can overlap rows the list has already drawn (it
+            // does whenever there is no detail block), so clear it first.
+            f.render_widget(Clear, rect);
             f.render_widget(
                 Paragraph::new(text)
                     .style(Style::default().fg(color))
@@ -791,22 +833,36 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 /// The footer text that does NOT fit on one row, with its colour — `None` when
 /// the footer has nothing to say, when what it says fits, or when `Mode::Filter`
 /// owns the footer (§6.8 priority 1).
-fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)> {
-    if w == 0 || app.mode == Mode::Filter {
-        return None;
+/// What the footer is saying, in priority order, with no clock read anywhere:
+/// `app.rs` expires both the delete window and the flashed message.
+///
+/// `Ctrl+X`'s open window outranks a flashed message on purpose. It is the one
+/// line here that describes what the NEXT keypress will do, and it must not be
+/// possible for an unrelated flash landing during those two seconds to take the
+/// warning off the screen while the verb stays loaded (§8.2).
+fn footer_message(app: &App, p: &Palette) -> Option<(String, Color)> {
+    if let Some(hint) = app.arm_hint() {
+        return Some((hint, p.red));
     }
-    let (text, color) = match (&app.message, &app.poll_error) {
-        (Some((text, level)), _) => (
+    match (&app.message, &app.poll_error) {
+        (Some((text, level)), _) => Some((
             text.clone(),
             match level {
                 MsgLevel::Info => p.green,
                 MsgLevel::Warn => p.yellow,
                 MsgLevel::Error => p.red,
             },
-        ),
-        (None, Some(err)) => (format!("agents: {}", err.lines().next().unwrap_or("")), p.red),
-        (None, None) => return None,
-    };
+        )),
+        (None, Some(err)) => Some((format!("agents: {}", err.lines().next().unwrap_or("")), p.red)),
+        (None, None) => None,
+    }
+}
+
+fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)> {
+    if w == 0 || app.mode == Mode::Filter {
+        return None;
+    }
+    let (text, color) = footer_message(app, p)?;
     if display_width(&text) <= w {
         return None;
     }
@@ -819,25 +875,25 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
 /// dropping it is what makes three whole pairs fit at the default 34 columns.
 /// Footer hint pairs, most-wanted first: `draw_footer` fits whole pairs from
 /// the left and stops at the first one that will not fit, so the order is the
-/// priority order. `d/u hide` sits fourth — above `S stop`, which is behind a
-/// confirm modal and cannot fire by accident — because `d` is the one key here
-/// that makes a row vanish on a single press, and the pair names its own undo.
-/// At the default 34 columns the budget runs out after `x close` and no fourth
-/// pair renders at all, so a narrow sidebar discovers `d` through `?` and the
-/// README, exactly as it already discovers `S`.
+/// priority order. `d/u hide` sits fourth — above `C-x stop`, which announces
+/// its own second half in the footer the moment it fires — because `d` is the
+/// one key here that makes a row vanish on a single press, and the pair names
+/// its own undo. At the default 34 columns the budget runs out after `x close`
+/// and no fourth pair renders at all, so a narrow sidebar discovers `d` through
+/// `?` and the README, exactly as it already discovers `C-x`.
 ///
 /// `t tab` is inserted FOURTH rather than beside `o/s split`, so the 34-column
 /// footer is unchanged: `x close` is the verb that acts on what is already on
 /// screen, and evicting it to advertise a new one would be a bad trade at the
 /// default width. `t` is discovered through `?` and the README, on the same
-/// precedent `d/u hide` and `S stop` already set.
+/// precedent `d/u hide` and `C-x stop` already set.
 const HINTS: &[(&str, &str)] = &[
     ("⏎", "open"),
     ("o/s", "split"),
     ("x", "close"),
     ("t", "tab"),
     ("d/u", "hide"),
-    ("S", "stop"),
+    ("C-x", "stop"),
     ("n", "new"),
     ("L", "logs"),
     ("/", "filter"),
@@ -864,31 +920,14 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         return;
     }
 
-    // 2. A flashed message. Its 4s lifetime is `app.rs`'s business: rendering
-    //    never reads a clock, only `app.message`.
-    if let Some((text, level)) = &app.message {
-        let color = match level {
-            MsgLevel::Info => p.green,
-            MsgLevel::Warn => p.yellow,
-            MsgLevel::Error => p.red,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_end(text, w),
-                Style::default().fg(color),
-            ))),
-            area,
-        );
-        return;
-    }
-
-    // 3. A standing poll error.
-    if let Some(err) = &app.poll_error {
-        let text = format!("agents: {}", err.lines().next().unwrap_or(""));
+    // 2. `Ctrl+X`'s open delete window, else a flashed message, else a standing
+    //    poll error. Their 2s and 4s lifetimes are `app.rs`'s business:
+    //    rendering never reads a clock.
+    if let Some((text, color)) = footer_message(app, p) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 truncate_end(&text, w),
-                Style::default().fg(p.red),
+                Style::default().fg(color),
             ))),
             area,
         );
@@ -988,7 +1027,12 @@ const KEYS: &[(&str, &str)] = &[
     ("s", "open in horizontal split"),
     ("t", "open in a new tab"),
     ("x", "close pane (agent lives)"),
-    ("S", "stop session (confirm)"),
+    ("Ctrl-x", "stop session"),
+    // Sized to survive the 34-column overlay uncut: the escalation's
+    // CONSEQUENCE is the half an operator must be able to read, and the
+    // two-second window is stated where it is actionable — the footer warning
+    // that stands while it is open.
+    ("Ctrl-x ×2", "delete it + worktree"),
     ("n", "new background session"),
     ("L", "logs for this session"),
     ("d", "hide row (pane stays)"),
@@ -998,7 +1042,7 @@ const KEYS: &[(&str, &str)] = &[
     ("r", "force refresh"),
     ("?", "this help"),
     ("q", "quit sidebar"),
-    ("Esc", "clear filter"),
+    ("Esc", "cancel window/filter"),
     ("Ctrl-c", "quit from any mode"),
     ("▌N", "open in tab N (blank: here)"),
 ];
@@ -1369,6 +1413,9 @@ mod tests {
             migrated: true,
             degraded: false,
             confirm_armed_at: None,
+            stop_arm: None,
+            cx_last_press: None,
+            pending_delete: None,
             message: None,
             msg_deadline: None,
             poll_error: None,
@@ -1699,6 +1746,116 @@ mod tests {
 
     /// The `?` overlay is where a narrow sidebar discovers `d`, so both halves
     /// of the pair have to be in it.
+    /// The `?` overlay is where the binding is discovered, and the 34-column
+    /// sidebar is the width it is discovered at. Both halves must render uncut
+    /// there — a clipped `delete it + workt…` is the one truncation in this
+    /// overlay that costs the operator the consequence.
+    #[test]
+    fn the_help_overlay_documents_ctrl_x_and_what_the_second_press_takes() {
+        let mut app = app_with(many(3));
+        app.mode = Mode::Help;
+        app.help_lines = help_line_count();
+        for w in [60u16, 34] {
+            let rows = rows_at(&app, w, 40).join("\n");
+            assert!(rows.contains("Ctrl-x"), "w={w}: {rows}");
+            assert!(rows.contains("stop session"), "w={w}: {rows}");
+            assert!(rows.contains("delete it + worktree"), "w={w}: {rows}");
+            assert!(!rows.contains("stop session (confirm)"), "w={w}: {rows}");
+        }
+    }
+
+    /// §8.2: while `Ctrl+X`'s window is open the footer must say what the next
+    /// press does AND what it takes, and it must outrank the flashed message —
+    /// nothing may take the warning off the screen while the verb is loaded.
+    /// It is over-width by design, so it wraps into the detail block the same
+    /// way an over-width refusal does, and every word survives.
+    #[test]
+    fn the_open_delete_window_owns_the_footer_and_says_what_it_takes() {
+        let mut app = app_with(many(3));
+        app.stop_arm = Some(crate::app::StopArm {
+            session_id: "uuid-0001".into(),
+            short_id: "1c45d64f".into(),
+            name: "bt/reg-update".into(),
+            at: Instant::now(),
+        });
+        // A flash from the stop that opened the window. The warning wins.
+        app.message = Some(("stopped bt/reg-update".into(), MsgLevel::Info));
+
+        let rows = rows_at(&app, 34, 24);
+        let flat = rows[18..].join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("Ctrl+X again: delete bt/reg-update"), "{flat:?}");
+        assert!(flat.contains("worktree"), "{flat:?}");
+        assert!(flat.contains("cannot be undone"), "{flat:?}");
+        assert!(!flat.contains("stopped bt/reg-update"), "the flash outranked the warning: {flat:?}");
+
+        // Closed window: the flash comes back, unchanged.
+        app.stop_arm = None;
+        let rows = rows_at(&app, 34, 24);
+        assert!(rows[23].contains("stopped bt/reg-update"), "{:?}", rows[23]);
+    }
+
+    /// REGRESSION. §6.8's overflow wrap used to need the detail block, which
+    /// `slots` only allocates at height >= 12. Below that the armed warning —
+    /// the longest line ccmux produces, and the only one whose TAIL carries the
+    /// consequence — fell back to a one-line `truncate_end` and the operator
+    /// was left looking at a loaded irreversible verb whose warning said
+    /// neither what it takes nor that it cannot be undone.
+    #[test]
+    fn the_armed_warning_survives_a_sidebar_too_short_for_a_detail_block() {
+        let mut app = app_with(many(3));
+        app.stop_arm = Some(crate::app::StopArm {
+            session_id: "uuid-0001".into(),
+            short_id: "1c45d64f".into(),
+            name: "bt/reg-update".into(),
+            at: Instant::now(),
+        });
+
+        // Every height that can hold the warning at all but has no detail
+        // block, plus the first height that has one. The message is 70 columns
+        // and wraps to three lines at 34, so it needs three carved rows on top
+        // of the header — h >= 5.
+        for h in 5u16..=12 {
+            let rows = rows_at(&app, 34, h);
+            let flat = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("Ctrl+X again: delete bt/reg-update"), "h={h}: {flat:?}");
+            assert!(flat.contains("worktree"), "h={h}: {flat:?}");
+            assert!(flat.contains("cannot be undone"), "h={h}: {flat:?}");
+            // The header is never carved away, and neither is the last list row
+            // above the block.
+            assert!(rows[0].contains("sessions"), "h={h}: header lost: {:?}", rows[0]);
+        }
+
+        // h == 4 cannot hold all three lines without carving the list away
+        // entirely, which the cap forbids. It still says what delete TAKES,
+        // which the one-line truncation it replaced did not.
+        let flat = rows_at(&app, 34, 4).join(" ");
+        assert!(flat.contains("worktree"), "{flat:?}");
+
+        // Nothing is carved when there is nothing over-wide to carve for: the
+        // list keeps every row it had.
+        app.stop_arm = None;
+        app.message = Some(("stopped it".into(), MsgLevel::Info));
+        let rows = rows_at(&app, 34, 10);
+        assert!(rows[1].contains("Working"), "{:?}", rows[1]);
+        assert!(rows[9].contains("stopped it"), "{:?}", rows[9]);
+    }
+
+    /// §8.2: `Esc`'s FIRST meaning is closing the delete window — `key_normal`
+    /// gives the arm precedence over the filter — so the overlay that is the
+    /// only place a narrow sidebar discovers keys must not still call it the
+    /// filter key and nothing else.
+    #[test]
+    fn the_help_overlay_says_esc_closes_the_delete_window() {
+        let mut app = app_with(many(3));
+        app.mode = Mode::Help;
+        app.help_lines = help_line_count();
+        for w in [34u16, 60] {
+            let rows = rows_at(&app, w, 40).join("\n");
+            assert!(rows.contains("cancel window/filter"), "w={w}: {rows}");
+            assert!(!rows.contains("Esc       clear filter"), "w={w}: {rows}");
+        }
+    }
+
     #[test]
     fn the_help_overlay_documents_dismiss_and_undo() {
         let mut app = app_with(many(3));
@@ -1719,7 +1876,7 @@ mod tests {
     #[test]
     fn a_message_too_wide_for_the_footer_wraps_instead_of_clipping() {
         let mut app = app_with(many(3));
-        // Quoted verbatim from `App::act_request_stop` — a refusal is the class
+        // Quoted verbatim from `App::stop_and_arm` — a refusal is the class
         // of message the operator must read in full, and this one is 38 display
         // columns, so a 34-column sidebar cannot show it without wrapping.
         const REFUSAL: &str = "no short id — cannot stop this session";
