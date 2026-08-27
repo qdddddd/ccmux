@@ -872,6 +872,311 @@ pub fn rightmost_pane_excluding(panes: &[PaneInfo], sidebar: &PaneId) -> Option<
         .map(|p| p.id.clone())
 }
 
+// ── Even layout: spreading the content panes along one axis (§1.4) ──────────
+//
+// `split-window` HALVES its target, so a fourth `o` on a 120-column window
+// leaves `34 42 21 20`. Evening it afterwards with a sequence of
+// `resize-pane -x` calls does work — right to left, twice, because a single
+// pass does not settle — but it costs one command per pane per pass and it
+// only converges to a fixed point, it is not one by construction.
+//
+// A tmux layout string is. `select-layout` writes the whole window's geometry
+// in ONE command, exactly as asked, so re-applying it is a byte-identical
+// no-op and the per-tick `resize-pane -t <sidebar> -x <W>` that follows asks
+// for a width the sidebar already has. Both were measured; see the return-value
+// report. A malformed string is refused ("invalid layout", exit 1) with the
+// window untouched, so the failure mode is fail-closed too.
+
+/// tmux's own layout checksum (`layout_checksum` in layout-custom.c): a 16-bit
+/// rotate-right-then-add over the layout body, rendered as `%04x`.
+///
+/// Verified byte-for-byte on tmux 3.4 against four layouts tmux itself printed
+/// through `#{window_visible_layout}`; those are the test vectors.
+pub fn layout_checksum(layout: &str) -> u16 {
+    let mut csum: u16 = 0;
+    for b in layout.bytes() {
+        csum = (csum >> 1) + ((csum & 1) << 15);
+        csum = csum.wrapping_add(u16::from(b));
+    }
+    csum
+}
+
+/// The geometry the non-sidebar panes of ONE window form.
+///
+/// Only two shapes divide cleanly along a single axis: a row (side by side)
+/// and a column (stacked). A mix of `o` and `s` builds a TREE, where "even
+/// along the axis" has no single meaning, and both plausible readings —
+/// `select-layout tiled`, or evening the top-level groups — move panes the
+/// operator deliberately placed. `Ragged` is therefore a no-op, not a
+/// best-effort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentShape {
+    /// Side by side, each full height. `o` geometry: even the WIDTHS.
+    Row,
+    /// Stacked, each the full content width. `s` geometry: even the HEIGHTS.
+    Column,
+    /// Fewer than two content panes, a sidebar that is not the full-height
+    /// left edge, or a tree that is neither of the above. Nothing to do.
+    Ragged,
+}
+
+impl SplitDir {
+    /// The shape a split in this direction leaves behind when it lands in a
+    /// window that held one content pane, or already held that shape. This is
+    /// the whole of the `o`-vs-`s` axis choice: `o` (`Vertical`, tmux `-h`)
+    /// puts panes side by side and so divides WIDTH; `s` (`Horizontal`, tmux
+    /// `-v`) stacks them and so divides HEIGHT.
+    pub fn shape(self) -> ContentShape {
+        match self {
+            SplitDir::Vertical => ContentShape::Row,
+            SplitDir::Horizontal => ContentShape::Column,
+        }
+    }
+}
+
+/// Window extent implied by a WINDOW-SCOPED pane slice, as `(cols, rows)`.
+/// tmux reports no window geometry in `PANE_FMT`, but the panes tile the
+/// window exactly, so the maxima of `left + width` and `top + height` are it.
+fn window_extent(panes: &[PaneInfo]) -> (u16, u16) {
+    let cols = panes.iter().map(|p| p.left.saturating_add(p.width)).max().unwrap_or(0);
+    let rows = panes.iter().map(|p| p.top.saturating_add(p.height)).max().unwrap_or(0);
+    (cols, rows)
+}
+
+/// Classify the content panes of one window. Pass a WINDOW-SCOPED slice
+/// (`panes_in_window`); `left`/`top` mean nothing across windows.
+///
+/// The sidebar must be the full-height left edge — which is what §1.3 pins it
+/// to — or the remainder of the window is not a rectangle and no single axis
+/// divides it. That guard also covers the degenerate case where the operator's
+/// very first `s` split the SIDEBAR itself.
+pub fn content_shape(panes: &[PaneInfo], sidebar: &PaneId) -> ContentShape {
+    let Some(sb) = panes.iter().find(|p| &p.id == sidebar) else {
+        return ContentShape::Ragged;
+    };
+    let (win_w, win_h) = window_extent(panes);
+    if sb.left != 0 || sb.top != 0 || sb.height != win_h || win_h == 0 {
+        return ContentShape::Ragged;
+    }
+    let mut content: Vec<&PaneInfo> = panes.iter().filter(|p| &p.id != sidebar).collect();
+    if content.len() < 2 {
+        return ContentShape::Ragged;
+    }
+    let x0 = sb.width.saturating_add(1);
+    let inner_w = win_w.saturating_sub(x0);
+
+    // A clean row: every pane full height, tiling [x0, win_w) left to right
+    // with exactly one separator column between neighbours.
+    content.sort_by_key(|p| p.left);
+    let mut x = x0;
+    let mut row = true;
+    for p in &content {
+        if p.top != 0 || p.height != win_h || p.left != x {
+            row = false;
+            break;
+        }
+        x = p.left.saturating_add(p.width).saturating_add(1);
+    }
+    if row && x == win_w.saturating_add(1) {
+        return ContentShape::Row;
+    }
+
+    // A clean column: every pane the full inner width at x0, tiling
+    // [0, win_h) top to bottom with one separator row between neighbours.
+    content.sort_by_key(|p| p.top);
+    let mut y = 0u16;
+    let mut col = true;
+    for p in &content {
+        if p.left != x0 || p.width != inner_w || p.top != y {
+            col = false;
+            break;
+        }
+        y = p.top.saturating_add(p.height).saturating_add(1);
+    }
+    if col && y == win_h.saturating_add(1) {
+        return ContentShape::Column;
+    }
+
+    ContentShape::Ragged
+}
+
+/// `total` cells divided among `n` panes, the remainder spread ONE CELL PER
+/// PANE from the front, so no two panes ever differ by more than a single cell.
+///
+/// This is what tmux's own `even-horizontal` does, and the reason not to pile
+/// the whole remainder on one pane: at `n = 3` either policy looks fine
+/// (`28 + 28 + 27` against `27 + 27 + 29`), but remainder-to-one degrades with
+/// the pane count — 78 columns over 8 panes is seven panes of 9 beside one of
+/// 15, which is not what "evenly" means.
+///
+/// `None` when `total < n`, i.e. when some pane would get zero cells: tmux's
+/// minimum pane size is 1, and refusing outright is what stops a window too
+/// narrow to share from being re-laid-out into something invalid on every
+/// split.
+pub fn even_shares(total: u16, n: usize) -> Option<Vec<u16>> {
+    let n16 = u16::try_from(n).ok()?;
+    if n16 == 0 || total < n16 {
+        return None;
+    }
+    let mut shares = vec![total / n16; n];
+    for share in shares.iter_mut().take(usize::from(total % n16)) {
+        *share += 1;
+    }
+    Some(shares)
+}
+
+/// Does the cell order `even_layout` is about to emit — the sidebar first,
+/// then the content panes in visual order — match the window's PANE-LIST
+/// order?
+///
+/// tmux binds cells to panes POSITIONALLY and the pane ids written into a
+/// layout string are cosmetic: `layout_parse` walks the parsed tree and hands
+/// its leaves to `w->panes` in list order, discarding the id it read from each
+/// one. Verified on 3.4 — a layout whose ids were permuted `2,1,0` while its
+/// cells stayed put was accepted verbatim, no pane moved, and tmux rewrote the
+/// ids back to canonical order on read-back.
+///
+/// `#{pane_index}` IS a pane's position in that list, so "every cell reaches
+/// the pane it was drawn for" is exactly "the emitted order increases in
+/// `index`". Every window ccmux can build satisfies that already — `o`, `s`,
+/// the `-b` sidebar heal and a split of a middle pane all leave pane-list order
+/// equal to visual order — but nothing in tmux enforces it, and the cost of
+/// being wrong is not a cosmetic one: the sidebar cell is emitted first, so a
+/// disagreeing pane list would drop the SIDEBAR into a content cell and hand
+/// its slot to an agent. So it is checked, and a window that fails the check is
+/// left exactly as it is.
+fn cells_follow_pane_list_order(sidebar: &PaneInfo, ordered_content: &[&PaneInfo]) -> bool {
+    let mut prev = sidebar.index;
+    for pane in ordered_content {
+        if pane.index <= prev {
+            return false;
+        }
+        prev = pane.index;
+    }
+    true
+}
+
+/// The `<checksum>,<layout>` string that spreads the content panes of one
+/// window evenly along their axis, with the sidebar at exactly `sidebar_cols`.
+///
+/// `want` is `Some(shape)` on the split path — `o` must have produced a row and
+/// `s` a column, and a split that produced neither built a tree the operator
+/// gets to keep. On the kill path it is `None`: whatever clean shape the
+/// survivors form is the one to even.
+///
+/// `sidebar_cols` MUST be the same number the caller's `pin_sidebar` will
+/// assert. That is the whole of the fixed-point argument: the layout puts the
+/// sidebar where the pin wants it, so the pin is a no-op forever after.
+///
+/// `None` means "leave the window alone" for every reason: no sidebar, a
+/// ragged tree, the wrong axis, fewer than two content panes, a window with no
+/// room to give each pane a cell, or a pane list whose order disagrees with
+/// what the operator sees (`cells_follow_pane_list_order`).
+pub fn even_layout(
+    panes: &[PaneInfo],
+    sidebar: &PaneId,
+    sidebar_cols: u16,
+    want: Option<ContentShape>,
+) -> Option<String> {
+    let shape = content_shape(panes, sidebar);
+    if shape == ContentShape::Ragged || want.is_some_and(|w| w != shape) {
+        return None;
+    }
+    let sb = panes.iter().find(|p| &p.id == sidebar)?;
+    let (win_w, win_h) = window_extent(panes);
+    // `+ 2` = the separator column plus at least one column of content.
+    if sidebar_cols == 0 || win_w < sidebar_cols.saturating_add(2) {
+        return None;
+    }
+    let x0 = sidebar_cols + 1;
+    let inner_w = win_w - x0;
+    let mut content: Vec<&PaneInfo> = panes.iter().filter(|p| &p.id != sidebar).collect();
+    let n = content.len();
+    let seps = u16::try_from(n.checked_sub(1)?).ok()?;
+
+    // Visual order along the axis being divided: that is the order the cells
+    // come out in, and therefore the order tmux will bind panes to them in.
+    match shape {
+        ContentShape::Row => content.sort_by_key(|p| p.left),
+        ContentShape::Column => content.sort_by_key(|p| p.top),
+        ContentShape::Ragged => return None,
+    }
+    if !cells_follow_pane_list_order(sb, &content) {
+        return None;
+    }
+
+    // The trailing `,<id>` of each cell below is COSMETIC — tmux parses it and
+    // throws it away, then renumbers. It is written anyway because that is the
+    // shape `#{window_visible_layout}` prints, which is what makes a generated
+    // string diffable against one tmux produced. The guard above, not the id,
+    // is what puts each pane in the right cell.
+    let mut cells = String::new();
+    match shape {
+        ContentShape::Row => {
+            let shares = even_shares(inner_w.checked_sub(seps)?, n)?;
+            let mut x = x0;
+            for (p, w) in content.iter().zip(&shares) {
+                if !cells.is_empty() {
+                    cells.push(',');
+                }
+                cells.push_str(&format!("{w}x{win_h},{x},0,{}", p.id.num()));
+                x = x.saturating_add(*w).saturating_add(1);
+            }
+        }
+        ContentShape::Column => {
+            let shares = even_shares(win_h.checked_sub(seps)?, n)?;
+            let mut y = 0u16;
+            for (p, h) in content.iter().zip(&shares) {
+                if !cells.is_empty() {
+                    cells.push(',');
+                }
+                cells.push_str(&format!("{inner_w}x{h},{x0},{y},{}", p.id.num()));
+                y = y.saturating_add(*h).saturating_add(1);
+            }
+        }
+        ContentShape::Ragged => return None,
+    }
+
+    let sb_cell = format!("{sidebar_cols}x{win_h},0,0,{}", sb.id.num());
+    // `{}` is tmux's left-right split, `[]` its top-bottom one. A column of
+    // content panes is one cell of the top-level row, so it nests.
+    let body = match shape {
+        ContentShape::Row => format!("{win_w}x{win_h},0,0{{{sb_cell},{cells}}}"),
+        _ => format!("{win_w}x{win_h},0,0{{{sb_cell},{inner_w}x{win_h},{x0},0[{cells}]}}"),
+    };
+    Some(format!("{:04x},{body}", layout_checksum(&body)))
+}
+
+/// `tmux select-layout -t <pane> <checksum,layout>`. R2-gated.
+///
+/// BLAST RADIUS (R1/R2): `select-layout` acts on a WINDOW — the one holding
+/// `target` — and it is addressed by an `assert_in_session`-gated `PaneId` for
+/// precisely the reason `WindowId` is never rendered into a `-t`: a bare `@N`
+/// reaches a window in ANOTHER session, and a session-qualified `@N` that does
+/// not exist returns exit 0 while rewriting ccmux's CURRENT window. A pane
+/// target has neither mode. The "a grep for `-t` next to a `WindowId` returns
+/// nothing" invariant is untouched by this function.
+///
+/// `layout` is checked against `^[0-9a-f]{4},` before the call, so it can never
+/// be mistaken for an option flag and a caller cannot smuggle a layout name
+/// (`tiled`, `even-horizontal`) through this door.
+///
+/// Verified on tmux 3.4: a malformed layout is refused with "invalid layout"
+/// and exit 1, leaving geometry unchanged; a pane in a NON-current window is
+/// laid out without moving the client.
+pub fn apply_layout(session: &str, target: &PaneId, layout: &str) -> Result<(), TmuxError> {
+    let checksummed = layout.split_once(',').is_some_and(|(sum, rest)| {
+        sum.len() == 4
+            && sum.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            && !rest.is_empty()
+    });
+    if !checksummed {
+        return Err(TmuxError::BadTarget(format!("not a tmux layout string: {layout:?}")));
+    }
+    assert_in_session(target, session)?;
+    tmux(&["select-layout", "-t", target.as_str(), layout]).map(|_| ())
+}
+
 // ── User options (map persistence) ──────────────────────────────────────────
 
 /// `tmux show-options -t <session> -qv <key>`.
@@ -1540,6 +1845,414 @@ mod tests {
     fn split_dir_maps_vim_words_to_tmux_flags() {
         assert_eq!(SplitDir::Vertical.tmux_flag(), "-h");
         assert_eq!(SplitDir::Horizontal.tmux_flag(), "-v");
+    }
+
+    // ── Even layout (§1.4) ──────────────────────────────────────────────────
+
+    /// A pane with real geometry. The `pane`/`pane_in` helpers above fix
+    /// `top`/`width`/`height`, which is exactly what layout arithmetic reads.
+    ///
+    /// `index` is `#{pane_index}`, i.e. the pane's position in the WINDOW'S
+    /// PANE LIST — the order tmux binds layout cells in, so it is load-bearing
+    /// here and not decoration. Every fixture below numbers its panes in the
+    /// order the operator sees them, which is what a real ccmux window looks
+    /// like (SPEC §1.3's table: `1:34 2:85`, `1:34 2:42 3:42`, ...).
+    fn geo(id: &str, index: u32, left: u16, top: u16, width: u16, height: u16) -> PaneInfo {
+        PaneInfo {
+            id: PaneId::parse(id).expect("test pane id"),
+            index,
+            left,
+            top,
+            width,
+            height,
+            active: false,
+            window_index: 1,
+            window_id: WindowId::parse("@1").expect("test window id"),
+        }
+    }
+
+    /// Sidebar 34 wide, then three content panes side by side, mid-halving:
+    /// the state a third `o` leaves behind on a 120x40 window.
+    fn row_window() -> Vec<PaneInfo> {
+        vec![
+            geo("%0", 1, 0, 0, 34, 40),
+            geo("%3", 2, 35, 0, 1, 40),
+            geo("%2", 3, 37, 0, 1, 40),
+            geo("%1", 4, 39, 0, 81, 40),
+        ]
+    }
+
+    /// The same window after four `s` presses: a column of four, halving down
+    /// to 20/9/4/4.
+    fn column_window() -> Vec<PaneInfo> {
+        vec![
+            geo("%0", 1, 0, 0, 34, 40),
+            geo("%1", 2, 35, 0, 85, 20),
+            geo("%2", 3, 35, 21, 85, 9),
+            geo("%3", 4, 35, 31, 85, 4),
+            geo("%4", 5, 35, 36, 85, 4),
+        ]
+    }
+
+    fn sb() -> PaneId {
+        PaneId::parse("%0").expect("id")
+    }
+
+    /// tmux's checksum, not a re-derivation of it. Every vector below is a
+    /// string tmux 3.4 either PRINTED through `#{window_visible_layout}` or
+    /// ACCEPTED through `select-layout`; if this function ever drifts, tmux
+    /// answers "invalid layout" and the whole feature silently stops working.
+    #[test]
+    fn layout_checksum_matches_the_strings_tmux_itself_printed() {
+        for (want, body) in [
+            (0x11ce, "120x40,0,0{34x40,0,0,0,85x40,35,0,1}"),
+            (0x9285, "120x40,0,0{34x40,0,0,0,1x40,35,0,2,83x40,37,0,1}"),
+            (0x31fd, "120x40,0,0{34x40,0,0,0,1x40,35,0,3,1x40,37,0,2,81x40,39,0,1}"),
+            (0xee36, "120x40,0,0{34x40,0,0,0,85x40,35,0[85x20,35,0,1,85x19,35,21,2]}"),
+            (
+                0xdab9,
+                "120x40,0,0{34x40,0,0,0,85x40,35,0[85x20,35,0,1,85x9,35,21,2,85x9,35,31,3]}",
+            ),
+            // The row and the column this feature writes, both applied live on
+            // 3.4 and ACCEPTED — which is itself a checksum check, since
+            // `layout_parse` refuses a string whose leading `%04x` disagrees
+            // with the body. The column one tmux then echoed back byte for
+            // byte through `#{window_visible_layout}`.
+            (0xfa10, "120x40,0,0{34x40,0,0,0,28x40,35,0,3,28x40,64,0,2,27x40,93,0,1}"),
+            (
+                0x3f34,
+                "120x40,0,0{34x40,0,0,0,85x40,35,0[85x10,35,0,1,85x9,35,11,2,85x9,35,21,3,85x9,35,31,4]}",
+            ),
+        ] {
+            assert_eq!(layout_checksum(body), want, "checksum of {body}");
+        }
+    }
+
+    /// The share arithmetic, including where the leftover cells go.
+    #[test]
+    fn even_shares_spreads_the_remainder_one_cell_per_pane() {
+        // 120 window - 34 sidebar - 3 separators = 83 content columns over 3
+        // panes. 83/3 = 27 remainder 2, so two panes get 28 and one gets 27.
+        assert_eq!(even_shares(83, 3), Some(vec![28, 28, 27]));
+        // 40 rows - 3 separators = 37 over 4 panes: 10 + 9 + 9 + 9.
+        assert_eq!(even_shares(37, 4), Some(vec![10, 9, 9, 9]));
+        // Exact division leaves nothing over.
+        assert_eq!(even_shares(84, 3), Some(vec![28, 28, 28]));
+        assert_eq!(even_shares(85, 1), Some(vec![85]));
+        // One cell each is the floor, and it is legal: tmux's minimum is 1.
+        assert_eq!(even_shares(3, 3), Some(vec![1, 1, 1]));
+        // Below it, refuse rather than emit a zero-sized pane.
+        assert_eq!(even_shares(2, 3), None);
+        assert_eq!(even_shares(0, 1), None);
+        assert_eq!(even_shares(99, 0), None);
+    }
+
+    /// The property the policy exists for, over every division this feature can
+    /// hit: NO TWO PANES DIFFER BY MORE THAN ONE CELL, and the shares always
+    /// tile the space exactly.
+    ///
+    /// Piling the whole remainder on one pane satisfies neither at scale — 78
+    /// columns over 8 panes would be seven of 9 beside one of 15 — and it is
+    /// unregressable by an example-based test, because every individual number
+    /// still looks plausible. This checks the invariant instead.
+    #[test]
+    fn even_shares_never_lets_two_panes_differ_by_more_than_a_cell() {
+        for n in 1..=16usize {
+            for total in 0..=200u16 {
+                let Some(shares) = even_shares(total, n) else {
+                    assert!(
+                        total < u16::try_from(n).expect("n fits"),
+                        "refused a division that had room: {total} over {n}"
+                    );
+                    continue;
+                };
+                assert_eq!(shares.len(), n, "{total} over {n}");
+                assert_eq!(shares.iter().sum::<u16>(), total, "shares tile {total} over {n}");
+                let hi = *shares.iter().max().expect("non-empty");
+                let lo = *shares.iter().min().expect("non-empty");
+                assert!(hi - lo <= 1, "{total} over {n} spread {shares:?}");
+                assert!(lo >= 1, "no pane may be given zero cells: {shares:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn content_shape_tells_a_row_from_a_column_from_a_tree() {
+        assert_eq!(content_shape(&row_window(), &sb()), ContentShape::Row);
+        assert_eq!(content_shape(&column_window(), &sb()), ContentShape::Column);
+
+        // A mix of `o` and `s`: %1 alone on the left, %2 over %3 on the right.
+        // Neither axis divides this, so it is a tree and it stays one.
+        let mixed = vec![
+            geo("%0", 1, 0, 0, 34, 40),
+            geo("%1", 2, 35, 0, 42, 40),
+            geo("%2", 3, 78, 0, 42, 20),
+            geo("%3", 4, 78, 21, 42, 19),
+        ];
+        assert_eq!(content_shape(&mixed, &sb()), ContentShape::Ragged);
+
+        // Nothing to even: the sidebar alone, and the sidebar plus one.
+        assert_eq!(content_shape(&[geo("%0", 1, 0, 0, 120, 40)], &sb()), ContentShape::Ragged);
+        let one = vec![geo("%0", 1, 0, 0, 34, 40), geo("%1", 2, 35, 0, 85, 40)];
+        assert_eq!(content_shape(&one, &sb()), ContentShape::Ragged);
+
+        // A sidebar that is not the full-height left edge — what the very first
+        // `s` would leave if it split the sidebar itself. The remainder of the
+        // window is not a rectangle, so no axis divides it.
+        let split_sidebar = vec![
+            geo("%0", 1, 0, 0, 34, 20),
+            geo("%9", 2, 0, 21, 34, 19),
+            geo("%1", 3, 35, 0, 85, 40),
+        ];
+        assert_eq!(content_shape(&split_sidebar, &sb()), ContentShape::Ragged);
+
+        // An unresolvable sidebar is not a licence to lay out the window.
+        assert_eq!(
+            content_shape(&row_window(), &PaneId::parse("%99").expect("id")),
+            ContentShape::Ragged
+        );
+    }
+
+    /// The exact byte string `select-layout` accepted on a live 3.4 server.
+    #[test]
+    fn even_layout_row_reproduces_the_string_tmux_accepted() {
+        const WANT: &str = "fa10,120x40,0,0{34x40,0,0,0,28x40,35,0,3,28x40,64,0,2,27x40,93,0,1}";
+        assert_eq!(
+            even_layout(&row_window(), &sb(), 34, Some(ContentShape::Row)).as_deref(),
+            Some(WANT)
+        );
+        // The kill path asks for no particular axis and gets the same answer.
+        assert_eq!(even_layout(&row_window(), &sb(), 34, None).as_deref(), Some(WANT));
+    }
+
+    #[test]
+    fn even_layout_column_reproduces_the_string_tmux_accepted() {
+        const WANT: &str = "3f34,120x40,0,0{34x40,0,0,0,85x40,35,0\
+            [85x10,35,0,1,85x9,35,11,2,85x9,35,21,3,85x9,35,31,4]}";
+        assert_eq!(
+            even_layout(&column_window(), &sb(), 34, Some(ContentShape::Column)).as_deref(),
+            Some(WANT)
+        );
+        assert_eq!(even_layout(&column_window(), &sb(), 34, None).as_deref(), Some(WANT));
+    }
+
+    /// THE FIXED-POINT PROOF, in pure code: feed `even_layout` the geometry its
+    /// own output describes and it returns that output again, unchanged — and
+    /// the sidebar cell it writes is exactly the width `pin_sidebar` asserts,
+    /// so the per-tick `resize-pane -x 34` that follows has nothing to do.
+    #[test]
+    fn evening_an_already_even_window_is_the_same_layout_again() {
+        let evened_row = vec![
+            geo("%0", 1, 0, 0, 34, 40),
+            geo("%3", 2, 35, 0, 28, 40),
+            geo("%2", 3, 64, 0, 28, 40),
+            geo("%1", 4, 93, 0, 27, 40),
+        ];
+        let once = even_layout(&row_window(), &sb(), 34, None).expect("row layout");
+        assert_eq!(even_layout(&evened_row, &sb(), 34, None).as_deref(), Some(once.as_str()));
+        assert!(once.contains("34x40,0,0,0"), "sidebar cell is the pinned width: {once}");
+
+        let evened_col = vec![
+            geo("%0", 1, 0, 0, 34, 40),
+            geo("%1", 2, 35, 0, 85, 10),
+            geo("%2", 3, 35, 11, 85, 9),
+            geo("%3", 4, 35, 21, 85, 9),
+            geo("%4", 5, 35, 31, 85, 9),
+        ];
+        let once = even_layout(&column_window(), &sb(), 34, None).expect("column layout");
+        assert_eq!(even_layout(&evened_col, &sb(), 34, None).as_deref(), Some(once.as_str()));
+        assert!(once.contains("34x40,0,0,0"), "sidebar cell is the pinned width: {once}");
+    }
+
+    /// The pane ids a layout string names, in the order tmux binds them.
+    ///
+    /// Flattening `{}`/`[]` to commas leaves a plain token stream: every cell
+    /// contributes `WxH`, `X`, `Y`, and a LEAF cell alone adds `ID`. The token
+    /// after a CONTAINER's `Y` is the `WxH` of its first child, and a `WxH`
+    /// token always holds an `x` while an id never does, so the two cannot be
+    /// confused.
+    fn layout_cell_ids(layout: &str) -> Vec<u64> {
+        let body = layout.split_once(',').map_or(layout, |(_, b)| b);
+        let flat: String = body
+            .chars()
+            .map(|c| if "{}[]".contains(c) { ',' } else { c })
+            .collect();
+        let toks: Vec<&str> = flat.split(',').filter(|t| !t.is_empty()).collect();
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i < toks.len() {
+            if !toks[i].contains('x') {
+                i += 1;
+                continue;
+            }
+            match toks.get(i + 3) {
+                Some(t) if !t.contains('x') => {
+                    ids.push(t.parse().expect("cell id"));
+                    i += 4;
+                }
+                _ => i += 3,
+            }
+        }
+        ids
+    }
+
+    /// tmux does NOT read the pane ids in a layout string. It binds cells to
+    /// panes POSITIONALLY, in the window's pane-list order, and rewrites
+    /// whatever ids it was handed.
+    ///
+    /// Verified on 3.4: applying
+    /// `fa10,120x40,0,0{34x40,0,0,0,28x40,35,0,3,28x40,64,0,2,27x40,93,0,1}`
+    /// — content ids `3,2,1` — to a window whose panes were %0 %1 %2 %3 left to
+    /// right moved no pane at all, and read back renumbered `0,1,2,3`.
+    ///
+    /// So `even_layout` preserves identity only while the order it emits cells
+    /// in (the sidebar, then the content along the axis) IS the pane-list
+    /// order, which `#{pane_index}` reports. Nothing about the strings this
+    /// module generates would reveal that going wrong — every other test here
+    /// compares whole strings — while the cost of it going wrong is the SIDEBAR
+    /// being handed a content cell. Hence both a runtime guard and this test.
+    #[test]
+    fn every_layout_cell_reaches_the_pane_it_was_drawn_for() {
+        for (name, panes) in [("row", row_window()), ("column", column_window())] {
+            let layout = even_layout(&panes, &sb(), 34, None).expect(name);
+            let mut by_index: Vec<&PaneInfo> = panes.iter().collect();
+            by_index.sort_by_key(|p| p.index);
+            let want: Vec<u64> = by_index.iter().map(|p| p.id.num()).collect();
+            assert_eq!(layout_cell_ids(&layout), want, "{name} cell order: {layout}");
+        }
+    }
+
+    /// And a window whose pane list disagrees with what the operator sees is
+    /// left alone, rather than laid out into a permutation of itself.
+    #[test]
+    fn even_layout_refuses_a_pane_list_that_disagrees_with_the_eye() {
+        // The sidebar is not first in the pane list. Its cell is emitted first
+        // regardless, so laying this out would put a content pane in the
+        // sidebar's slot and the SIDEBAR in a content cell.
+        let mut sidebar_late = row_window();
+        sidebar_late[0].index = 9;
+        assert_eq!(content_shape(&sidebar_late, &sb()), ContentShape::Row);
+        assert_eq!(even_layout(&sidebar_late, &sb(), 34, None), None);
+
+        // Two content panes whose pane-list order is the reverse of their
+        // left-to-right order: evening them would swap what they show.
+        let mut swapped = row_window();
+        swapped[1].index = 4;
+        swapped[3].index = 2;
+        assert_eq!(content_shape(&swapped, &sb()), ContentShape::Row);
+        assert_eq!(even_layout(&swapped, &sb(), 34, None), None);
+
+        // The same guard down a column.
+        let mut col = column_window();
+        col[2].index = 5;
+        col[4].index = 3;
+        assert_eq!(content_shape(&col, &sb()), ContentShape::Column);
+        assert_eq!(even_layout(&col, &sb(), 34, None), None);
+
+        // A repeated index is not an order either: tmux cannot hold two panes
+        // in one list slot, so a list claiming it is not one to lay out from.
+        let mut dup = row_window();
+        dup[2].index = dup[1].index;
+        assert_eq!(even_layout(&dup, &sb(), 34, None), None);
+
+        // The guard is the ONLY thing refusing these: put the indices back in
+        // the order the eye reads and each window lays out again.
+        assert!(even_layout(&row_window(), &sb(), 34, None).is_some());
+        assert!(even_layout(&column_window(), &sb(), 34, None).is_some());
+    }
+
+    /// `o` divides width, `s` divides height, and neither key ever evens the
+    /// other axis: a split that produced the wrong shape built a tree.
+    #[test]
+    fn even_layout_divides_the_axis_the_key_asked_for() {
+        assert_eq!(SplitDir::Vertical.shape(), ContentShape::Row);
+        assert_eq!(SplitDir::Horizontal.shape(), ContentShape::Column);
+
+        // `s` landing in a row, and `o` landing in a column: both no-ops.
+        assert_eq!(
+            even_layout(&row_window(), &sb(), 34, Some(SplitDir::Horizontal.shape())),
+            None
+        );
+        assert_eq!(
+            even_layout(&column_window(), &sb(), 34, Some(SplitDir::Vertical.shape())),
+            None
+        );
+
+        // And the matching key divides the matching axis: widths differ across
+        // the row, heights differ down the column, never the other way.
+        let row = even_layout(&row_window(), &sb(), 34, Some(SplitDir::Vertical.shape()))
+            .expect("row");
+        assert!(row.contains("28x40,35,0,3"), "row panes keep full height: {row}");
+        let col = even_layout(&column_window(), &sb(), 34, Some(SplitDir::Horizontal.shape()))
+            .expect("column");
+        assert!(col.contains("85x10,35,0,1"), "column panes keep full width: {col}");
+    }
+
+    #[test]
+    fn even_layout_is_a_clean_no_op_with_nothing_to_even() {
+        // Sidebar alone in the window.
+        assert_eq!(even_layout(&[geo("%0", 1, 0, 0, 120, 40)], &sb(), 34, None), None);
+        // Sidebar plus exactly one content pane: already "even".
+        let one = vec![geo("%0", 1, 0, 0, 34, 40), geo("%1", 2, 35, 0, 85, 40)];
+        assert_eq!(even_layout(&one, &sb(), 34, None), None);
+        assert_eq!(even_layout(&one, &sb(), 34, Some(ContentShape::Row)), None);
+        // No panes at all.
+        assert_eq!(even_layout(&[], &sb(), 34, None), None);
+        // A tree the operator built with a mix of `o` and `s`.
+        let mixed = vec![
+            geo("%0", 1, 0, 0, 34, 40),
+            geo("%1", 2, 35, 0, 42, 40),
+            geo("%2", 3, 78, 0, 42, 20),
+            geo("%3", 4, 78, 21, 42, 19),
+        ];
+        assert_eq!(even_layout(&mixed, &sb(), 34, None), None);
+        assert_eq!(even_layout(&mixed, &sb(), 34, Some(ContentShape::Row)), None);
+    }
+
+    /// Too little room to give every pane a cell: refuse, and keep refusing.
+    /// A window this small must not be re-laid-out into something invalid on
+    /// every split, which is the difference between a no-op and a thrash.
+    #[test]
+    fn even_layout_refuses_a_window_with_no_room_to_share() {
+        // A 14-column window with three content panes tiles perfectly well —
+        // the shape is a row — but pinning the sidebar to 10 leaves 3 inner
+        // columns, and 2 of those are separators. One cell for three panes.
+        let cramped = vec![
+            geo("%0", 1, 0, 0, 8, 10),
+            geo("%1", 2, 9, 0, 1, 10),
+            geo("%2", 3, 11, 0, 1, 10),
+            geo("%3", 4, 13, 0, 1, 10),
+        ];
+        assert_eq!(content_shape(&cramped, &sb()), ContentShape::Row);
+        assert_eq!(even_layout(&cramped, &sb(), 10, None), None, "one cell for three panes");
+
+        // The same refusal from the other end: a sidebar so wide there is no
+        // content column left at all, and a nonsensical zero-width one.
+        let starved = vec![geo("%0", 1, 0, 0, 34, 40), geo("%1", 2, 35, 0, 2, 40), geo("%2", 3, 38, 0, 2, 40)];
+        assert_eq!(content_shape(&starved, &sb()), ContentShape::Row);
+        assert_eq!(even_layout(&starved, &sb(), 39, None), None, "sidebar leaves no content");
+        assert_eq!(even_layout(&starved, &sb(), 0, None), None, "zero-width sidebar refused");
+        // One cell each IS legal, and is the floor: 40 - 36 - 1 = 3 inner
+        // columns, one separator, one column per pane.
+        assert_eq!(
+            even_layout(&starved, &sb(), 36, None).as_deref(),
+            Some("a204,40x40,0,0{36x40,0,0,0,1x40,37,0,1,1x40,39,0,2}")
+        );
+    }
+
+    /// `apply_layout` is the one new mutating door, and it only opens for a
+    /// checksummed layout string — never for a layout NAME like `tiled`, which
+    /// would rearrange panes the operator placed, and never for something that
+    /// could be read as a flag.
+    #[test]
+    fn apply_layout_refuses_anything_that_is_not_a_layout_string() {
+        let p = sb();
+        for bad in ["", "tiled", "even-horizontal", "-Ewhatever", "abcd", "ABCD,120x40,0,0", "zzzz,120x40,0,0", "a15,120x40,0,0", "a150,"] {
+            assert!(
+                matches!(apply_layout("ccmux", &p, bad), Err(TmuxError::BadTarget(_))),
+                "{bad:?} must be refused before any tmux call"
+            );
+        }
     }
 
     // ── sh_quote / sh_join (SPEC §7 table, verbatim) ────────────────────────

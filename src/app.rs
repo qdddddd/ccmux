@@ -797,6 +797,10 @@ impl App {
                 // exists in a freshly enumerated list.
                 self.refresh_panes();
                 self.save_map_now();
+                // §1.4: `o` built a row, `s` a column — even that axis, then
+                // pin. The pin is a no-op afterwards because `even_content`
+                // laid the sidebar out at the width it is about to ask for.
+                self.even_content(Some(dir.shape()));
                 self.pin_sidebar();
                 match self.pane_index_of(&pane) {
                     Some(i) => self.flash(format!("opened {name} in pane {i}"), MsgLevel::Info),
@@ -941,10 +945,17 @@ impl App {
             self.flash("refusing to close the sidebar", MsgLevel::Warn);
             return;
         }
-        // Read the index and the tab before the kill; afterwards the pane is
-        // gone.
+        // Read the index, the tab, and the window before the kill; afterwards
+        // the pane is gone.
         let idx = self.pane_index_of(&pane);
         let where_ = self.tab_suffix(&pane);
+        // §1.4: `pane_of` spans tabs, so the pane about to die may be in
+        // ANOTHER window. Only the window that actually lost a pane is uneven,
+        // and only its own sidebar process lays it out — evening mine on
+        // someone else's kill would snap a layout my operator may have dragged
+        // by hand, which is the same fight the tick is kept out of.
+        let killed_here = self.sidebar_window().is_some()
+            && tmux::window_of(&self.panes, &pane) == self.sidebar_window();
         match tmux::kill_pane(&self.tmux_session, &pane) {
             Ok(()) => {
                 // A pane in ANOTHER tab is not mine to unmap: that window's
@@ -958,6 +969,12 @@ impl App {
                 }
                 self.refresh_panes();
                 self.save_map_now();
+                // §1.4: a kill leaves the survivors uneven. No `SplitDir` is in
+                // play here, so whatever clean shape they still form is the
+                // axis.
+                if killed_here {
+                    self.even_content(None);
+                }
                 self.pin_sidebar();
                 // §8.5's last step: this wording is the operator-facing statement of
                 // PROBE-FINDINGS §3, shown every time, so nobody confuses `x`
@@ -1684,6 +1701,39 @@ impl App {
             .unwrap_or(self.sidebar_width)
     }
 
+    /// Spread the content panes of the sidebar's window evenly along one axis
+    /// (SPEC §1.4). Errors are swallowed exactly as `pin_sidebar` swallows
+    /// them: this is cosmetic geometry, and a window that refuses to be laid
+    /// out is still a working window.
+    ///
+    /// CALLED ONLY FROM `act_open` AND `act_close_pane`, never from `tick`.
+    /// The mouse is on, so the operator can drag a pane border at any time;
+    /// evening on a timer would undo that every 2.5 seconds. Evening on the
+    /// two verbs that made the layout uneven in the first place cannot.
+    ///
+    /// The width handed to `even_layout` is `pinned_width()` — the very number
+    /// `pin_sidebar` re-asserts — so the layout this writes is a fixed point of
+    /// the per-tick pin by construction, not by luck.
+    fn even_content(&self, want: Option<tmux::ContentShape>) {
+        if self.degraded {
+            return;
+        }
+        let (Some(sb), Some(cols)) = (&self.sidebar_pane, self.pinned_width()) else {
+            return;
+        };
+        let Some(win) = tmux::window_of(&self.panes, sb) else {
+            return;
+        };
+        // Window-scoped, for the same reason `split_anchor` is: `pane_left` and
+        // `pane_top` are per-window coordinates, and an unfiltered slice would
+        // describe a geometry no window actually has.
+        let scoped = tmux::panes_in_window(&self.panes, win);
+        let Some(layout) = tmux::even_layout(&scoped, sb, cols, want) else {
+            return;
+        };
+        let _ = tmux::apply_layout(&self.tmux_session, sb, &layout);
+    }
+
     fn pin_sidebar(&self) {
         if self.degraded {
             return;
@@ -2352,6 +2402,240 @@ mod tests {
             last_poll: Instant::now(),
             should_quit: false,
         }
+    }
+
+    // ── live: the §1.4 even-layout verbs against a real tmux server ─────────
+
+    /// Every tmux command this test issues, including the raw ones below,
+    /// names socket `ccmux-evenfix` explicitly and runs with `$TMUX`/`$TMUX_PANE`
+    /// cleared. PROBE-FINDINGS RULE T1 is therefore structural here and not a
+    /// matter of discipline: there is no code path from this test to the
+    /// operator's default server, where their live work lives.
+    const LIVE_SOCKET: &str = "ccmux-evenfix";
+    const LIVE_SESSION: &str = "ccmux-even-test";
+
+    /// A raw tmux call, for the two things the crate deliberately has no public
+    /// helper for: creating a server-side window at a fixed 120x40 (ccmux
+    /// itself always inherits the client's size) and tearing the session down.
+    /// It is NOT a back door around R1-R3 — production code cannot reach it,
+    /// `-L LIVE_SOCKET` is hard-coded, and the session name is a constant.
+    fn live_raw(args: &[&str]) -> String {
+        let out = std::process::Command::new("tmux")
+            .arg("-L")
+            .arg(LIVE_SOCKET)
+            .args(args)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .expect("tmux");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Widths of one window's panes, left to right — `#{pane_width}` in the
+    /// order the operator sees them.
+    fn live_widths(a: &mut App) -> Vec<u16> {
+        a.refresh_panes();
+        let mut p = a.panes.clone();
+        p.sort_by_key(|i| i.left);
+        p.iter().map(|i| i.width).collect()
+    }
+
+    /// The evenness the feature exists to produce: no two content panes may
+    /// differ by more than a single cell.
+    ///
+    /// Written as a bare `max - min <= 1` on purpose. An earlier form allowed
+    /// `max - min < content.len()` as a second chance for "the remainder", and
+    /// that disjunct is TAUTOLOGICAL under any remainder policy — the leftover
+    /// is `total % n`, which is always below `n` — so the assertion could not
+    /// fail for any pane count and would not have noticed the division getting
+    /// less even.
+    fn assert_spread_is_at_most_one(what: &str, content: &[u16]) {
+        let hi = *content.iter().max().expect("at least one content pane");
+        let lo = *content.iter().min().expect("at least one content pane");
+        assert!(hi - lo <= 1, "{what} are not even: {content:?}");
+    }
+
+    /// Heights of one window's panes, top to bottom.
+    fn live_heights(a: &mut App) -> Vec<u16> {
+        a.refresh_panes();
+        let mut p = a.panes.clone();
+        p.sort_by_key(|i| i.top);
+        p.iter().map(|i| i.height).collect()
+    }
+
+    /// Build a fresh 120x40 session with a sidebar, and an `App` bound to it.
+    fn live_app() -> App {
+        live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
+        live_raw(&[
+            "new-session",
+            "-d",
+            "-s",
+            LIVE_SESSION,
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "-n",
+            "cc",
+            "--",
+            "sleep",
+            "600",
+        ]);
+        let panes = tmux::list_panes_in_session(LIVE_SESSION).expect("list panes");
+        let sb = panes.first().expect("sidebar pane").id.clone();
+        tmux::configure_session(LIVE_SESSION, &sb, 34).expect("configure");
+
+        let mut a = app();
+        a.tmux_session = LIVE_SESSION.into();
+        a.sidebar_pane = Some(sb);
+        a.map = PaneMap::new();
+        load(&mut a, vec![
+            bg("aaaaaaaa", "one", State::Working),
+            bg("bbbbbbbb", "two", State::Working),
+            bg("cccccccc", "three", State::Working),
+            bg("dddddddd", "four", State::Working),
+            bg("eeeeeeee", "five", State::Working),
+            bg("ffffffff", "six", State::Working),
+        ]);
+        a.refresh_panes();
+        a
+    }
+
+    /// Row indices that actually carry a session. `App::rows` is
+    /// Header | Spacer | Session, so `selected = 0` is a group header and every
+    /// verb on it is a no-op — which is correct behaviour and useless here.
+    fn live_session_rows(a: &App) -> Vec<usize> {
+        (0..a.rows.len()).filter(|i| a.is_session_row(*i)).collect()
+    }
+
+    /// Drives the REAL `act_open` / `act_close_pane` against a real tmux 3.4
+    /// server and prints the geometry after every step, so the numbers in the
+    /// report are reproducible rather than transcribed.
+    ///
+    /// Run with:
+    ///   cargo test -- --ignored --nocapture live_even_layout
+    ///
+    /// The name filter is REQUIRED. `tmux::socket()` is process-global (see the
+    /// socket-selection note in `tmux.rs`) and `tmux::tests::live_round_trip`
+    /// sets it to `ccmux`, so running every ignored test at once has the two
+    /// racing for one global. The failure is loud and harmless — "can't find
+    /// session" against the other socket, nothing mutated — but it is a
+    /// failure, so run this one by name or with `--test-threads=1`.
+    ///
+    /// The last phase emulates idle poll ticks by their exact geometry
+    /// sequence: `tick` touches pane geometry in step 2 (`refresh_panes`) and
+    /// step 7 (`pin_sidebar`) and nowhere else — steps 1, 4, 4b, 5, 6 and 8 are
+    /// the clock, `claude`, the row list and the option flush — so repeating
+    /// those two is repeating everything a tick can do to the layout, without
+    /// making a hermetic-by-default test depend on the `claude` CLI.
+    #[test]
+    #[ignore = "mutates a tmux server; run by name (see the doc comment)"]
+    fn live_even_layout_spreads_panes_on_split_and_kill() {
+        tmux::set_socket(Some(LIVE_SOCKET));
+        assert_eq!(tmux::socket().as_deref(), Some(LIVE_SOCKET), "throwaway socket only");
+
+        // ── `o`: four content panes, widths evened ──────────────────────────
+        let mut a = live_app();
+        println!("\n== `o` (SplitDir::Vertical) — widths, 120x40 window, sidebar 34 ==");
+        println!("start           : {:?}", live_widths(&mut a));
+        let rows = live_session_rows(&a);
+        for (n, row) in rows.iter().take(4).enumerate() {
+            a.selected = *row;
+            a.act_open(SplitDir::Vertical);
+            println!("after o #{}      : {:?}", n + 1, live_widths(&mut a));
+        }
+        let evened = live_widths(&mut a);
+        assert_eq!(evened[0], 34, "sidebar keeps its pinned width");
+        assert_spread_is_at_most_one("`o` widths", &evened[1..]);
+
+        // ── `x`: kill one, survivors re-evened ──────────────────────────────
+        a.selected = rows[1];
+        a.act_close_pane();
+        let after_kill = live_widths(&mut a);
+        println!("after x         : {after_kill:?}");
+        assert_eq!(after_kill[0], 34, "sidebar keeps its pinned width");
+        assert_spread_is_at_most_one("widths after `x`", &after_kill[1..]);
+
+        // ── idle ticks: the pin must not disturb the layout ─────────────────
+        let before = live_widths(&mut a);
+        for i in 1..=5 {
+            a.refresh_panes();
+            a.pin_sidebar();
+            println!("after tick {i}    : {:?}", live_widths(&mut a));
+        }
+        assert_eq!(live_widths(&mut a), before, "the per-tick pin is a no-op on an even layout");
+
+        // ── `s`: four content panes, heights evened ─────────────────────────
+        let mut a = live_app();
+        println!("\n== `s` (SplitDir::Horizontal) — heights, 120x40 window ==");
+        // One `o` first, because `s` pressed while the sidebar is ALONE splits
+        // the sidebar itself (`split_anchor` step 3) and leaves it stacked, not
+        // a full-height left edge. §1.4 correctly declines to lay that out —
+        // see the mixed-tree phase below — and it is the same pane the operator
+        // would open first in practice.
+        let rows = live_session_rows(&a);
+        a.selected = rows[0];
+        a.act_open(SplitDir::Vertical);
+        println!("start (one o)   : {:?}", live_heights(&mut a));
+        for (n, row) in rows.iter().skip(1).take(4).enumerate() {
+            a.selected = *row;
+            a.act_open(SplitDir::Horizontal);
+            println!("after s #{}      : {:?}", n + 1, live_heights(&mut a));
+        }
+        println!("widths          : {:?}", live_widths(&mut a));
+        assert_spread_is_at_most_one("`s` heights", &live_heights(&mut a)[1..]);
+        a.selected = rows[1];
+        a.act_close_pane();
+        let after_kill = live_heights(&mut a);
+        println!("after x         : {after_kill:?}");
+        assert_spread_is_at_most_one("heights after `x`", &after_kill[1..]);
+
+        let before = live_heights(&mut a);
+        for i in 1..=5 {
+            a.refresh_panes();
+            a.pin_sidebar();
+            println!("after tick {i}    : {:?}", live_heights(&mut a));
+        }
+        assert_eq!(live_heights(&mut a), before, "the per-tick pin is a no-op on an even layout");
+        assert_eq!(live_widths(&mut a)[0], 34, "sidebar keeps its pinned width");
+
+        // ── mixed `o` + `s`: the tree is left exactly as the operator built it
+        let mut a = live_app();
+        println!("\n== mixed `o` then `s` — the tree is left alone ==");
+        let rows = live_session_rows(&a);
+        a.selected = rows[0];
+        a.act_open(SplitDir::Vertical);
+        a.selected = rows[1];
+        a.act_open(SplitDir::Vertical);
+        a.refresh_panes();
+        let row = a.panes.iter().map(|p| (p.left, p.width, p.top, p.height)).collect::<Vec<_>>();
+        println!("two o           : {row:?}");
+        a.selected = rows[2];
+        a.act_open(SplitDir::Horizontal);
+        a.refresh_panes();
+        let tree = a.panes.iter().map(|p| (p.left, p.width, p.top, p.height)).collect::<Vec<_>>();
+        println!("then one s      : {tree:?}");
+        let sb = a.sidebar_pane.clone().expect("sidebar");
+        let win = tmux::window_of(&a.panes, &sb).expect("window");
+        let scoped = tmux::panes_in_window(&a.panes, win);
+        assert_eq!(
+            tmux::content_shape(&scoped, &sb),
+            tmux::ContentShape::Ragged,
+            "a mix of o and s is a tree"
+        );
+        assert_eq!(tmux::even_layout(&scoped, &sb, 34, None), None, "and a tree is never re-laid out");
+        let after_ticks = {
+            for _ in 0..3 {
+                a.refresh_panes();
+                a.pin_sidebar();
+            }
+            a.refresh_panes();
+            a.panes.iter().map(|p| (p.left, p.width, p.top, p.height)).collect::<Vec<_>>()
+        };
+        println!("after 3 ticks   : {after_ticks:?}");
+        assert_eq!(after_ticks, tree, "ticks do not move a tree either");
+
+        live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
     }
 
     fn bg(short: &str, name: &str, state: State) -> Session {

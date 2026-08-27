@@ -109,8 +109,8 @@ environment-variable equivalent of `--socket`.
 | `Tab` | First row of the next non-empty group | no |
 | `Shift-Tab` | Previous non-empty group | no |
 | `Enter` | Jump to the session's pane, or open it in a vertical split | no |
-| `o` | Open in a **vertical** split (vim geometry: side by side) | no |
-| `s` | Open in a **horizontal** split (vim geometry: stacked) | no |
+| `o` | Open in a **vertical** split (vim geometry: side by side), then spread the panes evenly across the width | no |
+| `s` | Open in a **horizontal** split (vim geometry: stacked), then spread the panes evenly down the height | no |
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
 | `S` | **Stop the session.** Asks `y`/`n` first | **yes** |
@@ -127,6 +127,18 @@ environment-variable equivalent of `--socket`.
 
 `o` and `s` are named for vim's geometry, not tmux's: `o` = vertical =
 side-by-side, `s` = horizontal = stacked.
+
+tmux's own `split-window` halves whichever pane it lands on, so a fourth `o`
+would leave a 20-column sliver next to a 42-column pane. ccmux re-lays the
+window after a split, and after an `x` that closed a pane **in the tab you are
+looking at**, so the panes it opened share the axis evenly — the sidebar keeps
+its pinned width, and the leftover cells are handed out one apiece rather than
+piled on one pane, so no two panes differ by more than a column (83 content
+columns over three panes is 28 + 28 + 27). Evening happens **only** on those two
+keys, never on the poll tick, so a border you drag with the mouse stays where
+you put it. A window holding a mix of `o` and `s` is a tree rather than a row or
+a column, and is left exactly as you built it — as is the other tab's geometry
+when `x` reaches across tabs to close a pane there.
 
 `Enter` and `x` reach across tabs: `Enter` on a session open in another tab
 switches to that window and selects its pane, and `x` closes a pane wherever it

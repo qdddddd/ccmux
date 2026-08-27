@@ -226,6 +226,75 @@ kill-pane -t %25        ; resize-pane -t %24 -x 34
 
 The sidebar stays leftmost, full height, exactly 34 columns throughout.
 
+### 1.4 Spreading the content panes evenly
+
+`split-window` HALVES its target, so successive `o` presses give progressively
+narrower panes: on a 120x40 window with a 34-column sidebar, four of them leave
+`34 42 21 20 …`. After a split or a kill — and at **no other time** — ccmux
+re-lays the window so the panes it opened share the axis that was split.
+
+- `o` (`SplitDir::Vertical`, tmux `-h`) puts panes side by side, so it divides
+  **width**. `s` (`SplitDir::Horizontal`, tmux `-v`) stacks them, so it divides
+  **height**. The sidebar spans the window's full height and is never part of a
+  height division, only of a width division.
+- The sidebar keeps its pinned width. It is never given a share.
+- The remainder is spread **one cell per pane**, never piled onto a single
+  pane, so no two content panes ever differ by more than one cell: 120 − 34 − 3
+  separators = 83 content columns over three panes is `28 + 28 + 27`. This is
+  what tmux's own `even-horizontal` does. Remainder-to-one-pane looks the same
+  at three panes and absurd at eight, where it would leave seven panes of 9
+  columns beside one of 15.
+- **Only a clean row or a clean column is evened.** A mix of `o` and `s` builds
+  a tree, where "even along the axis" has no single meaning; `select-layout
+  tiled` and evening the top-level groups both move panes the operator placed
+  on purpose, so a tree is a **no-op**.
+- The complete list of no-ops, each leaving the window byte-identical: zero or
+  one content pane; a ragged tree; a split whose direction did not produce the
+  matching shape; a window with too few columns or rows to give every pane a
+  cell; a sidebar that is not the full-height left edge; a window whose pane
+  list disagrees with the order the panes are seen in (below); an `x` that
+  killed a pane in **another tab**, which leaves that tab's geometry alone,
+  because only the process whose own window lost a pane evens anything; and
+  degraded mode.
+- **Never on the poll tick.** The mouse is on; evening on a timer would undo a
+  border the operator dragged, every 2.5 seconds. The two verbs that made the
+  layout uneven are the only ones that even it.
+
+The geometry is written as ONE tmux layout string through `select-layout`,
+not as a sequence of `resize-pane` calls. A sequence works — right to left,
+twice, because one pass does not settle — but it only *converges* to a fixed
+point. A layout string *is* one: it states every cell's size and position
+absolutely, so re-applying it changes nothing, and the sidebar cell is written
+at exactly the width §1.3 is about to re-assert, which makes the per-tick pin a
+no-op instead of a fight.
+
+**tmux binds cells to panes positionally, and the pane ids in a layout string
+are cosmetic.** `layout_parse` hands the parsed leaves to the window's pane list
+in order and discards the id it read from each one — verified on 3.4, where a
+string carrying the ids `3,2,1` was accepted with no pane moving and read back
+renumbered `0,1,2,3`. So the cell order ccmux emits (the sidebar, then the
+content along the axis) must BE the pane-list order that `#{pane_index}`
+reports, or panes would swap places and the sidebar itself would land in a
+content cell. Every window ccmux can build already satisfies that; it is
+checked anyway, and a window that fails the check is one more no-op.
+
+Verified on tmux 3.4 (120x40 window, sidebar pinned to 34):
+
+```
+o o o o     34 85 / 34 42 42 / 34 28 28 27 / 34 21 21 20 20   (widths)
+x           34 28 28 27
+5 ticks     34 28 28 27   (unchanged)
+
+o s s s s   40 40 / 40 20 19 / 40 13 13 12 / 40 10 9 9 9 / 40 8 7 7 7 7  (heights)
+x           40 10 9 9 9
+5 ticks     40 10 9 9 9   (unchanged)
+
+o o s       sidebar 34 | 42 | 42 over (20, 19)  — a tree, left exactly as built
+```
+
+The first number of each heights row is the sidebar, which spans the window's
+full height throughout and is never given a share of it.
+
 ---
 
 ## 2. Blast-radius rules (non-negotiable)
@@ -600,6 +669,39 @@ pub fn resize_pane_width(session: &str, pane: &PaneId, cols: u16) -> Result<(), 
 /// `resize_pane_width` with errors swallowed. Call this on every tick and after
 /// every split/kill (§1.3).
 pub fn pin_sidebar(session: &str, sidebar: &PaneId, cols: u16);
+
+/// tmux's own layout checksum (`layout_checksum` in layout-custom.c).
+pub fn layout_checksum(layout: &str) -> u16;
+
+/// The geometry the non-sidebar panes of one window form (§1.4). Only `Row`
+/// and `Column` divide along a single axis; a tree is `Ragged` and is a no-op.
+pub enum ContentShape { Row, Column, Ragged }
+
+/// Classify one WINDOW-SCOPED pane slice against its sidebar.
+pub fn content_shape(panes: &[PaneInfo], sidebar: &PaneId) -> ContentShape;
+
+/// `total` cells over `n` panes, the remainder spread ONE CELL PER PANE so no
+/// two differ by more than a cell. None below one each.
+pub fn even_shares(total: u16, n: usize) -> Option<Vec<u16>>;
+
+/// The `<checksum>,<layout>` string that spreads one window's content panes
+/// evenly (§1.4). `sidebar_cols` MUST be the width `pin_sidebar` will assert.
+/// `want` is the shape the pressed key produced, or None on the kill path.
+/// None for every no-op in §1.4's list, including a pane list whose order
+/// disagrees with the order the panes are seen in — tmux binds layout cells to
+/// panes positionally, so emitting them in any other order would permute the
+/// window.
+pub fn even_layout(
+    panes: &[PaneInfo],
+    sidebar: &PaneId,
+    sidebar_cols: u16,
+    want: Option<ContentShape>,
+) -> Option<String>;
+
+/// `tmux select-layout -t <pane> <checksum,layout>`. R2-gated, pane-addressed
+/// (never a `WindowId`), and refuses anything that is not a checksummed layout
+/// string — a layout NAME like `tiled` cannot get through this door.
+pub fn apply_layout(session: &str, target: &PaneId, layout: &str) -> Result<(), TmuxError>;
 
 /// Leftmost pane by `#{pane_left}`, tie-broken by lowest `pane_index`.
 pub fn leftmost_pane(panes: &[PaneInfo]) -> Option<PaneId>;
