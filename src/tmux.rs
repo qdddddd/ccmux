@@ -582,9 +582,13 @@ pub fn configure_session(session: &str, sidebar: &PaneId, width: u16) -> Result<
     set_user_option(session, OPT_WIDTH, &width.to_string())?;
     set_user_option(session, OPT_MAP, &serialize_map(&PaneMap::new()))?;
 
-    // `status` and `mouse` are cosmetic: a tmux build that renamed either must
-    // not stop the launcher from producing a working session.
-    let _ = tmux(&["set-option", "-t", &target, "status", "off"]);
+    // The status bar is left ALONE, deliberately: with tabs it is the tab
+    // strip, and the operator's own tmux config already styles it and places
+    // it. Inheriting rather than setting `status on` means ccmux never
+    // overrides that — if they turn the bar off globally, ccmux respects it.
+    //
+    // `mouse` is cosmetic: a tmux build that renamed it must not stop the
+    // launcher from producing a working session.
     let _ = tmux(&["set-option", "-t", &target, "mouse", "on"]);
     Ok(())
 }
