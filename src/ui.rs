@@ -5,7 +5,7 @@
 //! and mutates nothing. Any `Command`, `std::fs`, or `&mut App` appearing in
 //! this file is a spec violation.
 //!
-//! Consumes `app::{App, Mode, Confirm, Prompt, PromptKind, MsgLevel, LogsView}`,
+//! Consumes `app::{App, Mode, Prompt, PromptKind, MsgLevel, LogsView}`,
 //! `model::{Group, Row, Session, Kind, Status, format_age, shorten_cwd,
 //! truncate_end}`, `tmux::PaneId` (for `Display` only).
 //!
@@ -30,7 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Confirm, LogsView, Mode, MsgLevel, Prompt, PromptKind};
+use crate::app::{App, LogsView, Mode, MsgLevel, Prompt, PromptKind};
 use crate::model::{
     Group, Kind, Row, Session, State, Status, display_width, format_age, shorten_cwd,
     truncate_end,
@@ -273,7 +273,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Help => draw_help(f, area, app, &p),
         Mode::Logs => draw_logs(f, area, app.logs.as_ref(), &p),
-        Mode::Confirm(c) => draw_confirm(f, area, c, &p),
         Mode::Prompt(kind) => draw_prompt(f, area, *kind, app.prompt.as_ref(), &p),
         Mode::Normal | Mode::Filter => {}
     }
@@ -1143,63 +1142,6 @@ fn draw_logs(f: &mut Frame, area: Rect, logs: Option<&LogsView>, p: &Palette) {
     f.render_widget(Paragraph::new(lines), body);
 }
 
-fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm, p: &Palette) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    // §8.2: the modal renders the payload CAPTURED when `S` was pressed, never
-    // the live selection — a poll landing between `S` and `y` must not change
-    // what the operator is being asked about.
-    let Confirm::StopSession { short_id, name, .. } = confirm;
-
-    let rect = centered(area, area.width.min(34), 13);
-    f.render_widget(Clear, rect);
-    let body = inner(rect);
-    f.render_widget(overlay_block(" stop session ", p.red, p), rect);
-    if body.width == 0 || body.height == 0 {
-        return;
-    }
-
-    let w = body.width as usize;
-    let id = if short_id.is_empty() { "—" } else { short_id.as_str() };
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            truncate_end(&format!(" {name}"), w),
-            Style::default().fg(p.fg).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            truncate_end(&format!(" {id}"), w),
-            Style::default().fg(p.gray),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            " Stops the agent. The".to_string(),
-            Style::default().fg(p.gray),
-        )),
-        Line::from(Span::styled(
-            " conversation is kept;".to_string(),
-            Style::default().fg(p.gray),
-        )),
-        Line::from(Span::styled(
-            " resume with Enter later.".to_string(),
-            Style::default().fg(p.gray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" y".to_string(), Style::default().fg(p.red).add_modifier(Modifier::BOLD)),
-            Span::styled(": stop     ".to_string(), Style::default().fg(p.gray)),
-            Span::styled("n/Esc".to_string(), Style::default().fg(p.fg)),
-            Span::styled(": cancel".to_string(), Style::default().fg(p.gray)),
-        ]),
-    ];
-    let take = lines.len().min(body.height as usize);
-    f.render_widget(
-        Paragraph::new(lines[..take].to_vec()).wrap(Wrap { trim: false }),
-        body,
-    );
-}
-
 fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prompt>, p: &Palette) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1412,7 +1354,6 @@ mod tests {
             own_state_loaded: true,
             migrated: true,
             degraded: false,
-            confirm_armed_at: None,
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
@@ -1504,11 +1445,6 @@ mod tests {
             Mode::Filter,
             Mode::Help,
             Mode::Logs,
-            Mode::Confirm(Confirm::StopSession {
-                session_id: "uuid-0001".into(),
-                short_id: "1c45d64f".into(),
-                name: "bt/reg-update".into(),
-            }),
             Mode::Prompt(PromptKind::NewBackground),
         ] {
             base.mode = mode.clone();

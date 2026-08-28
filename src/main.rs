@@ -28,7 +28,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{Action, Mode};
+use crate::app::Action;
 use crate::tmux::PaneId;
 
 #[derive(clap::Parser)]
@@ -519,7 +519,6 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                 // §4.1: filtering on Press is mandatory — without it a terminal
                 // that reports key repeat/release doubles every keystroke.
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    let was_confirm = matches!(app.mode, Mode::Confirm(_));
                     let started = std::time::Instant::now();
                     let action = app.on_key(k);
                     // Same rule as the slow tick below, for the other place the
@@ -531,14 +530,6 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                     // the burst it is; this drops the whole replay, including
                     // the keys that are not `Ctrl+X`.
                     if started.elapsed() >= SLOW_KEY {
-                        drain_pending_input()?;
-                    }
-                    // A confirmation must be answered by a keystroke made AFTER
-                    // it was drawn. Anything already sitting in the tty buffer
-                    // when `S` opened the modal is type-ahead aimed at the list,
-                    // so drop it; `App::key_confirm`'s arming delay is the
-                    // second, unit-testable half of the same guard.
-                    if !was_confirm && matches!(app.mode, Mode::Confirm(_)) {
                         drain_pending_input()?;
                     }
                     match action {
@@ -562,8 +553,8 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Discard every input event already queued. Called the instant a destructive
-/// confirmation opens.
+/// Discard every input event already queued. Called after a tick or keypress
+/// that blocked long enough for the tty to buffer input aimed at a frozen UI.
 fn drain_pending_input() -> anyhow::Result<()> {
     while event::poll(Duration::ZERO)? {
         let _ = event::read()?;
@@ -778,6 +769,16 @@ mod tests {
             "pub session_name: String",
             // the `NewInteractive` prompt variant, as a variant and not as prose
             "    NewInteractive,",
+            // the confirm-modal machinery, deleted outright once `Ctrl+X`
+            // replaced `S`: no declaration of it may come back
+            "pub enum Confirm",
+            "    Confirm(Confirm),",
+            "pub fn act_request_stop",
+            "pub fn act_confirm_stop",
+            "fn key_confirm",
+            "fn draw_confirm",
+            "pub confirm_armed_at",
+            "const CONFIRM_ARM_DELAY",
         ] {
             assert!(
                 !SPEC.contains(needle),

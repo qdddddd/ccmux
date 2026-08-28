@@ -29,15 +29,6 @@ const FAIL_BACKOFF_AT: u32 = 3;
 const LOGS_LINES: usize = 500;
 /// SPEC §9.1: `poll_error` is truncated to 120 chars.
 const POLL_ERR_MAX: usize = 120;
-/// How long the `S` confirmation must have been on screen before `y` is
-/// accepted (SPEC AMENDMENT §8.2).
-///
-/// crossterm hands us whatever the tty already buffered, so without this a
-/// paste or a fast typist's "Sy" arrives as two key events in the same instant:
-/// `S` opens the modal and the buffered `y` confirms it before a human could
-/// read the prompt. `claude stop` is the one verb that ends a running agent, so
-/// it must be answered by a keystroke made AFTER the question was visible.
-const CONFIRM_ARM_DELAY: Duration = Duration::from_millis(250);
 /// How long the second `Ctrl+X` has to arrive for it to mean DELETE
 /// (SPEC §8.2). Agent view's own shortcut table words it "press again within
 /// two seconds to delete it", and this is that two seconds.
@@ -54,16 +45,15 @@ const CX_WINDOW: Duration = Duration::from_secs(2);
 /// stop, and a repeat stream performs exactly one stop no matter how long the
 /// key is held.
 ///
-/// It is 750 ms rather than `CONFIRM_ARM_DELAY`'s 250 ms because of the held
-/// key. With `KeyEventKind::Press`-only events there is no release to observe,
+/// It is 750 ms rather than a shorter bar because of the held key. With
+/// `KeyEventKind::Press`-only events there is no release to observe,
 /// so "press, wait 660 ms, press, release" and "hold for 665 ms" are the SAME
 /// event stream — no settle can separate them after the fact, and at 250 ms
 /// every stock auto-repeat delay (GNOME 500 ms, KDE 600 ms, X11 `xset` default
 /// 660 ms) cleared the bar, so a hold released just after its first repeat
-/// deleted a session. 750 ms clears all of them with margin. It also serves
-/// `CONFIRM_ARM_DELAY`'s own stated reason better than 250 ms ever did: the
-/// warning this press answers is 60 characters of "delete <name> and its
-/// worktree — cannot be undone", and 250 ms is not time enough to read it.
+/// deleted a session. 750 ms clears all of them with margin. It also gives
+/// the operator time to read what the press answers: 60 characters of "delete
+/// <name> and its worktree — cannot be undone", which 250 ms never was.
 /// A press inside the bar is not lost — it says so in the footer and the
 /// window stays open (`act_ctrl_x`).
 const CX_MIN_GAP: Duration = Duration::from_millis(750);
@@ -99,16 +89,6 @@ pub enum MsgLevel {
     Info,
     Warn,
     Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Confirm {
-    /// `S` — the only destructive confirmation in v1.
-    StopSession {
-        session_id: String,
-        short_id: String,
-        name: String,
-    },
 }
 
 /// The session the FIRST `Ctrl+X` press acted on, and when the window opened.
@@ -161,7 +141,6 @@ pub struct LogsView {
 pub enum Mode {
     Normal,
     Filter,
-    Confirm(Confirm),
     Prompt(PromptKind),
     Help,
     Logs,
@@ -301,11 +280,6 @@ pub struct App {
     pub degraded: bool,
 
     // messaging + health
-    /// When the confirm modal went up. `key_confirm` refuses a `y` that arrives
-    /// within `CONFIRM_ARM_DELAY` of it, and `None` means "not armed" — both
-    /// fail closed.
-    pub confirm_armed_at: Option<Instant>,
-
     /// `Ctrl+X`'s delete window: `Some` for `CX_WINDOW` after a press that
     /// stopped (or found already stopped) a session. `None` is "the next press
     /// is a first press", which is the recoverable verb — fail closed.
@@ -378,7 +352,6 @@ impl App {
             migrated: false,
             degraded,
 
-            confirm_armed_at: None,
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
@@ -602,7 +575,6 @@ impl App {
         let action = match self.mode.clone() {
             Mode::Normal => self.key_normal(key),
             Mode::Filter => self.key_filter(key),
-            Mode::Confirm(_) => self.key_confirm(key),
             Mode::Prompt(_) => self.key_prompt(key),
             Mode::Help => self.key_help(key),
             Mode::Logs => self.key_logs(key),
@@ -1086,74 +1058,6 @@ impl App {
         }
     }
 
-    /// The confirmation modal's entry point. Never calls `agents::stop`.
-    ///
-    /// UNREACHABLE FROM ANY KEY PATH since stop moved to `Ctrl+X` (SPEC §8.2):
-    /// `S` no longer calls it and nothing else ever did, so `Mode::Confirm`,
-    /// `CONFIRM_ARM_DELAY`, `key_confirm`, `act_confirm_stop` and `draw_confirm`
-    /// are now reachable only through this function and through tests. Kept,
-    /// not deleted: it is the whole confirm mechanism for the next verb that
-    /// needs one, it costs one `allow` to keep compiling, and whether dead code
-    /// goes is the owner's call, not this change's.
-    #[allow(dead_code)]
-    pub fn act_request_stop(&mut self) {
-        let Some(sel) = self.selected_session() else {
-            return;
-        };
-        if !sel.is_attachable() {
-            self.flash("no short id — cannot stop this session", MsgLevel::Warn);
-            return;
-        }
-        if sel.group() == Group::Completed {
-            self.flash("session already completed", MsgLevel::Warn);
-            return;
-        }
-        // THE capture. `act_confirm_stop` uses these values, not the live
-        // cursor: a poll landing between `S` and `y` can reorder the list, and
-        // without capture `y` would stop whatever slid under the cursor.
-        self.mode = Mode::Confirm(Confirm::StopSession {
-            session_id: sel.session_id.clone(),
-            short_id: sel.id.clone().unwrap_or_default(),
-            name: sel.name.clone(),
-        });
-        // The modal is not answerable until it has been on screen for
-        // `CONFIRM_ARM_DELAY`; see the constant for why.
-        self.confirm_armed_at = Some(Instant::now());
-    }
-
-    /// `y` inside the confirm modal. The ONLY caller of `agents::stop`.
-    pub fn act_confirm_stop(&mut self) {
-        let Mode::Confirm(Confirm::StopSession {
-            short_id, name, ..
-        }) = self.mode.clone()
-        else {
-            return;
-        };
-        self.mode = Mode::Normal;
-        self.confirm_armed_at = None;
-
-        // Fail closed: re-validate the CAPTURED id against the current poll.
-        let still_there = self
-            .sessions
-            .iter()
-            .any(|s| s.id.as_deref() == Some(short_id.as_str()));
-        if !still_there {
-            self.flash(
-                format!("session {short_id} is gone — not stopped"),
-                MsgLevel::Warn,
-            );
-            return;
-        }
-        match agents::stop(&short_id) {
-            Ok(()) => {
-                // The pane, if any, is left open — closing it is a separate `x`.
-                self.flash(format!("stopped {name}"), MsgLevel::Info);
-                self.act_force_refresh();
-            }
-            Err(e) => self.flash(format!("stop failed: {}", agents_msg(&e)), MsgLevel::Error),
-        }
-    }
-
     // ── `Ctrl+X` — stop, and again inside the window to delete (§8.2) ───────
 
     /// THE `Ctrl+X` entry point. First press stops the selected session with no
@@ -1409,11 +1313,10 @@ impl App {
     /// path issues no tmux command whatsoever. The agent runs on, its pane (if
     /// any) stays open, and `total` in the header still counts it.
     ///
-    /// No confirm modal on purpose: `CONFIRM_ARM_DELAY` and the `y`/`n` gate
-    /// exist for `S`, the one verb that ends a running agent. Guarding a change
-    /// of what is on screen the same way would teach the operator to dismiss
-    /// the modal reflexively, which is exactly how a real `S` gets confirmed by
-    /// accident. `u` is the safety net instead, and the flash names it.
+    /// No confirmation on purpose: guarding a change of what is merely on
+    /// screen would teach the operator to answer prompts reflexively, which is
+    /// how a real destructive prompt gets confirmed by accident. `u` is the
+    /// safety net instead, and the flash names it.
     pub fn act_dismiss(&mut self) {
         let Some(sel) = self.selected_session() else {
             self.flash("no session selected", MsgLevel::Warn);
@@ -2443,33 +2346,6 @@ impl App {
         }
     }
 
-    /// §8.2: NO default-affirmative. Only the literal lowercase `y` confirms;
-    /// `Enter`, `n`, `Esc`, `q` and everything else cancel with no side effect.
-    ///
-    /// SPEC AMENDMENT (§8.2): a `y` that arrives within `CONFIRM_ARM_DELAY` of
-    /// the modal opening is treated as TYPE-AHEAD and cancels. It cannot be an
-    /// answer to a question the operator has not seen yet, and the input it
-    /// most likely came from — a paste, or "Sync" typed without `/` — would
-    /// otherwise stop a running agent.
-    fn key_confirm(&mut self, key: KeyEvent) -> Action {
-        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
-            let armed = self
-                .confirm_armed_at
-                .is_some_and(|t| t.elapsed() >= CONFIRM_ARM_DELAY);
-            if armed {
-                self.act_confirm_stop();
-            } else {
-                self.mode = Mode::Normal;
-                self.confirm_armed_at = None;
-                self.flash("ignored buffered 'y' — cancelled", MsgLevel::Warn);
-            }
-        } else {
-            self.mode = Mode::Normal;
-            self.confirm_armed_at = None;
-        }
-        Action::Redraw
-    }
-
     fn key_prompt(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -2747,10 +2623,6 @@ mod tests {
             // NOT degraded: the gates under test must fire on their own merits,
             // not because the degraded check short-circuited them.
             degraded: false,
-            // Armed in the past: the tests answer the modal instantly, which a
-            // human cannot, and `CONFIRM_ARM_DELAY` exists to reject exactly
-            // that. `confirm_gate_ignores_type_ahead` covers the delay itself.
-            confirm_armed_at: Instant::now().checked_sub(Duration::from_secs(1)),
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
@@ -3087,8 +2959,7 @@ mod tests {
     // ── `Ctrl+X` — stop, and again to delete (§8.2) ─────────────────────────
 
     /// Age the burst guard's clock so the NEXT press reads as a deliberate one.
-    /// No test sleeps: they backdate, exactly as the confirm tests backdate
-    /// `confirm_armed_at`.
+    /// No test sleeps: they backdate.
     fn after(a: &mut App, gap: Duration) {
         a.cx_last_press = a.cx_last_press.and_then(|t| t.checked_sub(gap));
     }
@@ -3652,50 +3523,6 @@ mod tests {
     }
 
     #[test]
-    fn confirm_gate_ignores_type_ahead() {
-        let mut a = app();
-        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
-
-        // `S` immediately followed by a `y` that was already in the tty buffer.
-        a.act_request_stop();
-        assert!(matches!(a.mode, Mode::Confirm(_)));
-        let act = a.on_key(press('y'));
-
-        assert_eq!(act, Action::Redraw);
-        assert_eq!(a.mode, Mode::Normal, "the modal must close");
-        assert!(a.confirm_armed_at.is_none());
-        let (text, level) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!(level, MsgLevel::Warn);
-        assert_eq!(text, "ignored buffered 'y' — cancelled");
-
-        // The session is untouched and still selectable.
-        assert_eq!(a.sessions.len(), 1);
-
-        // Once the modal has been on screen long enough, `y` is honoured. The
-        // session is gone from the poll, so the fail-closed path proves the
-        // gate was passed without `claude stop` ever being spawned.
-        a.act_request_stop();
-        a.confirm_armed_at = Instant::now().checked_sub(Duration::from_secs(1));
-        a.sessions.clear();
-        a.rebuild_rows();
-        a.on_key(press('y'));
-        let (text, _) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!(text, "session 1c45d64f is gone — not stopped");
-    }
-
-    #[test]
-    fn confirm_cancel_keys_disarm_the_modal() {
-        for key in [press('n'), press('q'), KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)] {
-            let mut a = app();
-            load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
-            a.act_request_stop();
-            a.on_key(key);
-            assert_eq!(a.mode, Mode::Normal);
-            assert!(a.confirm_armed_at.is_none(), "cancel must disarm");
-        }
-    }
-
-    #[test]
     fn paste_is_never_executed_as_a_keymap() {
         let mut a = app();
         load(
@@ -3941,62 +3768,6 @@ mod tests {
         }
         assert!(a.map.panes.is_empty());
         assert!(!a.map_dirty, "a refused verb must not dirty the map");
-    }
-
-    #[test]
-    fn confirm_modal_uses_the_captured_short_id() {
-        let mut a = app();
-        load(
-            &mut a,
-            vec![bg("1c45d64f", "bt/reg-update", State::Working)],
-        );
-        a.act_request_stop();
-        match &a.mode {
-            Mode::Confirm(Confirm::StopSession { short_id, name, .. }) => {
-                assert_eq!(short_id, "1c45d64f");
-                assert_eq!(name, "bt/reg-update");
-            }
-            other => panic!("expected the confirm modal, got {other:?}"),
-        }
-
-        // A poll lands between `S` and `y` and the session disappears. The
-        // captured id must still be the one acted on, and the re-validation
-        // must fail closed — so `claude stop` is never invoked.
-        a.sessions = vec![bg("deadbeef", "something else", State::Working)];
-        a.rebuild_rows();
-
-        // Backdate the arming so this stands in for a human who read the modal;
-        // the type-ahead window itself is covered separately.
-        a.confirm_armed_at = Instant::now().checked_sub(Duration::from_secs(1));
-        let act = a.on_key(press('y'));
-        assert_eq!(act, Action::Redraw);
-        assert_eq!(a.mode, Mode::Normal);
-        let (text, level) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!(level, MsgLevel::Warn);
-        assert_eq!(text, "session 1c45d64f is gone — not stopped");
-    }
-
-    #[test]
-    fn any_key_but_y_cancels_the_confirm_modal() {
-        let mut a = app();
-        load(
-            &mut a,
-            vec![bg("1c45d64f", "bt/reg-update", State::Working)],
-        );
-        a.act_request_stop();
-        assert!(matches!(a.mode, Mode::Confirm(_)));
-
-        // `n` is a Normal-mode binding; inside the modal it must only cancel.
-        a.on_key(press('n'));
-        assert_eq!(a.mode, Mode::Normal);
-        assert!(a.prompt.is_none(), "`n` inside the modal must not open a prompt");
-        assert!(a.message.is_none(), "cancelling has no side effect");
-
-        // Enter is explicitly NOT a default-affirmative.
-        a.act_request_stop();
-        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(a.mode, Mode::Normal);
-        assert!(a.message.is_none());
     }
 
     #[test]
@@ -4588,11 +4359,6 @@ mod tests {
             Mode::Help,
             Mode::Logs,
             Mode::Prompt(PromptKind::NewBackground),
-            Mode::Confirm(Confirm::StopSession {
-                session_id: "x".into(),
-                short_id: "x".into(),
-                name: "x".into(),
-            }),
         ] {
             let mut a = app();
             a.mode = mode;
@@ -4762,7 +4528,7 @@ mod tests {
         assert_eq!(ids_after, ids_before, "the poll is not mutated");
         assert_eq!(a.map, map_before, "no pane map entry is added or removed");
         assert!(!a.map_dirty, "no tmux pane work was queued");
-        assert_eq!(a.mode, Mode::Normal, "no confirm modal: this is not destructive");
+        assert_eq!(a.mode, Mode::Normal, "no mode change: this is not destructive");
         assert!(a.hidden_dirty, "the option write is queued for the next tick");
         assert!(!a.should_quit);
 

@@ -973,7 +973,7 @@ pub fn draw(f: &mut Frame, app: &App);
 pub fn list_viewport_rows(total_height: u16) -> u16;
 ```
 
-**Consumes:** `app::{App, Mode, Confirm, Prompt, PromptKind, MsgLevel, LogsView}`,
+**Consumes:** `app::{App, Mode, Prompt, PromptKind, MsgLevel, LogsView}`,
 `model::{Group, Row, Session, Kind, Status, format_age, shorten_cwd, truncate_end}`,
 `tmux::PaneId` (for `Display` only).
 
@@ -991,13 +991,6 @@ use crate::tmux::{PaneId, PaneInfo, PaneMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgLevel { Info, Warn, Error }
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Confirm {
-    /// The confirm mechanism. DORMANT since stop moved to `Ctrl+X` (§8.2):
-    /// no key path reaches it. Kept for the next verb that needs a modal.
-    StopSession { session_id: String, short_id: String, name: String },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
@@ -1026,7 +1019,6 @@ pub struct LogsView {
 pub enum Mode {
     Normal,
     Filter,
-    Confirm(Confirm),
     Prompt(PromptKind),
     Help,
     Logs,
@@ -1152,8 +1144,6 @@ impl App {
     pub fn act_open(&mut self, dir: crate::tmux::SplitDir);
     pub fn act_enter(&mut self);
     pub fn act_close_pane(&mut self);
-    pub fn act_request_stop(&mut self);
-    pub fn act_confirm_stop(&mut self);
     pub fn act_open_logs(&mut self);
     pub fn act_force_refresh(&mut self);
     pub fn act_submit_prompt(&mut self);
@@ -1511,10 +1501,6 @@ Claude pane.
   table one binding per line, two columns (`key`, `action`) when `W >= 30`,
   otherwise `key action` on one line each. Scrolls with `j`/`k` when it
   overflows.
-- **Confirm** — `Mode::Confirm`. Centred block, `p.red` border, titled
-  ` stop session `, body = the session name and short id, footer =
-  `y: stop    n/Esc: cancel`. **No key opens it** since stop moved to `Ctrl+X`
-  (§8.2); it is retained, unreached, for the next verb that needs a modal.
 - **Prompt (`n`)** — `Mode::Prompt`. Block titled ` new background session `.
   One line per field, the focused field prefixed
   `> ` and carrying a reverse-video cursor cell at `prompt.cursor`; unfocused
@@ -1630,7 +1616,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `t` | open in a **new tab** — a window with its own sidebar — and go there (§8.10) | no |
 | `x` | close the pane showing a session — the agent keeps running (§8.5) | no |
 | `Ctrl-x` | **stop the session**, immediately; again within 2 s **deletes** it and its worktree (§8.2) | **YES** (§8.2) |
-| `S` | unbound as a verb — flashes `stop is Ctrl+X now` and does nothing else | no |
+| `S` | deliberately unbound — pressing it does nothing, silently (stop is `Ctrl-x`, §8.2) | no |
 | `n` | dispatch a new background session with a typed task | no |
 | `L` | show `claude logs` for this session (ANSI-stripped) | no |
 | `/` | enter filter mode | no |
@@ -1657,9 +1643,10 @@ which is Claude Code's own agent-view shortcut, adopted verbatim. `stop` keeps
 the conversation (`Enter` resumes it); `claude rm` deletes the session **and its
 git worktree** and cannot be undone (PROBE-FINDINGS §2).
 
-`S` used to be this binding. It is now unbound as a verb: it flashes
-`stop is Ctrl+X now` (Info) and does nothing else. It is answered rather than
-ignored because it was the stop key for the whole life of the previous build.
+`S` used to be this binding. It is now completely unbound: pressing it does
+nothing and says nothing — no flash, no modal, no window.
+`s_is_completely_unbound` drives an uppercase `S` through `on_key` and asserts
+exactly that, so a keymap change cannot quietly give the old stop key a verb.
 
 **Placement, mandatory:** the `Ctrl+X` arm MUST sit above `key_normal`'s
 `_ if ctrl => Action::None` catch-all. Below it the arm compiles, reads
@@ -1808,13 +1795,12 @@ in one place, at the end of `on_key`, so no handler can forget it.
 
 #### The confirm modal
 
-`Mode::Confirm`, `Confirm::StopSession`, `CONFIRM_ARM_DELAY`, `key_confirm`,
-`act_confirm_stop` and `draw_confirm` still exist and still behave exactly as
-they always did — no default-affirmative, only a literal `y` confirms, a `y`
-inside `CONFIRM_ARM_DELAY` is type-ahead and cancels, the modal captures the
-short id at open. **No key path reaches any of it.** `act_request_stop` is its
-only entry point and nothing calls it. It is retained deliberately for the next
-verb that needs a modal; whether it is deleted is a separate decision.
+Deleted. The `y`/`n` modal `S` used to open — `Mode::Confirm`,
+`Confirm::StopSession`, `CONFIRM_ARM_DELAY`, `key_confirm`, `act_request_stop`,
+`act_confirm_stop` and `draw_confirm` — became unreachable when stop moved to
+`Ctrl+X` and has been removed from the crate outright. `Ctrl+X`'s own guards
+above — `CX_MIN_GAP`, `CX_SETTLE`, the footer warning — are the whole
+confirmation story now. The next verb that needs a modal builds one fresh.
 
 Every other verb is non-destructive by construction and takes no confirmation:
 `x` is proven safe (PROBE-FINDINGS §3: killing the pane leaves the agent
@@ -1959,13 +1945,12 @@ table.
 - `Mode::Help` — any key returns to `Normal`, except `j`/`k`/`Ctrl-d`/`Ctrl-u`
   which scroll the overlay.
 - `Mode::Logs` — `j`/`k`/`Ctrl-d`/`Ctrl-u`/`g`/`G` scroll; `q`/`Esc` closes.
-- `Mode::Confirm` — only `y` confirms; everything else cancels (§8.2).
 - `Mode::Prompt` — text editing; `Enter` submits; `Esc` cancels.
 - `Mode::Filter` — text editing; `Enter` commits; `Esc` clears.
 
 `Ctrl-c` quits from **any** mode, immediately, without confirming and without
 touching a session — the sidebar owns no agent state, so there is nothing to
-lose. It is deliberately not routed through `Mode::Confirm`.
+lose.
 
 ### 8.10 `t` — open in a new tab
 
@@ -2525,8 +2510,8 @@ behaviour, the pin is superseded by this appendix.
 
 | Amends | Was | Is |
 |---|---|---|
-| §8.2 | `y` confirms whenever the modal is open. | `y` is ignored for 250 ms after the modal opens (`CONFIRM_ARM_DELAY`), and the event loop drains queued input the instant the modal is drawn. Type-ahead — a paste, or `Sync` typed without `/` — cannot stop an agent. Now dormant: no key opens the modal. |
-| §8.2 | `S` stops the selected session behind a `y`/`n` modal, and there is no way to delete one. | `Ctrl+X` stops it immediately with no modal, and a second `Ctrl+X` within two seconds deletes it and its worktree via `claude rm` (PROBE-FINDINGS §2). `S` is unbound as a verb and only says where stop went. The modal is gone from the key paths, not from the crate. |
+| §8.2 | `y` confirms whenever the modal is open. | `y` is ignored for 250 ms after the modal opens (`CONFIRM_ARM_DELAY`), and the event loop drains queued input the instant the modal is drawn. Type-ahead — a paste, or `Sync` typed without `/` — cannot stop an agent. The machinery has since been deleted from the crate. |
+| §8.2 | `S` stops the selected session behind a `y`/`n` modal, and there is no way to delete one. | `Ctrl+X` stops it immediately with no modal, and a second `Ctrl+X` within two seconds deletes it and its worktree via `claude rm` (PROBE-FINDINGS §2). `S` is completely unbound and silent. The modal machinery has since been deleted from the crate entirely. |
 | §8.2 | `CX_MIN_GAP` is 250 ms and every press stamps it on entry, so "a buffered burst of any length performs exactly one stop" and "holding `Ctrl+X` down deletes nothing". | Both were falsified live. The entry-only stamp measured DEQUEUE time, so the ~0.85 s the first press spent blocked inside `claude stop` plus the forced refresh became the gap: two `Ctrl+X` events ~100 ms apart deleted a session and its worktree. Presses now re-stamp when the handler returns, `run_delete` re-stamps after its own shell-out, and `main.rs` drains the tty after any keypress that blocked over `SLOW_KEY` (300 ms). And 250 ms was under every stock auto-repeat delay, so a hold released inside its first repeat interval deleted; `CX_MIN_GAP` is now 750 ms, clear of GNOME 500 / KDE 600 / X11 660. |
 | §8.2 | A press suppressed by `CX_MIN_GAP` returns `Action::None` and draws nothing. | It flashes `too fast — press Ctrl+X again` and asks for a redraw. Silence was indistinguishable from a wedged sidebar: the press acted on nothing and left the previous line on screen. The window is not consumed. |
 | §8.2 | A refused second press always flashes `moved off <label> — nothing deleted`. | It says `<label> left the list — nothing deleted` when the captured row is no longer in the list at all — `a` hiding Completed, or a `/` filter written against the worktree path that `claude stop` reverts. The refusal is unchanged and still fails safe; only the cause it names is. |
