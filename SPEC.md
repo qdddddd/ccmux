@@ -1895,20 +1895,79 @@ PROBE-FINDINGS §3, shown every time, so nobody ever confuses `x` with `Ctrl+X`.
    ┌─ new background session ───┐
    │  cwd  ~/projects/shared    │
    │ > task  regenerate the ...  │
-   │  Tab: field  ⏎ run  Esc: ✕ │
+   │  Tab: cwd  ⏎ run  Esc: ✕   │
    └────────────────────────────┘
 ```
 
 - Field 0 `cwd` prefills with the selected session's `cwd`, or `$PWD` when the
   list is empty. Field 1 `task` starts empty and is focused.
-- `Tab` / `BackTab` move focus; `Left`/`Right`/`Home`/`End`/`Backspace` edit;
-  printable chars insert at `cursor`.
-- `Enter` submits from any field. `Esc` cancels, discarding both fields.
-- Validation before dispatch: `task.trim()` non-empty (else flash
-  `task cannot be empty`, Warn, stay in the prompt) and `cwd` is an existing
-  directory (`std::path::Path::is_dir`; else flash `no such directory: <cwd>`,
-  Warn, stay in the prompt).
-- Dispatch: `agents::dispatch_background(cwd, task)` — pure argv (Q4).
+- `Tab` from the task field moves to the cwd field; `BackTab` cycles backwards
+  from either field. **In the cwd field `Tab` path-completes instead of
+  cycling**: the text — trimmed of surrounding whitespace, exactly as `Enter`
+  trims it, so a value Enter would accept always completes — is split at its
+  last `/`, and the final component is
+  prefix-matched against that directory's SUBDIRECTORY names (read-only —
+  one `read_dir`, `is_dir` per surviving name; a symlink to a directory
+  counts). A unique match completes to `.../name/`; several matches extend to
+  their longest common prefix, or flash `N matches` (Info) when already there;
+  dot-directories only match a typed `.` prefix; an unreadable directory, a
+  relative path, or no match at all degrade to a no-op. The task field stays
+  one `BackTab` away, and `Enter` submits from any field, so completion costs
+  the common case nothing. The hint line tracks focus: `Tab: cwd` on the task
+  field, `Tab: complete dir` on the cwd field.
+- `Left`/`Right`/`Home`/`End`/`Backspace` edit; printable chars insert at
+  `cursor`. `Esc` cancels, discarding both fields.
+- Validation before dispatch, in order:
+  1. `task.trim()` non-empty — else flash `task cannot be empty` (Warn), stay.
+  2. The cwd input is trimmed of surrounding whitespace and `~`-expanded
+     against `App::home` — the input-side twin of `shorten_cwd`'s display
+     rule, so the `~/x` the detail block renders is typeable. Only a LEADING
+     tilde is syntax: `~` and `~/x` expand; `/data/~backup` is a literal name;
+     `~user/...` flashes `~user paths are not supported — use an absolute
+     path` (Warn). An empty cwd (empty list AND unreadable `$PWD` at open —
+     the degraded corner) flashes `cwd cannot be empty` (Warn), never arms.
+  3. The expanded cwd must be an existing directory (`Path::is_dir`) — else
+     the mkdir offer below.
+- **The mkdir offer.** A cwd that does not exist is created on request, one
+  level deep, via an inline arm — there is no confirm modal. Every `<path>` in
+  the flashes below is elided to `CWD_FLASH_MAX` (60) columns via
+  `shorten_cwd` — the same rule the detail block renders every cwd under, so
+  the FINAL, identifying components survive — because the overflow carve is at
+  most 4 rows of a 34-column sidebar and the actionable tail of the arm flash
+  must never wrap off the bottom. The elision is display-only: arming,
+  creation, and dispatch all use the full expanded path.
+  - An entry that EXISTS but is not an enterable directory (a plain file, a
+    dangling symlink, a symlink to a file — probed with `symlink_metadata`,
+    which does not follow the final component) flashes
+    `not a directory: <path>` (Warn). Nothing is followed or overwritten.
+  - A missing PARENT flashes `parent does not exist: <parent>` (Warn): one
+    level only, a typo'd deep path must never materialise a tree. A relative
+    cwd is refused with `no such directory` — creating relative to the
+    sidebar's own cwd would put the directory somewhere the operator never
+    named.
+  - Otherwise the first `Enter` ARMS creation: `Prompt::pending_create`
+    records the expanded path, the footer flashes
+    `<path> does not exist — ⏎ again to create it` (Warn), and the prompt's
+    hint line switches to `⏎ create cwd + run` for as long as the arm stands
+    (the flash expires in 4s; the hint is the durable statement). The arm
+    dies with the prompt (`Esc`, any mode change) and on ANY edit to either
+    field — keystroke, paste, or completion — and the second `Enter`
+    re-expands and compares before acting, so a stale arm can never mkdir a
+    path no longer on screen. A keypress that edits NOTHING — `Backspace` at
+    the start of a field, `Delete` at its end — is not an edit and keeps the
+    arm.
+  - The second `Enter` runs `std::fs::create_dir` (never `create_dir_all`;
+    `mkdir(2)` EEXISTs on any pre-existing entry, dangling symlinks included)
+    and dispatches. A failed create flashes
+    `could not create <path>: <os error>` (Error), names the path, disarms,
+    and keeps the prompt — nothing was made, nothing dispatched. The success
+    flash names what now exists:
+    `created <path> — dispatched background session` (Info) — and if dispatch
+    then fails, `created <path>, but dispatch failed: …` (Error), because the
+    mkdir half did happen and the directory stays. **This mkdir is the ONLY
+    filesystem write in ccmux.**
+- Dispatch: `agents::dispatch_background(cwd, task)` — pure argv (Q4), the
+  expanded cwd and the task text never touch a shell.
 - On success: leave the prompt, flash `dispatched background session` (Info),
   force a refresh. The new session appears in the next poll under **Working**.
   ccmux does **not** auto-open it — the operator decides with `Enter`.

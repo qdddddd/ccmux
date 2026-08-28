@@ -83,6 +83,15 @@ const MIN_CONTENT_COLS: u16 = 20;
 /// fit `hidden <name> — u to undo` into a 34-column footer, and the part that
 /// must survive is the part that says how to get the row back.
 const LABEL_MAX: usize = 14;
+/// Columns a cwd may take in a §8.6 flash, on `LABEL_MAX`'s precedent: bound
+/// the variable half so the actionable tail survives the default sidebar. The
+/// widest fixed tail is ` does not exist — ⏎ again to create it` (~39 cols),
+/// the overflow carve is at most 4 rows × 34 default columns, and a no-space
+/// path token hard-wraps, so a path elided to 60 fills ≤ 2 rows and leaves the
+/// tail its own ≤ 2. `shorten_cwd` keeps the FINAL components, so what the
+/// flash names is the identifying part of the path — the same rule the detail
+/// block renders every cwd under.
+const CWD_FLASH_MAX: usize = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgLevel {
@@ -128,6 +137,14 @@ pub struct Prompt {
     pub fields: Vec<String>,
     pub focus: usize,
     pub cursor: usize,
+    /// §8.6: the EXPANDED absolute path a missing-cwd `Enter` armed for
+    /// creation, so the next `Enter` runs `create_dir` instead of refusing
+    /// again. Lives inside `Prompt` on purpose: `Esc` and every mode change
+    /// drop the prompt and the arm with it. Any edit to a field clears it
+    /// (`key_prompt` / `on_paste`), and the second `Enter` re-expands the field
+    /// and compares before creating, so a stale arm can never mkdir a path the
+    /// operator is no longer looking at.
+    pub pending_create: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +314,14 @@ pub struct App {
     pub last_poll: Instant,
 
     pub should_quit: bool,
+
+    /// Seam for `agents::dispatch_background`, and nothing else. Production
+    /// (`App::new`) points it at the real function; the unit-test fixture
+    /// points it at a PANICKING stub so no hermetic test can ever spawn the
+    /// operator's real `claude` — `CCMUX_CLAUDE_BIN` cannot serve, because
+    /// `claude_bin()` is a process-wide `OnceLock` that other tests may have
+    /// already resolved to `claude`.
+    pub dispatch: fn(&str, &str) -> Result<(), AgentsError>,
 }
 
 impl App {
@@ -368,6 +393,8 @@ impl App {
                 .unwrap_or_else(Instant::now),
 
             should_quit: false,
+
+            dispatch: agents::dispatch_background,
         }
     }
 
@@ -625,6 +652,7 @@ impl App {
                     }
                 }
                 p.cursor = at;
+                p.pending_create = None; // §8.6: a paste is an edit
                 self.prompt = Some(p);
                 Action::Redraw
             }
@@ -1449,12 +1477,20 @@ impl App {
 
     /// `Enter` inside a prompt. SPEC §8.6 (§8.7, the interactive prompt, is
     /// gone along with its `c` binding).
+    ///
+    /// The cwd field is trimmed and `~`-expanded before any check, so the path
+    /// the detail block renders (`~/x`) is also a path the operator may type.
+    /// A cwd that does not exist is not rejected outright any more: when its
+    /// PARENT is a directory, the first `Enter` arms creation and the second
+    /// runs `std::fs::create_dir` — one level, never a tree, and never over an
+    /// existing file or symlink (`create_dir` is `mkdir(2)`: EEXIST on any
+    /// pre-existing entry, dangling symlinks included, so nothing is followed
+    /// or overwritten). This mkdir is the ONLY filesystem write in ccmux.
     pub fn act_submit_prompt(&mut self) {
         let Some(p) = self.prompt.clone() else {
             self.mode = Mode::Normal;
             return;
         };
-        let cwd = p.fields.first().cloned().unwrap_or_default();
 
         match p.kind {
             PromptKind::NewBackground => {
@@ -1464,24 +1500,123 @@ impl App {
                     self.flash("task cannot be empty", MsgLevel::Warn);
                     return; // stay in the prompt
                 }
-                if !Path::new(&cwd).is_dir() {
-                    self.flash(format!("no such directory: {cwd}"), MsgLevel::Warn);
+                let raw = p.fields.first().map(|s| s.trim().to_string()).unwrap_or_default();
+                if raw.is_empty() {
+                    // Reachable when the list is empty AND `$PWD` was unreadable
+                    // at `open_prompt` — the degraded corner. Refuse; never arm.
+                    self.flash("cwd cannot be empty", MsgLevel::Warn);
                     return;
                 }
-                // RULE Q4: pure argv, the task text never touches a shell.
-                match agents::dispatch_background(&cwd, &task) {
-                    Ok(()) => {
-                        self.prompt = None;
-                        self.mode = Mode::Normal;
-                        self.flash("dispatched background session", MsgLevel::Info);
-                        // ccmux does NOT auto-open it — the operator decides.
-                        self.act_force_refresh();
+                let cwd = match expand_tilde(&raw, self.home.as_deref()) {
+                    Ok(c) => c,
+                    Err(msg) => {
+                        self.disarm_create();
+                        self.flash(msg, MsgLevel::Warn);
+                        return;
                     }
-                    Err(e) => {
-                        self.flash(format!("dispatch failed: {}", agents_msg(&e)), MsgLevel::Error)
+                };
+                if Path::new(&cwd).is_dir() {
+                    self.dispatch_and_close(&cwd, &task, None);
+                    return;
+                }
+
+                // Not a directory. Decide between refusing and offering mkdir.
+                let path = Path::new(&cwd);
+                let shown = model::shorten_cwd(&cwd, self.home.as_deref(), CWD_FLASH_MAX);
+                // `symlink_metadata` does not follow the final component: an
+                // entry that exists but is not an enterable directory — a plain
+                // file, a dangling symlink, a symlink to a file — is refused,
+                // never created over. (A symlink to a real directory already
+                // passed `is_dir` above.)
+                if std::fs::symlink_metadata(path).is_ok() {
+                    self.disarm_create();
+                    self.flash(format!("not a directory: {shown}"), MsgLevel::Warn);
+                    return;
+                }
+                if !cwd.starts_with('/') {
+                    // Creating relative to the SIDEBAR's cwd would materialise
+                    // the directory somewhere the operator never named.
+                    self.disarm_create();
+                    self.flash(format!("no such directory: {shown}"), MsgLevel::Warn);
+                    return;
+                }
+                let parent_ok = path.parent().is_some_and(Path::is_dir);
+                if !parent_ok {
+                    // One level only: a typo'd deep path must fail loudly, not
+                    // materialise a tree.
+                    let parent = path
+                        .parent()
+                        .map(|pp| pp.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.disarm_create();
+                    self.flash(
+                        format!(
+                            "parent does not exist: {}",
+                            model::shorten_cwd(&parent, self.home.as_deref(), CWD_FLASH_MAX)
+                        ),
+                        MsgLevel::Warn,
+                    );
+                    return;
+                }
+                if p.pending_create.as_deref() == Some(cwd.as_str()) {
+                    // Second Enter on the SAME expanded path: create + dispatch.
+                    match std::fs::create_dir(path) {
+                        Ok(()) => self.dispatch_and_close(&cwd, &task, Some(shown)),
+                        Err(e) => {
+                            // Name the path: the operator must know WHAT was
+                            // not created without re-reading the field.
+                            self.disarm_create();
+                            self.flash(format!("could not create {shown}: {e}"), MsgLevel::Error);
+                        }
                     }
+                } else {
+                    if let Some(pr) = self.prompt.as_mut() {
+                        pr.pending_create = Some(cwd.clone());
+                    }
+                    self.flash(
+                        format!("{shown} does not exist — ⏎ again to create it"),
+                        MsgLevel::Warn,
+                    );
                 }
             }
+        }
+    }
+
+    /// The one exit that dispatches: `agents::dispatch_background` through the
+    /// `dispatch` seam — RULE Q4 intact, the task text and cwd stay pure argv.
+    /// `created` carries the `~`-shortened path when this submit mkdir'd it,
+    /// so the flash names what now exists on disk even if dispatch then fails.
+    fn dispatch_and_close(&mut self, cwd: &str, task: &str, created: Option<String>) {
+        match (self.dispatch)(cwd, task) {
+            Ok(()) => {
+                self.prompt = None;
+                self.mode = Mode::Normal;
+                match created {
+                    Some(c) => self.flash(format!("created {c} — dispatched background session"), MsgLevel::Info),
+                    None => self.flash("dispatched background session", MsgLevel::Info),
+                }
+                // ccmux does NOT auto-open it — the operator decides.
+                self.act_force_refresh();
+            }
+            Err(e) => {
+                // The directory, if this submit created it, stays — and stays
+                // named, so the operator knows the mkdir half happened.
+                self.disarm_create();
+                match created {
+                    Some(c) => self.flash(
+                        format!("created {c}, but dispatch failed: {}", agents_msg(&e)),
+                        MsgLevel::Error,
+                    ),
+                    None => self.flash(format!("dispatch failed: {}", agents_msg(&e)), MsgLevel::Error),
+                }
+            }
+        }
+    }
+
+    /// Clears a pending mkdir offer, keeping the prompt itself.
+    fn disarm_create(&mut self) {
+        if let Some(pr) = self.prompt.as_mut() {
+            pr.pending_create = None;
         }
     }
 
@@ -2158,6 +2293,7 @@ impl App {
             fields,
             focus,
             cursor,
+            pending_create: None,
         });
         self.mode = Mode::Prompt(kind);
     }
@@ -2371,6 +2507,33 @@ impl App {
         };
 
         match key.code {
+            // §8.6: in the cwd field `Tab` COMPLETES instead of cycling — the
+            // task field stays one `BackTab` (or `Enter`) away. From any other
+            // field `Tab` still cycles, which from the task field lands on the
+            // cwd field in one press.
+            KeyCode::Tab if p.focus == 0 => {
+                // Trimmed exactly as Enter trims: a value Enter would accept
+                // must also complete. On `Extend` the replacement is the
+                // trimmed text (the stray whitespace dies, as it would at
+                // submit); on `Stuck` nothing is written back, so a no-op Tab
+                // mutates nothing.
+                let cur = p.fields.first().map(|s| s.trim().to_string()).unwrap_or_default();
+                match complete_dir(&cur, self.home.as_deref()) {
+                    Completion::Extend(text) => {
+                        if let Some(f) = p.fields.get_mut(0)
+                            && *f != text
+                        {
+                            *f = text;
+                            p.pending_create = None; // an edit, like any other
+                        }
+                        p.cursor = len(&p);
+                    }
+                    Completion::Stuck(n) if n > 1 => {
+                        self.flash(format!("{n} matches"), MsgLevel::Info);
+                    }
+                    Completion::Stuck(_) => return Action::None,
+                }
+            }
             KeyCode::Tab => {
                 p.focus = (p.focus + 1) % nfields;
                 p.cursor = len(&p);
@@ -2390,12 +2553,19 @@ impl App {
                         remove_char_at(f, at);
                     }
                     p.cursor = at;
+                    p.pending_create = None; // §8.6: no mkdir offer survives an edit
                 }
             }
             KeyCode::Delete => {
+                // Mirror Backspace's `cursor > 0` guard: at end-of-field no
+                // char is removed, so a no-op keypress must not disarm the
+                // mkdir offer either.
                 let at = p.cursor;
-                if let Some(f) = p.fields.get_mut(p.focus) {
-                    remove_char_at(f, at);
+                if at < len(&p) {
+                    if let Some(f) = p.fields.get_mut(p.focus) {
+                        remove_char_at(f, at);
+                    }
+                    p.pending_create = None;
                 }
             }
             KeyCode::Char(c) if !ctrl => {
@@ -2404,6 +2574,7 @@ impl App {
                     insert_char_at(f, at, c);
                 }
                 p.cursor = at + 1;
+                p.pending_create = None;
             }
             _ => return Action::None,
         }
@@ -2507,6 +2678,90 @@ fn remove_char_at(s: &mut String, char_idx: usize) {
     if let Some((at, c)) = s.char_indices().nth(char_idx) {
         let end = at + c.len_utf8();
         s.replace_range(at..end, "");
+    }
+}
+
+/// §8.6: input-side twin of `model::shorten_cwd`'s display rule. The detail
+/// block renders `~/x`, so `~/x` must be typeable. Only a LEADING tilde is
+/// path syntax: `~` and `~/...` expand against `home`; `/data/~backup` is a
+/// literal file name and passes through untouched; `~user/...` is refused
+/// rather than half-implemented (no passwd lookup in this crate).
+fn expand_tilde(input: &str, home: Option<&str>) -> Result<String, String> {
+    if input == "~" || input.starts_with("~/") {
+        let Some(h) = home.filter(|h| !h.is_empty()) else {
+            return Err("cannot expand ~ — home directory unknown".to_string());
+        };
+        let rest = input.strip_prefix('~').unwrap_or_default();
+        return Ok(format!("{h}{rest}"));
+    }
+    if input.starts_with('~') {
+        return Err("~user paths are not supported — use an absolute path".to_string());
+    }
+    Ok(input.to_string())
+}
+
+/// What one `Tab` in the cwd field resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Completion {
+    /// Replace the field with this text (unique match completed to `.../`, or
+    /// several matches extended to their longest common prefix).
+    Extend(String),
+    /// Nothing to extend: how many directories matched the prefix. `0` is a
+    /// silent no-op (no match, unreadable dir, relative path — all degrade the
+    /// same way); `>1` is worth telling the operator about.
+    Stuck(usize),
+}
+
+/// §8.6: read-only prefix completion for the cwd field. Splits `input` at its
+/// last `/`, `~`-expands the directory half, and matches the final component
+/// against that directory's SUBDIRECTORY names (metadata queries only — one
+/// `read_dir`, one `is_dir` per name that survives the prefix filter; a
+/// symlink to a directory counts, exactly as dispatch would treat it).
+/// Dot-directories only match when the typed prefix itself starts with `.`.
+/// Every failure — no `/`, unexpandable `~`, unreadable directory, non-UTF-8
+/// names — degrades to `Stuck(0)`, a no-op.
+fn complete_dir(input: &str, home: Option<&str>) -> Completion {
+    let Some(cut) = input.rfind('/') else {
+        return Completion::Stuck(0);
+    };
+    let (head, prefix) = input.split_at(cut + 1);
+    let dir = match expand_tilde(head, home) {
+        Ok(d) if d.starts_with('/') => d,
+        _ => return Completion::Stuck(0),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Completion::Stuck(0);
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let visible = prefix.starts_with('.') || !name.starts_with('.');
+            (visible && name.starts_with(prefix) && e.path().is_dir()).then_some(name)
+        })
+        .collect();
+    names.sort();
+    match names.as_slice() {
+        [] => Completion::Stuck(0),
+        [one] => Completion::Extend(format!("{head}{one}/")),
+        many => {
+            // Longest common prefix across the candidates; extend only if it
+            // goes beyond what is already typed, else report the count.
+            let mut lcp = many[0].as_str();
+            for name in &many[1..] {
+                let shared = lcp
+                    .char_indices()
+                    .find(|(i, c)| !name[*i..].starts_with(*c))
+                    .map(|(i, _)| i)
+                    .unwrap_or_else(|| lcp.len().min(name.len()));
+                lcp = &lcp[..shared];
+            }
+            if lcp.len() > prefix.len() {
+                Completion::Extend(format!("{head}{lcp}"))
+            } else {
+                Completion::Stuck(many.len())
+            }
+        }
     }
 }
 
@@ -2632,6 +2887,11 @@ mod tests {
             fail_streak: 0,
             last_poll: Instant::now(),
             should_quit: false,
+            // STRUCTURAL, not disciplinary: no hermetic test may ever spawn the
+            // real `claude` (a dispatch here would start a real background
+            // session on the operator's daemon). Tests that exercise the submit
+            // path install their own recording stub.
+            dispatch: |_, _| panic!("unit test reached dispatch_background"),
         }
     }
 
@@ -4432,6 +4692,460 @@ mod tests {
         let (text, level) = a.message.clone().unwrap_or_default_msg();
         assert_eq!(level, MsgLevel::Warn);
         assert_eq!(text, "task cannot be empty");
+    }
+
+    // ── §8.6: tilde expansion, the mkdir offer, and cwd reachability ────────
+
+    // Per-thread record of what the `dispatch` seam received. Tests run one
+    // per thread, so a `thread_local!` needs no clearing between tests.
+    thread_local! {
+        static DISPATCHED: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn recording_dispatch(cwd: &str, task: &str) -> Result<(), AgentsError> {
+        DISPATCHED.with(|d| d.borrow_mut().push((cwd.to_string(), task.to_string())));
+        Ok(())
+    }
+
+    fn dispatched() -> Vec<(String, String)> {
+        DISPATCHED.with(|d| d.borrow().clone())
+    }
+
+    /// A fresh, empty fixture directory under `~/.local/tmp` — the ONE place
+    /// this suite is allowed to write. Unique per test name + pid so parallel
+    /// test threads never share a path.
+    fn fs_fixture(name: &str) -> std::path::PathBuf {
+        let home = std::env::var("HOME").expect("HOME");
+        let p = std::path::PathBuf::from(home)
+            .join(".local/tmp")
+            .join(format!("ccmux-ncwd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("fixture dir under ~/.local/tmp");
+        p
+    }
+
+    /// `n`, then force the prompt's cwd field to `cwd` and type `task`.
+    fn prompt_with(a: &mut App, cwd: &str, task: &str) {
+        a.on_key(press('n'));
+        let p = a.prompt.as_mut().expect("prompt");
+        p.fields[0] = cwd.to_string();
+        for c in task.chars() {
+            a.on_key(press(c));
+        }
+    }
+
+    fn enter(a: &mut App) {
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn tilde_expands_only_as_a_leading_path_component() {
+        let home = Some("/home/dev");
+        assert_eq!(expand_tilde("~", home), Ok("/home/dev".into()));
+        assert_eq!(expand_tilde("~/projects/foo", home), Ok("/home/dev/projects/foo".into()));
+        // A tilde that is merely CONTAINED is a file name, not syntax.
+        assert_eq!(expand_tilde("/data/~backup", home), Ok("/data/~backup".into()));
+        assert_eq!(expand_tilde("/a/b", home), Ok("/a/b".into()));
+        // `~user` is refused, not misexpanded.
+        assert!(expand_tilde("~root/x", home).is_err());
+        // No home to expand against: a clear refusal, not a bogus path.
+        assert!(expand_tilde("~", None).is_err());
+        assert!(expand_tilde("~/x", Some("")).is_err());
+    }
+
+    #[test]
+    fn a_tilde_cwd_is_expanded_before_dispatch() {
+        let tmp = fs_fixture("tilde-dispatch");
+        let sub = tmp.join("exists");
+        std::fs::create_dir(&sub).expect("fixture subdir");
+
+        let mut a = app();
+        a.dispatch = recording_dispatch;
+        // Point `~` at the fixture so the typed path exercises expansion while
+        // every real directory involved stays under ~/.local/tmp.
+        a.home = Some(tmp.to_string_lossy().into_owned());
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, "~/exists", "do the thing");
+        enter(&mut a);
+
+        assert_eq!(a.mode, Mode::Normal, "dispatch must close the prompt");
+        assert_eq!(dispatched(), vec![(sub.to_string_lossy().into_owned(), "do the thing".into())]);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!((text.as_str(), level), ("dispatched background session", MsgLevel::Info));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The common case must stay: `n`, type the task, ONE Enter — the
+    /// prefilled cwd (the selected row's) is honoured with no extra keystroke.
+    #[test]
+    fn the_common_case_is_still_one_enter_with_the_prefilled_cwd() {
+        let tmp = fs_fixture("common-case");
+        let mut a = app();
+        a.dispatch = recording_dispatch;
+        let mut sess = bg("aaaaaaaa", "one", State::Working);
+        sess.cwd = tmp.to_string_lossy().into_owned();
+        load(&mut a, vec![sess]);
+
+        a.on_key(press('n'));
+        for c in "run it".chars() {
+            a.on_key(press(c));
+        }
+        enter(&mut a);
+
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(dispatched(), vec![(tmp.to_string_lossy().into_owned(), "run it".into())]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_missing_dir_arms_the_offer_and_the_second_enter_creates_one_level() {
+        let tmp = fs_fixture("arm-create");
+        let target = tmp.join("newdir");
+        let mut a = app();
+        a.dispatch = recording_dispatch;
+        a.home = None; // flashes carry the full path
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, &target.to_string_lossy(), "build");
+
+        // First Enter: arms, creates NOTHING, stays in the prompt.
+        enter(&mut a);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground));
+        assert!(!target.exists(), "first Enter must not mkdir");
+        assert!(dispatched().is_empty(), "first Enter must not dispatch");
+        let armed = a.prompt.as_ref().and_then(|p| p.pending_create.clone());
+        assert_eq!(armed.as_deref(), Some(&*target.to_string_lossy()));
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert!(text.contains("does not exist"), "{text}");
+
+        // Second Enter: creates exactly this one directory and dispatches.
+        enter(&mut a);
+        assert!(target.is_dir(), "second Enter must create the directory");
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(dispatched(), vec![(target.to_string_lossy().into_owned(), "build".into())]);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Info);
+        assert!(
+            text.contains(&*target.to_string_lossy()),
+            "the flash must name the created path: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_missing_parent_is_refused_with_no_mkdir() {
+        let tmp = fs_fixture("deep-path");
+        let deep = tmp.join("nope").join("deep");
+        let mut a = app();
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, &deep.to_string_lossy(), "t");
+
+        enter(&mut a);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground));
+        assert!(!tmp.join("nope").exists(), "no level of a typo'd tree may materialise");
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()), "must not arm");
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert!(text.contains("parent does not exist"), "{text}");
+        // Enter again: still refused — a repeat cannot escalate into a tree.
+        enter(&mut a);
+        assert!(!tmp.join("nope").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_file_or_dangling_symlink_at_the_target_is_refused() {
+        let tmp = fs_fixture("not-a-dir");
+        let file = tmp.join("plain");
+        std::fs::write(&file, b"x").expect("fixture file");
+        let dangling = tmp.join("dangling");
+        std::os::unix::fs::symlink(tmp.join("void"), &dangling).expect("fixture symlink");
+
+        for target in [&file, &dangling] {
+            let mut a = app();
+            a.home = None;
+            load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+            prompt_with(&mut a, &target.to_string_lossy(), "t");
+            enter(&mut a);
+            assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground));
+            assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()));
+            let (text, level) = a.message.clone().unwrap_or_default_msg();
+            assert_eq!(level, MsgLevel::Warn);
+            assert!(text.contains("not a directory"), "{text}");
+            // The entry is untouched: still a file / still a dangling link.
+            assert!(std::fs::symlink_metadata(target).is_ok());
+            assert!(!target.is_dir());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tilde_user_and_empty_cwd_are_refused_cleanly() {
+        let mut a = app();
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, "~root/x", "t");
+        enter(&mut a);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground));
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert!(text.contains("~user paths are not supported"), "{text}");
+
+        // Empty cwd — the degraded/empty-list corner: refuse, never arm.
+        let p = a.prompt.as_mut().expect("prompt");
+        p.fields[0].clear();
+        enter(&mut a);
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground));
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()));
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!((text.as_str(), level), ("cwd cannot be empty", MsgLevel::Warn));
+    }
+
+    #[test]
+    fn the_mkdir_arm_survives_neither_esc_nor_edits() {
+        let tmp = fs_fixture("arm-drops");
+        let target = tmp.join("newdir");
+        let mut a = app();
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+
+        // Armed, then Esc: the prompt and the arm die together.
+        prompt_with(&mut a, &target.to_string_lossy(), "t");
+        enter(&mut a);
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_some()));
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.prompt.is_none());
+        a.on_key(press('n'));
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()));
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Armed, then an edit (task field is focused): disarmed on the spot,
+        // and the following Enter re-arms instead of creating.
+        prompt_with(&mut a, &target.to_string_lossy(), "t");
+        enter(&mut a);
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_some()));
+        a.on_key(press('x'));
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()));
+        enter(&mut a);
+        assert!(!target.exists(), "an Enter after an edit must arm again, not create");
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_some()));
+
+        // A paste is an edit too.
+        a.on_paste("y");
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()));
+
+        // Backspace as well.
+        enter(&mut a);
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_some()));
+        a.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()));
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tab_completes_directories_in_the_cwd_field_and_still_cycles_from_task() {
+        let tmp = fs_fixture("completion");
+        for d in ["alpha", "proj-one", "proj-two", ".hidden"] {
+            std::fs::create_dir(tmp.join(d)).expect("fixture subdir");
+        }
+        std::fs::write(tmp.join("alfile"), b"x").expect("fixture file");
+        let root = tmp.to_string_lossy().into_owned();
+        let home = None;
+
+        // Unique prefix: completed through to `.../alpha/` (the file `alfile`
+        // is not a directory and must not compete).
+        assert_eq!(
+            complete_dir(&format!("{root}/al"), home),
+            Completion::Extend(format!("{root}/alpha/"))
+        );
+        // Several matches: extended to their longest common prefix…
+        assert_eq!(
+            complete_dir(&format!("{root}/p"), home),
+            Completion::Extend(format!("{root}/proj-"))
+        );
+        // …and once at that prefix, stuck with a count.
+        assert_eq!(complete_dir(&format!("{root}/proj-"), home), Completion::Stuck(2));
+        // Dot-directories require a typed dot.
+        assert_eq!(
+            complete_dir(&format!("{root}/.h"), home),
+            Completion::Extend(format!("{root}/.hidden/"))
+        );
+        // Unreadable directory, no `/`, `~user`: all degrade to a no-op.
+        assert_eq!(complete_dir("/ccmux-definitely-missing/x", home), Completion::Stuck(0));
+        assert_eq!(complete_dir("relative", home), Completion::Stuck(0));
+        assert_eq!(complete_dir("~root/x", home), Completion::Stuck(0));
+
+        // Through the keymap: `Tab` from the task field still reaches the cwd
+        // field; a second `Tab` completes IN PLACE instead of cycling away.
+        let mut a = app();
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        a.on_key(press('n'));
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        {
+            let p = a.prompt.as_mut().expect("prompt");
+            assert_eq!(p.focus, 0, "Tab from the task field lands on cwd");
+            p.fields[0] = format!("{root}/alp");
+            p.cursor = p.fields[0].chars().count();
+        }
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let p = a.prompt.clone().expect("prompt");
+        assert_eq!(p.focus, 0, "completion must not move focus");
+        assert_eq!(p.fields[0], format!("{root}/alpha/"));
+        assert_eq!(p.cursor, p.fields[0].chars().count());
+
+        // BackTab still returns to the task field.
+        a.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(a.prompt.as_ref().is_some_and(|p| p.focus == 1));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The arm flash must survive the overflow carve — at most 4 rows of the
+    /// default 34-column sidebar — with its actionable tail intact, so a long
+    /// path is elided to `CWD_FLASH_MAX` instead of shoving `⏎ again to create
+    /// it` off the bottom. The elision is display-only: dispatch still gets
+    /// the full expanded path.
+    #[test]
+    fn the_arm_flash_elides_a_long_path_and_keeps_its_actionable_tail() {
+        let tmp = fs_fixture("long-arm");
+        let parent = tmp.join("a".repeat(40)).join("b".repeat(38));
+        std::fs::create_dir_all(&parent).expect("fixture parents");
+        let target = parent.join("newdir");
+        let mut a = app();
+        a.dispatch = recording_dispatch;
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, &target.to_string_lossy(), "t");
+
+        enter(&mut a);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Warn);
+        assert!(text.ends_with("⏎ again to create it"), "tail must survive: {text}");
+        assert!(text.contains('…'), "a long path must be elided: {text}");
+        assert!(text.contains("newdir"), "the identifying tail component must survive: {text}");
+        let fixed = " does not exist — ⏎ again to create it";
+        assert!(
+            model::display_width(&text) <= CWD_FLASH_MAX + model::display_width(fixed),
+            "flash wider than the elision budget allows: {text}"
+        );
+
+        // The elision changed nothing about WHAT is created or dispatched.
+        enter(&mut a);
+        assert!(target.is_dir(), "second Enter still creates the full path");
+        assert_eq!(dispatched(), vec![(target.to_string_lossy().into_owned(), "t".into())]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `Delete` at end-of-field removes nothing, so — mirroring Backspace's
+    /// `cursor > 0` guard — it must not disarm the mkdir offer either.
+    #[test]
+    fn a_noop_delete_at_end_of_field_keeps_the_mkdir_arm() {
+        let tmp = fs_fixture("del-eof");
+        let target = tmp.join("newdir");
+        let mut a = app();
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, &target.to_string_lossy(), "t");
+        enter(&mut a);
+        assert!(a.prompt.as_ref().is_some_and(|p| p.pending_create.is_some()));
+
+        // Cursor sits at end-of-field after typing: Delete is a no-op.
+        a.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        let p = a.prompt.as_ref().expect("prompt");
+        assert_eq!(p.fields[1], "t", "no char removed");
+        assert!(p.pending_create.is_some(), "a no-op Delete must keep the arm");
+
+        // Home + Delete removes a char: that IS an edit, and disarms.
+        a.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        let p = a.prompt.as_ref().expect("prompt");
+        assert_eq!(p.fields[1], "", "the char under the cursor is removed");
+        assert!(p.pending_create.is_none(), "a real Delete edit must disarm");
+        assert!(!target.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `Tab` completion sees the field exactly as `Enter` will — trimmed — so
+    /// a value Enter would accept cannot make Tab a silent no-op. On `Extend`
+    /// the stray whitespace dies with the replacement; on `Stuck` the field is
+    /// not touched at all.
+    #[test]
+    fn tab_completion_trims_the_field_exactly_as_enter_does() {
+        let tmp = fs_fixture("trim-complete");
+        std::fs::create_dir(tmp.join("proj-one")).expect("fixture subdir");
+        let root = tmp.to_string_lossy().into_owned();
+        let mut a = app();
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        a.on_key(press('n'));
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // to cwd
+        {
+            let p = a.prompt.as_mut().expect("prompt");
+            p.fields[0] = format!("  {root}/proj-o ");
+            p.cursor = p.fields[0].chars().count();
+        }
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let p = a.prompt.as_ref().expect("prompt");
+        assert_eq!(p.fields[0], format!("{root}/proj-one/"));
+        assert_eq!(p.cursor, p.fields[0].chars().count());
+
+        // A stuck completion writes nothing back — whitespace and all.
+        let stuck = "  /ccmux-definitely-missing/x".to_string();
+        {
+            let p = a.prompt.as_mut().expect("prompt");
+            p.fields[0] = stuck.clone();
+            p.cursor = stuck.chars().count();
+        }
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.prompt.as_ref().expect("prompt").fields[0], stuck);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A failed `create_dir` must say WHAT it could not create — the operator
+    /// should not have to re-read the field to know which path failed and that
+    /// nothing was made.
+    #[test]
+    fn a_failed_create_names_the_path_and_creates_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = fs_fixture("ro-parent");
+        let ro = tmp.join("roparent");
+        std::fs::create_dir(&ro).expect("fixture subdir");
+        let mut perms = std::fs::metadata(&ro).expect("meta").permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&ro, perms).expect("chmod 555");
+        let target = ro.join("kid");
+
+        let mut a = app();
+        a.dispatch = recording_dispatch;
+        a.home = None;
+        load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
+        prompt_with(&mut a, &target.to_string_lossy(), "t");
+        enter(&mut a); // arms
+        enter(&mut a); // create fails: EACCES
+
+        assert_eq!(a.mode, Mode::Prompt(PromptKind::NewBackground), "prompt must survive");
+        assert!(!target.exists(), "nothing may be created");
+        assert!(dispatched().is_empty(), "nothing may be dispatched");
+        assert!(
+            a.prompt.as_ref().is_some_and(|p| p.pending_create.is_none()),
+            "a failed create must disarm"
+        );
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(level, MsgLevel::Error);
+        assert!(text.contains("could not create"), "{text}");
+        // The path is named under the same elision rule as every §8.6 flash:
+        // the identifying FINAL components must be there verbatim.
+        assert!(
+            text.contains("roparent/kid"),
+            "the flash must name the path that failed: {text}"
+        );
+
+        let mut perms = std::fs::metadata(&ro).expect("meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ro, perms).expect("chmod 755");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

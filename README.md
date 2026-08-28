@@ -114,7 +114,7 @@ environment-variable equivalent of `--socket`.
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
 | `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
-| `n` | Dispatch a new background session with a typed task | no |
+| `n` | Dispatch a new background session with a typed task — the cwd field takes `~` paths, `Tab`-completes directories, and offers to create a missing directory (see below) | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
 | `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
 | `u` | Undo the most recent `d` | no |
@@ -149,13 +149,31 @@ lives — except a sidebar, which no tab will let you close.
 | Mode | Keys |
 |---|---|
 | Filter (`/`) | Type to filter live · `Ctrl-w` word · `Ctrl-u` clear · `Enter` commit · `Esc` clear and leave |
-| Prompt (`n`) | `Tab` next field · `Enter` run · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
+| Prompt (`n`) | `Tab` to the cwd field — and, once there, directory completion · `Shift-Tab` back to the task · `Enter` run (from either field) · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
 | Help (`?`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · any other key closes |
 | Logs (`L`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · `q`/`Esc` close |
 
 `Ctrl-c` quits from any mode; `q` quits from Normal. Pasted text is never
 executed as keys — it is discarded in Normal and taken as literal text in the
 filter and the prompts.
+
+### Dispatching into a new directory
+
+`n` prefills the cwd with the selected row's — accept it, type the task, and
+one `Enter` dispatches, same as ever. To send the session somewhere else,
+`Tab` jumps to the cwd field: type a path (`~` and `~/x` expand; a tilde
+anywhere else is a literal file name; `~user` is refused), and `Tab` completes
+directory names as you go — unique prefixes complete through to `.../name/`,
+ambiguous ones extend to the common prefix or report `N matches`.
+
+If the directory does not exist, `Enter` does not reject it outright: the
+footer says so, the hint line switches to `⏎ create cwd + run`, and a second
+`Enter` creates it and dispatches — the flash names the created path. Only ONE
+level is ever created: the parent must already exist, so a typo'd deep path is
+refused (`parent does not exist: …`) rather than materialised as a tree.
+Anything already occupying the name — a file, a dangling symlink — is refused,
+never overwritten. Editing either field, `Esc`, or leaving the prompt drops
+the offer. This `mkdir` is the only write ccmux ever makes to the filesystem.
 
 ## Reading the list
 

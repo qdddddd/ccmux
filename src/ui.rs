@@ -32,8 +32,8 @@ use ratatui::Frame;
 
 use crate::app::{App, LogsView, Mode, MsgLevel, Prompt, PromptKind};
 use crate::model::{
-    Group, Kind, Row, Session, State, Status, display_width, format_age, shorten_cwd,
-    truncate_end,
+    Group, Kind, Row, Session, State, Status, char_width, display_width, format_age,
+    shorten_cwd, truncate_end,
 };
 
 /// Gruvbox, matching ~/projects/slurm-tui/src/palette.rs.
@@ -1193,10 +1193,26 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
 
         if focused {
             let cursor = prompt.map(|pr| pr.cursor).unwrap_or(0).min(value.chars().count());
-            // Keep the cursor inside the visible window on a long value.
+            // Keep the cursor inside the visible window on a long value. The
+            // window start is walked BACK from the cursor in display columns
+            // (§6.6), not chars: subtracting a char count from a column budget
+            // let a CJK value overrun the budget, and `truncate_end` then cut
+            // the window's TAIL — the cursor and the text being typed — off
+            // the screen. `char_width` is per-char, so a narrow-base VS16 pair
+            // may be charged one column short — `truncate_end` below still
+            // bounds the render, and the CJK case this fixes is exact.
             let chars: Vec<char> = value.chars().collect();
             let win = budget.saturating_sub(1);
-            let start = if win == 0 { 0 } else { cursor.saturating_sub(win) };
+            let mut start = cursor;
+            let mut used = 0usize;
+            while start > 0 {
+                let cw = char_width(chars[start - 1]);
+                if used + cw > win {
+                    break;
+                }
+                used += cw;
+                start -= 1;
+            }
             let before: String = chars[start..cursor].iter().collect();
             let at: String = chars.get(cursor).map(|c| c.to_string()).unwrap_or_else(|| " ".into());
             let after: String = chars.get(cursor.saturating_add(1)..).map(|s| s.iter().collect()).unwrap_or_default();
@@ -1217,8 +1233,21 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
+    // §8.6: the hint tracks the prompt's state. An armed mkdir offer outlives
+    // the 4s footer flash, so the standing hint is what says the next ⏎
+    // creates; otherwise the hint names where Tab goes — to the cwd field from
+    // the task field, completing a directory prefix once there.
+    let armed = prompt.map(|pr| pr.pending_create.is_some()).unwrap_or(false);
+    let on_cwd = prompt.map(|pr| pr.focus == 0).unwrap_or(false);
+    let hint = if armed {
+        " ⏎ create cwd + run   Esc: cancel"
+    } else if on_cwd {
+        " Tab: complete dir   ⏎ run"
+    } else {
+        " Tab: cwd   ⏎ run   Esc: cancel"
+    };
     lines.push(Line::from(Span::styled(
-        truncate_end(" Tab: field   ⏎ run   Esc: cancel", w),
+        truncate_end(hint, w),
         Style::default().fg(p.gray),
     )));
 
@@ -1363,6 +1392,9 @@ mod tests {
             fail_streak: 0,
             last_poll: Instant::now(),
             should_quit: false,
+            // Rendering never dispatches; a panic here is a rendering test
+            // reaching into `agents`, which must be impossible.
+            dispatch: |_, _| panic!("ui test reached dispatch_background"),
         }
     }
 
@@ -1457,6 +1489,7 @@ mod tests {
                     ],
                     focus: 1,
                     cursor: 11,
+                    pending_create: None,
                 }),
                 _ => None,
             };
@@ -1957,6 +1990,77 @@ mod tests {
         term.draw(|f| draw(f, &app)).unwrap();
         let clamped = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(clamped.contains("quit from any mode"), "clamped overlay went blank: {clamped:?}");
+    }
+
+    /// §8.6: the prompt's hint line is the standing statement of what `Tab`
+    /// and `⏎` do RIGHT NOW — where Tab goes from the task field, that it
+    /// completes in the cwd field, and (outliving the 4s footer flash) that an
+    /// armed mkdir offer makes the next Enter create.
+    #[test]
+    fn the_prompt_hint_tracks_focus_and_the_armed_mkdir_offer() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.mode = Mode::Prompt(PromptKind::NewBackground);
+        let prompt = |focus: usize, pending: Option<&str>| Prompt {
+            kind: PromptKind::NewBackground,
+            fields: vec!["/home/dev/projects".into(), "task text".into()],
+            focus,
+            cursor: 0,
+            pending_create: pending.map(str::to_string),
+        };
+        let dump = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+
+        app.prompt = Some(prompt(1, None));
+        let d = dump(&app);
+        assert!(d.contains("Tab: cwd"), "task focus must advertise Tab → cwd: {d:?}");
+
+        app.prompt = Some(prompt(0, None));
+        let d = dump(&app);
+        assert!(d.contains("Tab: complete"), "cwd focus must advertise completion: {d:?}");
+
+        app.prompt = Some(prompt(0, Some("/home/dev/projects")));
+        let d = dump(&app);
+        assert!(d.contains("create cwd"), "an armed offer must be visible in the hint: {d:?}");
+    }
+
+    /// The focused field's visible window is a display-column walk back from
+    /// the cursor. Charging a CJK char one column (a char-count subtraction)
+    /// overfilled the window and `truncate_end` then cut its TAIL — the very
+    /// characters being typed — off the screen.
+    #[test]
+    fn the_focused_field_window_keeps_a_cjk_tail_visible() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.mode = Mode::Prompt(PromptKind::NewBackground);
+        let value = format!("/tmp/{}尾巴", "汉".repeat(30));
+        let cursor = value.chars().count();
+        app.prompt = Some(Prompt {
+            kind: PromptKind::NewBackground,
+            fields: vec![value, "task".into()],
+            focus: 0,
+            cursor,
+            pending_create: None,
+        });
+        let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        // Wide glyphs leave continuation cells behind them; squash blanks so
+        // the tail can be matched as a contiguous string.
+        let squashed: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|c| *c != ' ')
+            .collect();
+        assert!(
+            squashed.contains("尾巴"),
+            "the tail at the cursor must be inside the visible window: {squashed:?}"
+        );
     }
 
     #[test]
