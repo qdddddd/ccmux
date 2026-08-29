@@ -567,6 +567,10 @@ pub struct PaneInfo {
     pub height: u16,
     pub active: bool,
     pub window_index: u32,
+    /// `#{window_active}` — is this pane's window the one on screen?
+    pub window_active: bool,
+    /// `#{session_attached}` — clients attached to the session; 0 = nobody.
+    pub session_clients: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,10 +633,16 @@ pub fn attach_or_switch(session: &str) -> Result<(), TmuxError>;
 /// ONLY pane enumeration in the program. ccmux never lists the server.
 /// FMT = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t\
 ///        #{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_index}\t\
-///        #{window_id}"
+///        #{window_id}\t#{window_active}\t#{session_attached}"
 /// `#{window_id}` is not a duplicate of `#{window_index}`: the index shifts
 /// under `renumber-windows`, the id never does, and everything that must
 /// survive a tick is keyed by the id.
+/// The last two are the VISIBILITY pair §4.2's poll gate reads. They ride
+/// along in this listing because it already runs every tick: tmux answers
+/// both locally, in the process ccmux was going to spawn anyway.
+/// `#{window_active}` is per-window — 1 only for the session's current window.
+/// `#{session_attached}` is per-session — the attached-client count, 0 when
+/// the operator has detached. `app` reads both off its OWN pane's row.
 
 /// R2 gate. Err(BadTarget) when `pane` is absent from `session`.
 pub fn assert_in_session(pane: &PaneId, session: &str) -> Result<(), TmuxError>;
@@ -1081,6 +1091,15 @@ pub struct App {
     pub fail_streak: u32,
     pub last_poll: Instant,
 
+    // the poll gate (§4.2). `last_poll` times the TICK; these time the
+    // `claude agents` spawn, which is the only part of a tick that is gated.
+    pub last_agents: Instant,
+    pub idle_streak: u32,
+    pub payload_fp: Option<u64>,
+    pub force_poll: bool,
+    pub was_watched: bool,
+    pub quiesced: bool,
+
     pub should_quit: bool,
 }
 
@@ -1235,8 +1254,91 @@ bottleneck.
 Backoff: after `fail_streak >= 3`, `effective_interval()` returns 10 s. The
 first success resets `fail_streak` to 0 and the interval with it.
 
-`r` (force refresh) sets `last_poll = Instant::now() - effective_interval()` so
-the next loop iteration polls immediately; it does **not** call `tick()` inline.
+`r` (force refresh) sets `force_poll = true` and
+`last_poll = Instant::now() - effective_interval()` so the next loop iteration
+polls immediately; it does **not** call `tick()` inline.
+
+#### The poll gate — no spawn with nobody watching
+
+**AMENDED.** A poll costs a whole `claude` process, and although the listing
+itself is local, every invocation dials out. Spawning one for a pane no human
+can see buys nothing. So the poll is gated on two facts tmux answers locally,
+in the `list-panes` `tick` already runs:
+
+- `#{session_attached}` — the session's attached-client count. `0` means the
+  operator has detached and no window of this session is being drawn at all.
+- `#{window_active}` — true only for the session's current window. With one
+  sidebar per tab (§11), at most one of them is ever the tab on screen.
+
+Both ride along in `PANE_FMT`, so the gate costs **no extra process**.
+`App::watchers()` reads them off this process's OWN pane row and returns:
+
+| `watchers()` | meaning | polls? |
+| --- | --- | --- |
+| `Onscreen` | attached, and my tab is the current window | yes |
+| `OtherTab` | attached, but another tab is on screen | no |
+| `Detached` | no client attached to the session | no |
+| `Unknown` | no own pane, or the inventory does not carry it | **yes** |
+
+`Unknown` polls. The gate closes only on positive evidence that nobody is
+looking — degraded mode, a sidebar outside tmux, an unset `$TMUX_PANE` and a
+failed enumeration all keep today's behaviour exactly.
+
+**Only step 4 of `tick` is gated.** Steps 1-3 and 5-8 — the clock, the pane
+inventory, the visibility read, the row rebuild, the option flush, the §1.3
+pin — run every `effective_interval()` whatever the gate says. They are two
+tmux reads on a unix socket and cost no network, and keeping them on the fast
+cadence is what makes the sidebar notice the operator coming back within one
+interval rather than one backoff.
+
+A skipped poll is **not** a failed poll. Nothing about it touches `poll_error`,
+`fail_streak` or the §9.1 red indicator, and `reconcile_hidden` never runs, so
+no dismissal ages toward being dropped on the strength of a poll never taken
+(§5.6's debounce counts consecutive COMPLETE polls; a skip is not a poll).
+What the operator does see is the header dot going hollow-dim (§6.2): tmux
+replays the last frame a pane drew when you switch back to its tab, so the
+frame you land on says the list was paused, one tick before the forced poll
+refreshes it.
+
+#### Idle backoff — a still fleet is polled less
+
+`apply_poll` hashes every field of every listed session (`model::Session`
+derives `Hash`) and compares it against the previous payload. `idle_streak`
+counts consecutive identical payloads, and `idle_interval()` widens with it:
+
+```
+idle_streak      0  1  2  3   4    5     6     7+
+idle_interval  2.5 2.5 2.5 2.5  5s   10s   20s   30s      (at --interval 2500)
+```
+
+`IDLE_BACKOFF_AT = 4` so a fleet that just changed keeps being watched closely
+for a moment; `IDLE_MAX = 30s`. Ages (`2m`) are deliberately NOT in the hash —
+they are recomputed from `now_ms` on every draw, which still happens every
+tick, so a widened poll interval never freezes the clock on screen.
+
+`agents_interval()` is `max(effective_interval(), idle_interval())`: a failing
+CLI and a still fleet cannot talk each other into polling faster.
+
+The ladder collapses to `interval` at once on **any** of:
+
+- an observed change in the payload,
+- any keypress (`on_key`'s first statement) — a human at the keyboard is the
+  strongest evidence the sidebar is being read; it does not force a poll,
+  which would put a `claude` spawn behind every `j`,
+- the transition back to `Onscreen`, which also owes an immediate poll,
+- `r` and every post-verb refresh, via `force_poll`.
+
+A failed poll resets it too: an `Err` says nothing about whether the fleet is
+still, and `effective_interval`'s failure backoff owns the cadence from there.
+
+#### Why not a shared cross-instance poll
+
+Rejected deliberately. A cache in a `@ccmux_*` user option would need every
+tab to write the same function of ground truth for the option to have one
+author (§11's rule), and a payload keyed on time is not that — plus the
+payload could approach the ~16 KB option ceiling §5.5 already bounds `hidden`
+against. Visibility gating gets the same result without a second writer: with
+N tabs, at most one is `Onscreen`, so N-1 of them are already silent.
 
 ---
 
@@ -1395,10 +1497,14 @@ result in `App::viewport`; `app.rs` reads that field and never recomputes it.
 
 - `ccmux` in `p.aqua` + `BOLD`.
 - Count in `p.gray`. When a filter is active: `4/7` (matching/total).
-- Trailing single-cell poll indicator, right-aligned at `W-2`:
-  - healthy → `●` in `p.dim`
+- Trailing single-cell poll indicator, right-aligned at `W-2`, first match
+  wins:
   - `poll_error.is_some()` → `●` in `p.red`
   - `degraded` (outside tmux) → `○` in `p.yellow`
+  - `quiesced` (§4.2: nobody is watching, so polling is paused) → `○` in
+    `p.dim` — dim and not yellow, because a paused gate is normal operation
+    and not a fault
+  - healthy → `●` in `p.dim`
 
 ### 6.3 Group headers
 
@@ -2582,6 +2688,7 @@ behaviour, the pin is superseded by this appendix.
 | §9.6, §1.2 step 6 | `inside_tmux()` decides "already inside" and `switch-client` vs `attach-session`. | `inside_target_server()` decides both: `$TMUX`'s socket path compared against the target server's own `#{socket_path}`. Under `--socket` the two disagree, which made the launcher either fail on `switch-client` or report success without creating anything. |
 | §1.2 step 5 | `@ccmux_width` is written once at creation and never read. | It is the source of truth. `heal_sidebar` writes it; the running sidebar re-reads it each tick, so a relaunch with a new `--width` takes effect instead of being reverted. |
 | §1.3, §9.8 | The per-tick re-pin is unconditional; "tmux clamps `resize-pane`". | tmux does not clamp — it takes the columns from the other panes, and a 30-column window left a Claude pane at 1 column. The pin is bounded by the window (`MIN_CONTENT_COLS = 20`) and skipped while the sidebar is alone in its window. |
+| §4.2 | Every tick spawns `claude agents`. | The spawn is gated on `watchers()`: a session with no attached client and a sidebar whose tab is not the current window poll nothing, and a payload unchanged for four polls widens the gap up to `IDLE_MAX = 30s`. Both collapse instantly on a keypress, on a change, on `r`, and on the transition back into view, which also forces a poll on that tick. Only step 4 of `tick` is gated; the tmux reads and the §1.3 pin stay on `interval`. A skip sets no `poll_error`, no `fail_streak` and runs no `reconcile_hidden`. |
 | §4.2 | `agents::poll()` is synchronous and unbounded. | Still synchronous and thread-free, now bounded by `POLL_TIMEOUT = 5s`; the child is killed and reaped on expiry and the timeout surfaces as §9.1's red indicator plus `agents: timed out after 5s`. A `tick()` slower than 1 s also drains buffered input, so keys typed at a frozen UI are not replayed against it. |
 | §6.6 | Row budgets count chars; the overflow is "cosmetic". | Budgets count display columns (`model::display_width`). A CJK session name was deleting the age column, the pane badge and the selection bar, not merely overflowing. |
 | §8.9 | `help_scroll` caps at 64; the logs scroll caps at `len - 1`. | Both clamp to `len - overlay_viewport`, written by `main.rs` each frame, so `k` after `G` always moves the view. |

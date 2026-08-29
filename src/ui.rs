@@ -374,13 +374,24 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 
     // Poll indicator, right-aligned at column W-2. Priority: a live poll error
     // outranks the structural "outside tmux" degradation, because the error is
-    // the transient, actionable condition. Dropped below W=14 to match §6.2's
-    // third sample line, which renders the wordmark alone.
+    // the transient, actionable condition, and both outrank a quiesced gate,
+    // which is neither a failure nor a degradation. Dropped below W=14 to
+    // match §6.2's third sample line, which renders the wordmark alone.
+    //
+    // The quiesced dot is dim and HOLLOW, deliberately not the yellow of a
+    // degradation: polling paused because nothing was on screen is normal
+    // operation, not a fault. There is exactly one situation in which it can
+    // be seen, and that situation is the point — tmux replays the last frame
+    // this pane drew when the operator switches back to the tab, so the frame
+    // they land on says the list was paused, one tick before the forced poll
+    // refreshes it.
     if w >= 14 {
         let (glyph, style) = if app.poll_error.is_some() {
             ("●", Style::default().fg(p.red))
         } else if app.degraded {
             ("○", Style::default().fg(p.yellow))
+        } else if app.quiesced {
+            ("○", Style::default().fg(p.dim))
         } else {
             ("●", Style::default().fg(p.dim))
         };
@@ -1391,6 +1402,12 @@ mod tests {
             poll_error: None,
             fail_streak: 0,
             last_poll: Instant::now(),
+            last_agents: Instant::now(),
+            idle_streak: 0,
+            payload_fp: None,
+            force_poll: false,
+            was_watched: true,
+            quiesced: false,
             should_quit: false,
             // Rendering never dispatches; a panic here is a rendering test
             // reaching into `agents`, which must be impossible.
@@ -1411,6 +1428,8 @@ mod tests {
             active: false,
             window_index: window,
             window_id: crate::tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
+            window_active: true,
+            session_clients: 1,
         }
     }
 
@@ -1938,6 +1957,35 @@ mod tests {
         assert!(dump.contains("ccmux"));
         assert!(dump.contains("/6"), "filter ratio missing: {dump:?}");
         assert!(dump.contains("Working"));
+    }
+
+    /// The header's one-character health report, across all four states it can
+    /// be in. The quiesced dot has to be distinguishable from the healthy one
+    /// (the operator learns the pane was paused) and from the error one (it is
+    /// not a fault) — so it is hollow, and it is dim rather than yellow.
+    #[test]
+    fn the_header_dot_tells_paused_apart_from_healthy_and_from_failed() {
+        let dot = |app: &App| {
+            let rows = rows_at(app, 40, 24);
+            rows.first()
+                .and_then(|r| r.chars().nth(38))
+                .unwrap_or(' ')
+                .to_string()
+        };
+
+        let mut app = app_with(many(3));
+        assert_eq!(dot(&app), "●", "a healthy sidebar");
+
+        app.quiesced = true;
+        assert_eq!(dot(&app), "○", "nobody watching: the dot goes hollow");
+
+        // A failure still outranks it: a quiesced gate must never be able to
+        // hide a `claude` that is broken.
+        app.poll_error = Some("claude: connection refused".into());
+        assert_eq!(dot(&app), "●", "the error dot lost to the quiesced one");
+        app.poll_error = None;
+        app.degraded = true;
+        assert_eq!(dot(&app), "○");
     }
 
     #[test]

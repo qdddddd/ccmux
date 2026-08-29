@@ -7,13 +7,13 @@ use serde::Deserialize;
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Background,
     Interactive,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Status {
     Busy,
     Idle,
@@ -21,7 +21,7 @@ pub enum Status {
     Unknown(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum State {
     Working,
     /// Finished on its own.
@@ -82,7 +82,12 @@ impl Group {
 /// exactly. Identity is `session_id` and nothing else: the CLI's `pid` is
 /// UNSTABLE across attach/detach, and with the /proc ancestry walk gone
 /// nothing reads it, so it is no longer carried.
-#[derive(Debug, Clone)]
+/// `Hash` is derived so `App` can fingerprint a whole poll in one pass and
+/// tell an unchanged fleet from a changed one; every field here is payload the
+/// CLI reported, so hashing all of them is exactly the question "did the
+/// listing change". Nothing derived here is used for identity — that is
+/// `session_id` alone.
+#[derive(Debug, Clone, Hash)]
 pub struct Session {
     /// 8-hex short id. `None` for `kind == Interactive`.
     pub id: Option<String>,

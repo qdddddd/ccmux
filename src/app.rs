@@ -25,6 +25,19 @@ const MSG_TTL: Duration = Duration::from_secs(4);
 /// Backoff interval once `fail_streak` crosses `FAIL_BACKOFF_AT` (SPEC §4.2).
 const BACKOFF: Duration = Duration::from_secs(10);
 const FAIL_BACKOFF_AT: u32 = 3;
+/// Consecutive byte-identical payloads before the idle ladder starts widening
+/// the gap between `claude agents` spawns (SPEC §4.2).
+///
+/// Four, not one: a fleet that changed on the previous poll is a fleet worth
+/// watching closely for a moment, and at the 2500 ms default this still means
+/// ten seconds of a completely unchanging listing before anything slows down.
+const IDLE_BACKOFF_AT: u32 = 4;
+/// Ceiling on the idle ladder. Thirty seconds is the longest an operator who
+/// is STARING at an unchanged sidebar can be shown stale data, and it is only
+/// reachable after the listing has been identical for six polls running; any
+/// keypress, any visibility change and any observed change collapse it back to
+/// `interval` at once.
+const IDLE_MAX: Duration = Duration::from_secs(30);
 /// Lines requested from `claude logs` for the `L` overlay.
 const LOGS_LINES: usize = 500;
 /// SPEC §9.1: `poll_error` is truncated to 120 chars.
@@ -192,6 +205,36 @@ pub struct OpenPane {
     pub window: Option<WindowId>,
 }
 
+/// Who, if anyone, can see this sidebar right now — the poll gate's input.
+///
+/// SPEC §4.2 (amended): a `claude agents` spawn exists to put fresh rows in
+/// front of a human. tmux answers "is a human in front of this pane" locally
+/// and for free in the `list-panes` ccmux already runs every tick, so the
+/// question is asked there rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Watchers {
+    /// A client is attached AND this sidebar's tab is the session's current
+    /// window. This is the only state the fast path is for.
+    Onscreen,
+    /// A client is attached, but it is rendering some other tab. Nothing this
+    /// process draws reaches a screen until the operator switches back.
+    OtherTab,
+    /// No client is attached to the session at all — detached, or overnight.
+    Detached,
+    /// The pane inventory cannot answer: degraded, no resolvable own pane, or
+    /// a failed enumeration. **Counts as watched.** The gate closes only on
+    /// positive evidence that nobody is looking; a guess must never be able to
+    /// stop the sidebar updating.
+    Unknown,
+}
+
+impl Watchers {
+    /// Does this state justify spawning `claude agents`?
+    pub fn polls(self) -> bool {
+        matches!(self, Watchers::Onscreen | Watchers::Unknown)
+    }
+}
+
 pub struct App {
     // config
     pub tmux_session: String,
@@ -313,6 +356,34 @@ pub struct App {
     pub fail_streak: u32,
     pub last_poll: Instant,
 
+    // ── poll gate (SPEC §4.2, amended) ──────────────────────────────────────
+    //
+    // `last_poll` above times the TICK, which stays on `interval` whatever the
+    // gate decides: the tick is two local tmux reads plus the §1.3 pin, it
+    // costs no network, and it is what notices the operator coming back. These
+    // four time the `claude agents` spawn, which is the expensive thing.
+    /// When `agents::poll()` last actually ran. Separate from `last_poll`
+    /// precisely so a skipped poll does not also skip the pane refresh that
+    /// would notice the sidebar becoming visible again.
+    pub last_agents: Instant,
+    /// Consecutive polls whose payload hashed identical to the one before.
+    /// Drives the idle ladder; reset by any change, any keypress and any
+    /// transition back to `Onscreen`.
+    pub idle_streak: u32,
+    /// Hash of the last applied payload. `None` before the first one.
+    pub payload_fp: Option<u64>,
+    /// A poll owed on the next tick whatever the gate and the ladder say: `r`,
+    /// every post-verb refresh, the first tick of the process, and the edge
+    /// back to `Onscreen`.
+    pub force_poll: bool,
+    /// `watchers().polls()` as of the previous tick — one half of the edge
+    /// detector that makes becoming visible refresh immediately.
+    pub was_watched: bool,
+    /// True while the gate is closed. Purely for the operator: the header dot
+    /// goes hollow so the frame tmux replays when you switch back says "this
+    /// was paused" rather than pretending it is live. NOT an error state.
+    pub quiesced: bool,
+
     pub should_quit: bool,
 
     /// Seam for `agents::dispatch_background`, and nothing else. Production
@@ -392,6 +463,20 @@ impl App {
                 .checked_sub(interval)
                 .unwrap_or_else(Instant::now),
 
+            last_agents: Instant::now()
+                .checked_sub(interval)
+                .unwrap_or_else(Instant::now),
+            idle_streak: 0,
+            payload_fp: None,
+            // The FIRST tick polls unconditionally. The launcher creates the
+            // session detached and attaches a moment later, so a gate applied
+            // to tick one would meet `session_attached == 0` and open the
+            // sidebar on an empty list for a tick. Startup behaviour is
+            // therefore byte-for-byte what it was.
+            force_poll: true,
+            was_watched: false,
+            quiesced: false,
+
             should_quit: false,
 
             dispatch: agents::dispatch_background,
@@ -425,7 +510,11 @@ impl App {
     ///   1. now_ms = Utc::now().timestamp_millis()
     ///   2. panes = list_panes_in_session(tmux_session)   [skipped when degraded]
     ///   3. map.reconcile(&panes) -> map_dirty |= changed
-    ///   4. agents::poll() -> sessions (on Err: keep last good, bump fail_streak)
+    ///      3b. read the visibility pair off my own pane's row and open or
+    ///      close the poll gate — `observe_watchers`, which must run AFTER the
+    ///      inventory it reads and BEFORE the poll it gates
+    ///   4. agents::poll() -> sessions, IF `poll_due()` (on Err: keep last
+    ///      good, bump fail_streak)
     ///      4b. on Ok ONLY: reconcile the dismissed set against the fresh poll
     ///      — 4 and 4b are `apply_poll`, which is where their whole policy
     ///      lives so it can be tested without shelling out to `claude`
@@ -433,6 +522,12 @@ impl App {
     ///   6. flush the map if map_dirty, and the dismissed set if hidden_dirty
     ///   7. pin_sidebar (unconditional, §1.3)
     ///   8. last_poll = Instant::now()
+    ///
+    /// Steps 1-3 and 5-8 run EVERY tick, gate or no gate. They are local: two
+    /// tmux reads on a unix socket and the §1.3 pin. Only step 4 spawns
+    /// `claude`, and only step 4 is skipped — which is what keeps "the
+    /// operator switched back to this tab" a fact this process learns within
+    /// one `interval` rather than one backoff.
     pub fn tick(&mut self) {
         // 1
         self.now_ms = chrono::Utc::now().timestamp_millis();
@@ -440,8 +535,14 @@ impl App {
         // 2 + 3 (+ §5.3 step 5)
         self.refresh_panes();
 
-        // 4 + 4b
-        self.apply_poll(agents::poll());
+        // 3b
+        self.observe_watchers();
+
+        // 4 + 4b — gated. A skipped poll is NOT a failed poll: nothing here
+        // touches `poll_error`, `fail_streak`, or `reconcile_hidden`'s
+        // two-strike debounce, so the header stays healthy and no dismissal
+        // ages toward being dropped on the strength of a poll never taken.
+        self.poll_step(agents::poll);
 
         // 5
         self.rebuild_rows();
@@ -492,13 +593,47 @@ impl App {
                     .collect();
                 self.poll_error = None;
                 self.fail_streak = 0;
+                self.note_idle();
                 self.reconcile_hidden(complete);
             }
             Err(e) => {
                 self.fail_streak = self.fail_streak.saturating_add(1);
                 self.poll_error = Some(model::truncate_end(&agents_msg(&e), POLL_ERR_MAX));
+                // A failed poll says nothing about whether the fleet is still.
+                // `effective_interval`'s failure backoff owns the cadence from
+                // here, and `agents_interval` takes the longer of the two, so
+                // clearing the ladder cannot make a failing CLI poll faster.
+                self.idle_streak = 0;
             }
         }
+    }
+
+    /// Fold the payload just applied into the idle ladder.
+    ///
+    /// "Unchanged" is the hash of every field of every listed session, in the
+    /// order the CLI emitted them — not just the count, and not just identity:
+    /// a session going Working -> Idle changes no id and no row count, and it
+    /// is precisely the change the operator is watching for.
+    ///
+    /// Relative ages (`2m`) are NOT in the hash and must not be: they are
+    /// recomputed from `now_ms` on every draw, which still happens every tick,
+    /// so a widened poll interval never freezes them.
+    fn note_idle(&mut self) {
+        let fp = Self::fingerprint(&self.sessions);
+        if self.payload_fp == Some(fp) {
+            self.idle_streak = self.idle_streak.saturating_add(1);
+        } else {
+            self.idle_streak = 0;
+        }
+        self.payload_fp = Some(fp);
+    }
+
+    fn fingerprint(sessions: &[model::Session]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sessions.len().hash(&mut h);
+        sessions.hash(&mut h);
+        h.finish()
     }
 
     /// 4b — drop dismissals for sessions that are gone, WITHOUT a hair trigger.
@@ -564,13 +699,119 @@ impl App {
         self.hidden_absent = absent;
     }
 
-    /// Poll interval in force: `interval`, or 10s once `fail_streak >= 3`.
+    /// TICK interval in force: `interval`, or 10s once `fail_streak >= 3`.
+    ///
+    /// Unchanged by the poll gate on purpose. This is the cadence of the local
+    /// work — the pane inventory, the visibility read, the §1.3 pin — and
+    /// slowing it would make the gate's own edge detector slow, which is
+    /// exactly the responsiveness the amendment promises not to spend.
     pub fn effective_interval(&self) -> Duration {
         if self.fail_streak >= FAIL_BACKOFF_AT {
             BACKOFF
         } else {
             self.interval
         }
+    }
+
+    /// Who can see this sidebar, read off THIS process's own pane row in the
+    /// inventory `refresh_panes` already took. No tmux call of its own.
+    ///
+    /// Every unknown answers `Unknown`, which polls: no own pane (degraded,
+    /// outside tmux, `$TMUX_PANE` unset or naming a pane of another session),
+    /// or an inventory that does not carry my pane because the enumeration
+    /// failed and `self.panes` is stale or empty.
+    pub fn watchers(&self) -> Watchers {
+        let Some(me) = self.own_pane.as_ref() else {
+            return Watchers::Unknown;
+        };
+        let Some(row) = self.panes.iter().find(|p| &p.id == me) else {
+            return Watchers::Unknown;
+        };
+        if row.session_clients == 0 {
+            Watchers::Detached
+        } else if !row.window_active {
+            Watchers::OtherTab
+        } else {
+            Watchers::Onscreen
+        }
+    }
+
+    /// Step 3b of `tick`: latch the gate, and force a poll on the edge back
+    /// into view.
+    ///
+    /// The edge is what makes a long idle ladder safe. Coming back to the tab
+    /// must not mean waiting out however far the ladder had grown while nobody
+    /// was looking, so the transition both clears the ladder and owes a poll
+    /// on this very tick — at most `interval` after the switch, never longer.
+    fn observe_watchers(&mut self) {
+        let watched = self.watchers().polls();
+        if watched && !self.was_watched {
+            self.idle_streak = 0;
+            self.force_poll = true;
+        }
+        self.was_watched = watched;
+        self.quiesced = !watched;
+    }
+
+    /// Gap between `claude agents` spawns while the payload keeps coming back
+    /// identical: `interval` until `IDLE_BACKOFF_AT`, then doubling to
+    /// `IDLE_MAX`.
+    ///
+    /// At the 2500 ms default that is 2.5s, 2.5s, 2.5s, 2.5s, 5s, 10s, 20s,
+    /// then 30s for as long as nothing moves.
+    pub fn idle_interval(&self) -> Duration {
+        let steps = self.idle_streak.saturating_sub(IDLE_BACKOFF_AT.saturating_sub(1));
+        if steps == 0 {
+            return self.interval;
+        }
+        // `1 << 5` is already past `IDLE_MAX` at any sane `interval`; the clamp
+        // is there so a long streak cannot overflow the shift.
+        self.interval.saturating_mul(1u32 << steps.min(5)).min(IDLE_MAX)
+    }
+
+    /// The interval the `claude agents` spawn actually honours: the failure
+    /// backoff and the idle ladder, whichever is longer. A failing CLI and a
+    /// still fleet must not be able to talk each other into polling faster.
+    pub fn agents_interval(&self) -> Duration {
+        self.effective_interval().max(self.idle_interval())
+    }
+
+    /// Steps 4 and 4b of `tick`, with the decision in front of the spawn.
+    /// Returns whether `claude agents` actually ran.
+    ///
+    /// `fetch` is a CLOSURE, not a value, and that is the whole design: an
+    /// eagerly evaluated `agents::poll()` at the call site would spawn the
+    /// process and then throw its answer away, which is precisely the waste
+    /// this gate exists to remove. It is also the seam the gate's tests drive,
+    /// so they can assert what a skipped poll does not do — no `poll_error`,
+    /// no `fail_streak`, no reconciliation strike — without shelling out.
+    pub fn poll_step(
+        &mut self,
+        fetch: impl FnOnce() -> Result<model::Payload, AgentsError>,
+    ) -> bool {
+        if !self.poll_due() {
+            return false;
+        }
+        self.force_poll = false;
+        self.apply_poll(fetch());
+        self.last_agents = Instant::now();
+        true
+    }
+
+    /// Should this tick spawn `claude agents`?
+    ///
+    /// Order is the contract: a forced poll outranks everything, so `r` and
+    /// every post-verb refresh land immediately whatever the gate or the
+    /// ladder say. Otherwise the gate closes on positive evidence that nobody
+    /// is looking, and only then does the clock get a say.
+    pub fn poll_due(&self) -> bool {
+        if self.force_poll {
+            return true;
+        }
+        if !self.watchers().polls() {
+            return false;
+        }
+        self.last_agents.elapsed() >= self.agents_interval()
     }
 
     /// True when a timed message just expired (caller should redraw).
@@ -588,6 +829,14 @@ impl App {
     /// THE keymap. Full dispatch table in §8. Pure with respect to the
     /// terminal: it may shell out, but it never touches stdout.
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        // A keypress is a human at the keyboard, which is the strongest
+        // evidence the sidebar has that it is being read. Collapse the idle
+        // ladder: whatever it had grown to, the next tick is back on
+        // `interval`. It does not force a poll — that would put a `claude`
+        // spawn behind every `j` — it only stops the sidebar being slow to
+        // update for someone who is demonstrably looking at it.
+        self.idle_streak = 0;
+
         // §8.9: Ctrl-c quits from ANY mode, immediately, without confirming.
         // Checked before mode dispatch on purpose.
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1469,7 +1718,15 @@ impl App {
 
     /// `r` — SPEC §4.2: backdate `last_poll` so the NEXT loop iteration polls.
     /// Deliberately does not call `tick()` inline.
+    ///
+    /// `force_poll` is what carries it through the gate and the idle ladder.
+    /// Backdating alone would only buy a TICK, and a tick whose gate is shut
+    /// or whose ladder has not elapsed spawns nothing — so `r` in a background
+    /// tab, and `r` on a fleet that has been still for a minute, would both
+    /// have become no-ops. Every post-verb refresh routes through here too,
+    /// which is what makes a `Ctrl+X` stop show up on the next frame.
     pub fn act_force_refresh(&mut self) {
+        self.force_poll = true;
         self.last_poll = Instant::now()
             .checked_sub(self.effective_interval())
             .unwrap_or_else(Instant::now);
@@ -2886,6 +3143,14 @@ mod tests {
             poll_error: None,
             fail_streak: 0,
             last_poll: Instant::now(),
+            last_agents: Instant::now(),
+            idle_streak: 0,
+            payload_fp: None,
+            // The fixture is NOT mid-startup: `force_poll` starts false so the
+            // gate's tests see the gate, not the one-shot first-tick exemption.
+            force_poll: false,
+            was_watched: true,
+            quiesced: false,
             should_quit: false,
             // STRUCTURAL, not disciplinary: no hermetic test may ever spawn the
             // real `claude` (a dispatch here would start a real background
@@ -3213,6 +3478,11 @@ mod tests {
             active,
             window_index: window,
             window_id: WindowId::parse(&format!("@{window}")).expect("window id"),
+            // Watched by default: the pane fixtures predate the poll gate and
+            // exist to exercise layout, not visibility. The gate's own tests
+            // set these two explicitly.
+            window_active: true,
+            session_clients: 1,
         }
     }
 
@@ -5156,6 +5426,266 @@ mod tests {
         assert_eq!(a.effective_interval(), Duration::from_secs(10));
         a.fail_streak = 0;
         assert_eq!(a.effective_interval(), Duration::from_millis(2500));
+    }
+
+    // ── the poll gate: nobody watching, nothing spawned (SPEC §4.2) ─────────
+
+    /// Put the app in a tab whose visibility the test controls, exactly the
+    /// way `refresh_panes` would: an own pane that appears in the inventory,
+    /// carrying the two fields `PANE_FMT` now reads off it.
+    fn watched_by(a: &mut App, clients: u32, window_active: bool) {
+        own(a, "%1", "@1");
+        let mut me = pane("%1", 1, 1, 0, 34, true);
+        me.session_clients = clients;
+        me.window_active = window_active;
+        a.panes = vec![me];
+    }
+
+    /// A `fetch` that fails the test if the gate ever calls it. This is the
+    /// assertion — "no `claude agents` process was spawned" — expressed at the
+    /// one seam where a spawn could happen.
+    fn never_polls() -> Result<model::Payload, AgentsError> {
+        panic!("the gate spawned `claude agents` with nobody watching");
+    }
+
+    /// One gated tick's worth of the poll path: what `tick` does at steps 3b
+    /// and 4, minus the tmux reads and the row rebuild.
+    fn gated_tick(
+        a: &mut App,
+        fetch: impl FnOnce() -> Result<model::Payload, AgentsError>,
+    ) -> bool {
+        a.observe_watchers();
+        a.poll_step(fetch)
+    }
+
+    /// Age the gate's clock so the NEXT tick is due on the interval alone.
+    /// No test sleeps: they backdate, like the `Ctrl+X` guard's tests.
+    fn age(a: &mut App, by: Duration) {
+        a.last_agents = a.last_agents.checked_sub(by).unwrap_or(a.last_agents);
+    }
+
+    #[test]
+    fn a_detached_session_spawns_no_poll() {
+        let mut a = app();
+        watched_by(&mut a, 0, true);
+        a.observe_watchers();
+        assert_eq!(a.watchers(), Watchers::Detached);
+        age(&mut a, Duration::from_secs(60));
+        for _ in 0..20 {
+            assert!(!gated_tick(&mut a, never_polls), "a detached session polled");
+        }
+        assert!(a.quiesced, "the operator gets no sign the sidebar is paused");
+    }
+
+    #[test]
+    fn a_sidebar_in_a_background_tab_spawns_no_poll() {
+        let mut a = app();
+        watched_by(&mut a, 1, false);
+        a.observe_watchers();
+        assert_eq!(a.watchers(), Watchers::OtherTab);
+        age(&mut a, Duration::from_secs(60));
+        for _ in 0..20 {
+            assert!(!gated_tick(&mut a, never_polls), "a background tab polled");
+        }
+        assert!(a.quiesced);
+    }
+
+    /// The other half of the contract: the gate closes only on POSITIVE
+    /// evidence. No own pane, or an inventory that does not carry it, must
+    /// keep polling exactly as today — that is the degraded and outside-tmux
+    /// case, where the sidebar is presumably the thing on screen.
+    #[test]
+    fn an_unanswerable_inventory_keeps_polling() {
+        let mut a = app();
+        a.panes.clear();
+        a.own_pane = None;
+        assert_eq!(a.watchers(), Watchers::Unknown);
+        age(&mut a, Duration::from_secs(60));
+        assert!(gated_tick(&mut a, || complete(four())));
+        assert!(!a.quiesced, "an unknown answer is not a quiesced sidebar");
+
+        // Own pane set, but this tick's enumeration failed and left `panes`
+        // without it: still unknown, still polling.
+        own(&mut a, "%9", "@9");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, true)];
+        assert_eq!(a.watchers(), Watchers::Unknown);
+        age(&mut a, Duration::from_secs(60));
+        assert!(gated_tick(&mut a, || complete(four())));
+    }
+
+    /// Coming back to the tab must not mean waiting out whatever the ladder
+    /// had grown to while nobody was looking.
+    #[test]
+    fn becoming_visible_again_polls_on_that_very_tick() {
+        let mut a = app();
+        watched_by(&mut a, 1, false);
+        for _ in 0..10 {
+            assert!(!gated_tick(&mut a, never_polls));
+        }
+        // The ladder is irrelevant and the clock has just been reset by
+        // nothing at all — the poll is owed by the TRANSITION.
+        a.idle_streak = 99;
+        a.last_agents = Instant::now();
+        if let Some(me) = a.panes.first_mut() {
+            me.window_active = true;
+        }
+        assert!(
+            gated_tick(&mut a, || complete(four())),
+            "switching back to the tab did not refresh it"
+        );
+        assert_eq!(a.sessions.len(), 4);
+        assert!(!a.quiesced);
+        assert_eq!(a.idle_streak, 0, "the transition must collapse the ladder");
+    }
+
+    /// A skipped poll is not a failed poll, and it is not a poll.
+    #[test]
+    fn a_skipped_poll_raises_no_error_and_ages_no_dismissal() {
+        let mut a = app();
+        load(&mut a, four());
+        a.on_key(press('d')); // dismiss bt/reg-update
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
+        a.hidden_dirty = false;
+
+        // One real poll WITHOUT the dismissed session: strike one.
+        let without: Vec<Session> =
+            four().into_iter().filter(|s| s.name != "bt/reg-update").collect();
+        a.apply_poll(complete(without.clone()));
+        assert_eq!(a.hidden_absent.len(), 1, "strike one");
+
+        // Now nobody is watching. However many ticks pass, the second strike
+        // never lands, because a skip is not a poll.
+        watched_by(&mut a, 0, true);
+        age(&mut a, Duration::from_secs(600));
+        for _ in 0..50 {
+            assert!(!gated_tick(&mut a, never_polls));
+        }
+        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"], "a skip retired a dismissal");
+        assert_eq!(a.hidden_absent.len(), 1, "a skip advanced the debounce");
+        assert!(!a.hidden_dirty);
+
+        // And none of it looks like a failure.
+        assert!(a.poll_error.is_none(), "a skipped poll set a poll error");
+        assert_eq!(a.fail_streak, 0, "a skipped poll bumped the failure streak");
+        assert_eq!(a.effective_interval(), Duration::from_millis(2500));
+    }
+
+    /// `r` is the operator saying "now", and it outranks both the gate and the
+    /// ladder. It is also the path every post-verb refresh takes, so a `Ctrl+X`
+    /// in a tab that just lost focus still shows its result.
+    #[test]
+    fn force_refresh_polls_through_a_shut_gate_and_a_long_ladder() {
+        for (clients, active) in [(0u32, true), (1, false), (1, true)] {
+            let mut a = app();
+            watched_by(&mut a, clients, active);
+            a.observe_watchers();
+            a.idle_streak = 99;
+            a.last_agents = Instant::now();
+            assert!(!a.poll_due(), "the gate or the ladder should be holding");
+
+            a.on_key(press('r'));
+            assert!(a.force_poll, "`r` did not owe a poll");
+            assert!(a.poll_due(), "`r` did not get through: clients={clients} active={active}");
+            assert!(a.poll_step(|| complete(four())));
+            assert_eq!(a.sessions.len(), 4);
+            assert!(!a.force_poll, "the forced poll was not consumed");
+        }
+    }
+
+    /// The ladder: four identical payloads before anything widens, then
+    /// doubling to the 30 s ceiling — and one changed row puts it straight
+    /// back on `interval`.
+    #[test]
+    fn the_idle_ladder_grows_on_a_still_fleet_and_collapses_on_a_change() {
+        let mut a = app();
+        watched_by(&mut a, 1, true);
+        let base = Duration::from_millis(2500);
+
+        a.apply_poll(complete(four()));
+        assert_eq!(a.idle_streak, 0, "the first payload is a change");
+        assert_eq!(a.agents_interval(), base);
+
+        // Three more identical payloads are still the fast path.
+        for _ in 0..3 {
+            a.apply_poll(complete(four()));
+        }
+        assert_eq!(a.idle_streak, 3);
+        assert_eq!(a.agents_interval(), base, "the ladder started too early");
+
+        let rungs = [
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            Duration::from_secs(20),
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        ];
+        for want in rungs {
+            a.apply_poll(complete(four()));
+            assert_eq!(a.agents_interval(), want, "streak {}", a.idle_streak);
+        }
+
+        // A change of STATE alone — same ids, same count, same names.
+        let mut moved = four();
+        if let Some(s) = moved.first_mut() {
+            s.state = Some(State::Done);
+        }
+        a.apply_poll(complete(moved));
+        assert_eq!(a.idle_streak, 0, "a state change did not collapse the ladder");
+        assert_eq!(a.agents_interval(), base);
+    }
+
+    /// The ladder must never outlive a human at the keyboard.
+    #[test]
+    fn a_keypress_collapses_the_idle_ladder() {
+        let mut a = app();
+        load(&mut a, four());
+        watched_by(&mut a, 1, true);
+        for _ in 0..9 {
+            a.apply_poll(complete(four()));
+        }
+        assert_eq!(a.agents_interval(), Duration::from_secs(30));
+
+        a.on_key(press('j'));
+        assert_eq!(a.idle_streak, 0);
+        assert_eq!(a.agents_interval(), Duration::from_millis(2500));
+        // The gap since the last spawn is already past the collapsed interval,
+        // so the very next tick polls. No forced poll is owed — a keypress
+        // must not put a `claude` spawn behind every `j`.
+        assert!(!a.force_poll);
+        age(&mut a, Duration::from_millis(2500));
+        assert!(a.poll_due());
+    }
+
+    /// The fast path is the fast path: onscreen, attached, with a fleet that
+    /// keeps moving, every interval polls and nothing is skipped.
+    #[test]
+    fn the_visible_active_sidebar_polls_exactly_as_before() {
+        let mut a = app();
+        watched_by(&mut a, 1, true);
+        a.observe_watchers();
+        assert_eq!(a.watchers(), Watchers::Onscreen);
+
+        let mut polls = 0;
+        for n in 0..12 {
+            // A fleet that changes every tick — the ladder never starts.
+            let mut fleet = four();
+            if let Some(s) = fleet.first_mut() {
+                s.name = format!("bt/reg-update {n}");
+            }
+            age(&mut a, Duration::from_millis(2500));
+            if gated_tick(&mut a, || complete(fleet)) {
+                polls += 1;
+            }
+        }
+        assert_eq!(polls, 12, "the fast path skipped a poll");
+        assert_eq!(a.agents_interval(), Duration::from_millis(2500));
+        assert!(!a.quiesced);
+        assert!(a.poll_error.is_none());
+
+        // And one interval that has NOT elapsed still waits, exactly as it
+        // did before the gate existed.
+        a.last_agents = Instant::now();
+        assert!(!a.poll_due());
     }
 
     // ── `d` / `u`: dismissal is a VIEW filter ───────────────────────────────

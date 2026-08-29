@@ -83,6 +83,14 @@ const HIDDEN_OPS_MAX: usize = 128;
 /// next, while a window id is never reused. Everything that must survive a
 /// tick — the write-dedupe cache key, a dismissal's origin stamp, "is that pane
 /// in MY window" — is keyed by the id. The index is display-only.
+///
+/// The last two fields are the VISIBILITY pair, and they are here rather than
+/// in a call of their own because this listing already runs every tick: tmux
+/// answers both locally, for free, in the process ccmux was going to spawn
+/// anyway. `#{window_active}` is 1 only for the session's current window, and
+/// `#{session_attached}` is the session's attached-client count — 0 when the
+/// operator has detached entirely. Both are session/window facts repeated on
+/// every pane row; `app` reads them off its OWN pane's row.
 const PANE_FMT: &str = concat!(
     "#{pane_id}\t",
     "#{pane_index}\t",
@@ -92,10 +100,12 @@ const PANE_FMT: &str = concat!(
     "#{pane_height}\t",
     "#{pane_active}\t",
     "#{window_index}\t",
-    "#{window_id}",
+    "#{window_id}\t",
+    "#{window_active}\t",
+    "#{session_attached}",
 );
 
-const PANE_FIELDS: usize = 9;
+const PANE_FIELDS: usize = 11;
 
 /// `-F` format for `list_tabs`. The two JSON blobs are LAST so a value that
 /// somehow contained a tab could only corrupt the final field, never shift a
@@ -263,6 +273,14 @@ pub struct PaneInfo {
     pub window_index: u32,
     /// Stable across `renumber-windows`, unlike `window_index`.
     pub window_id: WindowId,
+    /// `#{window_active}` — true only for the session's CURRENT window, i.e.
+    /// the one tab a client is actually rendering. Per-window, so it differs
+    /// row to row within one listing.
+    pub window_active: bool,
+    /// `#{session_attached}` — how many clients are attached to the session.
+    /// 0 means nothing is drawing any of its windows at all. Per-session, so
+    /// every row of one listing carries the same number.
+    pub session_clients: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,6 +674,10 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     let active = parts[6] == "1";
     let window_index: u32 = parts[7].parse().map_err(|_| bad("window_index", parts[7]))?;
     let window_id = WindowId::parse(parts[8]).ok_or_else(|| bad("window_id", parts[8]))?;
+    let window_active = parts[9] == "1";
+    let session_clients: u32 = parts[10]
+        .parse()
+        .map_err(|_| bad("session_attached", parts[10]))?;
 
     Ok(PaneInfo {
         id,
@@ -667,6 +689,8 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         active,
         window_index,
         window_id,
+        window_active,
+        session_clients,
     })
 }
 
@@ -1801,6 +1825,8 @@ mod tests {
             active: false,
             window_index: window,
             window_id: WindowId::parse(&format!("@{window}")).expect("test window id"),
+            window_active: true,
+            session_clients: 1,
         }
     }
 
@@ -1868,6 +1894,8 @@ mod tests {
             active: false,
             window_index: 1,
             window_id: WindowId::parse("@1").expect("test window id"),
+            window_active: true,
+            session_clients: 1,
         }
     }
 
@@ -2283,7 +2311,7 @@ mod tests {
 
     #[test]
     fn parse_pane_line_reads_every_field() {
-        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0";
+        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2";
         let p = parse_pane_line(line).expect("parses");
         assert_eq!(p.id.as_str(), "%25");
         assert_eq!(p.index, 2);
@@ -2294,18 +2322,34 @@ mod tests {
         assert!(p.active);
         assert_eq!(p.window_index, 1);
         assert_eq!(p.window_id.as_str(), "@0");
+        assert!(p.window_active);
+        assert_eq!(p.session_clients, 2);
+    }
+
+    /// The visibility pair is what the poll gate reads, so a detached session
+    /// and a background tab must survive the parser as themselves.
+    #[test]
+    fn parse_pane_line_reads_a_detached_background_pane() {
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0").expect("parses");
+        assert!(!p.window_active);
+        assert_eq!(p.session_clients, 0);
     }
 
     #[test]
     fn parse_pane_lines_rejects_short_and_malformed_rows() {
         assert!(parse_pane_line("%1\t1\t0").is_err());
-        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0").is_err());
-        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0").is_err());
+        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
+        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
         // The ninth field is the window id, and a bad one is fatal like the rest.
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1").is_err());
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1").is_err());
+        // A non-numeric client count is fatal too: the poll gate must never
+        // read a garbled field as "nobody is watching".
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx").is_err());
+        // A row from the old nine-field format is short, and short is fatal.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1").is_err());
         // Blank lines are skipped, not fatal.
-        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\n\n").expect("parses");
+        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\n\n").expect("parses");
         assert_eq!(panes.len(), 1);
         assert!(parse_pane_lines("").expect("empty is fine").is_empty());
     }

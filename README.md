@@ -89,7 +89,7 @@ ccmux --dark                  # per invocation
 resolves the choice and forwards the answer to the sidebar pane, so it holds even
 though the pane may not inherit the variable.
 | `-L`, `--socket <NAME>` | tmux default | Use `tmux -L <NAME>`, a separate tmux server |
-| `--interval <MS>` | `2500` | *(`sidebar` only)* `claude agents --json` poll interval |
+| `--interval <MS>` | `2500` | *(`sidebar` only)* `claude agents --json` poll interval, when something is watching |
 
 `CCMUX_CLAUDE_BIN` overrides the `claude` binary. `CCMUX_TMUX_SOCKET` is an
 environment-variable equivalent of `--socket`.
@@ -193,8 +193,9 @@ Sessions are grouped exactly as `claude agents` groups them: **Working**,
 ### Tabs
 
 `t` puts a session in its own tmux window and takes you there. Every tab gets
-its own pinned sidebar, so the list is on screen wherever you are — the cost is
-one `claude agents` poll per tab, which is the trade the layout is for.
+its own pinned sidebar, so the list is on screen wherever you are. Only the tab
+you are looking at polls (see *Polling* below), so the extra tabs are close to
+free.
 
 The header says `tab 2` — tmux's own window number, so `prefix-2` goes there —
 once a second tab exists, and the badge in the second gutter column says which
@@ -317,6 +318,32 @@ that is known to have lost rows concludes nothing at all.
   to the ccmux session, without exception. Panes in your other tmux sessions are
   never split, resized, killed — or even focused. ccmux does not enumerate the
   tmux server at all; it lists only its own session's panes.
+
+## Polling
+
+The sidebar refreshes by running `claude agents --json --all` every 2.5 s. It
+does that **only while something is watching it**:
+
+- A sidebar in a tmux window that is not the one on screen polls nothing.
+  With three tabs, one polls and two are silent.
+- A session with no attached client — you detached, or went home — polls
+  nothing at all.
+- A listing that comes back identical four times running widens the gap, 5 s
+  to 10 s to 20 s to 30 s, for as long as nothing moves.
+
+Both are answered by the same `tmux list-panes` the sidebar already runs each
+tick, so the check costs nothing, and neither can make it slow when it matters:
+switching back to the tab refreshes it on that tick, any keypress puts it back
+on 2.5 s, and `r` always polls right now. Nothing runs in a background thread —
+a paused sidebar is paused, not queued.
+
+While polling is paused the header dot goes hollow (`○` dim) instead of solid,
+so the frame tmux replays when you switch back tells you the list is a moment
+stale rather than pretending it is live. It is not an error: a failed poll is
+still a red dot and a footer message.
+
+To keep a tab polling regardless, keep it on screen. There is no flag to
+disable the gate — a sidebar nobody can see has nothing to show.
 
 ## Degraded mode
 

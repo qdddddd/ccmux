@@ -685,6 +685,8 @@ mod tests {
             active: false,
             window_index: window,
             window_id: tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
+            window_active: true,
+            session_clients: 1,
         }
     }
 
