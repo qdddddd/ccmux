@@ -84,13 +84,29 @@ const HIDDEN_OPS_MAX: usize = 128;
 /// tick — the write-dedupe cache key, a dismissal's origin stamp, "is that pane
 /// in MY window" — is keyed by the id. The index is display-only.
 ///
-/// The last two fields are the VISIBILITY pair, and they are here rather than
+/// The last three fields are the VISIBILITY set, and they are here rather than
 /// in a call of their own because this listing already runs every tick: tmux
-/// answers both locally, for free, in the process ccmux was going to spawn
-/// anyway. `#{window_active}` is 1 only for the session's current window, and
-/// `#{session_attached}` is the session's attached-client count — 0 when the
-/// operator has detached entirely. Both are session/window facts repeated on
-/// every pane row; `app` reads them off its OWN pane's row.
+/// answers all of them locally, for free, in the process ccmux was going to
+/// spawn anyway. `#{window_active}` is 1 only for the session's current
+/// window; `#{session_attached}` is the session's attached-client count;
+/// `#{window_active_clients}` is how many clients are rendering THIS window,
+/// counted across every session the window is linked into. All are
+/// session/window facts repeated on every pane row; `app` reads them off its
+/// OWN pane's row.
+///
+/// `#{window_active_clients}` is the authoritative one and the other two are
+/// its fallback, because the pair is blind to a GROUPED session
+/// (`tmux new-session -t ccmux`), which is how tmux lets two clients sit on
+/// different windows of the same window list. A client attached to the grouped
+/// session and rendering the sidebar's window contributes NOTHING to
+/// `#{session_attached}` of the original session — verified on 3.4: the
+/// sidebar's own row reads `wact=1 sattach=0 wac=1` while it is fully on
+/// screen. Reading only the pair there would quiesce a visible sidebar.
+///
+/// A tmux too old to know the format expands it to the EMPTY STRING rather
+/// than dropping the field (verified on 3.4 with a nonsense format name), so
+/// the row still has its full field count and `window_viewers` parses as
+/// `None`, which is what routes such a build back onto the pair.
 const PANE_FMT: &str = concat!(
     "#{pane_id}\t",
     "#{pane_index}\t",
@@ -102,10 +118,11 @@ const PANE_FMT: &str = concat!(
     "#{window_index}\t",
     "#{window_id}\t",
     "#{window_active}\t",
-    "#{session_attached}",
+    "#{session_attached}\t",
+    "#{window_active_clients}",
 );
 
-const PANE_FIELDS: usize = 11;
+const PANE_FIELDS: usize = 12;
 
 /// `-F` format for `list_tabs`. The two JSON blobs are LAST so a value that
 /// somehow contained a tab could only corrupt the final field, never shift a
@@ -273,14 +290,21 @@ pub struct PaneInfo {
     pub window_index: u32,
     /// Stable across `renumber-windows`, unlike `window_index`.
     pub window_id: WindowId,
-    /// `#{window_active}` — true only for the session's CURRENT window, i.e.
-    /// the one tab a client is actually rendering. Per-window, so it differs
-    /// row to row within one listing.
+    /// `#{window_active}` — true only for the session's CURRENT window. NOT
+    /// the same as "a client is rendering it": a detached session still has a
+    /// current window, and a grouped session has its own. Per-window, so it
+    /// differs row to row within one listing.
     pub window_active: bool,
     /// `#{session_attached}` — how many clients are attached to the session.
-    /// 0 means nothing is drawing any of its windows at all. Per-session, so
-    /// every row of one listing carries the same number.
+    /// 0 means nothing is drawing any window of THIS session; it says nothing
+    /// about a grouped session sharing the same windows. Per-session, so every
+    /// row of one listing carries the same number.
     pub session_clients: u32,
+    /// `#{window_active_clients}` — how many clients are rendering this
+    /// window, across every session it is linked into. `None` on a tmux that
+    /// does not know the format, which is the only case where the two fields
+    /// above are the better answer available.
+    pub window_viewers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,6 +702,13 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     let session_clients: u32 = parts[10]
         .parse()
         .map_err(|_| bad("session_attached", parts[10]))?;
+    // Deliberately lenient where every field above is strict: this is the one
+    // field a supported tmux may not know, and it answers with an empty
+    // string. An unparseable value is therefore "no answer", not a broken row
+    // — it degrades to the `window_active`/`session_attached` pair instead of
+    // failing the whole enumeration, which `watchers()` would read as evidence
+    // that nobody is looking.
+    let window_viewers: Option<u32> = parts[11].parse().ok();
 
     Ok(PaneInfo {
         id,
@@ -691,6 +722,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         window_id,
         window_active,
         session_clients,
+        window_viewers,
     })
 }
 
@@ -1827,6 +1859,7 @@ mod tests {
             window_id: WindowId::parse(&format!("@{window}")).expect("test window id"),
             window_active: true,
             session_clients: 1,
+            window_viewers: Some(1),
         }
     }
 
@@ -1896,6 +1929,7 @@ mod tests {
             window_id: WindowId::parse("@1").expect("test window id"),
             window_active: true,
             session_clients: 1,
+            window_viewers: Some(1),
         }
     }
 
@@ -2311,7 +2345,7 @@ mod tests {
 
     #[test]
     fn parse_pane_line_reads_every_field() {
-        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2";
+        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2\t1";
         let p = parse_pane_line(line).expect("parses");
         assert_eq!(p.id.as_str(), "%25");
         assert_eq!(p.index, 2);
@@ -2324,32 +2358,61 @@ mod tests {
         assert_eq!(p.window_id.as_str(), "@0");
         assert!(p.window_active);
         assert_eq!(p.session_clients, 2);
+        assert_eq!(p.window_viewers, Some(1));
     }
 
-    /// The visibility pair is what the poll gate reads, so a detached session
-    /// and a background tab must survive the parser as themselves.
+    /// The visibility fields are what the poll gate reads, so a detached
+    /// session and a background tab must survive the parser as themselves.
     #[test]
     fn parse_pane_line_reads_a_detached_background_pane() {
-        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0").expect("parses");
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0\t0").expect("parses");
         assert!(!p.window_active);
         assert_eq!(p.session_clients, 0);
+        assert_eq!(p.window_viewers, Some(0));
+    }
+
+    /// REGRESSION (grouped sessions). `tmux new-session -t ccmux` shares the
+    /// window list, and a client attached to the GROUP renders the sidebar's
+    /// window while contributing nothing to the original session's
+    /// `#{session_attached}`. Verified on 3.4: the sidebar's own row reads
+    /// exactly this — on screen, but "nobody attached" by the pair alone.
+    /// `window_viewers` is the field that tells the truth there.
+    #[test]
+    fn parse_pane_line_reads_a_pane_watched_through_a_grouped_session() {
+        let p = parse_pane_line("%0\t0\t0\t0\t80\t24\t1\t1\t@0\t1\t0\t1").expect("parses");
+        assert!(p.window_active);
+        assert_eq!(p.session_clients, 0, "the grouped client is invisible to the pair");
+        assert_eq!(p.window_viewers, Some(1), "but it is rendering this window");
+    }
+
+    /// A tmux that does not know `#{window_active_clients}` expands it to the
+    /// empty string, which keeps the field COUNT and must parse as "no
+    /// answer" rather than failing the row: the gate falls back to the pair.
+    #[test]
+    fn an_unknown_viewer_count_is_none_and_not_an_error() {
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t").expect("parses");
+        assert_eq!(p.window_viewers, None);
+        assert!(p.window_active);
+        assert_eq!(p.session_clients, 1);
     }
 
     #[test]
     fn parse_pane_lines_rejects_short_and_malformed_rows() {
         assert!(parse_pane_line("%1\t1\t0").is_err());
-        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
-        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
+        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1").is_err());
+        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1").is_err());
         // The ninth field is the window id, and a bad one is fatal like the rest.
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1").is_err());
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1\t1").is_err());
         // A non-numeric client count is fatal too: the poll gate must never
         // read a garbled field as "nobody is watching".
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx").is_err());
-        // A row from the old nine-field format is short, and short is fatal.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx\t1").is_err());
+        // A row from the old nine- or eleven-field format is short, and short
+        // is fatal.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1").is_err());
         // Blank lines are skipped, not fatal.
-        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\n\n").expect("parses");
+        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t1\n\n").expect("parses");
         assert_eq!(panes.len(), 1);
         assert!(parse_pane_lines("").expect("empty is fine").is_empty());
     }

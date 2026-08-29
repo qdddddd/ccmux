@@ -211,20 +211,26 @@ pub struct OpenPane {
 /// front of a human. tmux answers "is a human in front of this pane" locally
 /// and for free in the `list-panes` ccmux already runs every tick, so the
 /// question is asked there rather than assumed.
+///
+/// The question is per WINDOW, not per session: a client attached through a
+/// grouped session renders one of these windows while leaving the sidebar's
+/// own session at zero attached clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Watchers {
-    /// A client is attached AND this sidebar's tab is the session's current
-    /// window. This is the only state the fast path is for.
+    /// Some client — of my session or of one grouped with it — is rendering
+    /// this sidebar's window. The only state the fast path is for.
     Onscreen,
-    /// A client is attached, but it is rendering some other tab. Nothing this
-    /// process draws reaches a screen until the operator switches back.
+    /// Nothing is rendering my window, but my session has clients: they are on
+    /// another tab. Nothing this process draws reaches a screen until the
+    /// operator switches back.
     OtherTab,
-    /// No client is attached to the session at all — detached, or overnight.
+    /// Nothing is rendering my window and my session has no clients at all —
+    /// detached, or overnight.
     Detached,
-    /// The pane inventory cannot answer: degraded, no resolvable own pane, or
-    /// a failed enumeration. **Counts as watched.** The gate closes only on
-    /// positive evidence that nobody is looking; a guess must never be able to
-    /// stop the sidebar updating.
+    /// The pane inventory cannot answer: degraded, a failed enumeration, or no
+    /// resolvable own pane. **Counts as watched.** The gate closes only on
+    /// positive evidence that nobody is looking; a guess, or a stale row from
+    /// the last good listing, must never be able to stop the sidebar updating.
     Unknown,
 }
 
@@ -383,6 +389,16 @@ pub struct App {
     /// goes hollow so the frame tmux replays when you switch back says "this
     /// was paused" rather than pretending it is live. NOT an error state.
     pub quiesced: bool,
+    /// Did the LAST `list_panes_in_session` succeed?
+    ///
+    /// `refresh_panes` keeps the previous inventory when an enumeration fails,
+    /// because the pane map, `pane_of` and the open list are all better served
+    /// by a slightly stale answer than by no answer. The poll gate is the one
+    /// reader for which that is false: a stale row is not evidence about who
+    /// is looking NOW, and reading it as such is how a sidebar that was in a
+    /// background tab when the session got renamed stayed quiesced forever.
+    /// So the gate reads this flag first and answers `Unknown` — which polls.
+    pub panes_fresh: bool,
 
     pub should_quit: bool,
 
@@ -476,6 +492,9 @@ impl App {
             force_poll: true,
             was_watched: false,
             quiesced: false,
+            // Nothing has been enumerated yet, and in degraded mode nothing
+            // ever will be: both must read as "cannot answer", which polls.
+            panes_fresh: false,
 
             should_quit: false,
 
@@ -505,7 +524,7 @@ impl App {
         self.hidden_absent.clear();
     }
 
-    /// Called when `last_poll.elapsed() >= effective_interval()`.
+    /// Called when `last_poll.elapsed() >= tick_interval()`.
     /// Order is fixed:
     ///   1. now_ms = Utc::now().timestamp_millis()
     ///   2. panes = list_panes_in_session(tmux_session)   [skipped when degraded]
@@ -523,11 +542,12 @@ impl App {
     ///   7. pin_sidebar (unconditional, §1.3)
     ///   8. last_poll = Instant::now()
     ///
-    /// Steps 1-3 and 5-8 run EVERY tick, gate or no gate. They are local: two
-    /// tmux reads on a unix socket and the §1.3 pin. Only step 4 spawns
-    /// `claude`, and only step 4 is skipped — which is what keeps "the
-    /// operator switched back to this tab" a fact this process learns within
-    /// one `interval` rather than one backoff.
+    /// Steps 1-3 and 5-8 run EVERY tick, gate or no gate, and every
+    /// `tick_interval()` — which is `interval`, flat, with no backoff in it.
+    /// They are local: two tmux reads on a unix socket and the §1.3 pin. Only
+    /// step 4 spawns `claude`, and only step 4 is skipped or backed off —
+    /// which is what keeps "the operator switched back to this tab" a fact
+    /// this process learns within one `interval` rather than one backoff.
     pub fn tick(&mut self) {
         // 1
         self.now_ms = chrono::Utc::now().timestamp_millis();
@@ -600,9 +620,9 @@ impl App {
                 self.fail_streak = self.fail_streak.saturating_add(1);
                 self.poll_error = Some(model::truncate_end(&agents_msg(&e), POLL_ERR_MAX));
                 // A failed poll says nothing about whether the fleet is still.
-                // `effective_interval`'s failure backoff owns the cadence from
-                // here, and `agents_interval` takes the longer of the two, so
-                // clearing the ladder cannot make a failing CLI poll faster.
+                // `fail_interval` owns the cadence from here, and
+                // `agents_interval` takes the longer of the two, so clearing
+                // the ladder cannot make a failing CLI poll faster.
                 self.idle_streak = 0;
             }
         }
@@ -699,13 +719,27 @@ impl App {
         self.hidden_absent = absent;
     }
 
-    /// TICK interval in force: `interval`, or 10s once `fail_streak >= 3`.
+    /// The tick cadence: `interval`, flat.
     ///
-    /// Unchanged by the poll gate on purpose. This is the cadence of the local
-    /// work — the pane inventory, the visibility read, the §1.3 pin — and
-    /// slowing it would make the gate's own edge detector slow, which is
-    /// exactly the responsiveness the amendment promises not to spend.
-    pub fn effective_interval(&self) -> Duration {
+    /// Neither the poll gate nor the failure backoff may touch it, and the
+    /// backoff is the one that had to be taken OUT. The tick is the local
+    /// work — the pane inventory, the visibility read, the §1.3 pin — and it
+    /// is also the gate's own edge detector. `fail_streak` can only be cleared
+    /// by a successful poll, and a poll is exactly what a shut gate skips, so
+    /// a sidebar that quiesced while the CLI was failing used to keep a 10 s
+    /// tick forever: it then took up to a backoff, not up to an interval, to
+    /// notice the operator had come back, and the §1.3 pin and the pane
+    /// reconcile were slowed with it for a `claude` that was never retried.
+    /// The backoff belongs to the spawn, and now lives only in
+    /// `agents_interval`.
+    pub fn tick_interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// The failure half of the poll cadence: `interval`, or 10s once
+    /// `fail_streak >= 3` (SPEC §4.2). A failing `claude` is retried less
+    /// often; nothing else slows down with it.
+    pub fn fail_interval(&self) -> Duration {
         if self.fail_streak >= FAIL_BACKOFF_AT {
             BACKOFF
         } else {
@@ -716,23 +750,41 @@ impl App {
     /// Who can see this sidebar, read off THIS process's own pane row in the
     /// inventory `refresh_panes` already took. No tmux call of its own.
     ///
-    /// Every unknown answers `Unknown`, which polls: no own pane (degraded,
-    /// outside tmux, `$TMUX_PANE` unset or naming a pane of another session),
-    /// or an inventory that does not carry my pane because the enumeration
-    /// failed and `self.panes` is stale or empty.
+    /// Every unknown answers `Unknown`, which polls: an enumeration that
+    /// failed this tick (`panes_fresh` false, which also covers degraded mode
+    /// and the pre-first-tick state), no own pane (`$TMUX_PANE` unset or
+    /// naming a pane of another session), or a fresh inventory that does not
+    /// carry my pane.
+    ///
+    /// "On screen" is `#{window_active_clients}` when tmux answered it —
+    /// clients rendering THIS window, from whichever session — and only when
+    /// it did not does it fall back to the `window_active`/`session_attached`
+    /// pair. The pair alone reads a grouped session (`new-session -t ccmux`)
+    /// as detached while the operator is looking straight at the sidebar.
+    ///
+    /// When nothing is rendering the window, the two silent labels are
+    /// attributed by THIS session's own client count: they are diagnostic, and
+    /// the gate treats them identically.
     pub fn watchers(&self) -> Watchers {
+        if !self.panes_fresh {
+            return Watchers::Unknown;
+        }
         let Some(me) = self.own_pane.as_ref() else {
             return Watchers::Unknown;
         };
         let Some(row) = self.panes.iter().find(|p| &p.id == me) else {
             return Watchers::Unknown;
         };
-        if row.session_clients == 0 {
-            Watchers::Detached
-        } else if !row.window_active {
-            Watchers::OtherTab
-        } else {
+        let onscreen = match row.window_viewers {
+            Some(viewers) => viewers > 0,
+            None => row.session_clients > 0 && row.window_active,
+        };
+        if onscreen {
             Watchers::Onscreen
+        } else if row.session_clients == 0 {
+            Watchers::Detached
+        } else {
+            Watchers::OtherTab
         }
     }
 
@@ -772,8 +824,12 @@ impl App {
     /// The interval the `claude agents` spawn actually honours: the failure
     /// backoff and the idle ladder, whichever is longer. A failing CLI and a
     /// still fleet must not be able to talk each other into polling faster.
+    ///
+    /// This is where the failure backoff applies, and the only place. A forced
+    /// poll still outranks it (`poll_due`), so returning to a quiesced tab
+    /// refreshes on the next tick even mid-backoff.
     pub fn agents_interval(&self) -> Duration {
-        self.effective_interval().max(self.idle_interval())
+        self.fail_interval().max(self.idle_interval())
     }
 
     /// Steps 4 and 4b of `tick`, with the decision in front of the spawn.
@@ -1716,7 +1772,7 @@ impl App {
         }
     }
 
-    /// `r` — SPEC §4.2: backdate `last_poll` so the NEXT loop iteration polls.
+    /// `r` — SPEC §4.2: backdate `last_poll` so the NEXT loop iteration ticks.
     /// Deliberately does not call `tick()` inline.
     ///
     /// `force_poll` is what carries it through the gate and the idle ladder.
@@ -1728,7 +1784,7 @@ impl App {
     pub fn act_force_refresh(&mut self) {
         self.force_poll = true;
         self.last_poll = Instant::now()
-            .checked_sub(self.effective_interval())
+            .checked_sub(self.tick_interval())
             .unwrap_or_else(Instant::now);
     }
 
@@ -1946,9 +2002,14 @@ impl App {
             return;
         }
         let Ok(live) = tmux::list_panes_in_session(&self.tmux_session) else {
+            // The previous inventory stays: every other reader wants the last
+            // good answer. The poll gate does not, and `panes_fresh` is how it
+            // is told the difference.
+            self.panes_fresh = false;
             return;
         };
         self.panes = live;
+        self.panes_fresh = true;
         if let Ok((tabs, width)) = tmux::list_tabs(&self.tmux_session) {
             self.tabs = tabs;
             self.width_opt = width;
@@ -3151,6 +3212,10 @@ mod tests {
             force_poll: false,
             was_watched: true,
             quiesced: false,
+            // The fixture's inventory is whatever the test puts in `panes`,
+            // and it counts as freshly enumerated. A test that wants a FAILED
+            // enumeration clears this, the way `refresh_panes` does.
+            panes_fresh: true,
             should_quit: false,
             // STRUCTURAL, not disciplinary: no hermetic test may ever spawn the
             // real `claude` (a dispatch here would start a real background
@@ -3480,9 +3545,10 @@ mod tests {
             window_id: WindowId::parse(&format!("@{window}")).expect("window id"),
             // Watched by default: the pane fixtures predate the poll gate and
             // exist to exercise layout, not visibility. The gate's own tests
-            // set these two explicitly.
+            // set these three explicitly.
             window_active: true,
             session_clients: 1,
+            window_viewers: Some(1),
         }
     }
 
@@ -5421,24 +5487,67 @@ mod tests {
     #[test]
     fn backoff_widens_the_interval_after_three_failures() {
         let mut a = app();
-        assert_eq!(a.effective_interval(), Duration::from_millis(2500));
+        assert_eq!(a.agents_interval(), Duration::from_millis(2500));
         a.fail_streak = 3;
-        assert_eq!(a.effective_interval(), Duration::from_secs(10));
+        assert_eq!(a.agents_interval(), Duration::from_secs(10));
         a.fail_streak = 0;
-        assert_eq!(a.effective_interval(), Duration::from_millis(2500));
+        assert_eq!(a.agents_interval(), Duration::from_millis(2500));
+    }
+
+    /// REGRESSION. The failure backoff belongs to the `claude agents` spawn
+    /// and to nothing else. It used to be the TICK interval, which is also the
+    /// poll gate's edge detector — and since only a successful poll clears
+    /// `fail_streak`, and a shut gate takes no poll, a sidebar that quiesced
+    /// while the CLI was failing kept a 10 s tick for as long as it stayed off
+    /// screen. Coming back then took up to a backoff to be noticed instead of
+    /// up to an interval, and the §1.3 width pin and the pane reconcile were
+    /// slowed with it.
+    #[test]
+    fn the_failure_backoff_never_slows_the_tick() {
+        let mut a = app();
+        a.fail_streak = 9;
+        assert_eq!(a.tick_interval(), Duration::from_millis(2500));
+        assert_eq!(a.agents_interval(), Duration::from_secs(10));
+
+        // And it cannot slow the wake-up either. Quiesce with the streak
+        // latched — no poll can clear it from here — then come back.
+        watched_by(&mut a, 1, false);
+        a.observe_watchers();
+        assert!(a.quiesced);
+        assert_eq!(a.tick_interval(), Duration::from_millis(2500), "the tick took the backoff");
+
+        watched_by(&mut a, 1, true);
+        a.last_agents = Instant::now();
+        assert!(
+            gated_tick(&mut a, || complete(four())),
+            "the backoff outranked the visibility edge"
+        );
+        assert_eq!(a.fail_streak, 0, "the forced poll did not clear the streak");
     }
 
     // ── the poll gate: nobody watching, nothing spawned (SPEC §4.2) ─────────
 
     /// Put the app in a tab whose visibility the test controls, exactly the
-    /// way `refresh_panes` would: an own pane that appears in the inventory,
-    /// carrying the two fields `PANE_FMT` now reads off it.
+    /// way `refresh_panes` would: an own pane that appears in a freshly
+    /// enumerated inventory, carrying the three fields `PANE_FMT` now reads
+    /// off it. The viewer count is the one tmux would report for this pair —
+    /// a client on my session, rendering my window.
     fn watched_by(a: &mut App, clients: u32, window_active: bool) {
+        let viewers = u32::from(clients > 0 && window_active);
+        watched_by_row(a, clients, window_active, Some(viewers));
+    }
+
+    /// The same, with the three fields set independently — for the states the
+    /// pair alone cannot express: a grouped session (`sattach=0 wact=1 wac=1`)
+    /// and a tmux too old to answer `#{window_active_clients}` (`None`).
+    fn watched_by_row(a: &mut App, clients: u32, window_active: bool, viewers: Option<u32>) {
         own(a, "%1", "@1");
         let mut me = pane("%1", 1, 1, 0, 34, true);
         me.session_clients = clients;
         me.window_active = window_active;
+        me.window_viewers = viewers;
         a.panes = vec![me];
+        a.panes_fresh = true;
     }
 
     /// A `fetch` that fails the test if the gate ever calls it. This is the
@@ -5513,6 +5622,88 @@ mod tests {
         assert!(gated_tick(&mut a, || complete(four())));
     }
 
+    /// REGRESSION. A failed enumeration must not be answered out of the LAST
+    /// good one. `refresh_panes` keeps `self.panes` on an error — every other
+    /// reader wants the last good answer — so a sidebar that was in a
+    /// background tab when `list-panes -t '=ccmux:'` began failing (the
+    /// session was renamed, say) kept reading its own stale `wact=0` row as
+    /// positive evidence that nobody was looking. The gate then never saw a
+    /// false->true edge, and the sidebar never polled again — while being the
+    /// on-screen, active pane of an attached session. Only `r` moved it, one
+    /// poll at a time.
+    #[test]
+    fn a_failed_enumeration_cannot_latch_the_gate_shut() {
+        let mut a = app();
+        // In a background tab, correctly silent.
+        watched_by(&mut a, 1, false);
+        a.observe_watchers();
+        assert_eq!(a.watchers(), Watchers::OtherTab);
+        age(&mut a, Duration::from_secs(60));
+        assert!(!gated_tick(&mut a, never_polls));
+
+        // Now every enumeration fails. The rows are the same rows, and they
+        // are now worth nothing as evidence about who is looking.
+        a.panes_fresh = false;
+        assert_eq!(
+            a.watchers(),
+            Watchers::Unknown,
+            "a stale row was read as positive evidence that nobody is watching"
+        );
+        assert!(a.poll_due(), "the gate stayed shut on a stale inventory");
+        assert!(gated_tick(&mut a, || complete(four())));
+        assert!(!a.quiesced, "an unanswerable inventory is not a quiesced sidebar");
+
+        // And it keeps polling, tick after tick, for as long as tmux cannot
+        // answer — not once, the way `r` did.
+        for _ in 0..5 {
+            age(&mut a, Duration::from_secs(60));
+            assert!(gated_tick(&mut a, || complete(four())), "the gate re-latched");
+        }
+    }
+
+    /// REGRESSION. `#{session_attached}` counts clients whose session is MINE.
+    /// A grouped session (`tmux new-session -t ccmux`) shares the window list,
+    /// so an operator watching the sidebar through the group leaves my own
+    /// session at zero attached clients while the sidebar is fully on screen.
+    /// Reading the pair alone quiesced it there, stably — no visibility edge
+    /// could ever fire, because nothing was changing.
+    #[test]
+    fn a_client_on_a_grouped_session_still_counts_as_watching() {
+        let mut a = app();
+        // The row tmux actually prints in that state, verified on 3.4:
+        // `%0 wact=1 sattach=0 wac=1`.
+        watched_by_row(&mut a, 0, true, Some(1));
+        a.observe_watchers();
+        assert_eq!(a.watchers(), Watchers::Onscreen, "a visible sidebar was called detached");
+        assert!(!a.quiesced);
+        for _ in 0..5 {
+            age(&mut a, Duration::from_millis(2500));
+            assert!(gated_tick(&mut a, || complete(four())), "a visible sidebar skipped a poll");
+        }
+
+        // The same client moves to another window of the group: my row keeps
+        // `wact=1` (it is still my session's current window) but nothing is
+        // rendering it any more, and the viewer count is what says so.
+        watched_by_row(&mut a, 0, true, Some(0));
+        age(&mut a, Duration::from_secs(60));
+        assert!(!gated_tick(&mut a, never_polls), "an unwatched window polled");
+        assert!(a.quiesced);
+    }
+
+    /// A tmux that does not know `#{window_active_clients}` answers with the
+    /// empty string, and the gate falls back to the pair — exactly the
+    /// behaviour that shipped before the field was added.
+    #[test]
+    fn without_a_viewer_count_the_gate_falls_back_to_the_pair() {
+        let mut a = app();
+        watched_by_row(&mut a, 1, true, None);
+        assert_eq!(a.watchers(), Watchers::Onscreen);
+        watched_by_row(&mut a, 1, false, None);
+        assert_eq!(a.watchers(), Watchers::OtherTab);
+        watched_by_row(&mut a, 0, true, None);
+        assert_eq!(a.watchers(), Watchers::Detached);
+    }
+
     /// Coming back to the tab must not mean waiting out whatever the ladder
     /// had grown to while nobody was looking.
     #[test]
@@ -5526,9 +5717,7 @@ mod tests {
         // nothing at all — the poll is owed by the TRANSITION.
         a.idle_streak = 99;
         a.last_agents = Instant::now();
-        if let Some(me) = a.panes.first_mut() {
-            me.window_active = true;
-        }
+        watched_by(&mut a, 1, true);
         assert!(
             gated_tick(&mut a, || complete(four())),
             "switching back to the tab did not refresh it"
@@ -5567,7 +5756,7 @@ mod tests {
         // And none of it looks like a failure.
         assert!(a.poll_error.is_none(), "a skipped poll set a poll error");
         assert_eq!(a.fail_streak, 0, "a skipped poll bumped the failure streak");
-        assert_eq!(a.effective_interval(), Duration::from_millis(2500));
+        assert_eq!(a.tick_interval(), Duration::from_millis(2500));
     }
 
     /// `r` is the operator saying "now", and it outranks both the gate and the

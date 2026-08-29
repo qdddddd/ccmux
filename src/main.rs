@@ -487,7 +487,7 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
             needs_draw = true;
         }
 
-        if app.last_poll.elapsed() >= app.effective_interval() {
+        if app.last_poll.elapsed() >= app.tick_interval() {
             let started = std::time::Instant::now();
             app.tick();
             needs_draw = true;
@@ -687,6 +687,7 @@ mod tests {
             window_id: tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
             window_active: true,
             session_clients: 1,
+            window_viewers: Some(1),
         }
     }
 

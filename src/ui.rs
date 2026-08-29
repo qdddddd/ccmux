@@ -1408,6 +1408,7 @@ mod tests {
             force_poll: false,
             was_watched: true,
             quiesced: false,
+            panes_fresh: true,
             should_quit: false,
             // Rendering never dispatches; a panic here is a rendering test
             // reaching into `agents`, which must be impossible.
@@ -1430,6 +1431,7 @@ mod tests {
             window_id: crate::tmux::WindowId::parse(&format!("@{window}")).expect("window id"),
             window_active: true,
             session_clients: 1,
+            window_viewers: Some(1),
         }
     }
 

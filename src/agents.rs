@@ -11,7 +11,8 @@
 //! event-loop thread* — "No threads, no channels, no async runtime" — and §10.3
 //! lists any background thread as an explicit non-goal. `poll()` is therefore a
 //! blocking call costing ~0.21s (PROBE-FINDINGS §1); `app.rs` calls it from
-//! `tick()` every `effective_interval()`. AMENDED: the call is still
+//! `tick()` every `agents_interval()`, and only when someone is watching
+//! (§4.2's poll gate). AMENDED: the call is still
 //! synchronous and thread-free, but it is now bounded by `POLL_TIMEOUT` — an
 //! unbounded one froze the entire sidebar, Ctrl-C included, whenever `claude`
 //! wedged.

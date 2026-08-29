@@ -324,18 +324,29 @@ that is known to have lost rows concludes nothing at all.
 The sidebar refreshes by running `claude agents --json --all` every 2.5 s. It
 does that **only while something is watching it**:
 
-- A sidebar in a tmux window that is not the one on screen polls nothing.
-  With three tabs, one polls and two are silent.
+- A sidebar in a tmux window that no client is rendering polls nothing. With
+  three tabs, one polls and two are silent.
 - A session with no attached client — you detached, or went home — polls
   nothing at all.
 - A listing that comes back identical four times running widens the gap, 5 s
   to 10 s to 20 s to 30 s, for as long as nothing moves.
 
-Both are answered by the same `tmux list-panes` the sidebar already runs each
-tick, so the check costs nothing, and neither can make it slow when it matters:
-switching back to the tab refreshes it on that tick, any keypress puts it back
-on 2.5 s, and `r` always polls right now. Nothing runs in a background thread —
-a paused sidebar is paused, not queued.
+"Watching" is counted per WINDOW, not per session, so a second client attached
+through a grouped session (`tmux new-session -t ccmux`) keeps the window it is
+displaying on the fast path even though the original session shows no clients
+of its own.
+
+All of it is answered by the same `tmux list-panes` the sidebar already runs
+each tick, so the check costs nothing, and none of it can make the sidebar slow
+when it matters: switching back to the tab refreshes it on that tick, any
+keypress puts it back on 2.5 s, and `r` always polls right now. The tick itself
+never slows down — not for the gate and not for a failing `claude` — because it
+is what notices you coming back. Nothing runs in a background thread; a paused
+sidebar is paused, not queued.
+
+If tmux cannot say who is watching — the sidebar is outside tmux, or a
+`list-panes` failed this tick — it polls. The gate closes on evidence, never on
+a guess.
 
 While polling is paused the header dot goes hollow (`○` dim) instead of solid,
 so the frame tmux replays when you switch back tells you the list is a moment
