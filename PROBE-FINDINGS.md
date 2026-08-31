@@ -20,10 +20,12 @@ Element shape (keys union across all observed rows):
   "startedAt": 1787626475282,     // epoch ms
   "sessionId": "1c45d64f-9bba-4038-8de7-d5f112c92360",  // UUID, stable
   "name": "bt/reg-update",        // live-updating; Claude renames sessions as work evolves
-  "status": "busy",               // "busy" | "idle" | "waiting"
-  "waitingFor": "input needed",   // ONLY on status=="waiting". Free text;
-                                  // observed "permission prompt" and
-                                  // "input needed" (verified 2026-08-31).
+  "status": "busy",               // "busy" | "idle" | "waiting". OPTIONAL:
+                                  // the key is absent on some rows.
+  "waitingFor": "input needed",   // OPTIONAL, and only seen alongside
+                                  // status=="waiting". Free text; observed
+                                  // "permission prompt" and "input needed"
+                                  // (verified 2026-08-31).
   "state": "working"              // "working" | "done" | "stopped" | "blocked";
                                   // ABSENT for kind=="interactive".
                                   // "stopped" = halted by `claude stop`; the
@@ -32,32 +34,53 @@ Element shape (keys union across all observed rows):
                                   // an error state.
                                   // "blocked" = running, but stopped at a
                                   // permission prompt or a question and
-                                  // WAITING ON THE OPERATOR (verified). Always
-                                  // paired with status=="waiting". It is the
-                                  // most urgent row on the screen, not an
+                                  // WAITING ON THE OPERATOR (verified). It is
+                                  // the most urgent row on the screen, not an
                                   // error and not an unknown.
 }
 ```
 
-`status` is ABSENT on every `state: "done"` row (verified: 9 of 17 live rows,
-2026-08-31). An absent `status` is not an unrecognised one.
+**`state` and `status` are two INDEPENDENT axes. Do not infer either from the
+other.** It is tempting to read `blocked` and `waiting` as two spellings of one
+fact, and ccmux was briefly written as though they were. They are not. A census
+of the live fleet on 2026-08-31 (17 sessions, all `kind: "background"`):
+
+| `state` | `status` | rows |
+|---|---|---|
+| `done` | *(absent)* | 9 |
+| `done` | `idle` | 5 |
+| `blocked` | `waiting` | 1 |
+| `blocked` | `idle` | 1 |
+| `working` | `busy` | 1 |
+
+Two consequences, both of which ccmux has had to be corrected for:
+
+* **A `blocked` row need not carry `status: "waiting"`.** One of the two live
+  blocked rows (`629da7fc Kernel bugs investigation`) reported `status: "idle"`
+  and carried no `waitingFor` key at all. Anything that keys "needs a human" off
+  `status` alone will miss half of them.
+* **`status` is not absent on every `done` row.** 5 of the 14 `done` rows
+  carried `status: "idle"`. What is true is the weaker statement: `status` is
+  absent on *some* rows (9 of 17 here), and an absent `status` is not an
+  unrecognised one — it must not be reported as drift.
 
 **This key list has been INCOMPLETE twice.** The original §1 said
 `"working" | "done"`; `stopped` was added after it shipped unmodelled, and
-`blocked` after it shipped unmodelled a second time — on 2026-08-31 a live
-`claude agents --json --all` returned
-`state {done: 13, blocked: 2, working: 2}` and
-`status {absent: 9, idle: 4, waiting: 2, busy: 2}`, and both blocked sessions
-were rendering as a purple `?` under **Idle**. Treat the vocabulary here as
-what has been OBSERVED, never as what the CLI can emit. ccmux's guard against
-the third occurrence is `App::note_drift` (a one-shot named warning in the
-footer) plus `cargo test -- --ignored live_state_and_status`, which re-asks the
-running fleet this exact question.
+`blocked` after it shipped unmodelled a second time — both blocked sessions were
+rendering as a purple `?` under **Idle** when it was found. Treat the vocabulary
+here as what has been OBSERVED, never as what the CLI can emit. ccmux's guard
+against the third occurrence is `App::note_drift` (a named warning in the
+footer, repeated until it has actually been on screen uncovered) plus
+`cargo test -- --ignored live_state_and_status`, which re-asks the running fleet
+this exact question.
 
 Grouping used by the stock fleet view: **Working** (state=working), **Idle**,
 **Completed** (state=done). ccmux mirrors it with one deliberate addition:
-**Blocked** (state=blocked, or status=waiting) sorted ABOVE Working, because it
-is the only group that cannot make progress without a human.
+**Blocked** sorted ABOVE Working, because it is the only group that cannot make
+progress without a human. Its rule is `state == blocked`, OR `status ==
+waiting` at any state that is not already terminal — the second clause is
+forward-compat for a CLI that renames the state value again, and the terminal
+exclusion is why a `done` row carrying a stale status word is not hoisted.
 
 ## 2. Session verbs (hidden subcommands — NOT in `claude --help` Commands list)
 

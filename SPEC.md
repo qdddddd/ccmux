@@ -417,14 +417,27 @@ impl Session {
     /// Identity key. Always `&self.session_id`.
     pub fn key(&self) -> &str;
 
-    /// Grouping rule, mirroring the stock fleet view:
-    ///   Some(Blocked)                 -> Group::Blocked
-    ///   Some(Working)                 -> Group::Working
+    /// Grouping rule, mirroring the stock fleet view. Resolved top-down:
     ///   Some(Done) | Some(Stopped)    -> Group::Completed
-    ///   None | Some(Unknown(_))       -> Waiting => Blocked,
-    ///                                    Busy => Working, otherwise => Idle
+    ///   Some(Blocked)                 -> Group::Blocked
+    ///   status == Waiting             -> Group::Blocked
+    ///   Some(Working)                 -> Group::Working
+    ///   None | Some(Unknown(_))       -> Busy => Working, otherwise => Idle
     /// Interactive sessions have no `state`, so they fall through to the
     /// status rule and never land in Completed.
+    ///
+    /// TERMINAL STATES ARE MATCHED FIRST, both ways round. `Done`/`Stopped`
+    /// outrank `Waiting` because a finished session is waiting on nobody, and
+    /// `done` rows do carry a `status` of their own in the live payload. Below
+    /// them `Waiting` reaches Blocked from ANY state, not just an absent or
+    /// unmodelled one: the likeliest next CLI rename leaves a parked session
+    /// reading `state: "working", status: "waiting"`, and honouring `Waiting`
+    /// only under `None | Unknown` would file exactly that row under Working.
+    ///
+    /// THIS IS THE ONLY BLOCKED RULE. `ui::status_glyph` calls this function
+    /// rather than re-deriving the verdict from `state`/`status`; the two were
+    /// written separately once and disagreed on `working` + `waiting`, drawing
+    /// the `▲` that means "answer me" under the Working heading.
     pub fn group(&self) -> Group;
 
     /// True when `id.is_some()`. Gates `attach` / `stop` / `logs`.
@@ -1594,21 +1607,31 @@ result in `App::viewport`; `app.rs` reads that field and never recomputes it.
 
 ### 6.3 Group headers
 
-Rendered only for non-empty groups. Full line, `p.dim`, with the title in the
-group's accent colour:
+Rendered only for non-empty groups. The title starts on column 5 — the same
+column the session names start on, so it reads as a column heading — and the
+count's last cell sits on the rail at column W-1. At W=34:
 
 ```
-── Blocked (2) ──────────────
-── Working (3) ──────────────
-── Idle (1) ─────────────────
-── Completed (2) ────────────
+ ── Blocked                     2
+ ── Working                     3
+ ── Idle                        1
+ ── Completed                  12
 ```
 
-Accent: Blocked `p.yellow`, Working `p.orange`, Idle `p.blue`,
-Completed `p.gray`. **Blocked is FIRST**, above Working: it is the only group
-that cannot advance without a human, so it is the first thing on screen.
-At `W < 20` drop the rule characters and render `Working (3)` alone.
-Header rows are never selectable; `j`/`k` skip over them.
+There is no full-width `────────` rule and there are no parentheses: `Row::Spacer`
+already separates one group from the next, and the count is a bare number at
+every width so `Completed 12` fits where `Completed (12)` did not. The accent
+survives as the two-cell `──` chip in columns 2..3 — Blocked `p.yellow`, Working
+`p.orange`, Idle `p.blue`, Completed `p.gray` — while the title itself is
+`p.gray` BOLD and the count is `p.dim`. Painting the title in the accent put the
+Working header at 3.41:1 on the default ground, under the 4.0 floor.
+
+**Blocked is FIRST**, above Working: it is the only group that cannot advance
+without a human, so it is the first thing on screen.
+
+At `W < 20` the chip and the padding are dropped and the line is the accent-
+coloured `Blocked 2` alone, truncated to W. Header rows are never selectable;
+`j`/`k` skip over them.
 
 ### 6.4 Session rows — one line each
 
@@ -1638,17 +1661,27 @@ Resolved top-down; every row is one display column wide.
 |---|---|---|---|
 | `state=done` | `✓` | `p.green` | finished on its own |
 | `state=stopped` | `■` | `p.gray` | halted by `claude stop`, resumable |
-| `state=blocked` or `status=waiting` | `▲` | `p.yellow` | **waiting on YOU** |
+| `group() == Blocked` | `▲` | `p.yellow` | **waiting on YOU** |
 | `Status::Unknown` / `State::Unknown` | `?` | `p.purple` | forward-compat |
 | Working + Busy | `●` | `p.orange` | actively generating |
 | Working + Idle | `◐` | `p.blue` | live, waiting on input |
 | Idle group | `○` | `p.gray` | idle |
 | Completed | `✓` | `p.green` | done |
 
+The `▲` row DEFERS TO `Session::group` (§3.1) and does not restate its
+condition. It restated it once — as `state=blocked or status=waiting`, while
+§3.1 honoured `waiting` only under an absent or unmodelled `state` — and the
+spec then contradicted itself on `state: "working", status: "waiting"`, which is
+exactly what the code did too: the yellow "answer me" mark under the **Working**
+heading, out of `Tab`'s reach. One rule, in one place.
+`the_blocked_glyph_and_the_blocked_group_never_disagree` sweeps the whole
+state x status matrix asserting `▲` appears iff the row is in `Group::Blocked`.
+
 `done`, `stopped` and `blocked` resolve BEFORE the `?` fallback. Each was
 `Unknown` once and each time presented the same way — a purple `?` filed under
 Idle. An unrecognised value keeps `?` and keeps its group; what makes it loud is
-`App::note_drift`, which names it in the footer once per run.
+`App::note_drift`, which names it in the footer — and keeps naming it until the
+warning has actually been on screen with nothing covering it.
 
 **Pane badge** — the tmux `#{pane_index}` of the pane showing this session,
 right-aligned immediately left of the age, in `p.aqua`, formatted `%N` (e.g.
@@ -2427,9 +2460,14 @@ the CLI omits `id`, so a **listed** row can reach it.
 - `parse_sessions("{}")` → `ParseError::NotAnArray`; `parse_sessions("oops")` →
   `ParseError::Json`.
 - `group()`: `state=working, status=idle` → `Working` (state wins over status);
-  `state=done` → `Completed`; `state=blocked` → `Blocked`, and `Blocked` sorts
-  above `Working`; `status=waiting` alone → `Blocked`; interactive+busy →
-  `Working`; interactive+idle → `Idle`.
+  `state=done` → `Completed`; `state=blocked` → `Blocked` whatever the status
+  says, including `status=idle` (a live blocked row does not have to carry
+  `waiting`), and `Blocked` sorts above `Working`; `status=waiting` → `Blocked`
+  at every non-terminal state, `working` included; `state=done`/`stopped` with
+  `status=waiting` → `Completed` (terminal outranks the status axis);
+  interactive+busy → `Working`; interactive+idle → `Idle`.
+- glyph/group agreement: `status_glyph` returns `▲` for a session if and only if
+  `group()` returns `Blocked`, swept over the whole state x status matrix.
 - `build_rows` emits no header for an empty group; sorts newest-first; a filter
   matching nothing yields an empty `Vec`.
 - `format_age`: `0 → "0s"`, `59_000 → "59s"`, `120_000 → "2m"`,

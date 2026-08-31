@@ -525,11 +525,12 @@ fn group_header_line(g: Group, count: usize, w: usize, p: &Palette) -> Line<'sta
 /// §6.4's status glyph table.
 /// SPEC §6.4's glyph table, resolved top-down.
 ///
-/// SPEC NOTE: `Completed` is matched BEFORE the `Status::Unknown` /
-/// `State::Unknown` fallback. `claude agents --json` omits `status` on every
-/// `state: "done"` row (verified against the live payload: 10 of 10), so
+/// SPEC NOTE: `Done` and `Stopped` are matched BEFORE the `Status::Unknown` /
+/// `State::Unknown` fallback. `claude agents --json` omits `status` on most
+/// `state: "done"` rows (9 of 14 done rows on 2026-08-31; the other 5 carried
+/// `status: "idle"`), and an absent key parses to `Status::Unknown("")`, so
 /// checking unknown first would make the table's `Completed → ✓` row
-/// unreachable for every real completed session and paint the whole group
+/// unreachable for the majority of real completed sessions and paint them
 /// purple `?`. `state: "done"` is definitive knowledge, not forward-compat
 /// territory; the `?` fallback keeps its job for a status or state value the
 /// CLI invents that this build does not recognize.
@@ -546,25 +547,32 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     if matches!(sess.state, Some(State::Stopped)) {
         return ("■", p.gray);
     }
-    // BEFORE the unknown fallback, and on EITHER signal. A row whose `state`
-    // this build cannot name but whose `status` says `waiting` is still a row
-    // waiting on a human; painting it purple `?` is the exact mistake this
-    // whole change exists to undo, one axis over.
-    if matches!(sess.state, Some(State::Blocked)) || sess.status == Status::Waiting {
-        return ("▲", p.yellow);
-    }
     let unknown_status = matches!(sess.status, Status::Unknown(_));
     let unknown_state = matches!(sess.state, Some(State::Unknown(_)));
-    if unknown_status || unknown_state {
-        return ("?", p.purple);
-    }
+    // ONE match, in precedence order, and the blocked verdict is ASKED OF
+    // `group()` rather than re-derived from `state`/`status` here.
+    //
+    // It was re-derived once, and the two rules promptly disagreed: this arm
+    // read `state == Blocked || status == Waiting` while `Session::group` only
+    // honoured `Waiting` under an absent or unmodelled `state`, so a
+    // `state: "working", status: "waiting"` row drew the yellow `▲` that means
+    // "answer me" while sitting under the **Working** heading, out of `Tab`'s
+    // reach. A mark and a heading that contradict each other are worse than
+    // either alone. There is now one rule, in `group()`, and this reads it.
     match sess.group() {
+        // Before the `?` fallback, deliberately: a row this build cannot fully
+        // name but that `group()` has placed in Blocked is still a row waiting
+        // on a human, and purple `?` is not what that should look like.
         Group::Blocked => ("▲", p.yellow),
+        _ if unknown_status || unknown_state => ("?", p.purple),
         Group::Working => match sess.status {
             Status::Busy => ("●", p.orange),
             _ => ("◐", p.blue),
         },
         Group::Idle => ("○", p.gray),
+        // Unreachable in practice — `group()` returns Completed only for
+        // `Done`/`Stopped`, and both returned above — but kept as a real arm
+        // rather than an `unreachable!`, because `draw` must never panic.
         Group::Completed => ("✓", p.green),
     }
 }
@@ -771,8 +779,9 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         Kind::Background => "background",
         Kind::Interactive => "interactive",
     };
-    // `state: "done"` rows carry no `status` key (verified: 10 of 12 live
-    // completed sessions), so the group is resolved FIRST here for the same
+    // Most `state: "done"` rows carry no `status` key (9 of 14 done rows on
+    // 2026-08-31; the rest said `idle`), and an absent key parses to
+    // `Status::Unknown("")`, so the state is resolved FIRST here for the same
     // reason `status_glyph` resolves it first — otherwise the list says
     // "Completed" while the detail block says "?".
     let status = if matches!(sess.state, Some(State::Done)) {
@@ -1427,6 +1436,8 @@ mod tests {
             poll_error: None,
             fail_streak: 0,
             drift_seen: std::collections::BTreeSet::new(),
+            drift_pending: std::collections::BTreeSet::new(),
+            drift_flash: None,
             last_poll: Instant::now(),
             last_agents: Instant::now(),
             idle_streak: 0,
@@ -1473,14 +1484,26 @@ mod tests {
         }
     }
 
+    /// The fixture behind every `draw_never_panics_*` sweep.
+    ///
+    /// The cycle is 7 long, not 4, and the last three rungs are why: it used to
+    /// emit only Working/Busy, Working/Idle, Done and an unknown status, so no
+    /// panic sweep ever rendered a `Group::Blocked` header, a `▲`, a `■`, or a
+    /// `Status::Waiting` row at any of the hostile sizes. A guard test that
+    /// cannot reach the newest code is not guarding it. Every glyph
+    /// `status_glyph` can return is now reachable from here, and `many(40)` —
+    /// the widest sweep, over every size and every mode — hits all seven.
     fn many(n: usize) -> Vec<Session> {
         (0..n)
             .map(|i| {
-                let (status, state) = match i % 4 {
+                let (status, state) = match i % 7 {
                     0 => (Status::Busy, Some(State::Working)),
                     1 => (Status::Idle, Some(State::Working)),
                     2 => (Status::Idle, Some(State::Done)),
-                    _ => (Status::Unknown("weird".into()), None),
+                    3 => (Status::Unknown("weird".into()), None),
+                    4 => (Status::Waiting, Some(State::Blocked)),
+                    5 => (Status::Idle, Some(State::Stopped)),
+                    _ => (Status::Waiting, Some(State::Unknown("halted".into()))),
                 };
                 let mut s = sess(i, Kind::Background, status, state);
                 // Every fifth row has no short id. `parse_sessions` honours an
@@ -1582,7 +1605,7 @@ mod tests {
 
     #[test]
     fn draw_never_panics_in_degraded_and_error_states() {
-        let mut app = app_with(many(3));
+        let mut app = app_with(many(7));
         app.degraded = true;
         app.poll_error = Some("claude: command not found\nsecond line".into());
         app.message = Some(("stopped bt/reg-update".into(), MsgLevel::Info));
@@ -1596,7 +1619,7 @@ mod tests {
 
     #[test]
     fn draw_never_panics_with_out_of_range_selection_and_scroll() {
-        let mut app = app_with(many(5));
+        let mut app = app_with(many(7));
         app.selected = 9_999;
         app.scroll = 9_999;
         render(&app);
@@ -1607,7 +1630,7 @@ mod tests {
 
     #[test]
     fn draw_never_panics_on_filtered_and_unicode_content() {
-        let mut sessions = many(4);
+        let mut sessions = many(7);
         sessions[0].name = "日本語のセッション名前テキスト🙂🙂🙂".into();
         sessions[0].cwd = "/home/dev/プロジェクト/とても長いディレクトリ名".into();
         sessions[1].name = String::new();
@@ -2108,6 +2131,86 @@ mod tests {
         assert_eq!(display_width("▲"), 1);
     }
 
+    /// THE REGRESSION TEST for the two rules that drifted apart.
+    ///
+    /// `status_glyph` used to re-derive "is this blocked?" from `state` and
+    /// `status` instead of asking `group()`, and the two answers disagreed on
+    /// exactly one input: `state: "working", status: "waiting"` drew the yellow
+    /// `▲` — the mark that means "answer me" — under the **Working** heading,
+    /// where `Tab`'s Blocked stop cannot reach it and where it is not first on
+    /// screen. The mark said one thing and the sort said another.
+    ///
+    /// Exhaustive over every state x status pair this build can hold, both
+    /// palettes: the `▲` appears if and only if the row is in `Group::Blocked`.
+    /// Any future edit that gives either rule a clause the other lacks fails
+    /// here, naming the pair.
+    #[test]
+    fn the_blocked_glyph_and_the_blocked_group_never_disagree() {
+        let states = [
+            None,
+            Some(State::Working),
+            Some(State::Done),
+            Some(State::Stopped),
+            Some(State::Blocked),
+            Some(State::Unknown("halted".into())),
+        ];
+        let statuses = [
+            Status::Busy,
+            Status::Idle,
+            Status::Waiting,
+            Status::Unknown(String::new()),
+            Status::Unknown("pondering".into()),
+        ];
+        for p in [Palette::light(), Palette::dark()] {
+            for state in &states {
+                for status in &statuses {
+                    let mut s = sess(1, Kind::Background, status.clone(), state.clone());
+                    s.name = "n".into();
+                    let (glyph, colour) = status_glyph(&s, &p);
+                    let blocked = s.group() == Group::Blocked;
+                    assert_eq!(
+                        glyph == "▲",
+                        blocked,
+                        "state={state:?} status={status:?}: glyph {glyph:?} vs group {:?}",
+                        s.group()
+                    );
+                    if blocked {
+                        assert_eq!(colour, p.yellow, "state={state:?} status={status:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The specific pair that was wrong, stated on its own so a failure names
+    /// the scenario and not just a matrix cell: the likeliest way the CLI
+    /// breaks this build a third time is to stop emitting `state: "blocked"`
+    /// and leave a parked session reading `working` + `waiting`. That row must
+    /// reach the TOP of the list, not merely draw a yellow mark in the middle
+    /// of it.
+    #[test]
+    fn a_working_row_that_is_waiting_on_a_human_is_still_hoisted() {
+        let p = Palette::dark();
+        let renamed = sess(1, Kind::Background, Status::Waiting, Some(State::Working));
+        assert_eq!(renamed.group(), Group::Blocked, "a waiting row stayed under Working");
+        assert_eq!(status_glyph(&renamed, &p), ("▲", p.yellow));
+
+        // And it really is first on screen, above a genuinely working row.
+        let mut working = sess(2, Kind::Background, Status::Busy, Some(State::Working));
+        working.started_at = 9_999_999;
+        let app = app_with(vec![working, renamed]);
+        assert_eq!(app.rows[0], Row::Header { group: Group::Blocked, count: 1 });
+        assert!(matches!(app.rows[1], Row::Session { idx: 1 }));
+
+        // A FINISHED session is waiting on nobody, whatever `status` says, and
+        // 5 of 14 live `done` rows do carry a status word. Terminal wins.
+        for st in [State::Done, State::Stopped] {
+            let fin = sess(3, Kind::Background, Status::Waiting, Some(st.clone()));
+            assert_eq!(fin.group(), Group::Completed, "{st:?} + waiting was hoisted");
+            assert_ne!(status_glyph(&fin, &p).0, "▲", "{st:?} + waiting drew the blocked mark");
+        }
+    }
+
     /// The row that most deserves attention is the first one on screen, its
     /// header is the first header, and at the default 34 columns the grid it
     /// sits on is byte-for-byte the grid every other row sits on.
@@ -2278,7 +2381,10 @@ mod tests {
     /// that line is exactly W display columns — otherwise the selection band
     /// has a hole in it and the rail stops being a rail. Swept over hostile
     /// names (empty, CJK, 80 columns), hostile ages (`0s` .. `9999d`), pane
-    /// pane indices that clamp the badge to `+` (12, 999) and both palettes.
+    /// indices that clamp the badge to `+` (12, 999) and both palettes.
+    ///
+    /// The row this sweeps is Working/Busy throughout; every OTHER glyph is
+    /// swept by `every_glyph_holds_the_grid_at_every_width` below.
     #[test]
     fn every_session_line_is_exactly_the_sidebar_width() {
         let long = "x".repeat(80);
@@ -2331,6 +2437,103 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The same invariant, swept across EVERY row of the glyph table instead of
+    /// across hostile names.
+    ///
+    /// `every_session_line_is_exactly_the_sidebar_width` drives a single
+    /// Working/Busy session, so `●` was the only mark it ever measured: `✓`,
+    /// `■`, `○`, `?` and the new `▲` were pinned at exactly one width — 34 — in
+    /// one bespoke test each. Every glyph is one display column, so the grid
+    /// cannot break today; this is here so that a two-column mark slipped into
+    /// the table later fails a width sweep rather than shipping a torn
+    /// selection band. Split out from the sweep above rather than multiplied
+    /// into it, because the name and age dimensions do not interact with the
+    /// gutter and the cross-product costs seconds.
+    #[test]
+    fn every_glyph_holds_the_grid_at_every_width() {
+        let variants: &[(Status, Option<State>)] = &[
+            (Status::Busy, Some(State::Working)),                        // ●
+            (Status::Idle, Some(State::Working)),                        // ◐
+            (Status::Idle, None),                                        // ○
+            (Status::Unknown(String::new()), Some(State::Done)),         // ✓
+            (Status::Idle, Some(State::Stopped)),                        // ■
+            (Status::Waiting, Some(State::Blocked)),                     // ▲
+            (Status::Idle, Some(State::Blocked)),                        // ▲, state only
+            (Status::Waiting, Some(State::Working)),                     // ▲, status only
+            (Status::Waiting, Some(State::Unknown("halted".into()))),    // ▲, renamed state
+            (Status::Unknown("pondering".into()), None),                 // ?
+        ];
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        for (status, state) in variants {
+            app.sessions[0].status = status.clone();
+            app.sessions[0].state = state.clone();
+            // The mark itself must be one cell, or the grid arithmetic is a lie.
+            let (glyph, _) = status_glyph(&app.sessions[0], &Palette::dark());
+            assert_eq!(display_width(glyph), 1, "{glyph:?} is not one display column");
+            for name in ["", "alpha/opt", "回归模型数据清洗与因子测试流水线重构任务"] {
+                app.sessions[0].name = name.to_string();
+                for selected in [false, true] {
+                    for w in 0..=120usize {
+                        for pal in [Palette::light(), Palette::dark()] {
+                            let l = session_line(&app, &app.sessions[0], selected, w, &pal);
+                            assert_eq!(
+                                line_w(&l),
+                                w,
+                                "w={w} sel={selected} name={name:?} \
+                                 status={status:?} state={state:?} glyph={glyph:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// SPEC §6.3 prints a sample of the group headers at W=34. It went stale —
+    /// it showed a full-width `── Blocked (2) ─────` rule that
+    /// `group_header_line` stopped drawing, with parentheses it stopped
+    /// emitting — and nothing caught it, because no test read the block. This
+    /// reads it: every fenced line in §6.3 must be a line the renderer actually
+    /// produces. A doc that disagrees with the code is worse than no doc, and
+    /// §6.3 is where the next implementer looks before touching the header.
+    #[test]
+    fn the_spec_group_header_sample_is_what_the_renderer_draws() {
+        const SPEC: &str = include_str!("../SPEC.md");
+        let start = SPEC.find("### 6.3 Group headers").expect("SPEC §6.3 is gone");
+        let body = &SPEC[start..];
+        let open = start + body.find("```").expect("§6.3 has no sample block") + 3;
+        let close = open + SPEC[open..].find("```").expect("§6.3's sample block is unterminated");
+        let sample: Vec<&str> = SPEC[open..close].lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(sample.len(), 4, "§6.3 should sample all four groups: {sample:?}");
+
+        let p = Palette::dark();
+        let drawn: Vec<String> = [
+            (Group::Blocked, 2usize),
+            (Group::Working, 3),
+            (Group::Idle, 1),
+            (Group::Completed, 12),
+        ]
+        .iter()
+        .map(|&(g, c)| {
+            group_header_line(g, c, 34, &p)
+                .spans
+                .iter()
+                .flat_map(|sp| sp.content.chars())
+                .collect::<String>()
+        })
+        .collect();
+
+        for (want, got) in sample.iter().zip(&drawn) {
+            // Trailing spaces are the margin column; a Markdown block cannot be
+            // trusted to keep them, so compare the inked part.
+            assert_eq!(
+                want.trim_end(),
+                got.trim_end(),
+                "SPEC §6.3 shows {want:?} but the renderer draws {got:?}"
+            );
         }
     }
 
@@ -2927,3 +3130,4 @@ mod tests {
     }
 
 }
+

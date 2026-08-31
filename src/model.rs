@@ -18,10 +18,17 @@ pub enum Status {
     Busy,
     Idle,
     /// The session has stopped and is waiting for the OPERATOR — a permission
-    /// prompt or a question. Always paired with `State::Blocked` in every live
-    /// payload observed, and modelled separately for the same reason `Blocked`
-    /// is: if a future CLI drops `state` but keeps `status`, this alone still
-    /// carries the row to the top of the list.
+    /// prompt or a question, named by the row's `waitingFor` key.
+    ///
+    /// NOT interchangeable with `State::Blocked`, and it is a mistake to treat
+    /// the two as one fact wearing two hats. They are independent axes: of the
+    /// two blocked sessions in the live fleet on 2026-08-31, one reported
+    /// `status: "waiting"` and the other `status: "idle"` with no `waitingFor`
+    /// at all. So `Blocked` cannot be inferred from this, which is why
+    /// `Session::group` checks `State::Blocked` on its own — and this is
+    /// modelled separately anyway, because if a future CLI drops the `state`
+    /// value but keeps the `status` word, this alone still carries the row to
+    /// the top of the list.
     Waiting,
     /// Forward-compatibility: CLI versions churn; unknown strings are preserved.
     Unknown(String),
@@ -38,8 +45,14 @@ pub enum State {
     /// purple `?` under Idle — reading as broken when it is merely parked.
     Stopped,
     /// Running, but stopped at a permission prompt or a question and WAITING ON
-    /// THE OPERATOR. Paired with `Status::Waiting`, whose `waitingFor` key says
-    /// which (verified: `"permission prompt"`, `"input needed"`).
+    /// THE OPERATOR.
+    ///
+    /// It is THE signal — do not look to `status` to confirm it. A blocked row
+    /// often carries `Status::Waiting`, whose `waitingFor` key names what is
+    /// wanted (observed: `"permission prompt"`, `"input needed"`), but it need
+    /// not: on 2026-08-31 one of the two live blocked sessions reported
+    /// `status: "idle"` with no `waitingFor` at all. A rule that demanded both
+    /// would have surfaced exactly half of them.
     ///
     /// This is the SECOND time this exact failure has shipped — `Stopped` was
     /// the first, and the warning on it did not stop it happening again. Left
@@ -139,27 +152,47 @@ impl Session {
     }
 
     /// Grouping rule, mirroring the stock fleet view:
-    ///   Some(Blocked)                 -> Group::Blocked
-    ///   Some(Working)                 -> Group::Working
     ///   Some(Done) | Some(Stopped)    -> Group::Completed
-    ///   None | Some(Unknown(_))       -> Waiting => Blocked,
-    ///                                    Busy    => Working,
-    ///                                    else    => Idle
+    ///   Some(Blocked)                 -> Group::Blocked
+    ///   status == Waiting             -> Group::Blocked
+    ///   Some(Working)                 -> Group::Working
+    ///   None | Some(Unknown(_))       -> Busy => Working, else => Idle
     /// Interactive sessions have no `state`, so they fall through to the
     /// status rule and never land in Completed.
     ///
-    /// `Status::Waiting` reaches Blocked through the fallback arm as well as
-    /// through `State::Blocked`, deliberately: the two always agree in the live
-    /// payload, and belt-and-braces here means a CLI that renames the `state`
-    /// value again still cannot bury a session that is waiting on a human.
+    /// TERMINAL STATES ARE MATCHED FIRST, and that ordering is load-bearing in
+    /// both directions.
+    ///
+    /// `Done`/`Stopped` outrank `Status::Waiting` because a finished session is
+    /// waiting on nobody. This is not hypothetical tidiness: 5 of the 14 `done`
+    /// rows in the live fleet carry a `status` of their own (2026-08-31), so a
+    /// `done` row is perfectly capable of arriving with a stale status word
+    /// attached, and hoisting one to the top of the list would be a lie.
+    ///
+    /// Below them, `Status::Waiting` reaches Blocked from ANY remaining state,
+    /// not just an absent or unmodelled one. That is the belt to
+    /// `State::Blocked`'s braces, and the belt only works if it is fastened at
+    /// every state: the likeliest way the CLI breaks this build a third time is
+    /// to stop emitting `state: "blocked"` and leave a parked session reading
+    /// `state: "working", status: "waiting"`. Honouring `Waiting` only under
+    /// `None | Unknown` would file exactly that row under **Working** — visible,
+    /// but not first, and not what `Tab` lands on — which is the same burial
+    /// this whole change exists to undo, one field over.
+    ///
+    /// `ui::status_glyph` asks THIS function for the blocked verdict rather
+    /// than re-deriving it, so the mark on the row and the heading above it
+    /// cannot disagree. `the_blocked_glyph_and_the_blocked_group_never_disagree`
+    /// pins that across the whole state x status matrix.
     pub fn group(&self) -> Group {
         match &self.state {
-            Some(State::Blocked) => Group::Blocked,
-            Some(State::Working) => Group::Working,
-            // Stopped is finished-and-not-running, like Done.
+            // Terminal, and terminal wins. Stopped is finished-and-not-running,
+            // like Done.
             Some(State::Done) | Some(State::Stopped) => Group::Completed,
+            Some(State::Blocked) => Group::Blocked,
+            // Either axis, at every state that is still running.
+            _ if self.status == Status::Waiting => Group::Blocked,
+            Some(State::Working) => Group::Working,
             None | Some(State::Unknown(_)) => match self.status {
-                Status::Waiting => Group::Blocked,
                 Status::Busy => Group::Working,
                 _ => Group::Idle,
             },
@@ -812,14 +845,13 @@ mod tests {
           },
           {
             "pid": 4090765,
-            "id": "d224d495",
+            "id": "629da7fc",
             "cwd": "/home/dev/Documents/portfolios/tceef",
             "kind": "background",
             "startedAt": 1788158184428,
-            "sessionId": "d224d495-034a-4e40-a3b2-f642cfb49cdf",
-            "name": "client statement automation",
-            "status": "waiting",
-            "waitingFor": "input needed",
+            "sessionId": "629da7fc-034a-4e40-a3b2-f642cfb49cdf",
+            "name": "Kernel bugs investigation",
+            "status": "idle",
             "state": "blocked"
           }
         ]"#;
@@ -828,9 +860,20 @@ mod tests {
         assert_eq!(p.sessions.len(), 2);
         for sess in &p.sessions {
             assert_eq!(sess.state, Some(State::Blocked), "`blocked` must not be Unknown");
-            assert_eq!(sess.status, Status::Waiting, "`waiting` must not be Unknown");
             assert_eq!(sess.group(), Group::Blocked);
         }
+        // THE SECOND ROW IS THE POINT. `blocked` was documented as "always
+        // paired with status==waiting" and it is not: this row is the live
+        // counter-example, `status: "idle"` with no `waitingFor` key at all.
+        // Anything that keys "needs a human" off the status axis alone finds
+        // one of these two sessions and buries the other under Idle.
+        assert_eq!(p.sessions[0].status, Status::Waiting);
+        assert_eq!(p.sessions[1].status, Status::Idle);
+        assert_eq!(
+            p.sessions[1].group(),
+            Group::Blocked,
+            "a blocked row without `waiting` must still be Blocked"
+        );
     }
 
     /// The two words, on their own, against the two enums.

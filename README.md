@@ -197,11 +197,15 @@ it, so it is the first thing on screen.
 | `5` aqua | Open in **tab 5** (column 2). Blank means open in the tab you are looking at; `+` means a tab number of ten or more |
 
 When `claude agents` reports a `state` or `status` this build has no variant for,
-the row still renders (`?` purple) and still groups — and the footer says so
-once, by name: `unmodelled state "…" — update ccmux`. Two such values, `stopped`
-and `blocked`, shipped unnoticed before that warning existed.
-`cargo test -- --ignored live_state_and_status` asks the running fleet the same
-question, and is worth running after a `claude` upgrade.
+the row still renders (`?` purple) and still groups — and the footer says so by
+name: `unmodelled state "…" — update ccmux`. Two such values, `stopped` and
+`blocked`, shipped unnoticed before that warning existed.
+
+Each value is announced once, but "once" means once it has actually been on
+screen: if a keypress message overwrites the warning, or the help overlay is
+covering the footer when it lands, it comes back on a later poll rather than
+being spent unread. `cargo test -- --ignored live_state_and_status` asks the
+running fleet the same question, and is worth running after a `claude` upgrade.
 
 ### Tabs
 

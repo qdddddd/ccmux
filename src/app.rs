@@ -363,10 +363,17 @@ pub struct App {
     pub last_poll: Instant,
 
     /// THE DRIFT GUARD (see `note_drift`). Every unmodelled `state=`/`status=`
-    /// value already announced this run, so the warning fires once per new
-    /// value and never nags. Bounded by the CLI's vocabulary, which is a
-    /// handful of words.
+    /// value whose warning has been DELIVERED — it held an uncovered footer
+    /// for its full window. These never warn again. Bounded by the CLI's
+    /// vocabulary, which is a handful of words.
     pub drift_seen: BTreeSet<String>,
+    /// Unmodelled values seen in a payload but not yet delivered. A value sits
+    /// here while an overlay covers the footer or another flash owns it, and is
+    /// re-posted on a later poll rather than being retired unread.
+    pub drift_pending: BTreeSet<String>,
+    /// The exact warning text `announce_drift` last put in the footer, kept so
+    /// the next poll can tell "it ran its course" from "something stomped it".
+    pub drift_flash: Option<String>,
 
     // ── poll gate (SPEC §4.2, amended) ──────────────────────────────────────
     //
@@ -479,6 +486,8 @@ impl App {
             poll_error: None,
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
+            drift_pending: BTreeSet::new(),
+            drift_flash: None,
             // Backdated so the event loop's first iteration polls immediately.
             // `checked_sub` because a bare `Instant - Duration` can panic when
             // the process starts within `interval` of the monotonic epoch.
@@ -613,6 +622,13 @@ impl App {
                 // payload lost rows to parse errors", which makes
                 // `reconcile_hidden` distrust the whole poll. An intentional
                 // exclusion is not a loss and must not suppress reconciliation.
+                // THE DRIFT GUARD reads the payload as the CLI sent it, BEFORE
+                // the interactive filter below. The other half of the guard —
+                // `agents::tests::live_state_and_status_values_are_all_modelled`
+                // — iterates `poll()`'s raw payload, and the two halves must
+                // scan the same population or the ignored test can fail over a
+                // row the running sidebar never had a word to say about.
+                self.note_drift(&payload.sessions);
                 self.sessions = payload
                     .sessions
                     .into_iter()
@@ -620,7 +636,6 @@ impl App {
                     .collect();
                 self.poll_error = None;
                 self.fail_streak = 0;
-                self.note_drift();
                 self.note_idle();
                 self.reconcile_hidden(complete);
             }
@@ -636,8 +651,9 @@ impl App {
         }
     }
 
-    /// THE DRIFT GUARD. Say out loud, once, that the CLI reported a `state` or
-    /// `status` this build does not model.
+    /// THE DRIFT GUARD. Say out loud that the CLI reported a `state` or
+    /// `status` this build does not model — and keep saying it until it has
+    /// actually been said somewhere a human could have read it.
     ///
     /// `state: "stopped"` shipped unmodelled, was fixed, and the fix carried a
     /// doc comment warning that it would happen again. It then happened again,
@@ -651,46 +667,108 @@ impl App {
     ///     the CLI being newer than this build, not the operator doing anything
     ///     wrong; the row still renders (`?`, purple) and still groups (Idle,
     ///     or Blocked when `status` says `waiting`).
-    ///   * It fires ONCE per distinct value per run — `drift_seen` is the
-    ///     dedup set. A warning on every poll is a warning nobody reads.
-    ///   * An ABSENT `status` key is not drift. `state: "done"` rows carry no
-    ///     `status` at all (verified: 9 of 17 live rows), which parses to
+    ///   * It fires ONCE per distinct value per run. A warning on every poll is
+    ///     a warning nobody reads.
+    ///   * An ABSENT `status` key is not drift. Most `state: "done"` rows carry
+    ///     no `status` at all (9 of 14 on 2026-08-31), which parses to
     ///     `Status::Unknown("")` — the empty string is the tell, and it is
     ///     skipped.
     ///
+    /// "ONCE" IS COUNTED IN DELIVERIES, NOT IN ATTEMPTS, and that distinction
+    /// is the whole difference between a guard and a gesture. The warning's
+    /// only channel is the single shared `message` slot on a 4s timer, which
+    /// any keypress flash overwrites and which `Mode::Help`, `Mode::Logs`, a
+    /// prompt and the filter line all cover completely. Retiring a value at
+    /// POST time therefore let one stray `d` — or having the help overlay open
+    /// when the poll landed — silence it for the rest of the process, putting
+    /// the row straight back to being a quiet purple `?` under Idle. So a value
+    /// moves from `drift_pending` to `drift_seen` only once `announce_drift`
+    /// has OBSERVED its warning run a full window in an uncovered footer with
+    /// nothing replacing it; anything else puts it back in the queue for the
+    /// next poll.
+    ///
     /// The second half of the guard is the `#[ignore]`d live test
-    /// `every_live_state_and_status_is_modelled`, which asks the real fleet the
-    /// same question ahead of an operator having to notice it on screen.
-    fn note_drift(&mut self) {
-        let mut fresh: Vec<String> = Vec::new();
-        for sess in &self.sessions {
-            let mut note = |label: String| {
-                if !self.drift_seen.contains(&label) && !fresh.contains(&label) {
-                    fresh.push(label);
-                }
-            };
+    /// `agents::tests::live_state_and_status_values_are_all_modelled`, which
+    /// asks the real fleet the same question ahead of an operator having to
+    /// notice it on screen. It reads `poll()`'s raw payload, which is why this
+    /// is handed the raw payload too.
+    fn note_drift(&mut self, raw: &[Session]) {
+        for sess in raw {
             if let model::Status::Unknown(v) = &sess.status
                 && !v.is_empty()
             {
-                note(format!("status {v:?}"));
+                let label = format!("status {v:?}");
+                if !self.drift_seen.contains(&label) {
+                    self.drift_pending.insert(label);
+                }
             }
             if let Some(model::State::Unknown(v)) = &sess.state {
-                note(format!("state {v:?}"));
+                let label = format!("state {v:?}");
+                if !self.drift_seen.contains(&label) {
+                    self.drift_pending.insert(label);
+                }
             }
         }
-        if fresh.is_empty() {
-            return;
+        self.announce_drift();
+    }
+
+    /// True while something owns or covers the footer, so a warning posted now
+    /// would not be read. `Help`, `Logs` and `Prompt` all render over the WHOLE
+    /// sidebar rect (§6.7), and `Filter` owns the footer line itself.
+    fn footer_is_covered(&self) -> bool {
+        !matches!(self.mode, Mode::Normal)
+    }
+
+    /// Event-loop hook, called next to `check_message_timeout` — returns true
+    /// when it just put a warning on screen and the caller should redraw.
+    ///
+    /// A poll is the WRONG and only-nearly-right moment to retry. Polls
+    /// legitimately quiesce: the visibility gate stops them dead when no client
+    /// is attached, and the idle ladder stretches them to 30s on a still fleet.
+    /// A warning stomped by a `d` at the top of the ladder would then wait half
+    /// a minute for its next chance, and one stomped after the last client
+    /// detached would wait for a client to come back. The moment the footer
+    /// actually frees up is a tick, not a poll, so the retry lives on the tick.
+    pub fn tick_drift(&mut self) -> bool {
+        let before = self.message.clone();
+        self.announce_drift();
+        self.message != before
+    }
+
+    /// Post the pending drift warning when the footer can actually carry it,
+    /// and retire values only once their warning has been seen through.
+    fn announce_drift(&mut self) {
+        // First settle the fate of the warning posted last time. Delivery is
+        // OBSERVED, never assumed.
+        if let Some(txt) = self.drift_flash.clone() {
+            let still_ours = matches!(&self.message, Some((m, _)) if *m == txt);
+            if still_ours && !self.footer_is_covered() {
+                // On screen and still counting down. Leave it be.
+                return;
+            }
+            self.drift_flash = None;
+            if self.message.is_none() && !self.footer_is_covered() {
+                // Gone, with nothing in its place and nothing over it: it ran
+                // its whole window where it could be read. That is as much as
+                // this can honestly check, and it is enough to stop nagging.
+                self.drift_seen.append(&mut self.drift_pending);
+            }
+            // Otherwise it was clobbered by another flash or hidden behind an
+            // overlay. `drift_pending` still holds the values; a later poll
+            // posts them again.
         }
-        for label in &fresh {
-            self.drift_seen.insert(label.clone());
+        if self.drift_pending.is_empty() || self.footer_is_covered() || self.message.is_some() {
+            return;
         }
         // Truncated to the sidebar's own budget by `draw_footer`; naming the
         // first value and counting the rest keeps the sentence readable at 34
         // columns, where the whole list of them would not fit.
-        let msg = match fresh.len() {
-            1 => format!("unmodelled {} — update ccmux", fresh[0]),
-            n => format!("unmodelled {} +{} more — update ccmux", fresh[0], n - 1),
+        let first = self.drift_pending.iter().next().cloned().unwrap_or_default();
+        let msg = match self.drift_pending.len() - 1 {
+            0 => format!("unmodelled {first} — update ccmux"),
+            n => format!("unmodelled {first} +{n} more — update ccmux"),
         };
+        self.drift_flash = Some(msg.clone());
         self.flash(msg, MsgLevel::Warn);
     }
 
@@ -3270,6 +3348,8 @@ mod tests {
             poll_error: None,
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
+            drift_pending: BTreeSet::new(),
+            drift_flash: None,
             last_poll: Instant::now(),
             last_agents: Instant::now(),
             idle_streak: 0,
@@ -5910,9 +5990,11 @@ mod tests {
         // Same ids, same count, same names, same order — only `state` and
         // `status` move, exactly as they do when a session hits a permission
         // prompt.
+        // NOTE the status stays `Busy`: a live blocked row need not carry
+        // `waiting` (one of the two in the fleet on 2026-08-31 said `idle`), so
+        // the fingerprint has to move on the `state` change alone.
         let mut blocked = four();
         blocked[0].state = Some(State::Blocked);
-        blocked[0].status = Status::Waiting;
         a.apply_poll(complete(blocked));
 
         assert_ne!(a.payload_fp, still, "a session becoming blocked hashed identical");
@@ -5920,7 +6002,7 @@ mod tests {
         assert_eq!(
             a.agents_interval(),
             Duration::from_millis(2500),
-            "the next poll is still 30s away"
+            "the ladder did not collapse to base — the next poll is still far away"
         );
         // And it is on screen, at the top.
         a.rebuild_rows();
@@ -5988,6 +6070,136 @@ mod tests {
         fleet[2].status = Status::Idle;
         a.apply_poll(complete(fleet));
         assert_eq!(a.message, None, "a modelled value was reported as drift");
+    }
+
+    /// THE REGRESSION TEST for a guard that could be switched off by accident.
+    ///
+    /// The warning's only channel is the one shared `message` slot, and a value
+    /// used to be marked "already announced" the instant it was POSTED there.
+    /// So any flash landing inside the 4s window — a `d`, a `u`, an `x`, a
+    /// failed verb, or `stop_and_arm`'s own "stopped …" in the very same tick —
+    /// retired it for the life of the process, and the unmodelled row went back
+    /// to being a silent purple `?` under Idle. A value is now retired only
+    /// once its warning has been SEEN THROUGH.
+    #[test]
+    fn a_drift_warning_stomped_before_it_could_be_read_comes_back() {
+        let mut a = app();
+        let mut odd = four();
+        odd[0].state = Some(State::Unknown("hibernating".into()));
+        a.apply_poll(complete(odd.clone()));
+        let (first, _) = a.message.clone().expect("no warning for an unmodelled state");
+        assert!(first.contains("hibernating"), "{first:?}");
+
+        // A keypress flash overwrites it well inside its window.
+        a.flash("hidden bt/reg-update — u to undo", MsgLevel::Info);
+        a.apply_poll(complete(odd.clone()));
+        assert!(
+            a.drift_seen.is_empty(),
+            "a warning nobody could have read was retired anyway"
+        );
+        assert!(!a.drift_pending.is_empty(), "the value was dropped from the queue");
+
+        // That message runs out; the warning must return on its own.
+        a.message = None;
+        a.apply_poll(complete(odd.clone()));
+        let (again, level) = a.message.clone().expect("the stomped warning never came back");
+        assert!(again.contains("hibernating"), "{again:?}");
+        assert_eq!(level, MsgLevel::Warn);
+
+        // And once it HAS run its window in an uncovered footer, it is done:
+        // this is a guard, not a nag.
+        a.message = None;
+        a.apply_poll(complete(odd.clone()));
+        assert_eq!(a.message, None, "the delivered warning warned again");
+        assert!(a.drift_seen.iter().any(|v| v.contains("hibernating")));
+        a.message = None;
+        a.apply_poll(complete(odd));
+        assert_eq!(a.message, None, "the delivered warning warned again");
+    }
+
+    /// The same hole, entered through the other door: `Mode::Help`, `Mode::Logs`
+    /// and the prompts render over the WHOLE sidebar rect and `Mode::Filter`
+    /// owns the footer line, so a warning posted while one of them is up is
+    /// written somewhere nobody can see. It must wait, not be spent.
+    #[test]
+    fn a_drift_warning_waits_for_an_overlay_to_come_down() {
+        for cover in [Mode::Help, Mode::Logs, Mode::Filter, Mode::Prompt(PromptKind::NewBackground)] {
+            let mut a = app();
+            a.mode = cover.clone();
+            let mut odd = four();
+            odd[0].state = Some(State::Unknown("hibernating".into()));
+            a.apply_poll(complete(odd.clone()));
+            assert_eq!(a.message, None, "{cover:?}: warned into a covered footer");
+            assert!(a.drift_seen.is_empty(), "{cover:?}: retired an unseen warning");
+            assert!(
+                a.drift_pending.iter().any(|v| v.contains("hibernating")),
+                "{cover:?}: the value was dropped instead of queued"
+            );
+
+            // Esc, and the next poll finally says it.
+            a.mode = Mode::Normal;
+            a.apply_poll(complete(odd));
+            let (msg, _) = a.message.clone().expect("the overlay swallowed the warning");
+            assert!(msg.contains("hibernating"), "{cover:?}: {msg:?}");
+        }
+    }
+
+    /// The retry rides the TICK, not the poll. Polls quiesce — the visibility
+    /// gate stops them when no client is attached and the idle ladder stretches
+    /// them to 30s on a still fleet — so a warning stomped at the top of the
+    /// ladder would otherwise wait half a minute, and one stomped after the
+    /// last client detached would wait for a client to come back. Reproduced
+    /// exactly that on `-L ccmux-blkfix`: with the payload frozen and no client
+    /// attached, no further poll ever arrived and the stomped warning never
+    /// returned until this hook existed.
+    #[test]
+    fn the_drift_retry_does_not_wait_for_the_next_poll() {
+        let mut a = app();
+        let mut odd = four();
+        odd[0].state = Some(State::Unknown("hibernating".into()));
+        a.apply_poll(complete(odd));
+        assert!(a.message.as_ref().unwrap().0.contains("hibernating"));
+
+        // A keypress flash takes the footer; then it expires. No poll happens
+        // at all from here on.
+        a.flash("hidden bt/reg-update — u to undo", MsgLevel::Info);
+        assert!(!a.tick_drift(), "posted over a message still on screen");
+        a.message = None;
+        a.msg_deadline = None;
+
+        assert!(a.tick_drift(), "the tick did not bring the warning back");
+        let (msg, level) = a.message.clone().expect("no warning after the tick");
+        assert!(msg.contains("hibernating"), "{msg:?}");
+        assert_eq!(level, MsgLevel::Warn);
+
+        // Delivered on a later tick, and then it stops for good.
+        a.message = None;
+        a.msg_deadline = None;
+        assert!(!a.tick_drift(), "the delivered warning posted again");
+        assert!(a.drift_seen.iter().any(|v| v.contains("hibernating")));
+        assert_eq!(a.message, None);
+    }
+
+    /// The two halves of the guard must scan the SAME population. `note_drift`
+    /// used to run after `apply_poll` had already dropped every interactive row,
+    /// while the `#[ignore]`d live test iterates `poll()`'s raw payload — so the
+    /// test could fail, naming a session, while the sidebar had nothing to say
+    /// and never listed that session in the first place.
+    #[test]
+    fn the_drift_guard_reads_rows_the_list_never_shows() {
+        let mut a = app();
+        let mut fleet = four();
+        let mut chat = inter("11111111-2222-3333-4444-555555555555", "desktop chat");
+        chat.status = Status::Unknown("pondering".into());
+        fleet.push(chat);
+
+        a.apply_poll(complete(fleet));
+        let (msg, _) = a.message.clone().expect("an interactive row's drift went unannounced");
+        assert!(msg.contains("pondering"), "{msg:?}");
+
+        // Announcing it must NOT list it: interactive sessions stay unlisted.
+        assert_eq!(a.sessions.len(), 4);
+        assert!(a.sessions.iter().all(|s| s.kind != Kind::Interactive));
     }
 
     /// The ladder must never outlive a human at the keyboard.

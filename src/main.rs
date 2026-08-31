@@ -479,6 +479,16 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
         if app.check_message_timeout() {
             needs_draw = true;
         }
+        // THE DRIFT GUARD's retry. `App::note_drift` posts an unmodelled
+        // `state`/`status` into the same one-line footer every flash uses, so a
+        // keypress message or a full-screen overlay can take it away before it
+        // has been read. This is the moment the footer frees up again — a tick,
+        // not a poll, because polls quiesce behind the visibility gate and
+        // stretch to 30s on a still fleet, and the warning must not wait on
+        // either.
+        if app.tick_drift() {
+            needs_draw = true;
+        }
         // §8.2: expires `Ctrl+X`'s delete window, and runs a delete that has
         // settled. It lives here rather than in the keypress so a held key's
         // repeat stream gets its chance to cancel one, and so the footer stops
