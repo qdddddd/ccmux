@@ -957,11 +957,11 @@ mod tests {
     fn build_rows_groups_headers_and_order() {
         let s = sample();
         let rows = build_rows(&s, "", true, &[]);
-        // Working: bt/reg-update + GNOME (both state=working)
+        // Working: bt/reg-update + Kernel bugs (both state=working)
         // Working also gets the interactive busy session.
         // Idle: none. Completed: prediction analysis.
         assert_eq!(rows[0], Row::Header { group: Group::Working, count: 3 });
-        // newest first: interactive (1787630000000), bt/reg-update, GNOME
+        // newest first: interactive (1787630000000), bt/reg-update, Kernel bugs
         let names: Vec<&str> = rows[1..4]
             .iter()
             .map(|r| match r {

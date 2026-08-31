@@ -178,8 +178,8 @@ Layout string: `274x76,0,0{103x76,0,0, 102x76,104,0, 67x76,207,0[67x37, 67x38]}`
 | SESSIONS | prediction analy... | bt/reg-update       |
 | (sidebar)|  live claude TUI    |  live claude TUI    |
 | Working  |                     |                     |
-|  run-a  |  * Thundering... 3m |  * Bunning... 16m   |
-|  gnome   |  >                  |  >                  |
+|  run-a   |  * Thundering... 3m |  * Bunning... 16m   |
+|  kernel  |  >                  |  >                  |
 | Idle     |                     |                     |
 |  alpha   |                     |                     |
 +----------+---------------------+---------------------+
