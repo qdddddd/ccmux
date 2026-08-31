@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agents::{self, AgentsError};
 use crate::model::{self, Group, ParseError, Row, Session};
@@ -362,6 +362,12 @@ pub struct App {
     pub fail_streak: u32,
     pub last_poll: Instant,
 
+    /// THE DRIFT GUARD (see `note_drift`). Every unmodelled `state=`/`status=`
+    /// value already announced this run, so the warning fires once per new
+    /// value and never nags. Bounded by the CLI's vocabulary, which is a
+    /// handful of words.
+    pub drift_seen: BTreeSet<String>,
+
     // ── poll gate (SPEC §4.2, amended) ──────────────────────────────────────
     //
     // `last_poll` above times the TICK, which stays on `interval` whatever the
@@ -472,6 +478,7 @@ impl App {
             msg_deadline: None,
             poll_error: None,
             fail_streak: 0,
+            drift_seen: BTreeSet::new(),
             // Backdated so the event loop's first iteration polls immediately.
             // `checked_sub` because a bare `Instant - Duration` can panic when
             // the process starts within `interval` of the monotonic epoch.
@@ -613,6 +620,7 @@ impl App {
                     .collect();
                 self.poll_error = None;
                 self.fail_streak = 0;
+                self.note_drift();
                 self.note_idle();
                 self.reconcile_hidden(complete);
             }
@@ -626,6 +634,64 @@ impl App {
                 self.idle_streak = 0;
             }
         }
+    }
+
+    /// THE DRIFT GUARD. Say out loud, once, that the CLI reported a `state` or
+    /// `status` this build does not model.
+    ///
+    /// `state: "stopped"` shipped unmodelled, was fixed, and the fix carried a
+    /// doc comment warning that it would happen again. It then happened again,
+    /// with `state: "blocked"` — two sessions genuinely waiting on the operator
+    /// sat under **Idle** behind a purple `?` for as long as the CLI had been
+    /// emitting the value. Nothing in ccmux said a word, because an unmodelled
+    /// value renders as a legal-looking row: `Unknown` is quiet by design.
+    ///
+    /// So the quiet is what this removes. The rules it deliberately keeps:
+    ///   * It NEVER panics and NEVER hides the row. An unrecognised value is
+    ///     the CLI being newer than this build, not the operator doing anything
+    ///     wrong; the row still renders (`?`, purple) and still groups (Idle,
+    ///     or Blocked when `status` says `waiting`).
+    ///   * It fires ONCE per distinct value per run — `drift_seen` is the
+    ///     dedup set. A warning on every poll is a warning nobody reads.
+    ///   * An ABSENT `status` key is not drift. `state: "done"` rows carry no
+    ///     `status` at all (verified: 9 of 17 live rows), which parses to
+    ///     `Status::Unknown("")` — the empty string is the tell, and it is
+    ///     skipped.
+    ///
+    /// The second half of the guard is the `#[ignore]`d live test
+    /// `every_live_state_and_status_is_modelled`, which asks the real fleet the
+    /// same question ahead of an operator having to notice it on screen.
+    fn note_drift(&mut self) {
+        let mut fresh: Vec<String> = Vec::new();
+        for sess in &self.sessions {
+            let mut note = |label: String| {
+                if !self.drift_seen.contains(&label) && !fresh.contains(&label) {
+                    fresh.push(label);
+                }
+            };
+            if let model::Status::Unknown(v) = &sess.status
+                && !v.is_empty()
+            {
+                note(format!("status {v:?}"));
+            }
+            if let Some(model::State::Unknown(v)) = &sess.state {
+                note(format!("state {v:?}"));
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        for label in &fresh {
+            self.drift_seen.insert(label.clone());
+        }
+        // Truncated to the sidebar's own budget by `draw_footer`; naming the
+        // first value and counting the rest keeps the sentence readable at 34
+        // columns, where the whole list of them would not fit.
+        let msg = match fresh.len() {
+            1 => format!("unmodelled {} — update ccmux", fresh[0]),
+            n => format!("unmodelled {} +{} more — update ccmux", fresh[0], n - 1),
+        };
+        self.flash(msg, MsgLevel::Warn);
     }
 
     /// Fold the payload just applied into the idle ladder.
@@ -3203,6 +3269,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             fail_streak: 0,
+            drift_seen: BTreeSet::new(),
             last_poll: Instant::now(),
             last_agents: Instant::now(),
             idle_streak: 0,
@@ -5821,6 +5888,106 @@ mod tests {
         a.apply_poll(complete(moved));
         assert_eq!(a.idle_streak, 0, "a state change did not collapse the ladder");
         assert_eq!(a.agents_interval(), base);
+    }
+
+    /// The idle ladder is what decides when the next poll happens, and it only
+    /// collapses when the payload fingerprint changes. A session becoming
+    /// BLOCKED must be such a change — otherwise, at the top of the ladder, the
+    /// one row that needs a human would not appear on screen for another 30
+    /// seconds, and only then because something else moved.
+    #[test]
+    fn a_session_becoming_blocked_changes_the_fingerprint() {
+        let mut a = app();
+        watched_by(&mut a, 1, true);
+
+        // Climb to the top rung on a still fleet.
+        for _ in 0..9 {
+            a.apply_poll(complete(four()));
+        }
+        assert_eq!(a.agents_interval(), Duration::from_secs(30), "the ladder never grew");
+        let still = a.payload_fp;
+
+        // Same ids, same count, same names, same order — only `state` and
+        // `status` move, exactly as they do when a session hits a permission
+        // prompt.
+        let mut blocked = four();
+        blocked[0].state = Some(State::Blocked);
+        blocked[0].status = Status::Waiting;
+        a.apply_poll(complete(blocked));
+
+        assert_ne!(a.payload_fp, still, "a session becoming blocked hashed identical");
+        assert_eq!(a.idle_streak, 0, "blocked did not collapse the ladder");
+        assert_eq!(
+            a.agents_interval(),
+            Duration::from_millis(2500),
+            "the next poll is still 30s away"
+        );
+        // And it is on screen, at the top.
+        a.rebuild_rows();
+        assert!(matches!(
+            a.rows.first(),
+            Some(Row::Header { group: Group::Blocked, count: 1 })
+        ));
+    }
+
+    /// THE DRIFT GUARD, runtime half. An unrecognised value is announced ONCE,
+    /// by name, without panicking and without hiding the row.
+    #[test]
+    fn an_unmodelled_state_or_status_says_so_once_and_keeps_the_row() {
+        let mut a = app();
+        let mut odd = four();
+        odd[0].state = Some(State::Unknown("hibernating".into()));
+        odd[0].status = Status::Idle;
+        a.apply_poll(complete(odd.clone()));
+
+        let (msg, level) = a.message.clone().expect("no warning for an unmodelled state");
+        assert!(msg.contains("hibernating"), "the warning does not name the value: {msg:?}");
+        assert!(msg.contains("unmodelled"), "{msg:?}");
+        assert_eq!(level, MsgLevel::Warn);
+        // The row is still there, and still grouped — never dropped, never fatal.
+        assert_eq!(a.sessions.len(), 4);
+        assert_eq!(a.sessions[0].group(), Group::Idle, "an unknown state is still filed under Idle");
+        a.rebuild_rows();
+        assert!(session_rows(&a).contains(&"bt/reg-update".to_string()));
+
+        // Once. A warning on every poll is a warning nobody reads.
+        a.message = None;
+        a.apply_poll(complete(odd));
+        assert_eq!(a.message, None, "the same value warned twice");
+
+        // A NEW value warns again.
+        let mut odder = four();
+        odder[1].status = Status::Unknown("pondering".into());
+        a.apply_poll(complete(odder));
+        let (msg, _) = a.message.clone().expect("a new value did not warn");
+        assert!(msg.contains("pondering"), "{msg:?}");
+    }
+
+    /// The one case that must NOT warn, and the reason the guard tests for an
+    /// empty string: every `state: "done"` row omits `status` entirely, which
+    /// parses to `Status::Unknown("")`. A guard that cried drift on those would
+    /// warn on most of a real fleet and be muted within a day.
+    #[test]
+    fn an_absent_status_key_is_not_drift() {
+        let mut a = app();
+        let mut fleet = four();
+        for s in &mut fleet {
+            s.state = Some(State::Done);
+            s.status = Status::Unknown(String::new());
+        }
+        a.apply_poll(complete(fleet));
+        assert_eq!(a.message, None, "an absent `status` key was reported as drift");
+        assert!(a.drift_seen.is_empty());
+
+        // Nor do the four values this build models.
+        let mut a = app();
+        let mut fleet = four();
+        fleet[0].state = Some(State::Blocked);
+        fleet[0].status = Status::Waiting;
+        fleet[1].state = Some(State::Stopped);
+        fleet[2].status = Status::Idle;
+        a.apply_poll(complete(fleet));
+        assert_eq!(a.message, None, "a modelled value was reported as drift");
     }
 
     /// The ladder must never outlive a human at the keyboard.

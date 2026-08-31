@@ -642,6 +642,56 @@ mod tests {
         );
     }
 
+    /// THE DRIFT GUARD, live half (see `App::note_drift` for the other).
+    ///
+    /// `state: "stopped"` and then `state: "blocked"` both shipped unmodelled,
+    /// and both times the CLI had been emitting the value for a while before
+    /// anyone noticed a purple `?` on a row. This asks the real fleet the
+    /// question directly: is there a `state` or `status` word out there that
+    /// this build cannot name? A failure here is not a bug in ccmux's logic —
+    /// it is ccmux being older than the CLI, and the fix is to add the variant.
+    ///
+    /// `#[ignore]`d, so it shells out ONLY when run by name, and READ-ONLY by
+    /// construction: `agents --json --all` and nothing else. It is worth
+    /// running after every `claude` upgrade.
+    ///
+    ///   cargo test -- --ignored live_state_and_status
+    ///
+    /// It can only see states the fleet happens to be in right now, which is
+    /// why it is the second half of the guard and not the whole of it: the
+    /// runtime warning catches what a snapshot misses.
+    #[test]
+    #[ignore]
+    fn live_state_and_status_values_are_all_modelled() {
+        use crate::model::{State, Status};
+        let payload = poll().expect("claude agents --json --all");
+        let mut unmodelled: Vec<String> = Vec::new();
+        for s in &payload.sessions {
+            if let Some(State::Unknown(v)) = &s.state {
+                unmodelled.push(format!("state {v:?} (session {})", s.session_id));
+            }
+            // An ABSENT `status` key parses to `Unknown("")` and is not drift:
+            // every `state: "done"` row omits it.
+            if let Status::Unknown(v) = &s.status
+                && !v.is_empty()
+            {
+                unmodelled.push(format!("status {v:?} (session {})", s.session_id));
+            }
+        }
+        eprintln!(
+            "live fleet: {} sessions, {} unmodelled value(s)",
+            payload.sessions.len(),
+            unmodelled.len()
+        );
+        assert!(
+            unmodelled.is_empty(),
+            "the CLI reports state/status values this build does not model — \
+             add the variant to `model::State`/`model::Status`, give it a group \
+             and a glyph, and do NOT leave it in `Unknown`:\n  {}",
+            unmodelled.join("\n  ")
+        );
+    }
+
     #[test]
     fn stop_delete_and_logs_refuse_an_empty_id_without_spawning() {
         // Fail-closed guard: never `claude stop ''`, never `claude rm ''`.

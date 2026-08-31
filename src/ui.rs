@@ -455,7 +455,10 @@ fn margin(w: usize) -> usize {
 /// top.
 fn name_tier(sess: &Session, p: &Palette) -> Color {
     match sess.group() {
-        Group::Working => p.fg,
+        // Blocked shares the top rung with Working. There is nothing above
+        // `p.fg` to promote it to, and it does not need one: it is already the
+        // first group on screen, under a yellow rule, behind a yellow `▲`.
+        Group::Blocked | Group::Working => p.fg,
         Group::Idle => p.gray,
         Group::Completed => p.dim,
     }
@@ -463,6 +466,11 @@ fn name_tier(sess: &Session, p: &Palette) -> Color {
 
 fn group_accent(g: Group, p: &Palette) -> Color {
     match g {
+        // Yellow is the one accent this list did not already spend, and it is
+        // the colour the header dot already uses for "look at this": 8.69:1 on
+        // the dark ground, 5.04:1 on the light one, both over the 4.0 floor on
+        // `sel_bg` too. Red was not an option — blocked is not a failure.
+        Group::Blocked => p.yellow,
         Group::Working => p.orange,
         Group::Idle => p.blue,
         Group::Completed => p.gray,
@@ -524,7 +532,13 @@ fn group_header_line(g: Group, count: usize, w: usize, p: &Palette) -> Line<'sta
 /// unreachable for every real completed session and paint the whole group
 /// purple `?`. `state: "done"` is definitive knowledge, not forward-compat
 /// territory; the `?` fallback keeps its job for a status or state value the
-/// CLI invents that this build does not recognize (e.g. `state: "stopped"`).
+/// CLI invents that this build does not recognize.
+///
+/// `done`, `stopped` and `blocked` are ALL resolved before that fallback for
+/// the same reason. Every one of them was `Unknown` once, and each time the
+/// symptom was identical: a purple `?` filed under Idle. `App::note_drift` is
+/// what now makes the next one announce itself instead of hiding in plain
+/// sight — see the note there.
 fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     if matches!(sess.state, Some(State::Done)) {
         return ("✓", p.green);
@@ -532,12 +546,20 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     if matches!(sess.state, Some(State::Stopped)) {
         return ("■", p.gray);
     }
+    // BEFORE the unknown fallback, and on EITHER signal. A row whose `state`
+    // this build cannot name but whose `status` says `waiting` is still a row
+    // waiting on a human; painting it purple `?` is the exact mistake this
+    // whole change exists to undo, one axis over.
+    if matches!(sess.state, Some(State::Blocked)) || sess.status == Status::Waiting {
+        return ("▲", p.yellow);
+    }
     let unknown_status = matches!(sess.status, Status::Unknown(_));
     let unknown_state = matches!(sess.state, Some(State::Unknown(_)));
     if unknown_status || unknown_state {
         return ("?", p.purple);
     }
     match sess.group() {
+        Group::Blocked => ("▲", p.yellow),
         Group::Working => match sess.status {
             Status::Busy => ("●", p.orange),
             _ => ("◐", p.blue),
@@ -757,10 +779,13 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         "done".to_string()
     } else if matches!(sess.state, Some(State::Stopped)) {
         "stopped".to_string()
+    } else if matches!(sess.state, Some(State::Blocked)) {
+        "blocked".to_string()
     } else {
         match &sess.status {
             Status::Busy => "busy".to_string(),
             Status::Idle => "idle".to_string(),
+            Status::Waiting => "waiting".to_string(),
             Status::Unknown(s) if s.is_empty() => "?".to_string(),
             Status::Unknown(s) => s.clone(),
         }
@@ -1401,6 +1426,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             fail_streak: 0,
+            drift_seen: std::collections::BTreeSet::new(),
             last_poll: Instant::now(),
             last_agents: Instant::now(),
             idle_streak: 0,
@@ -1912,6 +1938,36 @@ mod tests {
         assert!(!id_line.contains('?'), "{id_line:?}");
     }
 
+    /// The detail block must not contradict the row above it. It said `?` for
+    /// a blocked session while the list said Idle; now both say the same word.
+    #[test]
+    fn detail_block_says_blocked_for_a_blocked_session() {
+        let app = app_with(vec![sess(
+            1,
+            Kind::Background,
+            Status::Waiting,
+            Some(State::Blocked),
+        )]);
+        let rows = rows_at(&app, 40, 24);
+        let id_line = rows
+            .iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(id_line.contains("blocked"), "{id_line:?}");
+        assert!(!id_line.contains('?'), "{id_line:?}");
+        // And the `waiting` status word survives on its own, for a row whose
+        // `state` this build cannot name.
+        let app = app_with(vec![sess(2, Kind::Background, Status::Waiting, None)]);
+        let rows = rows_at(&app, 40, 24);
+        let id_line = rows
+            .iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .cloned()
+            .unwrap_or_default();
+        assert!(id_line.contains("waiting"), "{id_line:?}");
+    }
+
     /// `draw_detail`'s `Kind` match is kept TOTAL on purpose, and this is the
     /// test that keeps the `Interactive` arm honest. `Kind::Interactive`
     /// survives in `model`, `parse_sessions` still emits it, and the arm is
@@ -2007,11 +2063,89 @@ mod tests {
         let idle_no_state = sess(4, Kind::Background, Status::Idle, None);
         assert_eq!(status_glyph(&idle_no_state, &p), ("○", p.gray));
 
-        // `?` still means "this build does not recognize the value".
-        let odd_state = sess(5, Kind::Background, Status::Idle, Some(State::Unknown("stopped".into())));
+        // `?` still means "this build does not recognize the value", and such a
+        // row is still filed under Idle. Neither may change: `?` is the honest
+        // answer for a value this build has never seen, and the drift guard —
+        // not a re-grouping — is what makes it loud.
+        let odd_state = sess(5, Kind::Background, Status::Idle, Some(State::Unknown("hibernating".into())));
         assert_eq!(status_glyph(&odd_state, &p), ("?", p.purple));
+        assert_eq!(odd_state.group(), Group::Idle);
         let odd_status = sess(6, Kind::Background, Status::Unknown("thinking".into()), None);
         assert_eq!(status_glyph(&odd_status, &p), ("?", p.purple));
+        assert_eq!(odd_status.group(), Group::Idle);
+    }
+
+    /// The bug, at the glyph: a blocked session used to render purple `?`.
+    /// It renders `▲` in `p.yellow`, on either signal, on both palettes, and
+    /// the glyph is unique in the table — no two rows may share a mark.
+    #[test]
+    fn a_blocked_session_gets_its_own_glyph_and_not_the_unknown_one() {
+        for p in [Palette::light(), Palette::dark()] {
+            let blocked = sess(1, Kind::Background, Status::Waiting, Some(State::Blocked));
+            assert_eq!(status_glyph(&blocked, &p), ("▲", p.yellow));
+            assert_ne!(status_glyph(&blocked, &p), ("?", p.purple), "the old bug");
+
+            // The status alone is enough, even when the state is unmodelled —
+            // otherwise the same bug just moves one field over.
+            let renamed = sess(2, Kind::Background, Status::Waiting, Some(State::Unknown("halted".into())));
+            assert_eq!(status_glyph(&renamed, &p), ("▲", p.yellow));
+
+            // Distinct from every other glyph in the table.
+            let others = [
+                sess(3, Kind::Background, Status::Busy, Some(State::Working)),
+                sess(4, Kind::Background, Status::Idle, Some(State::Working)),
+                sess(5, Kind::Background, Status::Idle, None),
+                sess(6, Kind::Background, Status::Idle, Some(State::Done)),
+                sess(7, Kind::Background, Status::Idle, Some(State::Stopped)),
+                sess(8, Kind::Background, Status::Unknown("thinking".into()), None),
+            ];
+            for o in &others {
+                assert_ne!(status_glyph(o, &p).0, "▲", "{:?} stole the Blocked glyph", o.state);
+            }
+        }
+        // One display column, like every other glyph on the grid. Measured in
+        // tmux 3.4 with `#{cursor_x}`: U+25B2 is one cell.
+        assert_eq!(display_width("▲"), 1);
+    }
+
+    /// The row that most deserves attention is the first one on screen, its
+    /// header is the first header, and at the default 34 columns the grid it
+    /// sits on is byte-for-byte the grid every other row sits on.
+    #[test]
+    fn a_blocked_row_leads_the_list_and_keeps_the_thirty_four_column_grid() {
+        let mut blocked = sess(1, Kind::Background, Status::Waiting, Some(State::Blocked));
+        blocked.name = "client statement automation".into();
+        blocked.started_at = 0; // OLDEST: the group must outrank the age
+        let mut working = sess(2, Kind::Background, Status::Busy, Some(State::Working));
+        working.started_at = 4_000_000;
+        let app = app_with(vec![working, blocked]);
+
+        assert_eq!(app.rows[0], Row::Header { group: Group::Blocked, count: 1 });
+        assert!(matches!(app.rows[1], Row::Session { idx: 1 }));
+
+        let p = Palette::dark();
+        let cols = line_cols(&session_line(&app, &app.sessions[1], false, 34, &p));
+        assert_eq!(cols.len(), 34, "the row is not 34 columns wide");
+        // The gutter is unchanged: marker, badge, glyph, space.
+        assert_eq!(cols[2], '▲', "the glyph must sit on column 3 like every other");
+        assert_eq!(cols[3], ' ');
+        assert_eq!(cols[4], 'c', "the name still starts on column 5");
+        assert_eq!(cols[33], ' ', "column W is still the margin");
+        assert_eq!(cols[31..33].iter().collect::<String>(), "1h", "the age still ends on W-1");
+        // The header above it is 34 columns too, and says Blocked.
+        let h = line_cols(&group_header_line(Group::Blocked, 1, 34, &p));
+        assert_eq!(h.len(), 34);
+        assert_eq!(h[0..11].iter().collect::<String>(), " ── Blocked");
+
+        // The glyph is painted yellow, and nothing else on the row is.
+        let line = session_line(&app, &app.sessions[1], false, 34, &p);
+        let yellow: Vec<String> = line
+            .spans
+            .iter()
+            .filter(|sp| sp.style.fg == Some(p.yellow))
+            .map(|sp| sp.content.to_string())
+            .collect();
+        assert_eq!(yellow, vec!["▲".to_string()]);
     }
 
     #[test]
@@ -2563,9 +2697,53 @@ mod tests {
         let working = sess(1, Kind::Background, Status::Busy, Some(State::Working));
         let idle = sess(2, Kind::Background, Status::Idle, None);
         let done = sess(3, Kind::Background, Status::Unknown(String::new()), Some(State::Done));
+        let blocked = sess(4, Kind::Background, Status::Waiting, Some(State::Blocked));
         assert_eq!(name_tier(&working, &p), p.fg);
         assert_eq!(name_tier(&idle, &p), p.gray);
         assert_eq!(name_tier(&done, &p), p.dim);
+        // Blocked shares Working's rung: there is nothing above `p.fg`, and the
+        // ladder must not be inverted to make room.
+        assert_eq!(name_tier(&blocked, &p), p.fg);
+    }
+
+    /// The new group's accent is subject to the same floor as every colour that
+    /// carries a mark, on BOTH grounds and on the selection band — a glyph that
+    /// means "answer me" is worthless if it cannot be seen.
+    #[test]
+    fn the_blocked_accent_clears_the_contrast_floor_on_both_grounds() {
+        fn lum(c: Color) -> f64 {
+            let Color::Rgb(r, g, b) = c else { panic!("not true-colour: {c:?}") };
+            let f = |v: u8| {
+                let v = v as f64 / 255.0;
+                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        }
+        fn ratio(a: Color, b: Color) -> f64 {
+            let (x, y) = (lum(a), lum(b));
+            (x.max(y) + 0.05) / (x.min(y) + 0.05)
+        }
+        for (name, p, bg) in [
+            ("dark", Palette::dark(), Color::Rgb(0x28, 0x28, 0x28)),
+            ("light", Palette::light(), Color::Rgb(0xfb, 0xf1, 0xc7)),
+        ] {
+            let g = group_accent(Group::Blocked, &p);
+            assert_eq!(g, p.yellow);
+            let on_bg = ratio(g, bg);
+            let on_sel = ratio(g, p.sel_bg);
+            assert!(on_bg >= 4.0, "{name}: blocked accent is {on_bg:.2}:1 on the ground");
+            assert!(on_sel >= 4.0, "{name}: blocked accent is {on_sel:.2}:1 on sel_bg");
+            // Distinct from every accent the list already spends.
+            for (other, c) in [
+                ("working", p.orange),
+                ("idle", p.blue),
+                ("completed", p.gray),
+                ("done", p.green),
+                ("unknown", p.purple),
+            ] {
+                assert_ne!(g, c, "{name}: the Blocked accent collides with {other}");
+            }
+        }
     }
 
     /// The id line's two facts, and which one loses. The status word is
@@ -2685,7 +2863,9 @@ mod tests {
                 let r = ratio(c, bg);
                 assert!(r >= 4.0, "{name}.{field} is {r:.2}:1 on the ground, needs >= 4.0:1");
             }
-            // Everything `session_line` can paint on a selected row.
+            // Everything `session_line` can paint on a selected row. `yellow`
+            // joined this list with the Blocked glyph: before that it only ever
+            // appeared on the header's poll dot, which is never on the band.
             for (field, c) in [
                 ("fg", p.fg),
                 ("gray", p.gray),
@@ -2694,6 +2874,7 @@ mod tests {
                 ("blue", p.blue),
                 ("purple", p.purple),
                 ("orange", p.orange),
+                ("yellow", p.yellow),
             ] {
                 let r = ratio(c, p.sel_bg);
                 assert!(r >= 4.0, "{name}.{field} is {r:.2}:1 on sel_bg, needs >= 4.0:1");

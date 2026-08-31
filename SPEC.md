@@ -358,6 +358,8 @@ pub enum Kind {
 pub enum Status {
     Busy,
     Idle,
+    /// Stopped at a permission prompt or a question, waiting on the OPERATOR.
+    Waiting,
     /// Forward-compatibility: CLI versions churn; unknown strings are preserved.
     Unknown(String),
 }
@@ -366,20 +368,26 @@ pub enum Status {
 pub enum State {
     Working,
     Done,
+    /// Halted by `claude stop`; the conversation is kept and `claude attach`
+    /// resumes it. Finished-and-not-running, so it groups with Done.
+    Stopped,
+    /// Running but waiting on the operator. Groups FIRST, above Working.
+    Blocked,
     Unknown(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    Working = 0,
-    Idle = 1,
-    Completed = 2,
+    Blocked = 0,
+    Working = 1,
+    Idle = 2,
+    Completed = 3,
 }
 
 impl Group {
-    pub fn title(self) -> &'static str;      // "Working" | "Idle" | "Completed"
-    pub fn all() -> [Group; 3];              // [Working, Idle, Completed]
-    pub fn next(self) -> Group;              // Working->Idle->Completed->Working
+    pub fn title(self) -> &'static str;      // "Blocked" | "Working" | "Idle" | "Completed"
+    pub fn all() -> [Group; 4];              // [Blocked, Working, Idle, Completed]
+    pub fn next(self) -> Group;              // Blocked->Working->Idle->Completed->Blocked
     pub fn prev(self) -> Group;
 }
 
@@ -410,9 +418,11 @@ impl Session {
     pub fn key(&self) -> &str;
 
     /// Grouping rule, mirroring the stock fleet view:
+    ///   Some(Blocked)                 -> Group::Blocked
     ///   Some(Working)                 -> Group::Working
-    ///   Some(Done)                    -> Group::Completed
-    ///   None | Some(Unknown(_))       -> Busy => Working, otherwise => Idle
+    ///   Some(Done) | Some(Stopped)    -> Group::Completed
+    ///   None | Some(Unknown(_))       -> Waiting => Blocked,
+    ///                                    Busy => Working, otherwise => Idle
     /// Interactive sessions have no `state`, so they fall through to the
     /// status rule and never land in Completed.
     pub fn group(&self) -> Group;
@@ -452,8 +462,8 @@ pub enum Row {
     Session { idx: usize },
 }
 
-/// Build the flat render list: for each group in Working, Idle, Completed
-/// order, emit a `Header` (only if the group has >=1 matching session) followed
+/// Build the flat render list: for each group in Blocked, Working, Idle,
+/// Completed order, emit a `Header` (only if the group has >=1 matching session) followed
 /// by its `Session` rows.
 ///
 /// Filtering: case-insensitive substring of `filter` against
@@ -1588,12 +1598,15 @@ Rendered only for non-empty groups. Full line, `p.dim`, with the title in the
 group's accent colour:
 
 ```
+── Blocked (2) ──────────────
 ── Working (3) ──────────────
 ── Idle (1) ─────────────────
 ── Completed (2) ────────────
 ```
 
-Accent: Working `p.orange`, Idle `p.blue`, Completed `p.gray`.
+Accent: Blocked `p.yellow`, Working `p.orange`, Idle `p.blue`,
+Completed `p.gray`. **Blocked is FIRST**, above Working: it is the only group
+that cannot advance without a human, so it is the first thing on screen.
 At `W < 20` drop the rule characters and render `Working (3)` alone.
 Header rows are never selectable; `j`/`k` skip over them.
 
@@ -1619,13 +1632,23 @@ pane" required by the brief:
 
 **Status glyph (col 1)**, derived from `Group` + `Status`:
 
+Resolved top-down; every row is one display column wide.
+
 | Session | Glyph | Colour | Meaning |
 |---|---|---|---|
+| `state=done` | `✓` | `p.green` | finished on its own |
+| `state=stopped` | `■` | `p.gray` | halted by `claude stop`, resumable |
+| `state=blocked` or `status=waiting` | `▲` | `p.yellow` | **waiting on YOU** |
+| `Status::Unknown` / `State::Unknown` | `?` | `p.purple` | forward-compat |
 | Working + Busy | `●` | `p.orange` | actively generating |
 | Working + Idle | `◐` | `p.blue` | live, waiting on input |
 | Idle group | `○` | `p.gray` | idle |
 | Completed | `✓` | `p.green` | done |
-| `Status::Unknown` / `State::Unknown` | `?` | `p.purple` | forward-compat |
+
+`done`, `stopped` and `blocked` resolve BEFORE the `?` fallback. Each was
+`Unknown` once and each time presented the same way — a purple `?` filed under
+Idle. An unrecognised value keeps `?` and keeps its group; what makes it loud is
+`App::note_drift`, which names it in the footer once per run.
 
 **Pane badge** — the tmux `#{pane_index}` of the pane showing this session,
 right-aligned immediately left of the age, in `p.aqua`, formatted `%N` (e.g.
@@ -2404,8 +2427,9 @@ the CLI omits `id`, so a **listed** row can reach it.
 - `parse_sessions("{}")` → `ParseError::NotAnArray`; `parse_sessions("oops")` →
   `ParseError::Json`.
 - `group()`: `state=working, status=idle` → `Working` (state wins over status);
-  `state=done` → `Completed`; interactive+busy → `Working`; interactive+idle →
-  `Idle`.
+  `state=done` → `Completed`; `state=blocked` → `Blocked`, and `Blocked` sorts
+  above `Working`; `status=waiting` alone → `Blocked`; interactive+busy →
+  `Working`; interactive+idle → `Idle`.
 - `build_rows` emits no header for an empty group; sorts newest-first; a filter
   matching nothing yields an empty `Vec`.
 - `format_age`: `0 → "0s"`, `59_000 → "59s"`, `120_000 → "2m"`,

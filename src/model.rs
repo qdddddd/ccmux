@@ -17,6 +17,12 @@ pub enum Kind {
 pub enum Status {
     Busy,
     Idle,
+    /// The session has stopped and is waiting for the OPERATOR — a permission
+    /// prompt or a question. Always paired with `State::Blocked` in every live
+    /// payload observed, and modelled separately for the same reason `Blocked`
+    /// is: if a future CLI drops `state` but keeps `status`, this alone still
+    /// carries the row to the top of the list.
+    Waiting,
     /// Forward-compatibility: CLI versions churn; unknown strings are preserved.
     Unknown(String),
 }
@@ -31,27 +37,45 @@ pub enum State {
     /// explicitly because otherwise it lands in `Unknown` and renders as a
     /// purple `?` under Idle — reading as broken when it is merely parked.
     Stopped,
+    /// Running, but stopped at a permission prompt or a question and WAITING ON
+    /// THE OPERATOR. Paired with `Status::Waiting`, whose `waitingFor` key says
+    /// which (verified: `"permission prompt"`, `"input needed"`).
+    ///
+    /// This is the SECOND time this exact failure has shipped — `Stopped` was
+    /// the first, and the warning on it did not stop it happening again. Left
+    /// in `Unknown` this landed in `Group::Idle` behind a purple `?`, which
+    /// files the one row that cannot make progress without a human under the
+    /// heading that means "nothing to do here". It is modelled explicitly, it
+    /// gets `Group::Blocked` ABOVE Working, and `App::note_drift` now says so
+    /// out loud the next time the CLI invents a value this build lacks.
+    Blocked,
     Unknown(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    Working = 0,
-    Idle = 1,
-    Completed = 2,
+    /// FIRST, above Working, and the discriminants say so: a blocked session is
+    /// the only kind that cannot advance one token until the operator answers
+    /// it, so it is the first thing on screen. `build_rows` walks `all()` in
+    /// this order and `Ord` is derived from it.
+    Blocked = 0,
+    Working = 1,
+    Idle = 2,
+    Completed = 3,
 }
 
 impl Group {
     pub fn title(self) -> &'static str {
         match self {
+            Group::Blocked => "Blocked",
             Group::Working => "Working",
             Group::Idle => "Idle",
             Group::Completed => "Completed",
         }
     }
 
-    pub fn all() -> [Group; 3] {
-        [Group::Working, Group::Idle, Group::Completed]
+    pub fn all() -> [Group; 4] {
+        [Group::Blocked, Group::Working, Group::Idle, Group::Completed]
     }
 
     /// SPEC §3.1 surface. `App::cycle_group` walks `rows`' header positions
@@ -59,9 +83,10 @@ impl Group {
     #[allow(dead_code)]
     pub fn next(self) -> Group {
         match self {
+            Group::Blocked => Group::Working,
             Group::Working => Group::Idle,
             Group::Idle => Group::Completed,
-            Group::Completed => Group::Working,
+            Group::Completed => Group::Blocked,
         }
     }
 
@@ -69,7 +94,8 @@ impl Group {
     #[allow(dead_code)]
     pub fn prev(self) -> Group {
         match self {
-            Group::Working => Group::Completed,
+            Group::Blocked => Group::Completed,
+            Group::Working => Group::Blocked,
             Group::Idle => Group::Working,
             Group::Completed => Group::Idle,
         }
@@ -113,17 +139,27 @@ impl Session {
     }
 
     /// Grouping rule, mirroring the stock fleet view:
+    ///   Some(Blocked)                 -> Group::Blocked
     ///   Some(Working)                 -> Group::Working
-    ///   Some(Done)                    -> Group::Completed
-    ///   None | Some(Unknown(_))       -> Busy => Working, otherwise => Idle
+    ///   Some(Done) | Some(Stopped)    -> Group::Completed
+    ///   None | Some(Unknown(_))       -> Waiting => Blocked,
+    ///                                    Busy    => Working,
+    ///                                    else    => Idle
     /// Interactive sessions have no `state`, so they fall through to the
     /// status rule and never land in Completed.
+    ///
+    /// `Status::Waiting` reaches Blocked through the fallback arm as well as
+    /// through `State::Blocked`, deliberately: the two always agree in the live
+    /// payload, and belt-and-braces here means a CLI that renames the `state`
+    /// value again still cannot bury a session that is waiting on a human.
     pub fn group(&self) -> Group {
         match &self.state {
+            Some(State::Blocked) => Group::Blocked,
             Some(State::Working) => Group::Working,
             // Stopped is finished-and-not-running, like Done.
             Some(State::Done) | Some(State::Stopped) => Group::Completed,
             None | Some(State::Unknown(_)) => match self.status {
+                Status::Waiting => Group::Blocked,
                 Status::Busy => Group::Working,
                 _ => Group::Idle,
             },
@@ -217,6 +253,7 @@ impl RawSession {
         let status = match self.status.as_deref() {
             Some("busy") => Status::Busy,
             Some("idle") => Status::Idle,
+            Some("waiting") => Status::Waiting,
             Some(other) => Status::Unknown(other.to_string()),
             None => Status::Unknown(String::new()),
         };
@@ -225,6 +262,7 @@ impl RawSession {
             "working" => State::Working,
             "done" => State::Done,
             "stopped" => State::Stopped,
+            "blocked" => State::Blocked,
             _ => State::Unknown(s),
         });
 
@@ -308,8 +346,8 @@ pub enum Row {
     Session { idx: usize },
 }
 
-/// Build the flat render list: for each group in Working, Idle, Completed
-/// order, emit a `Header` (only if the group has >=1 matching session) followed
+/// Build the flat render list: for each group in Blocked, Working, Idle,
+/// Completed order, emit a `Header` (only if the group has >=1 matching session) followed
 /// by its `Session` rows. Groups after the first are preceded by a `Spacer`.
 ///
 /// Filtering: case-insensitive substring of `filter` against
@@ -338,8 +376,8 @@ pub fn build_rows(
         .filter(|&i| needle.is_empty() || sessions[i].filter_haystack().contains(&needle))
         .collect();
 
-    // 3 headers + 2 spacers in the worst case.
-    let mut rows = Vec::with_capacity(matching.len() + 5);
+    // 4 headers + 3 spacers in the worst case.
+    let mut rows = Vec::with_capacity(matching.len() + 7);
     for group in Group::all() {
         if group == Group::Completed && !show_completed {
             continue;
@@ -740,6 +778,82 @@ mod tests {
             sess(None, Status::Unknown(String::new()), None).group(),
             Group::Idle
         );
+        // blocked wins over everything, and lands ABOVE Working.
+        let blocked = sess(Some("a"), Status::Waiting, Some(State::Blocked));
+        assert_eq!(blocked.group(), Group::Blocked);
+        assert!(blocked.group() < Group::Working);
+        // The status alone is enough. This is the belt to `State::Blocked`'s
+        // braces: a CLI that renames the state value a third time still cannot
+        // file a session that is waiting on a human under Idle.
+        assert_eq!(
+            sess(Some("a"), Status::Waiting, Some(State::Unknown("halted".into()))).group(),
+            Group::Blocked
+        );
+        assert_eq!(sess(None, Status::Waiting, None).group(), Group::Blocked);
+    }
+
+    /// The exact rows `claude agents --json --all` returned for the two live
+    /// sessions that were sitting under **Idle** behind a purple `?` when this
+    /// was found — `waitingFor` and all, so the extra key is proven ignorable.
+    #[test]
+    fn the_live_blocked_rows_parse_and_group_first() {
+        const BLOCKED: &str = r#"[
+          {
+            "pid": 3873944,
+            "id": "e9f37339",
+            "cwd": "/home/dev/projects/shared/Foundation",
+            "kind": "background",
+            "startedAt": 1788029154725,
+            "sessionId": "e9f37339-b11c-4194-89c9-84a2ab25eb83",
+            "name": "alpha/pit",
+            "status": "waiting",
+            "waitingFor": "permission prompt",
+            "state": "blocked"
+          },
+          {
+            "pid": 4090765,
+            "id": "d224d495",
+            "cwd": "/home/dev/Documents/portfolios/tceef",
+            "kind": "background",
+            "startedAt": 1788158184428,
+            "sessionId": "d224d495-034a-4e40-a3b2-f642cfb49cdf",
+            "name": "client statement automation",
+            "status": "waiting",
+            "waitingFor": "input needed",
+            "state": "blocked"
+          }
+        ]"#;
+        let p = parse_sessions(BLOCKED).expect("the live blocked payload parses");
+        assert!(p.is_complete(), "the unknown `waitingFor` key must not drop a row");
+        assert_eq!(p.sessions.len(), 2);
+        for sess in &p.sessions {
+            assert_eq!(sess.state, Some(State::Blocked), "`blocked` must not be Unknown");
+            assert_eq!(sess.status, Status::Waiting, "`waiting` must not be Unknown");
+            assert_eq!(sess.group(), Group::Blocked);
+        }
+    }
+
+    /// The two words, on their own, against the two enums.
+    #[test]
+    fn blocked_and_waiting_are_modelled_not_unknown() {
+        let json = r#"[
+          {"sessionId":"a","name":"n","cwd":"/tmp","id":"aaaaaaaa",
+           "kind":"background","status":"waiting","state":"blocked"}
+        ]"#;
+        let s = &parse_sessions(json).unwrap().sessions[0];
+        assert_eq!(s.state, Some(State::Blocked));
+        assert_eq!(s.status, Status::Waiting);
+        assert_ne!(s.state, Some(State::Unknown("blocked".into())));
+        assert_ne!(s.status, Status::Unknown("waiting".into()));
+        // Everything the CLI has NOT taught this build still round-trips.
+        let odd = r#"[
+          {"sessionId":"b","name":"n","cwd":"/tmp","id":"bbbbbbbb",
+           "kind":"background","status":"pondering","state":"hibernating"}
+        ]"#;
+        let s = &parse_sessions(odd).unwrap().sessions[0];
+        assert_eq!(s.state, Some(State::Unknown("hibernating".into())));
+        assert_eq!(s.status, Status::Unknown("pondering".into()));
+        assert_eq!(s.group(), Group::Idle, "an unknown value is still filed, not dropped");
     }
 
     #[test]
@@ -751,14 +865,49 @@ mod tests {
 
     #[test]
     fn group_helpers() {
+        assert_eq!(Group::Blocked.title(), "Blocked");
         assert_eq!(Group::Working.title(), "Working");
         assert_eq!(Group::Idle.title(), "Idle");
         assert_eq!(Group::Completed.title(), "Completed");
-        assert_eq!(Group::all(), [Group::Working, Group::Idle, Group::Completed]);
+        assert_eq!(
+            Group::all(),
+            [Group::Blocked, Group::Working, Group::Idle, Group::Completed]
+        );
+        assert_eq!(Group::Blocked.next(), Group::Working);
         assert_eq!(Group::Working.next(), Group::Idle);
-        assert_eq!(Group::Completed.next(), Group::Working);
-        assert_eq!(Group::Working.prev(), Group::Completed);
+        assert_eq!(Group::Completed.next(), Group::Blocked);
+        assert_eq!(Group::Blocked.prev(), Group::Completed);
+        assert_eq!(Group::Working.prev(), Group::Blocked);
+        assert!(Group::Blocked < Group::Working);
         assert!(Group::Working < Group::Idle && Group::Idle < Group::Completed);
+    }
+
+    /// `all()` is the ONE order `build_rows` walks, `next`/`prev` are a second
+    /// statement of it, and `Ord` is a third. All three used to be trivially
+    /// consistent with three variants; adding a fourth is exactly when they
+    /// drift apart, so the three are checked against each other rather than
+    /// against a hand-written list.
+    #[test]
+    fn the_group_order_is_stated_the_same_way_three_times() {
+        let all = Group::all();
+        assert_eq!(all[0], Group::Blocked, "Blocked must come FIRST, above Working");
+        for w in all.windows(2) {
+            assert!(w[0] < w[1], "Ord disagrees with all(): {:?} !< {:?}", w[0], w[1]);
+            assert_eq!(w[0].next(), w[1], "next() disagrees with all() at {:?}", w[0]);
+            assert_eq!(w[1].prev(), w[0], "prev() disagrees with all() at {:?}", w[1]);
+        }
+        assert_eq!(all[all.len() - 1].next(), all[0], "next() must wrap");
+        assert_eq!(all[0].prev(), all[all.len() - 1], "prev() must wrap");
+        // Every variant is reachable by walking `next` exactly `all().len()`
+        // times, which is the arity check `all()`'s type alone cannot make.
+        let mut g = all[0];
+        let mut seen = vec![g];
+        for _ in 1..all.len() {
+            g = g.next();
+            assert!(!seen.contains(&g), "next() cycles early at {g:?}");
+            seen.push(g);
+        }
+        assert_eq!(seen, all.to_vec(), "next() does not enumerate all()");
     }
 
     #[test]
@@ -786,6 +935,45 @@ mod tests {
         assert_ne!(rows[0], Row::Spacer);
         // no Idle header: the group is empty
         assert!(!rows.iter().any(|r| matches!(r, Row::Header { group: Group::Idle, .. })));
+    }
+
+    /// Blocked is the FIRST header in the flat row list, before Working — the
+    /// whole point of the group. Also pins the shape: header, its rows, spacer,
+    /// next header.
+    #[test]
+    fn build_rows_puts_the_blocked_group_first() {
+        let mut blocked = sess(Some("b1"), Status::Waiting, Some(State::Blocked));
+        blocked.session_id = "b1".into();
+        blocked.started_at = 1;
+        let mut working = sess(Some("w1"), Status::Busy, Some(State::Working));
+        working.session_id = "w1".into();
+        // NEWER than the blocked one: age must not be able to outrank the group.
+        working.started_at = 9_999;
+        let mut done = sess(Some("d1"), Status::Idle, Some(State::Done));
+        done.session_id = "d1".into();
+        let mut idle = sess(Some("i1"), Status::Idle, None);
+        idle.session_id = "i1".into();
+
+        let sessions = vec![working, done, idle, blocked];
+        let rows = build_rows(&sessions, "", true, &[]);
+        assert_eq!(rows[0], Row::Header { group: Group::Blocked, count: 1 });
+        assert_eq!(rows[1], Row::Session { idx: 3 });
+        assert_eq!(rows[2], Row::Spacer);
+        assert_eq!(rows[3], Row::Header { group: Group::Working, count: 1 });
+        let headers: Vec<Group> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Header { group, .. } => Some(*group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![Group::Blocked, Group::Working, Group::Idle, Group::Completed],
+            "all four groups, in all()'s order"
+        );
+        // 4 headers + 4 sessions + 3 spacers.
+        assert_eq!(rows.len(), 11);
     }
 
     #[test]
@@ -967,6 +1155,7 @@ mod tests {
             ("✔", 1),      // U+2714
             ("⬆", 1),      // U+2B06
             ("✓", 1),      // U+2713, the Completed glyph
+            ("▲", 1),      // U+25B2, the Blocked glyph
             ("●", 1),      // U+25CF
             ("▌", 1),      // U+258C, the open marker
             ("▏", 1),      // U+258F, the selection cap

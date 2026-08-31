@@ -14,6 +14,8 @@ and the layout orchestration that makes the two feel like one app.
 ```
 ┌──────────────────┬───────────────────────┬───────────────────────┐
 │ ccmux   18       │                       │                       │
+│ ── Blocked (1) ──│                       │                       │
+│  ▲ client statem… │                       │                       │
 │ ── Working (2) ──│                       │                       │
 │ ▌● bt/reg-update │   live Claude TUI     │   live Claude TUI     │
 │  ◐ kernel bugs   │                       │                       │
@@ -177,18 +179,29 @@ the offer. This `mkdir` is the only write ccmux ever makes to the filesystem.
 
 ## Reading the list
 
-Sessions are grouped exactly as `claude agents` groups them: **Working**,
-**Idle**, **Completed**.
+Sessions are grouped as `claude agents` groups them, with **Blocked** hoisted to
+the top: **Blocked**, **Working**, **Idle**, **Completed**. A blocked session is
+stopped at a permission prompt or a question and cannot advance until you answer
+it, so it is the first thing on screen.
 
 | Glyph | Meaning |
 |---|---|
+| `▲` yellow | **Blocked — waiting on you.** A permission prompt or a question |
 | `●` orange | Working, actively generating |
 | `◐` blue | Working, waiting on input |
 | `○` gray | Idle |
 | `✓` green | Completed |
+| `■` gray | Stopped with `Ctrl-x`; the conversation is kept, `o` resumes it |
 | `?` purple | A status or state this build does not recognize |
 | `▌` aqua | Open in a ccmux pane right now (column 1) |
 | `5` aqua | Open in **tab 5** (column 2). Blank means open in the tab you are looking at; `+` means a tab number of ten or more |
+
+When `claude agents` reports a `state` or `status` this build has no variant for,
+the row still renders (`?` purple) and still groups — and the footer says so
+once, by name: `unmodelled state "…" — update ccmux`. Two such values, `stopped`
+and `blocked`, shipped unnoticed before that warning existed.
+`cargo test -- --ignored live_state_and_status` asks the running fleet the same
+question, and is worth running after a `claude` upgrade.
 
 ### Tabs
 

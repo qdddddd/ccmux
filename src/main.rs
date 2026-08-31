@@ -782,6 +782,12 @@ mod tests {
             "fn draw_confirm",
             "pub confirm_armed_at",
             "const CONFIRM_ARM_DELAY",
+            // The group arity. `Group` gained `Blocked`, so a spec that still
+            // declares three is promising an `all()` the crate does not have —
+            // and the three-variant `Group` is what filed a blocked session
+            // under Idle in the first place.
+            "[Group; 3]",
+            "Working = 0",
         ] {
             assert!(
                 !SPEC.contains(needle),
@@ -803,6 +809,33 @@ mod tests {
         assert!(
             !SPEC.contains("permitted in exactly one place"),
             "R3 still carves out an exception for `list-panes -a`"
+        );
+        // The other direction, for the two values that shipped unmodelled: the
+        // spec must NAME them, because the glyph table and the state list are
+        // where the next implementer looks before touching `model::State`.
+        for needle in ["[Group; 4]", "Blocked = 0", "Blocked", "Stopped", "Waiting"] {
+            assert!(
+                SPEC.contains(needle),
+                "SPEC.md does not declare {needle:?}, which the crate has"
+            );
+        }
+    }
+
+    /// The README's glyph table is what an operator reads to find out what a
+    /// mark means, and a mark missing from it reads as noise on the screen.
+    /// Every glyph `ui::status_glyph` can return must appear there.
+    #[test]
+    fn the_readme_glyph_table_names_every_glyph_the_list_can_draw() {
+        const README: &str = include_str!("../README.md");
+        for glyph in ["▲", "●", "◐", "○", "✓", "■", "?"] {
+            assert!(
+                README.contains(&format!("| `{glyph}`")),
+                "the README glyph table is missing {glyph:?}"
+            );
+        }
+        assert!(
+            README.contains("Blocked"),
+            "the README does not mention the Blocked group"
         );
     }
 
