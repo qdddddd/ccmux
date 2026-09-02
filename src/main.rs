@@ -10,10 +10,12 @@
 mod agents;
 mod app;
 mod model;
+mod restart;
 mod tmux;
 mod ui;
 
 use std::io::{self, Stdout};
+use std::os::unix::process::CommandExt;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -28,7 +30,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::Action;
+use crate::app::{Action, MsgLevel};
 use crate::tmux::PaneId;
 
 #[derive(clap::Parser)]
@@ -439,6 +441,15 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     // launcher uses. `app` never imports `main`; the string is handed down, so
     // the module DAG stays acyclic.
     app.sidebar_cmd = sidebar_command(cli, width).ok();
+    // An `R` in the process image this one replaced left its summary here: the
+    // flash it wrote could never be drawn, because the process that wrote it
+    // stopped existing before the next frame. The environment is what survives
+    // an `exec`, so that is where the message rides across.
+    if let Ok(note) = std::env::var(restart::NOTE_ENV)
+        && !note.trim().is_empty()
+    {
+        app.flash(note, MsgLevel::Info);
+    }
 
     install_panic_hook();
     enable_raw_mode().context("cannot enter raw mode")?;
@@ -544,6 +555,31 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                     }
                     match action {
                         Action::Quit => break,
+                        Action::Restart => {
+                            // `exec` does not return on success, so everything
+                            // after this line is the FAILURE path.
+                            if let Some(p) = app.pending_restart.take() {
+                                let err = restart_now(
+                                    &p,
+                                    &mut |step| match step {
+                                        // Whatever the tty buffered while the
+                                        // respawns ran was aimed at a frozen
+                                        // screen, and it would survive the
+                                        // `exec` to be executed as keymap
+                                        // verbs by the NEW image.
+                                        RestartStep::DrainInput => {
+                                            let _ = drain_pending_input();
+                                        }
+                                        RestartStep::RestoreTerminal => restore_terminal(),
+                                        RestartStep::FlushTmuxState => app.shutdown(),
+                                    },
+                                    &mut exec_pending,
+                                );
+                                resume_terminal(terminal)?;
+                                restart_failed(app, &err);
+                            }
+                            needs_draw = true;
+                        }
                         Action::Redraw => needs_draw = true,
                         Action::None => {}
                     }
@@ -561,6 +597,75 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The steps `R` runs before it stops being this process, in the order they
+/// MUST happen. Named so the order is testable without a terminal and without
+/// a process to replace: `restart_now` is what the event loop calls, and its
+/// test drives the same function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartStep {
+    /// Type-ahead typed at the frozen UI would otherwise survive the `exec`.
+    DrainInput,
+    /// MANDATORY, and mandatory FIRST: leave the alternate screen, drop raw
+    /// mode, disable bracketed paste. The new image sets all three up again.
+    /// Skip it and a failed `exec` leaves the operator with a wedged terminal —
+    /// no echo, no newline translation — and no sidebar to fix it from.
+    RestoreTerminal,
+    /// `App::shutdown` — the deferred `@ccmux_tab_map` / `@ccmux_tab_hidden`
+    /// writes. There is no next `tick` to land them in, exactly as at `q`, so a
+    /// dismissal made since the last tick would not survive the restart.
+    FlushTmuxState,
+}
+
+/// `R`'s tail: the three steps, then the `exec` that does not return.
+///
+/// The steps are a parameter rather than three inlined calls so that "the
+/// terminal teardown runs before the exec" is a property of a function a test
+/// can run, not of a comment. Returns the `exec` error, because an `exec` that
+/// returns at all has failed and the sidebar must go on living.
+fn restart_now(
+    p: &restart::Pending,
+    step: &mut dyn FnMut(RestartStep),
+    exec: &mut dyn FnMut(&restart::Pending) -> io::Error,
+) -> io::Error {
+    step(RestartStep::DrainInput);
+    step(RestartStep::RestoreTerminal);
+    step(RestartStep::FlushTmuxState);
+    exec(p)
+}
+
+/// Replace this process image with `p.exe`, keeping this pane, its geometry and
+/// the window layout by construction — tmux is never told anything happened.
+///
+/// The argv is THIS process's own, minus argv[0]: same subcommand, same
+/// `--session`, `--width`, `--socket`, `--interval`, same palette. argv[0]
+/// becomes the freshly resolved path, which is what makes a SECOND restart find
+/// the binary the same way.
+fn exec_pending(p: &restart::Pending) -> io::Error {
+    std::process::Command::new(&p.exe)
+        .args(std::env::args_os().skip(1))
+        .env(restart::NOTE_ENV, &p.note)
+        .exec()
+}
+
+/// Undo `restore_terminal`. Reachable only when the `exec` failed, which is the
+/// one case where the operator must be left with a working sidebar rather than
+/// a dead pane.
+fn resume_terminal(terminal: &mut Tui) -> anyhow::Result<()> {
+    enable_raw_mode().context("cannot re-enter raw mode after a failed restart")?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
+        .context("cannot re-enter the alternate screen after a failed restart")?;
+    let _ = terminal.hide_cursor();
+    terminal.clear().context("cannot redraw after a failed restart")?;
+    Ok(())
+}
+
+/// What the operator is told when the `exec` did not happen. The panes that
+/// were already respawned are running the new binary; this one is not, and
+/// saying so is the difference between a visible half-restart and a silent one.
+fn restart_failed(app: &mut app::App, err: &io::Error) {
+    app.flash(format!("restart failed: {err}"), MsgLevel::Error);
 }
 
 /// Discard every input event already queued. Called after a tick or keypress
@@ -763,6 +868,62 @@ mod tests {
     /// as a DECLARATION. Prose that says a thing is gone is fine and expected
     /// — the tombstoned §5.4 and §8.7 are full of it — so every needle below
     /// is a signature or a field, never a bare name.
+    /// THE ORDER. The terminal teardown MUST precede the `exec`: an `exec`
+    /// that fails from inside raw mode + the alternate screen leaves the
+    /// operator a wedged terminal, and the new image sets both up again anyway.
+    /// The tmux flush must also precede it, or a dismissal made since the last
+    /// tick dies with the process image.
+    #[test]
+    fn the_restart_tears_the_terminal_down_before_it_execs() {
+        let p = restart::Pending {
+            exe: std::path::PathBuf::from("/nonexistent/ccmux"),
+            note: "restarted 1 sidebar, 0 panes".into(),
+        };
+        let seen: std::cell::RefCell<Vec<RestartStep>> = std::cell::RefCell::new(Vec::new());
+        let execs = std::cell::Cell::new(0usize);
+
+        let err = restart_now(
+            &p,
+            &mut |s| seen.borrow_mut().push(s),
+            &mut |got| {
+                execs.set(execs.get() + 1);
+                // The exec is LAST: every step has already run by the time it
+                // is reached, which is the property this test exists for.
+                assert_eq!(
+                    *seen.borrow(),
+                    vec![
+                        RestartStep::DrainInput,
+                        RestartStep::RestoreTerminal,
+                        RestartStep::FlushTmuxState
+                    ]
+                );
+                assert_eq!(got.exe, p.exe, "it execs the resolved binary");
+                io::Error::from(io::ErrorKind::NotFound)
+            },
+        );
+
+        assert_eq!(execs.get(), 1);
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "the failure is returned, not swallowed");
+        assert_eq!(
+            seen.borrow().iter().position(|s| *s == RestartStep::RestoreTerminal),
+            Some(1)
+        );
+    }
+
+    /// `exec` only returns when it FAILED, and a failed restart must leave a
+    /// live sidebar that says so — never a dead pane. The recovery path is
+    /// reachable because `restart_now` returns rather than diverging.
+    #[test]
+    fn a_failed_exec_keeps_the_sidebar_alive_and_says_so() {
+        let mut app = app::App::new("ccmux-test".into(), 34, Duration::from_millis(2500), true);
+        restart_failed(&mut app, &io::Error::from(io::ErrorKind::NotFound));
+
+        assert!(!app.should_quit, "a failed restart is not a quit");
+        let (text, level) = app.message.clone().expect("the operator is told");
+        assert!(text.starts_with("restart failed: "), "{text:?}");
+        assert_eq!(level, MsgLevel::Error);
+    }
+
     #[test]
     fn the_spec_declares_nothing_the_crate_no_longer_has() {
         const SPEC: &str = include_str!("../SPEC.md");
@@ -815,6 +976,10 @@ mod tests {
         assert!(
             SPEC.contains("| `Ctrl-x` | **stop the session**"),
             "SPEC.md does not document the `Ctrl-x` binding"
+        );
+        assert!(
+            SPEC.contains("| `R` | **restart ccmux in place**"),
+            "SPEC.md does not document the `R` binding"
         );
         assert!(
             !SPEC.contains("permitted in exactly one place"),

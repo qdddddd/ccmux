@@ -1860,6 +1860,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `/` | enter filter mode | no |
 | `a` | toggle visibility of the Completed group | no |
 | `r` | force refresh | no |
+| `R` | **restart ccmux in place** — this sidebar, every other tab's sidebar and every ccmux-opened Claude pane, keeping every window, pane and layout (§8.11) | no |
 | `?` | help overlay | no |
 | `q` | quit the sidebar (sessions and panes untouched) | no |
 | `Esc` | clear the filter if one is active, otherwise quit (§8.8) | no |
@@ -2313,6 +2314,103 @@ crate**. A tab ends when its last pane does, which tmux already handles, and
 every pane death goes through the R2-gated `kill_pane`. There is likewise no
 tab-cycling key: `Enter` on a row in another tab already switches, and tmux's
 own bindings remain.
+
+### 8.11 `R` — restart the binaries in place
+
+For the moment after `cargo install` replaced `ccmux` or `claude` on disk: every
+ccmux process in the session restarts, and nothing else changes. Windows, panes,
+pane ids, geometry and the layout are all preserved.
+
+```
+1. degraded -> flash "not inside tmux — restart unavailable" (Warn); return Redraw
+2. exe = restart::exe_path() or flash "cannot find the ccmux binary — not restarting" (Error); return Redraw
+3. cmd = restart::sidebar_command(exe) or flash "…not valid UTF-8…" (Error); return Redraw
+4. for t in restart::plan(tabs, panes, own_pane):
+       tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))   [R2-gated]
+5. pending_restart = { exe, restart::note(sidebars + 1, panes, failed, skipped) }
+   return Action::Restart
+6. main::event_loop, in this order and no other:
+       drain buffered input   (type-ahead would survive the exec)
+       restore_terminal()     (leave the alt screen, drop raw mode, drop paste)
+       app.shutdown()         (the deferred @ccmux_tab_map / @ccmux_tab_hidden writes)
+       exec(exe, argv[1..], CCMUX_RESTART_NOTE=<note>)
+7. exec returns only on FAILURE: re-enter raw mode + the alt screen, then flash
+   "restart failed: <err>" (Error) and keep running.
+```
+
+**Three populations, three mechanisms.** This sidebar is replaced by `exec(2)`,
+which keeps the pane by construction — tmux is never told anything happened, so
+there is no geometry to restore and no layout to rebuild. The other tabs'
+sidebars are separate processes this one cannot `exec`, so they are restarted
+with `respawn-pane -k`, which keeps the pane id and the layout. The Claude panes
+are respawned the same way; the AGENT survives, because every session ccmux
+lists is a daemon-owned background one (PROBE-FINDINGS §3) and an attach client
+is disposable.
+
+**`R` restarts the SESSION, not the tab.** The verb exists so that nothing is
+left running the replaced binary, and a per-tab `R` would leave the other tabs
+on it with no way to reach them — a process cannot `exec` another process, so
+respawn is the only mechanism available, and it works across tabs exactly as
+well as within one.
+
+**THE OWNERSHIP RULE (`restart::plan`, pure and tested).** A pane is respawned
+if and only if ccmux can prove it created it: it is some window's
+`@ccmux_tab_sidebar` and that marker names a live pane **of that window**, or it
+appears in some window's `@ccmux_tab_map` and is still live. Everything else is
+the operator's. A ccmux session may hold unmanaged panes — a shell, an editor,
+another agent — and respawning one would destroy what was running in it with no
+undo, so the test is positive evidence of ownership and never the absence of
+evidence against it. This process's own pane is excluded: it restarts by `exec`.
+A mapped pane whose entry carries no `short_id` has no `claude attach` to
+rebuild, so it is counted as skipped and left running rather than respawned into
+a guess.
+
+**Which file to exec.** `current_exe()` is the wrong answer here, and wrong in
+the worst way. `cargo install` renames a new file over the old path, so the
+running image's inode loses its last name and, measured on tmux 3.4 / Linux
+6.8:
+
+| source | after the binary was replaced | exec result |
+|---|---|---|
+| `std::env::current_exe()` | `"…/bin/ccmux (deleted)"` | `ENOENT` |
+| `readlink /proc/self/exe` | `"…/bin/ccmux (deleted)"` | `ENOENT` |
+| `exec("/proc/self/exe")` | the dead inode, still open | **runs the OLD binary**, silently |
+| `argv[0]` | `"…/bin/ccmux"` | **runs the NEW binary** |
+
+So `R` re-resolves the binary from `argv[0]` — a PATH the kernel resolves fresh
+at exec time — falling back to a `$PATH` lookup for a bare argv[0] and, last, to
+`current_exe()` with the kernel's `" (deleted)"` suffix stripped. The result is
+proven to be a file **before any pane is killed**, so a half-finished upgrade
+cannot cost the operator their sidebars. The same freshly resolved path builds
+the command the other tabs' sidebars are respawned with: `App::sidebar_cmd` was
+built at launch from a `current_exe()` that may now name the deleted inode, and
+respawning with it would leave those panes running nothing at all.
+
+**No confirmation and no arm.** `Ctrl+X` has a two-press window because its
+second press deletes a session and its git worktree, which has no undo. `R`
+kills only attach clients whose agents outlive them and sidebars whose entire
+state is in tmux window options, and it puts every one of them straight back
+into the same pane; the worst an accidental `R` costs is the panes' scrollback
+and about a second. An arm on a recoverable verb is a tax on the common case,
+and the confirm modal it would revive was deleted outright (§8.2). `R` also
+requires Shift, so no adjacent binding reaches it by a slip — `Ctrl-R` falls to
+the `_ if ctrl` catch-all and stays inert.
+
+**State across the restart.** The pane map and the dismissal set live in
+`@ccmux_tab_map` and `@ccmux_tab_hidden`, which are tmux **window** options: they
+belong to the window, not to the process, and survive both the `exec` and the
+respawn. This process's own deferred writes are flushed by step 6 before the
+`exec`, exactly as they are at `q`. The one accepted loss is another tab's
+deferred write: `respawn-pane -k` gives that process no chance to flush, so a
+`d` or `u` pressed there within the last tick interval reverts. Everything in
+memory only — the poll-quiescing ladder, the `Ctrl+X` window, the filter, the
+scroll position — starts fresh, which is what a restart means.
+
+**What the operator sees.** The flash naming the restart is written by a process
+that stops existing before the next frame, so it rides across the `exec` in
+`CCMUX_RESTART_NOTE` and is flashed by the new image on startup: `restarted 3
+sidebars, 4 panes`, plus `(N failed)` or `(N skipped)` when either applies. The
+count includes this sidebar.
 
 ---
 
@@ -2793,6 +2891,9 @@ not spend implementation time re-deriving them.
 | `/proc/<pid>/stat` gives `comm` parenthesized in field 2; ppid is the 2nd whitespace token after the **last** `)`. | Confirmed on a live shell whose ppid was the `kind:"interactive"` pid reported by `claude agents --json`. **Nothing consumes this any more** — §5.4 and the whole /proc walk were removed. |
 | `claude agents --json` output matches PROBE-FINDINGS §1 exactly on the current build (2.1.245), including `id`/`state` absent for `kind:"interactive"`. | Re-read during authoring. |
 | `claude --bg, --background` takes the prompt as a **positional** argument. | `claude --help`. Basis of RULE Q4. |
+| `respawn-pane -k` keeps the pane id, its geometry and the window layout, and replaces only the command. | Across a whole-session `R`: every `%N` unchanged, every `pane_left,top WxH` unchanged, and all three `window_layout` checksums byte-identical (`5e48,…`, `a4a6,…`, `b263,…`). Basis of §8.11. |
+| After the running binary's path is renamed over, `current_exe()` and `readlink /proc/self/exe` both answer `"<path> (deleted)"`, `exec` of that path is `ENOENT`, and `exec("/proc/self/exe")` runs the **old** image; `argv[0]` runs the **new** one. | Measured twice: once with a purpose-built probe, once end-to-end with two ccmux builds carrying distinct trailing image markers. After `R` the sidebar kept pid and start time (`exec` replaces the image, not the process) while `/proc/<pid>/exe` moved from the old inode to the new one. Basis of §8.11's `exe_path`. |
+| A file can pass `is_file()` and still fail `execve`. | A `chmod -x` on the installed binary respawned every other pane and then failed with `EACCES`, taking out another tab's sidebar. `exe_path` now requires an execute bit, and refuses **before** anything is killed. |
 
 ### A.1 A cautionary note that became RULE R1
 

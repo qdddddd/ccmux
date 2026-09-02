@@ -123,6 +123,7 @@ environment-variable equivalent of `--socket`.
 | `/` | Filter by name, cwd, or short id | no |
 | `a` | Toggle visibility of the Completed group | no |
 | `r` | Force refresh | no |
+| `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, and every pane ccmux opened. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
 | `?` | Help overlay | no |
 | `q` | Quit the sidebar. Sessions and panes are untouched | no |
 | `Esc` | Close an open delete window if there is one; else clear the filter if one is active; otherwise does nothing | no |
@@ -233,6 +234,48 @@ same list in every tab. Two tabs dismissing different rows in the same interval
 both stick: each sidebar writes only its own window's state, so neither can
 revert the other.
 
+### Restarting after an upgrade
+
+`cargo install --path .` replaces the binary on disk, but the sidebar you are
+looking at is still the old image, and so is every `claude attach` client in
+every pane. `R` restarts all of them **in place**: every window, every pane,
+every pane id and the whole layout stay exactly as they are — only the processes
+change. There is no confirmation, and none is needed (see *Safety*).
+
+What it restarts, and how:
+
+| | mechanism | what survives |
+|---|---|---|
+| this sidebar | `exec(2)` — the process image is replaced | the pane, by construction: tmux is never told |
+| the other tabs' sidebars | `respawn-pane -k` | the pane id, its geometry, the layout |
+| the panes ccmux opened | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
+
+**Nothing else is touched.** A pane is restarted only if ccmux can prove it
+created it — it is a tab's recorded sidebar, or it is in that tab's pane map. A
+pane you opened yourself inside the ccmux session, with `prefix-"` or
+`prefix-%`, is in neither, and `R` leaves it alone: whatever is running in it
+keeps running, with the same pid.
+
+The footer then says what happened, from the new image: `restarted 3 sidebars,
+4 panes`.
+
+Two things do not survive, both by nature. The panes' **scrollback** is gone,
+because the commands in them were restarted — the agents' transcripts are not,
+and `L` still shows them. And a `d`/`u` pressed in **another** tab within the
+last poll interval reverts, because that sidebar is killed before it flushes;
+dismissals in the tab you press `R` in are flushed first, and everything already
+written to tmux — the pane map and the dismissal set are tmux *window* options —
+comes back untouched.
+
+`R` re-resolves the binary from `argv[0]` rather than from `current_exe()`, and
+that is not a detail: once `cargo install` has renamed a new file over the old
+path, `current_exe()` answers `…/ccmux (deleted)` and `/proc/self/exe` still
+opens the **old** image, so the obvious implementation would either fail or
+restart the very binary you just replaced while reporting success. The path is
+also checked to exist before any pane is killed, so a half-finished upgrade
+cannot cost you your sidebars. If the `exec` fails anyway, the sidebar re-enters
+its screen and says `restart failed: …` instead of dying.
+
 ### Which sessions are listed
 
 Only **background** sessions — the ones started with `claude --bg` or with `n`.
@@ -285,6 +328,10 @@ that is known to have lost rows concludes nothing at all.
 - Closing a pane with `x` does **not** stop the agent: background sessions are
   daemon-owned and outlive their pane. Only background sessions are listed, so
   `x` can never reach a process that dies with its pane.
+- `R` restarts processes but destroys nothing: it only respawns panes ccmux
+  itself created, the agents outlive their attach clients, and every pane comes
+  straight back. That is why it has no confirmation — an arm belongs on a verb
+  with no undo, and `Ctrl-x`'s second press is the only one of those.
 - `Ctrl-x` is the only verb that stops a session, and the only one that can
   delete one. The first press **stops** — recoverable: the conversation is kept
   and `Enter` resumes it. Only a **second press within two seconds** deletes: it

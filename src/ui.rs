@@ -941,6 +941,12 @@ const HINTS: &[(&str, &str)] = &[
     ("n", "new"),
     ("L", "logs"),
     ("/", "filter"),
+    // LAST, deliberately. `R` is an upgrade verb pressed once after a
+    // `cargo install`, not a working verb, so it must not evict a pair an
+    // operator uses every minute. At the 34-column default it never renders,
+    // and is discovered through `?` and the README exactly as `t` and `C-x`
+    // already are.
+    ("R", "restart"),
 ];
 /// Pinned to the rail at every width that can hold it.
 const HELP_HINT: &str = "? help";
@@ -1084,6 +1090,7 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "filter"),
     ("a", "toggle Completed group"),
     ("r", "force refresh"),
+    ("R", "restart ccmux + panes"),
     ("?", "this help"),
     ("q", "quit sidebar"),
     ("Esc", "cancel window/filter"),
@@ -1449,6 +1456,8 @@ mod tests {
             should_quit: false,
             // Rendering never dispatches; a panic here is a rendering test
             // reaching into `agents`, which must be impossible.
+            pending_restart: None,
+            respawn: |_, _, _| panic!("ui test reached respawn_pane"),
             dispatch: |_, _| panic!("ui test reached dispatch_background"),
         }
     }
@@ -2755,6 +2764,27 @@ mod tests {
         app.help_lines = help_line_count();
         let dump = rows_at(&app, 40, 30).join("\n");
         assert!(dump.contains("open in a new tab"), "{dump}");
+    }
+
+    /// `R` is documented in both places an operator looks, and the 34-column
+    /// footer is unchanged by it — the pair sits last, below every working verb.
+    #[test]
+    fn the_help_overlay_and_footer_document_the_restart_key() {
+        assert!(KEYS.iter().any(|(k, a)| *k == "R" && a.contains("restart")));
+        assert!(HINTS.iter().any(|(k, a)| *k == "R" && *a == "restart"));
+        assert_eq!(HINTS.last().map(|(k, _)| *k), Some("R"), "`R` is the last pair");
+
+        let mut app = app_with(many(3));
+        app.mode = Mode::Help;
+        app.help_lines = help_line_count();
+        let dump = rows_at(&app, 40, 34).join("\n");
+        assert!(dump.contains("restart ccmux + panes"), "{dump}");
+
+        // The label survives the 34-column overlay uncut: the key column is 10
+        // wide and the body 32, which leaves 22 for a 21-column label.
+        app.mode = Mode::Help;
+        let narrow = rows_at(&app, 34, 34).join("\n");
+        assert!(narrow.contains("restart ccmux + panes"), "{narrow}");
     }
 
     /// Column 1 is the marker's, not the selection's: an open row keeps its

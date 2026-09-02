@@ -840,6 +840,27 @@ pub fn kill_pane(session: &str, pane: &PaneId) -> Result<(), TmuxError> {
     tmux(&["kill-pane", "-t", pane.as_str()]).map(|_| ())
 }
 
+/// `tmux respawn-pane -k -t <pane> -- <shell_cmd>`. R2-gated.
+///
+/// THE PANE SURVIVES. `-k` kills only the command running inside it; the pane
+/// id, its geometry and the window layout are untouched, which is the whole
+/// reason `R` restarts other processes this way instead of kill + split
+/// (verified on tmux 3.4: same `%N`, same `pane_left/top/width/height`, same
+/// `window_layout` checksum across a respawn).
+///
+/// SAFE with respect to Claude sessions for exactly the reason `kill_pane` is:
+/// every session ccmux lists is a daemon-owned background one, so the attach
+/// client dies and the agent does not (PROBE-FINDINGS §3).
+///
+/// It is NOT safe with respect to a pane ccmux does not own — it destroys
+/// whatever was running there with no undo — so the caller must prove ownership
+/// first. `restart::plan` is the only place that proof is computed.
+pub fn respawn_pane(session: &str, pane: &PaneId, shell_cmd: &str) -> Result<(), TmuxError> {
+    require_shell_cmd(shell_cmd)?;
+    assert_in_session(pane, session)?;
+    tmux(&["respawn-pane", "-k", "-t", pane.as_str(), "--", shell_cmd]).map(|_| ())
+}
+
 /// `tmux select-pane -t <pane>`. R2-gated.
 pub fn select_pane(session: &str, pane: &PaneId) -> Result<(), TmuxError> {
     assert_in_session(pane, session)?;

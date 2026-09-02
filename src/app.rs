@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agents::{self, AgentsError};
 use crate::model::{self, Group, ParseError, Row, Session};
+use crate::restart::{self, Role};
 use crate::tmux::{
     self, HiddenLog, HiddenOp, HiddenSet, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TabInfo,
     TmuxError, WindowId,
@@ -183,6 +184,11 @@ pub enum Mode {
 pub enum Action {
     None,
     Redraw,
+    /// Restart this process in place: `main` tears the terminal down, flushes
+    /// what is owed to tmux, and `exec`s `App::pending_restart`. Distinct from
+    /// `Quit` because it must NOT leave the event loop by the exit path — that
+    /// path returns to a launcher that is no longer there.
+    Restart,
     Quit,
 }
 
@@ -415,6 +421,17 @@ pub struct App {
 
     pub should_quit: bool,
 
+    /// `R`'s decision, made and consumed within one keypress: every other pane
+    /// has been respawned and this process's own image is what is left to
+    /// replace. `main::event_loop` takes it on `Action::Restart`.
+    pub pending_restart: Option<restart::Pending>,
+
+    /// Seam for `tmux::respawn_pane`, for the same reason `dispatch` is one:
+    /// `R` is the one verb whose whole job is killing processes in panes, and
+    /// a hermetic test of WHICH panes it picks must be able to run it without
+    /// a tmux server. Production (`App::new`) points it at the real command.
+    pub respawn: fn(&str, &PaneId, &str) -> Result<(), TmuxError>,
+
     /// Seam for `agents::dispatch_background`, and nothing else. Production
     /// (`App::new`) points it at the real function; the unit-test fixture
     /// points it at a PANICKING stub so no hermetic test can ever spawn the
@@ -514,6 +531,8 @@ impl App {
 
             should_quit: false,
 
+            pending_restart: None,
+            respawn: tmux::respawn_pane,
             dispatch: agents::dispatch_background,
         }
     }
@@ -1932,6 +1951,69 @@ impl App {
             .unwrap_or_else(Instant::now);
     }
 
+    /// `R` — restart the ccmux binaries in place (SPEC §8.11).
+    ///
+    /// WHAT IT RESTARTS: every ccmux process in the session — this sidebar,
+    /// every other tab's sidebar, and every Claude pane ccmux opened. The
+    /// SESSION, not this tab, because `R` exists for the moment after
+    /// `cargo install`, and the point of that moment is that nothing is left
+    /// running the old binary. A per-tab `R` would leave the other tabs on the
+    /// replaced image and give the operator no way to reach them: this process
+    /// cannot `exec` another process, so a respawn is the only mechanism there
+    /// is, and it works across tabs exactly as well as within one.
+    ///
+    /// WHAT IT DOES NOT RESTART: anything ccmux cannot prove it created. See
+    /// `restart::plan` — the rule lives there, pure and tested, because it is
+    /// the one part of this verb that is not recoverable if it is wrong.
+    ///
+    /// NO CONFIRMATION, NO ARM. `Ctrl+X` has one because its second press
+    /// deletes a session and its git worktree; there is no undo for that.
+    /// `R` kills only attach clients whose agents are daemon-owned and survive
+    /// (PROBE-FINDINGS §3) and sidebars whose entire state is in tmux window
+    /// options, and it puts every one of them straight back in the same pane.
+    /// The worst an accidental `R` costs is the panes' scrollback and about a
+    /// second. An arm on a recoverable verb is a tax on the common case, and
+    /// the confirm modal it would revive was deleted outright.
+    ///
+    /// The binary is resolved and proven to exist BEFORE anything is killed,
+    /// so a half-finished upgrade cannot cost the operator their sidebars.
+    pub fn act_restart(&mut self) -> Action {
+        if self.degraded {
+            self.flash("not inside tmux — restart unavailable", MsgLevel::Warn);
+            return Action::Redraw;
+        }
+        // Re-resolved HERE, not inherited: `sidebar_cmd` was built at launch
+        // from a `current_exe()` that now names a deleted inode. See
+        // `restart::exe_path`.
+        let Some(exe) = restart::exe_path() else {
+            self.flash("cannot find the ccmux binary — not restarting", MsgLevel::Error);
+            return Action::Redraw;
+        };
+        let Some(cmd) = restart::sidebar_command(&exe) else {
+            self.flash("ccmux path is not valid UTF-8 — not restarting", MsgLevel::Error);
+            return Action::Redraw;
+        };
+
+        let plan = restart::plan(&self.tabs, &self.panes, self.own_pane.as_ref());
+        let mut failed = 0usize;
+        for t in &plan.targets {
+            let shell_cmd = match &t.role {
+                Role::Sidebar => cmd.clone(),
+                Role::Claude { short_id } => agents::attach_pane_cmd(short_id),
+            };
+            // R2 lives inside the helper: every one of these is an
+            // `assert_in_session`-gated write on a validated `PaneId`.
+            if (self.respawn)(&self.tmux_session, &t.pane, &shell_cmd).is_err() {
+                failed += 1;
+            }
+        }
+
+        // +1 for this process, which restarts by `exec` a moment from now.
+        let note = restart::note(plan.sidebars + 1, plan.claude, failed, plan.unattachable);
+        self.pending_restart = Some(restart::Pending { exe, note });
+        Action::Restart
+    }
+
     /// `Enter` inside a prompt. SPEC §8.6 (§8.7, the interactive prompt, is
     /// gone along with its `c` binding).
     ///
@@ -2865,6 +2947,10 @@ impl App {
                 self.act_force_refresh();
                 Action::Redraw
             }
+            // Reachable: `R` arrives with SHIFT set, and no arm above it
+            // requires empty modifiers. It sits BELOW `_ if ctrl`, which is
+            // correct — `Ctrl-R` is not this binding and must stay inert.
+            KeyCode::Char('R') => self.act_restart(),
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 self.help_scroll = 0;
@@ -3364,6 +3450,11 @@ mod tests {
             // enumeration clears this, the way `refresh_panes` does.
             panes_fresh: true,
             should_quit: false,
+            pending_restart: None,
+            // Same rule as `dispatch`: no hermetic test may respawn a pane on
+            // the operator's live server. A test that exercises `R` installs
+            // its own recording stub.
+            respawn: |_, _, _| panic!("unit test reached respawn_pane"),
             // STRUCTURAL, not disciplinary: no hermetic test may ever spawn the
             // real `claude` (a dispatch here would start a real background
             // session on the operator's daemon). Tests that exercise the submit
@@ -6916,6 +7007,198 @@ mod tests {
         a.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(a.hidden.ids().is_empty());
         assert!(a.message.is_none(), "no 'nothing to undo' from Ctrl-u");
+    }
+
+    // ── `R` — restart in place (§8.11) ──────────────────────────────────────
+
+    thread_local! {
+        /// Every `(pane, command)` the respawn seam was handed, in order.
+        static RESPAWNS: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// The respawn seam, recording instead of shelling out. Thread-local, so
+    /// two `R` tests running in parallel cannot see each other's calls.
+    fn recording_respawn(_session: &str, pane: &PaneId, cmd: &str) -> Result<(), TmuxError> {
+        RESPAWNS.with(|r| r.borrow_mut().push((pane.to_string(), cmd.to_string())));
+        Ok(())
+    }
+
+    fn recorded() -> Vec<(String, String)> {
+        RESPAWNS.with(|r| r.borrow().clone())
+    }
+
+    /// One ccmux tab plus a second one, and — the point of the fixture — `%3`,
+    /// an UNMANAGED pane in ccmux's own window. It is in no map and is no
+    /// window's marker, which is exactly the state of the operator's
+    /// `opencode` pane in the live session.
+    fn restartable(a: &mut App) {
+        own(a, "%1", "@1");
+        a.panes = vec![
+            pane("%1", 1, 0, 0, 34, false),
+            pane("%2", 1, 1, 35, 40, false),
+            pane("%3", 1, 2, 76, 40, true),
+            pane("%4", 2, 0, 0, 34, false),
+            pane("%5", 2, 1, 35, 80, false),
+        ];
+        let mut m1 = PaneMap::new();
+        m1.insert(
+            &PaneId::parse("%2").expect("pane id"),
+            PaneEntry {
+                session_id: "sid-a".into(),
+                short_id: "aaaaaaaa".into(),
+                name: "a".into(),
+                opened_at: 0,
+            },
+        );
+        let mut m2 = PaneMap::new();
+        m2.insert(
+            &PaneId::parse("%5").expect("pane id"),
+            PaneEntry {
+                session_id: "sid-b".into(),
+                short_id: "bbbbbbbb".into(),
+                name: "b".into(),
+                opened_at: 0,
+            },
+        );
+        a.tabs = vec![
+            TabInfo {
+                window: WindowId::parse("@1").expect("window id"),
+                index: 1,
+                sidebar: PaneId::parse("%1"),
+                map: m1,
+                hidden: HiddenLog::new(),
+            },
+            TabInfo {
+                window: WindowId::parse("@2").expect("window id"),
+                index: 2,
+                sidebar: PaneId::parse("%4"),
+                map: m2,
+                hidden: HiddenLog::new(),
+            },
+        ];
+        a.respawn = recording_respawn;
+        RESPAWNS.with(|r| r.borrow_mut().clear());
+    }
+
+    /// THE SAFETY TEST, driven through the keymap rather than the verb: `R`
+    /// respawns this session's other sidebars and the panes ccmux opened, and
+    /// never `%3`, which ccmux did not create. It also never respawns `%1` —
+    /// this process's own pane, which restarts by `exec`.
+    #[test]
+    fn r_restarts_only_the_panes_ccmux_owns() {
+        let mut a = app();
+        restartable(&mut a);
+
+        let act = a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(act, Action::Restart, "`R` is reachable in the Normal keymap");
+        let got = recorded();
+        let panes: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(panes, vec!["%2", "%4", "%5"]);
+        assert!(
+            !panes.contains(&"%3"),
+            "an unmanaged pane must never be respawned: {panes:?}"
+        );
+        assert!(
+            !panes.contains(&"%1"),
+            "my own pane restarts by exec, never by respawn: {panes:?}"
+        );
+
+        // The commands are the ones that rebuild each role, not a guess.
+        assert!(got[0].1.contains("attach aaaaaaaa;"), "{:?}", got[0].1);
+        // The other tab's sidebar is respawned with a command built from the
+        // FRESHLY RESOLVED binary. The fixture's `sidebar_cmd` is `None`, so
+        // the only way this string exists is that `R` rebuilt it rather than
+        // reusing the one the launcher computed from a `current_exe()` that a
+        // `cargo install` may since have turned into a deleted inode.
+        assert!(a.sidebar_cmd.is_none(), "nothing stale was available to reuse");
+        let exe = restart::exe_path().expect("the test binary is on disk");
+        let want = restart::sidebar_command(&exe).expect("build");
+        assert_eq!(got[1].1, want);
+        assert!(got[2].1.contains("attach bbbbbbbb;"), "{:?}", got[2].1);
+
+        // The summary counts this process too, and is what the new image
+        // flashes once it is drawing.
+        let p = a.pending_restart.take().expect("a restart was authorised");
+        assert_eq!(p.note, "restarted 2 sidebars, 2 panes");
+        assert!(p.exe.is_file(), "the binary is resolved before anything is killed");
+    }
+
+    /// `R` is a single keypress that kills processes, and deliberately has no
+    /// arm: it must not open one, borrow `Ctrl+X`'s, or leave a mode behind.
+    #[test]
+    fn r_needs_no_arm_and_opens_none() {
+        let mut a = app();
+        restartable(&mut a);
+        load(&mut a, four());
+
+        a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert!(a.stop_arm.is_none(), "`R` does not arm a delete window");
+        assert!(a.pending_delete.is_none());
+        assert_eq!(a.mode, Mode::Normal, "no modal, no prompt: the confirm mode is gone");
+        assert!(!a.should_quit, "a restart is not a quit");
+        assert!(a.arm_hint().is_none(), "the footer promises no second press");
+    }
+
+    /// A dismissal made just before `R` is still in memory AND still owed to
+    /// tmux afterwards, so `main`'s flush step writes it to
+    /// `@ccmux_tab_hidden` — the window option that carries it across the
+    /// restart. The pane map is likewise untouched.
+    #[test]
+    fn a_dismissal_and_the_pane_map_survive_a_restart() {
+        let mut a = app();
+        restartable(&mut a);
+        load(&mut a, four());
+        a.map = a.tabs[0].map.clone();
+
+        a.on_key(press('d'));
+        let hidden_before = a.hidden.ids().to_vec();
+        let log_before = a.hidden_log.clone();
+        let map_before = a.map.clone();
+        assert_eq!(hidden_before.len(), 1, "the fixture dismissed a row");
+
+        a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(a.hidden.ids(), hidden_before.as_slice(), "`R` un-hides nothing");
+        assert_eq!(a.hidden_log, log_before, "the dismissal log is not rewritten");
+        assert_eq!(a.map, map_before, "the pane map is not rewritten");
+        assert!(
+            a.hidden_dirty,
+            "still owed to tmux, so `shutdown` writes it before the exec"
+        );
+    }
+
+    /// Outside tmux there is nothing to respawn and nothing to exec into.
+    /// The panicking respawn stub is the proof that no pane was touched.
+    #[test]
+    fn r_refuses_outside_tmux() {
+        let mut a = app();
+        a.degraded = true;
+
+        let act = a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(act, Action::Redraw);
+        assert!(a.pending_restart.is_none(), "nothing to exec");
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "not inside tmux — restart unavailable"
+        );
+    }
+
+    /// `Ctrl-R` is not this binding. It falls to the `_ if ctrl` catch-all
+    /// above the char arms and must stay completely inert.
+    #[test]
+    fn ctrl_r_is_not_the_restart_binding() {
+        let mut a = app();
+        restartable(&mut a);
+
+        let act = a.on_key(ctrl('r'));
+
+        assert_eq!(act, Action::None);
+        assert!(recorded().is_empty(), "Ctrl-R respawns nothing");
+        assert!(a.pending_restart.is_none());
     }
 
     /// Small ergonomic shim so assertions read cleanly without `unwrap`.
