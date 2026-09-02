@@ -257,7 +257,16 @@ pane you opened yourself inside the ccmux session, with `prefix-"` or
 keeps running, with the same pid.
 
 The footer then says what happened, from the new image: `restarted 3 sidebars,
-4 panes`.
+4 panes`. It is a count of what was actually restarted, not a plan announced in
+advance — the sidebar you pressed `R` in restarts first, and the image that
+comes up is the one that restarts everything else.
+
+That order is the safety property. `respawn-pane -k` has no undo: it kills the
+pane, runs the new command, and if that command exits the pane closes and the
+window layout collapses with it. So `R` spends none of them until the new binary
+has proven it runs, by running. If the binary is broken, or the path is wrong,
+or the `exec` fails anyway, the sidebar re-enters its screen, says
+`restart failed: …`, and every pane in the session is exactly where it was.
 
 Two things do not survive, both by nature. The panes' **scrollback** is gone,
 because the commands in them were restarted — the agents' transcripts are not,
@@ -271,10 +280,14 @@ comes back untouched.
 that is not a detail: once `cargo install` has renamed a new file over the old
 path, `current_exe()` answers `…/ccmux (deleted)` and `/proc/self/exe` still
 opens the **old** image, so the obvious implementation would either fail or
-restart the very binary you just replaced while reporting success. The path is
-also checked to exist before any pane is killed, so a half-finished upgrade
-cannot cost you your sidebars. If the `exec` fails anyway, the sidebar re-enters
-its screen and says `restart failed: …` instead of dying.
+restart the very binary you just replaced while reporting success.
+
+Then it runs it. `<ccmux> --version` has to spawn, exit 0 and print `ccmux`
+before `R` will hand the session over to it — an execute bit is not proof that a
+file can be executed, and "the binary was replaced seconds ago" is exactly the
+situation that produces a truncated download, a wrong-architecture build or one
+linked against a library that is no longer installed. A candidate that fails
+that check is refused with a message and nothing is restarted.
 
 ### Which sessions are listed
 
@@ -330,8 +343,11 @@ that is known to have lost rows concludes nothing at all.
   `x` can never reach a process that dies with its pane.
 - `R` restarts processes but destroys nothing: it only respawns panes ccmux
   itself created, the agents outlive their attach clients, and every pane comes
-  straight back. That is why it has no confirmation — an arm belongs on a verb
-  with no undo, and `Ctrl-x`'s second press is the only one of those.
+  straight back. Nothing is killed until the new binary is proven to run — it is
+  run, and then it is the process doing the respawning — so a failed upgrade
+  costs a message rather than your sidebars. That is why it has no confirmation:
+  an arm belongs on a verb with no undo, and `Ctrl-x`'s second press is the only
+  one of those.
 - `Ctrl-x` is the only verb that stops a session, and the only one that can
   delete one. The first press **stops** — recoverable: the conversation is kept
   and `Enter` resumes it. Only a **second press within two seconds** deletes: it

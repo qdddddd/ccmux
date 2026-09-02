@@ -2322,20 +2322,32 @@ ccmux process in the session restarts, and nothing else changes. Windows, panes,
 pane ids, geometry and the layout are all preserved.
 
 ```
+THE IMAGE THAT PRESSES `R` KILLS NOTHING.
 1. degraded -> flash "not inside tmux — restart unavailable" (Warn); return Redraw
 2. exe = restart::exe_path() or flash "cannot find the ccmux binary — not restarting" (Error); return Redraw
-3. cmd = restart::sidebar_command(exe) or flash "…not valid UTF-8…" (Error); return Redraw
-4. for t in restart::plan(tabs, panes, own_pane):
-       tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))   [R2-gated]
-5. pending_restart = { exe, restart::note(sidebars + 1, panes, failed, skipped) }
-   return Action::Restart
-6. main::event_loop, in this order and no other:
+3. restart::probe(exe): RUN it. `<exe> --version` must spawn, exit 0 within
+   PROBE_TIMEOUT (3 s) and name itself `ccmux`; otherwise flash
+   "<why> — not restarting" (Error) and return Redraw
+4. pending_restart = { exe }; return Action::Restart
+5. main::event_loop, in this order and no other:
        drain buffered input   (type-ahead would survive the exec)
        restore_terminal()     (leave the alt screen, drop raw mode, drop paste)
        app.shutdown()         (the deferred @ccmux_tab_map / @ccmux_tab_hidden writes)
-       exec(exe, argv[1..], CCMUX_RESTART_NOTE=<note>)
-7. exec returns only on FAILURE: re-enter raw mode + the alt screen, then flash
-   "restart failed: <err>" (Error) and keep running.
+       exec(exe, argv[1..], CCMUX_RESTART=<this pid>)
+6. exec returns only on FAILURE: re-enter raw mode + the alt screen, then flash
+   "restart failed: <err>" (Error) and keep running. Every pane in the session
+   is still exactly as it was, because none of them was touched.
+
+THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
+7. main::run_sidebar, when restart::is_handoff():
+       app.finish_restart():
+           refresh_panes()                     fresh panes + every tab's records
+           tabs := list-windows, with MY window's map replaced by self.map
+           for t in restart::plan(tabs, panes, own_pane):
+               tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))  [R2-gated]
+           flash restart::note(sidebars + 1, panes, failed, skipped)  (Info)
+8. event_loop draws ONE frame before its first tick, so that note is on screen
+   before `claude agents --json` blocks the loop.
 ```
 
 **Three populations, three mechanisms.** This sidebar is replaced by `exec(2)`,
@@ -2346,6 +2358,23 @@ with `respawn-pane -k`, which keeps the pane id and the layout. The Claude panes
 are respawned the same way; the AGENT survives, because every session ccmux
 lists is a daemon-owned background one (PROBE-FINDINGS §3) and an attach client
 is disposable.
+
+**NOTHING IS KILLED UNTIL THE NEW IMAGE IS RUNNING.** `respawn-pane -k` has no
+undo: the pane is killed, the replacement command runs, and if that command
+exits at once the pane closes and the window layout collapses with it. Spending
+one on a binary that has not yet been shown to run is how a half-finished
+upgrade costs the operator every sidebar in the session — measured, with a file
+that had an execute bit and a `#!` line naming an interpreter that did not
+exist: the other tab's sidebar pane was gone and its layout had collapsed by the
+time `execve` returned ENOENT, and the only surviving process could say nothing
+but `restart failed: No such file or directory`. So the order is inverted. This
+process `exec`s FIRST, and the image that comes up — running, drawing, provably
+the new binary — is what respawns everyone else. A refusal, a bad path or a
+failed `exec` now costs one flash and no pane at all.
+
+The `exec` is still not taken on trust: `restart::probe` RUNS the candidate
+first (§ *Which file to exec*), because the one pane an `exec` can still cost is
+this one.
 
 **`R` restarts the SESSION, not the tab.** The verb exists so that nothing is
 left running the replaced binary, and a per-tab `R` would leave the other tabs
@@ -2379,12 +2408,25 @@ running image's inode loses its last name and, measured on tmux 3.4 / Linux
 
 So `R` re-resolves the binary from `argv[0]` — a PATH the kernel resolves fresh
 at exec time — falling back to a `$PATH` lookup for a bare argv[0] and, last, to
-`current_exe()` with the kernel's `" (deleted)"` suffix stripped. The result is
-proven to be a file **before any pane is killed**, so a half-finished upgrade
-cannot cost the operator their sidebars. The same freshly resolved path builds
-the command the other tabs' sidebars are respawned with: `App::sidebar_cmd` was
-built at launch from a `current_exe()` that may now name the deleted inode, and
-respawning with it would leave those panes running nothing at all.
+`current_exe()` with the kernel's `" (deleted)"` suffix stripped. The same
+freshly resolved path builds the command the other tabs' sidebars are respawned
+with: `App::sidebar_cmd` was built at launch from a `current_exe()` that may now
+name the deleted inode, and respawning with it would leave those panes running
+nothing at all.
+
+**And then it is RUN, not stat'd.** An execute bit is not an `execve`. A
+truncated download, an ELF for the wrong architecture, a script whose
+interpreter is not installed and a build linked against a `.so` that is no
+longer on the system are all regular files with the execute bit set, and all of
+them are exactly what "the binary was replaced seconds ago" produces.
+`restart::probe` spawns `<exe> --version` — stdin `/dev/null`, stdout a pipe,
+stderr discarded, so nothing can write over the alternate screen — and requires
+that it spawn at all (where `execve`'s own ENOENT / ENOEXEC / EACCES land), exit
+within `PROBE_TIMEOUT`, exit **0** (where a missing shared library's 127 and a
+startup panic's 101 land), and print a first word of `ccmux` (so a `$PATH`
+lookup that found a namesake is refused rather than `exec`d). A build too old to
+answer `--version` is refused; that is the conservative direction, and under the
+ordering above a refusal costs one flash.
 
 **No confirmation and no arm.** `Ctrl+X` has a two-press window because its
 second press deletes a session and its git worktree, which has no undo. `R`
@@ -2406,11 +2448,32 @@ deferred write: `respawn-pane -k` gives that process no chance to flush, so a
 memory only — the poll-quiescing ladder, the `Ctrl+X` window, the filter, the
 scroll position — starts fresh, which is what a restart means.
 
-**What the operator sees.** The flash naming the restart is written by a process
-that stops existing before the next frame, so it rides across the `exec` in
-`CCMUX_RESTART_NOTE` and is flashed by the new image on startup: `restarted 3
-sidebars, 4 panes`, plus `(N failed)` or `(N skipped)` when either applies. The
-count includes this sidebar.
+**Which records `R` plans from.** Every OTHER window's, from a `list-windows`
+taken inside `finish_restart` — a fresh read in a fresh process, so a tab that
+appeared or healed since the last tick is seen. For **this** window, `self.map`,
+not the snapshot of `@ccmux_tab_map` that read returns: the in-memory map is
+what this process writes and the option is a lagging shadow of it, and `act_open`
+inserts, refreshes, and only THEN saves — so straight after an `o` the snapshot
+provably lacks the pane just opened. Planning from the shadow left that pane
+running the `claude` binary the operator had just replaced while the footer
+counted it as restarted. This does not widen ownership: every entry in
+`self.map` was written by ccmux when it created the pane, and `plan` still
+requires the pane to be live.
+
+**What the operator sees.** The new image counts what it restarts and flashes
+it: `restarted 3 sidebars, 4 panes`, plus `(N failed)` or `(N skipped)` when
+either applies. The count includes this sidebar. It is a report, not a promise
+made before the fact — which is only possible because the respawns happen after
+the `exec` rather than before it. `event_loop` draws one frame before its first
+tick so that the note cannot expire against `MSG_TTL` while `claude agents
+--json` blocks the loop on the cold start an upgrade guarantees.
+
+`CCMUX_RESTART` carries the handoff, and its value is the **pid** of the process
+that set it. `exec(2)` preserves a pid, so the image that comes up matches and
+knows it owes the session a restart pass, while any process that merely
+inherited the variable — a sidebar `respawn-pane` started from a tmux
+environment carrying it — does not, and does nothing. Without that, one stray
+variable would have every sidebar respawn every other one on startup, forever.
 
 ---
 
@@ -2893,7 +2956,10 @@ not spend implementation time re-deriving them.
 | `claude --bg, --background` takes the prompt as a **positional** argument. | `claude --help`. Basis of RULE Q4. |
 | `respawn-pane -k` keeps the pane id, its geometry and the window layout, and replaces only the command. | Across a whole-session `R`: every `%N` unchanged, every `pane_left,top WxH` unchanged, and all three `window_layout` checksums byte-identical (`5e48,…`, `a4a6,…`, `b263,…`). Basis of §8.11. |
 | After the running binary's path is renamed over, `current_exe()` and `readlink /proc/self/exe` both answer `"<path> (deleted)"`, `exec` of that path is `ENOENT`, and `exec("/proc/self/exe")` runs the **old** image; `argv[0]` runs the **new** one. | Measured twice: once with a purpose-built probe, once end-to-end with two ccmux builds carrying distinct trailing image markers. After `R` the sidebar kept pid and start time (`exec` replaces the image, not the process) while `/proc/<pid>/exe` moved from the old inode to the new one. Basis of §8.11's `exe_path`. |
-| A file can pass `is_file()` and still fail `execve`. | A `chmod -x` on the installed binary respawned every other pane and then failed with `EACCES`, taking out another tab's sidebar. `exe_path` now requires an execute bit, and refuses **before** anything is killed. |
+| A file can pass `is_file()` **and an execute bit** and still fail `execve`, and a file-mode pre-check cannot tell the difference. | A `chmod -x` failed with `EACCES`; a 22-byte file with mode 755 and `#!/nonexistent/interp` failed with `ENOENT`. Both passed every check `restart::runnable` can make. While the respawns ran BEFORE the `exec`, each one destroyed the other tab's sidebar pane on the way to that error — measured, layout `9e3c,200x50,0,0{34x50,0,0,3,165x50,35,0,2}` collapsing to `ac9f,200x50,0,0,2`. Basis of `probe` and of §8.11's `exec`-first ordering. |
+| Running the candidate is a check a file-mode test is not. With `exec` first and the respawns moved into the new image, a binary that cannot run costs nothing. | Same `#!/nonexistent/interp` file, same rig, after the change: every pane id, every pid and both `window_layout` checksums byte-identical across `R`, and the sidebar flashed `the new ccmux will not start: No such file or directory (os error 2) — not restarting`. |
+| The `exec`-first ordering bounds the damage even when `execve` SUCCEEDS and the new image dies — the case no pre-check can catch. | A file answering `--version` with `ccmux 9.9.9` and exiting 1 otherwise passed `probe`, was `exec`d, and closed only the pane that pressed `R`. The other tab was untouched: sidebar pid `1984234` unchanged, `window_layout` `9e3c,…` byte-identical. Before the change the same binary took every sidebar in the session. |
+| `exec(2)` preserves the pid, which makes a pid-valued handoff token unforgeable by a process that merely inherited it. | `CCMUX_RESTART=<pid>`: the `exec`d image matched and ran one restart pass; the sidebars it respawned inherit nothing and ran none. Pane pids stable across three samples at 2 s intervals — no respawn loop. |
 
 ### A.1 A cautionary note that became RULE R1
 

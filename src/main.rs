@@ -28,13 +28,16 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::app::{Action, MsgLevel};
 use crate::tmux::PaneId;
 
 #[derive(clap::Parser)]
-#[command(name = "ccmux", about = "tmux-backed frontend for Claude Code sessions")]
+// `version` is not decoration: `restart::probe` runs `<candidate> --version`
+// to prove the binary `R` is about to `exec` actually starts, and reads the
+// name it prints back to prove it is ccmux and not a `$PATH` namesake.
+#[command(name = "ccmux", version, about = "tmux-backed frontend for Claude Code sessions")]
 pub struct Cli {
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
@@ -441,15 +444,6 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     // launcher uses. `app` never imports `main`; the string is handed down, so
     // the module DAG stays acyclic.
     app.sidebar_cmd = sidebar_command(cli, width).ok();
-    // An `R` in the process image this one replaced left its summary here: the
-    // flash it wrote could never be drawn, because the process that wrote it
-    // stopped existing before the next frame. The environment is what survives
-    // an `exec`, so that is where the message rides across.
-    if let Ok(note) = std::env::var(restart::NOTE_ENV)
-        && !note.trim().is_empty()
-    {
-        app.flash(note, MsgLevel::Info);
-    }
 
     install_panic_hook();
     enable_raw_mode().context("cannot enter raw mode")?;
@@ -468,6 +462,14 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
             let _ = terminal.hide_cursor();
             // §9.5: outside tmux this sets degraded mode; it never fails.
             app.init();
+            // THE SECOND HALF OF AN `R`. The image that pressed it killed
+            // nothing: it resolved this binary, proved it runs, and `exec`d.
+            // This process running at all is the proof that licenses the
+            // respawns, so they happen HERE — and only when the handoff token
+            // is this process's own pid, which only an `exec` can arrange.
+            if restart::is_handoff() {
+                app.finish_restart();
+            }
             event_loop(&mut terminal, &mut app)
         });
 
@@ -482,9 +484,43 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     result
 }
 
+/// The terminal-derived geometry `app.rs` reads but never computes.
+///
+/// Runs on every iteration whether or not a frame follows: `on_key` pages by
+/// `viewport`, so a stale one is a wrong `Ctrl-d`.
+///
+/// Generic over the backend for one reason: so `first_frame` is, and so the
+/// thing `first_frame` exists to guarantee is a test and not a comment.
+fn measure<B: Backend>(terminal: &Terminal<B>, app: &mut app::App) -> anyhow::Result<()> {
+    let height = terminal.size()?.height;
+    app.viewport = ui::list_viewport_rows(height);
+    app.overlay_viewport = height.saturating_sub(2);
+    app.help_lines = ui::help_line_count();
+    app.clamp_scroll();
+    Ok(())
+}
+
+/// ONE FRAME BEFORE THE FIRST TICK, and the whole reason it is a function.
+///
+/// `last_poll` is backdated in `App::new`, so the loop's first act is a
+/// `tick()` that blocks on `claude agents --json` — up to
+/// `agents::POLL_TIMEOUT`, and slowest of all on the cold start straight after
+/// an upgrade, which is precisely when `R` was pressed. Drawing only after it
+/// costs two things: the pane stays blank for that whole wait, and a message
+/// armed before the loop can reach `MSG_TTL` with no frame ever having existed
+/// — which is how `R`'s summary, the only feedback the verb has, was lost
+/// outright. This frame makes both impossible, and it is the frame the operator
+/// is looking at while the tick blocks.
+fn first_frame<B: Backend>(terminal: &mut Terminal<B>, app: &mut app::App) -> anyhow::Result<()> {
+    measure(terminal, app)?;
+    terminal.draw(|f| ui::draw(f, app))?;
+    Ok(())
+}
+
 /// SPEC §4.1, verbatim.
 fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
-    let mut needs_draw = true;
+    first_frame(terminal, app)?;
+    let mut needs_draw = false;
 
     loop {
         if app.check_message_timeout() {
@@ -521,14 +557,7 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
             }
         }
 
-        // `app.rs` reads these but never computes them; this is the only place
-        // they are written. `overlay_viewport` is the body height of a bordered
-        // full-area overlay, which is what `Mode::Logs`/`Mode::Help` scroll.
-        let height = terminal.size()?.height;
-        app.viewport = ui::list_viewport_rows(height);
-        app.overlay_viewport = height.saturating_sub(2);
-        app.help_lines = ui::help_line_count();
-        app.clamp_scroll();
+        measure(terminal, app)?;
 
         if needs_draw {
             terminal.draw(|f| ui::draw(f, app))?;
@@ -641,11 +670,17 @@ fn restart_now(
 /// The argv is THIS process's own, minus argv[0]: same subcommand, same
 /// `--session`, `--width`, `--socket`, `--interval`, same palette. argv[0]
 /// becomes the freshly resolved path, which is what makes a SECOND restart find
-/// the binary the same way.
+/// the binary the same way, and what lets the new image rebuild the command the
+/// other tabs' sidebars are respawned with.
+///
+/// `HANDOFF_ENV` carries this process's pid, which `exec` preserves: it is how
+/// the image that comes up knows it owes the rest of the session a restart, and
+/// — because only an `exec` keeps a pid — how a sidebar that merely inherited
+/// the variable knows it does not.
 fn exec_pending(p: &restart::Pending) -> io::Error {
     std::process::Command::new(&p.exe)
         .args(std::env::args_os().skip(1))
-        .env(restart::NOTE_ENV, &p.note)
+        .env(restart::HANDOFF_ENV, restart::handoff_token())
         .exec()
 }
 
@@ -875,10 +910,7 @@ mod tests {
     /// tick dies with the process image.
     #[test]
     fn the_restart_tears_the_terminal_down_before_it_execs() {
-        let p = restart::Pending {
-            exe: std::path::PathBuf::from("/nonexistent/ccmux"),
-            note: "restarted 1 sidebar, 0 panes".into(),
-        };
+        let p = restart::Pending { exe: std::path::PathBuf::from("/nonexistent/ccmux") };
         let seen: std::cell::RefCell<Vec<RestartStep>> = std::cell::RefCell::new(Vec::new());
         let execs = std::cell::Cell::new(0usize);
 
@@ -907,6 +939,36 @@ mod tests {
         assert_eq!(
             seen.borrow().iter().position(|s| *s == RestartStep::RestoreTerminal),
             Some(1)
+        );
+    }
+
+    /// THE REGRESSION TEST for a restart note nobody ever saw.
+    ///
+    /// `R`'s summary is armed before the event loop, and the loop's first act
+    /// is a `tick()` that blocks on `claude agents --json` for as long as
+    /// `agents::POLL_TIMEOUT`. With the first `draw` behind that tick, a poll
+    /// of four seconds or more expired the message before a single frame had
+    /// existed and the operator saw nothing at all. The frame comes first.
+    #[test]
+    fn the_first_frame_carries_a_message_armed_before_the_loop() {
+        let mut app = app::App::new("ccmux-test".into(), 34, Duration::from_millis(2500), true);
+        app.flash("restarted 2 sidebars, 3 panes", MsgLevel::Info);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(34, 20))
+            .expect("test backend");
+
+        // No tick, no key, nothing else: exactly what `event_loop` does first.
+        first_frame(&mut term, &mut app).expect("the first frame draws");
+
+        let dump: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            dump.contains("restarted 2 sidebars, 3 panes"),
+            "the note must be on screen before anything can block: {dump:?}"
         );
     }
 

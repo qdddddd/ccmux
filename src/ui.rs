@@ -1458,6 +1458,7 @@ mod tests {
             // reaching into `agents`, which must be impossible.
             pending_restart: None,
             respawn: |_, _, _| panic!("ui test reached respawn_pane"),
+            probe: |_| panic!("ui test reached restart::probe"),
             dispatch: |_, _| panic!("ui test reached dispatch_background"),
         }
     }

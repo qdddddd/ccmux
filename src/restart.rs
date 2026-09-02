@@ -14,19 +14,63 @@
 //!      is daemon-owned and outlives its pane (PROBE-FINDINGS §3), so an attach
 //!      client is disposable.
 //!
-//! This module owns the two questions that answer badly if guessed: WHICH panes
-//! may be respawned (`plan`, pure) and WHICH file to exec (`exe_path`).
+//! THE ORDER IS THE SAFETY PROPERTY. Population 1 goes FIRST, and populations
+//! 2 and 3 are respawned by the image it `exec`s into — never by the image that
+//! is about to be replaced. A `respawn-pane -k` cannot be undone: the pane is
+//! killed, the new command runs, and if that command exits at once the pane
+//! closes and takes the window layout with it. Doing that to another tab's
+//! sidebar on the strength of a binary this process has not yet proven can run
+//! is exactly how a half-finished upgrade costs the operator every sidebar in
+//! the session. So the candidate is `exec`d first, and the fact that the new
+//! image is RUNNING is what licenses it to touch anyone else's pane. If the
+//! `exec` fails, nothing anywhere has been killed and this sidebar says so.
+//!
+//! This module owns the three questions that answer badly if guessed: WHICH
+//! panes may be respawned (`plan`, pure), WHICH file to exec (`exe_path`), and
+//! whether that file actually RUNS (`probe`).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::tmux::{self, PaneId, PaneInfo, TabInfo};
 
-/// The env var `R` uses to hand its summary to the process image it execs
-/// into. The flash it names is written by a process that no longer exists by
-/// the time anything could draw it, so the message has to survive the exec —
-/// and the environment is the one thing that does.
-pub const NOTE_ENV: &str = "CCMUX_RESTART_NOTE";
+/// The env var that tells a fresh sidebar it is the second half of an `R`, and
+/// so must finish the job by respawning everything this image could not.
+///
+/// Its VALUE is the pid of the process that set it, and that is what makes the
+/// handoff self-validating: `exec(2)` keeps the pid, so the image that comes up
+/// matches, while any other process that merely INHERITED the variable does
+/// not. Without that check a stray `CCMUX_RESTART` in the tmux server's
+/// environment would reach every sidebar tmux ever starts, and each would
+/// respawn all the others on startup — a respawn loop with no exit.
+pub const HANDOFF_ENV: &str = "CCMUX_RESTART";
+
+/// The value `main::exec_pending` writes into `HANDOFF_ENV`: this process's own
+/// pid, which `exec` preserves across the image swap.
+pub fn handoff_token() -> String {
+    std::process::id().to_string()
+}
+
+/// Is this image the one an `R` in this very process `exec`d into? Only then
+/// may it respawn other panes — see the module header on ordering.
+pub fn is_handoff() -> bool {
+    handoff_matches(std::env::var(HANDOFF_ENV).ok().as_deref())
+}
+
+/// The rule `is_handoff` applies, split out so it can be tested without
+/// writing to the process environment — `setenv` while other test threads sit
+/// inside `getenv` is exactly the race Rust 2024 made `set_var` unsafe for.
+fn handoff_matches(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v == handoff_token())
+}
+
+/// How long `probe` waits for the candidate binary to answer `--version`.
+/// Generous beside a cold start (milliseconds) and short enough that a binary
+/// that hangs costs a keypress rather than the session.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often `probe` looks at the child. Small enough to be invisible.
+const PROBE_STEP: Duration = Duration::from_millis(5);
 
 /// What a pane must be restarted as. The role is what decides the command, and
 /// it can only be derived from ccmux's own ownership records — never from what
@@ -186,8 +230,10 @@ fn plural(n: usize, word: &str) -> String {
 /// is still the live inode. A hand-typed `ccmux sidebar` gives a bare name
 /// instead, which is why the PATH branch exists.
 ///
-/// Everything is resolved to a path that EXISTS before any pane is killed, so a
-/// half-finished upgrade cannot cost the operator their sidebars.
+/// Resolution only says WHICH file. `probe` says whether that file runs, and
+/// the `exec`-before-respawn ordering says what it costs if it does not: with
+/// no pane killed until the new image is up, a wrong answer here is a flash,
+/// not a lost sidebar.
 pub fn exe_path() -> Option<PathBuf> {
     let argv0 = std::env::args_os().next().map(PathBuf::from).unwrap_or_default();
     if !argv0.as_os_str().is_empty() {
@@ -211,16 +257,17 @@ pub fn exe_path() -> Option<PathBuf> {
 
 /// A regular file with an execute bit set.
 ///
-/// The mode check is not pedantry, it is the pre-check doing its job. `R`
-/// respawns every other pane BEFORE it execs, so a path that passes here and
-/// fails at `execve` costs the operator the sidebars that were already
-/// restarted with it. Verified live: a `chmod -x` on the installed binary
-/// passes `is_file()`, and the restart then took out the other tab's sidebar
-/// on its way to an `EACCES` this process could only report. The mode check
-/// refuses that restart before anything is killed.
+/// A FILTER, not a proof. It is how `exe_path` decides whether a candidate is
+/// worth considering at all — and how `which` picks between `$PATH` entries,
+/// where a directory or a mode-644 file of the right name would otherwise win.
+/// The mode check earns its keep there: a `chmod -x` on the installed binary
+/// still passes `is_file()`.
 ///
-/// It is a pre-check, not a guarantee — the file can still be replaced between
-/// this call and the `exec`, which is why the failure path exists at all.
+/// It says NOTHING about whether `execve` will succeed. A `#!` line naming an
+/// interpreter that is not installed, an ELF for the wrong architecture, a
+/// truncated download and a build linked against a `.so` that has since gone
+/// all pass this and all fail when they are run. `probe` is what settles that
+/// question, and the `exec` ordering is what makes the residue survivable.
 fn runnable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -244,6 +291,86 @@ fn which(name: &Path) -> Option<PathBuf> {
         .find(|c| runnable(c))
 }
 
+/// WHETHER THE CANDIDATE ACTUALLY RUNS — the question `runnable` cannot answer
+/// and the one `R` bets the session on.
+///
+/// An execute bit is not an `execve`. The whole point of `R` is that the file
+/// at that path was replaced by something the operator installed seconds ago,
+/// and "it is a file, and it is executable" is true of a truncated download, a
+/// wrong-architecture ELF, a script whose interpreter is not installed and a
+/// build linked against a `.so` that is no longer there. Every one of them
+/// passes `runnable`; every one of them leaves this pane dead if it is `exec`d.
+///
+/// So the candidate is RUN, in a child, before this process hands itself over:
+/// `<exe> --version`, which touches no tmux server, no `claude` daemon and no
+/// terminal — stdin is `/dev/null`, stdout a pipe and stderr discarded, so a
+/// chatty or broken binary cannot scribble over the alternate screen. It must
+///
+///   * spawn at all, which is where `execve`'s own failures land (ENOENT for a
+///     missing `#!` interpreter, ENOEXEC for the wrong arch, EACCES for a lost
+///     execute bit),
+///   * exit within `timeout` rather than hang,
+///   * exit 0, which is where a missing shared library (127) and a panic during
+///     startup (101) land, and
+///   * name itself `ccmux`, so a `$PATH` lookup that found somebody else's
+///     binary of that name is refused instead of `exec`d.
+///
+/// A ccmux so old that it has no `--version` fails the third test and the
+/// restart is refused. That is the conservative direction, and under the
+/// `exec`-first ordering a refusal costs exactly one flash: no pane has been
+/// killed, because none is killed until the new image is up.
+pub fn probe(exe: &Path) -> Result<(), String> {
+    probe_within(exe, PROBE_TIMEOUT)
+}
+
+/// `probe` with the deadline as a parameter, so the hang case is a test that
+/// finishes rather than a test that waits `PROBE_TIMEOUT`.
+fn probe_within(exe: &Path, timeout: Duration) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(exe)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("the new ccmux will not start: {e}"))?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot check the new ccmux: {e}"));
+            }
+        }
+        if Instant::now() >= deadline {
+            // Reaped, not left behind: an orphan holding the pipe would
+            // outlive the sidebar that spawned it.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("the new ccmux does not answer --version".into());
+        }
+        std::thread::sleep(PROBE_STEP);
+    };
+    if !status.success() {
+        return Err(format!("the new ccmux does not run ({status})"));
+    }
+
+    let mut out = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    match out.split_whitespace().next() {
+        Some(env!("CARGO_PKG_NAME")) => Ok(()),
+        _ => Err("that binary is not ccmux".into()),
+    }
+}
+
 /// The shell command that starts a sidebar running `exe`, for the panes this
 /// process cannot `exec`.
 ///
@@ -262,15 +389,17 @@ pub fn sidebar_command(exe: &Path) -> Option<String> {
     Some(tmux::sh_join(&parts))
 }
 
-/// A restart that `App` has authorised and `main` has still to perform: every
-/// other pane has been respawned, and what is left is this process's own image.
+/// A restart that `App` has authorised and `main` has still to perform.
+///
+/// NOTHING HAS BEEN KILLED YET, and nothing will be until the image named here
+/// is running: the respawns are the new image's job. There is no note to carry
+/// either — the new image counts what it restarts and says so itself, which is
+/// also why the count cannot be a promise made before the fact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
-    /// The file to exec — resolved and proven to exist BEFORE anything was
-    /// killed, so the exec is not a leap of faith.
+    /// The file to exec: resolved from argv[0] by `exe_path` and proven to run
+    /// by `probe`, so the exec is not a leap of faith.
     pub exe: PathBuf,
-    /// What to say once the new image is drawing. Handed over in `NOTE_ENV`.
-    pub note: String,
 }
 
 #[cfg(test)]
@@ -461,10 +590,9 @@ mod tests {
         assert!(runnable(&exe), "{exe:?}");
     }
 
-    /// `is_file()` is not enough, and the difference is not academic: `R`
-    /// respawns every other pane before it execs, so a path that passes the
-    /// pre-check and fails at `execve` costs the sidebars already restarted
-    /// with it.
+    /// `is_file()` is not enough for `exe_path` to pick a candidate: a
+    /// mode-644 file of the right name on `$PATH` would win the lookup and
+    /// resolve `R` to something that cannot be `exec`d at all.
     #[test]
     fn a_readable_but_not_executable_file_is_not_a_binary() {
         let dir = std::env::temp_dir().join(format!("ccmux-runnable-{}", std::process::id()));
@@ -482,6 +610,126 @@ mod tests {
 
         assert!(!runnable(&dir), "a directory is never a binary");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── `probe`: does the candidate actually RUN? ───────────────────────────
+
+    /// A throwaway executable with `body` in it. Named per-test so two of
+    /// these cannot collide, and per-pid so two `cargo test` runs cannot.
+    fn script(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ccmux-probe-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("ccmux");
+        std::fs::write(&f, body).expect("write");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        f
+    }
+
+    /// `probe`, retried past Linux's ETXTBSY race.
+    ///
+    /// `cargo test` runs these in parallel with tests that spawn processes, and
+    /// a child that has forked but not yet reached its own `exec` still holds
+    /// an inherited write descriptor on the file this test created a moment
+    /// ago. `execve` answers ETXTBSY until it closes. It is a property of the
+    /// test rig, not of the probe, so it is absorbed here rather than in
+    /// production code that would then be papering over a real failure.
+    fn settled(f: &Path, timeout: Duration) -> Result<(), String> {
+        for _ in 0..100 {
+            match probe_within(f, timeout) {
+                Err(e) if e.contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+        probe_within(f, timeout)
+    }
+
+    fn scrub(f: &Path) {
+        if let Some(d) = f.parent() {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// THE REGRESSION TEST for the pre-check that only checked a mode bit.
+    ///
+    /// This is the exact shape that took out another tab's sidebar live: a
+    /// regular file, execute bit set, `#!` naming an interpreter that does not
+    /// exist. `runnable` says yes — it has always said yes — and `execve` says
+    /// ENOENT. `probe` is the check that tells them apart.
+    #[test]
+    fn a_file_that_cannot_be_execd_is_refused_however_executable_it_looks() {
+        let f = script("badinterp", "#!/nonexistent/interp\n");
+        assert!(runnable(&f), "the mode check passes it — that was the whole bug");
+        let err = settled(&f, PROBE_TIMEOUT).expect_err("but it cannot be run");
+        assert!(err.contains("will not start"), "{err:?}");
+        scrub(&f);
+    }
+
+    /// The superset: `execve` SUCCEEDS and the image dies immediately. A
+    /// missing `.so` (127), a wrong `--session`, a panic in startup (101) —
+    /// all of them reach `exec` intact and then close the pane. Exit status is
+    /// how the probe sees them coming.
+    #[test]
+    fn a_binary_that_starts_and_exits_nonzero_is_refused() {
+        let f = script("exits", "#!/bin/sh\nexit 127\n");
+        let err = settled(&f, PROBE_TIMEOUT).expect_err("it runs, and that is not enough");
+        assert!(err.contains("does not run"), "{err:?}");
+        scrub(&f);
+    }
+
+    /// A bare argv[0] is resolved off `$PATH`, and `$PATH` can hand back
+    /// somebody else's `ccmux`. Exiting 0 is not identity.
+    #[test]
+    fn a_binary_that_is_not_ccmux_is_refused() {
+        let f = script("stranger", "#!/bin/sh\necho 'notccmux 9.9.9'\n");
+        let err = settled(&f, PROBE_TIMEOUT).expect_err("wrong binary");
+        assert_eq!(err, "that binary is not ccmux");
+        scrub(&f);
+    }
+
+    /// A candidate that never answers must not take the sidebar down with it.
+    /// The deadline is a parameter so this test costs 150 ms, not `PROBE_TIMEOUT`.
+    #[test]
+    fn a_binary_that_hangs_is_killed_and_refused() {
+        let f = script("hangs", "#!/bin/sh\nsleep 30\n");
+        let started = Instant::now();
+        let err = settled(&f, Duration::from_millis(150)).expect_err("it hung");
+        assert!(err.contains("does not answer"), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "the probe is bounded");
+        scrub(&f);
+    }
+
+    /// And the happy path: something that runs, exits 0 and says it is ccmux.
+    #[test]
+    fn a_binary_that_runs_and_names_itself_is_accepted() {
+        let f = script("good", "#!/bin/sh\necho 'ccmux 9.9.9'\n");
+        assert_eq!(settled(&f, PROBE_TIMEOUT), Ok(()));
+        scrub(&f);
+    }
+
+    /// `exec` keeps the pid, so a token that IS the pid is a handoff only the
+    /// process that wrote it can claim. Anything else — a variable inherited
+    /// from a tmux environment, most of all — must not start a restart pass,
+    /// or every sidebar would respawn every other one on startup, forever.
+    #[test]
+    fn only_the_process_that_set_the_token_is_a_handoff() {
+        assert!(!handoff_matches(None), "no variable, no handoff");
+        assert!(!handoff_matches(Some("")), "an empty value is not a pid");
+        assert!(
+            !handoff_matches(Some("1")),
+            "a value that is not my pid belongs to somebody else"
+        );
+        assert!(
+            handoff_matches(Some(&handoff_token())),
+            "the pid `exec` preserved is the proof"
+        );
+        // And the wiring: the live reader agrees with the rule it applies.
+        assert_eq!(
+            is_handoff(),
+            handoff_matches(std::env::var(HANDOFF_ENV).ok().as_deref())
+        );
     }
 
     /// The respawn command is this process's own argv with the resolved binary

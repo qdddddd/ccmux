@@ -421,9 +421,10 @@ pub struct App {
 
     pub should_quit: bool,
 
-    /// `R`'s decision, made and consumed within one keypress: every other pane
-    /// has been respawned and this process's own image is what is left to
-    /// replace. `main::event_loop` takes it on `Action::Restart`.
+    /// `R`'s decision, made and consumed within one keypress: a binary that has
+    /// been resolved and PROVEN to run, waiting for `main::event_loop` to hand
+    /// this process's image over to it on `Action::Restart`. No pane has been
+    /// killed at this point — that is the next image's job.
     pub pending_restart: Option<restart::Pending>,
 
     /// Seam for `tmux::respawn_pane`, for the same reason `dispatch` is one:
@@ -431,6 +432,12 @@ pub struct App {
     /// a hermetic test of WHICH panes it picks must be able to run it without
     /// a tmux server. Production (`App::new`) points it at the real command.
     pub respawn: fn(&str, &PaneId, &str) -> Result<(), TmuxError>,
+
+    /// Seam for `restart::probe`. The real one SPAWNS the candidate binary,
+    /// and in a unit test the candidate is the test harness — `--version` is
+    /// not a thing libtest answers, so every `R` test would exercise the
+    /// refusal path and nothing else. Production points it at the real probe.
+    pub probe: fn(&Path) -> Result<(), String>,
 
     /// Seam for `agents::dispatch_background`, and nothing else. Production
     /// (`App::new`) points it at the real function; the unit-test fixture
@@ -533,6 +540,7 @@ impl App {
 
             pending_restart: None,
             respawn: tmux::respawn_pane,
+            probe: restart::probe,
             dispatch: agents::dispatch_background,
         }
     }
@@ -1975,8 +1983,15 @@ impl App {
     /// second. An arm on a recoverable verb is a tax on the common case, and
     /// the confirm modal it would revive was deleted outright.
     ///
-    /// The binary is resolved and proven to exist BEFORE anything is killed,
-    /// so a half-finished upgrade cannot cost the operator their sidebars.
+    /// NOTHING IS KILLED HERE. `R` resolves the new binary, proves it runs, and
+    /// hands this process's image over to it; every OTHER pane is respawned by
+    /// the image that comes up, in `finish_restart`. That ordering is the whole
+    /// safety argument, and it was learned the hard way: respawning first meant
+    /// a binary that passed a file-mode pre-check and then failed at `execve`
+    /// had already killed another tab's sidebar — the pane closed, the layout
+    /// collapsed, and the only survivor could say nothing but "restart failed".
+    /// A `respawn-pane -k` has no undo, so it must never be spent on a binary
+    /// that has not yet proven it can run. Here, a refusal costs a flash.
     pub fn act_restart(&mut self) -> Action {
         if self.degraded {
             self.flash("not inside tmux — restart unavailable", MsgLevel::Warn);
@@ -1989,16 +2004,58 @@ impl App {
             self.flash("cannot find the ccmux binary — not restarting", MsgLevel::Error);
             return Action::Redraw;
         };
-        let Some(cmd) = restart::sidebar_command(&exe) else {
-            self.flash("ccmux path is not valid UTF-8 — not restarting", MsgLevel::Error);
+        // RUN it, do not merely stat it: an execute bit is not an `execve`.
+        if let Err(why) = (self.probe)(&exe) {
+            self.flash(format!("{why} — not restarting"), MsgLevel::Error);
             return Action::Redraw;
-        };
+        }
+        self.pending_restart = Some(restart::Pending { exe });
+        Action::Restart
+    }
 
-        let plan = restart::plan(&self.tabs, &self.panes, self.own_pane.as_ref());
+    /// The second half of `R`, run by the image the first half `exec`d into —
+    /// and only by it (`restart::is_handoff`).
+    ///
+    /// THIS PROCESS IS THE PROOF. It is the new binary, it started, it is
+    /// about to draw; that is the licence to kill another tab's sidebar pane,
+    /// and nothing weaker is. The panes it restarts are exactly the panes
+    /// `restart::plan` says ccmux created — an unmanaged pane in ccmux's own
+    /// window is never one of them.
+    ///
+    /// The evidence is re-read first, in this fresh process, so the plan is
+    /// built from what tmux says NOW rather than from a snapshot taken before
+    /// the operator's last keypress.
+    pub fn finish_restart(&mut self) {
+        if self.degraded {
+            return;
+        }
+        self.refresh_panes();
+        self.restart_others();
+    }
+
+    /// Plan and respawn — everything `finish_restart` does after the reads, so
+    /// the rule it enforces is testable without a tmux server.
+    fn restart_others(&mut self) {
+        // Built from THIS image's argv[0], which is the path `act_restart`
+        // resolved and probed. `sidebar_cmd` is the launcher's string, built
+        // from a `current_exe()` that a `cargo install` may since have turned
+        // into a deleted inode; respawning with it leaves a pane running
+        // nothing at all.
+        let cmd = restart::exe_path().and_then(|exe| restart::sidebar_command(&exe));
+        let tabs = self.restart_tabs();
+        let plan = restart::plan(&tabs, &self.panes, self.own_pane.as_ref());
         let mut failed = 0usize;
         for t in &plan.targets {
             let shell_cmd = match &t.role {
-                Role::Sidebar => cmd.clone(),
+                Role::Sidebar => match cmd.as_ref() {
+                    Some(c) => c.clone(),
+                    // No path to start a sidebar with. Counted as a failure and
+                    // reported; a pane is never respawned into a guess.
+                    None => {
+                        failed += 1;
+                        continue;
+                    }
+                },
                 Role::Claude { short_id } => agents::attach_pane_cmd(short_id),
             };
             // R2 lives inside the helper: every one of these is an
@@ -2008,10 +2065,58 @@ impl App {
             }
         }
 
-        // +1 for this process, which restarts by `exec` a moment from now.
-        let note = restart::note(plan.sidebars + 1, plan.claude, failed, plan.unattachable);
-        self.pending_restart = Some(restart::Pending { exe, note });
-        Action::Restart
+        // +1 for this process: it has already restarted, by the better
+        // mechanism, which is why it is here to do the rest.
+        self.flash(
+            restart::note(plan.sidebars + 1, plan.claude, failed, plan.unattachable),
+            MsgLevel::Info,
+        );
+    }
+
+    /// The tab records `R` plans from: `list-windows` for every OTHER window,
+    /// and this process's own in-memory map for THIS one.
+    ///
+    /// `self.map` is the authoritative copy of my window's map; the stored
+    /// `@ccmux_tab_map` is a lagging shadow of it, and `self.tabs` is a
+    /// snapshot of that shadow taken at some earlier tick. `act_open` inserts
+    /// into `self.map`, then refreshes, and only THEN writes — so immediately
+    /// after an `o` or an `s` the snapshot provably lacks the pane that was
+    /// just opened. Planning from it silently skips that pane: it keeps running
+    /// the `claude` binary the operator just replaced, while the footer counts
+    /// it as restarted. Reading `self.map` for my own window makes the freshest
+    /// record the one that decides.
+    ///
+    /// This does not weaken the ownership rule. Every entry in `self.map` was
+    /// written by ccmux when it created the pane — it is the same evidence `x`
+    /// and `Ctrl+X` already act on — and `restart::plan` still requires the
+    /// pane to be live before it becomes a target.
+    fn restart_tabs(&self) -> Vec<TabInfo> {
+        let mut tabs = self.tabs.clone();
+        let Some(win) = self.own_window.clone() else {
+            return tabs;
+        };
+        match tabs.iter_mut().find(|t| t.window == win) {
+            Some(mine) => mine.map = self.map.clone(),
+            // `list-windows` failed, or has not yet carried my window. My own
+            // map is still evidence about my own panes, so it is planned from
+            // rather than dropped on the floor.
+            None => {
+                let index = self
+                    .panes
+                    .iter()
+                    .find(|i| i.window_id == win)
+                    .map(|i| i.window_index)
+                    .unwrap_or(0);
+                tabs.push(TabInfo {
+                    window: win,
+                    index,
+                    sidebar: self.sidebar_pane.clone(),
+                    map: self.map.clone(),
+                    hidden: HiddenLog::new(),
+                });
+            }
+        }
+        tabs
     }
 
     /// `Enter` inside a prompt. SPEC §8.6 (§8.7, the interactive prompt, is
@@ -3455,6 +3560,9 @@ mod tests {
             // the operator's live server. A test that exercises `R` installs
             // its own recording stub.
             respawn: |_, _, _| panic!("unit test reached respawn_pane"),
+            // The test harness is what argv[0] names here, and it answers no
+            // `--version`. Tests that want the refusal path install their own.
+            probe: |_| Ok(()),
             // STRUCTURAL, not disciplinary: no hermetic test may ever spawn the
             // real `claude` (a dispatch here would start a real background
             // session on the operator's daemon). Tests that exercise the submit
@@ -7061,6 +7169,10 @@ mod tests {
                 opened_at: 0,
             },
         );
+        // My own window's map is `self.map` — the record this process writes —
+        // and `tabs[0].map` is the stored shadow of it that `list-windows`
+        // reads back. In the ordinary case they agree, and the fixture says so.
+        a.map = m1.clone();
         a.tabs = vec![
             TabInfo {
                 window: WindowId::parse("@1").expect("window id"),
@@ -7081,18 +7193,17 @@ mod tests {
         RESPAWNS.with(|r| r.borrow_mut().clear());
     }
 
-    /// THE SAFETY TEST, driven through the keymap rather than the verb: `R`
-    /// respawns this session's other sidebars and the panes ccmux opened, and
-    /// never `%3`, which ccmux did not create. It also never respawns `%1` —
-    /// this process's own pane, which restarts by `exec`.
+    /// THE SAFETY TEST: the panes `R` respawns are exactly the panes ccmux can
+    /// prove it created. Never `%3`, the operator's own pane sitting in ccmux's
+    /// own window — the state of the live session's `opencode` pane. Never
+    /// `%1` either, this process's own, which restarted by `exec`.
     #[test]
     fn r_restarts_only_the_panes_ccmux_owns() {
         let mut a = app();
         restartable(&mut a);
 
-        let act = a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        a.restart_others();
 
-        assert_eq!(act, Action::Restart, "`R` is reachable in the Normal keymap");
         let got = recorded();
         let panes: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(panes, vec!["%2", "%4", "%5"]);
@@ -7118,11 +7229,123 @@ mod tests {
         assert_eq!(got[1].1, want);
         assert!(got[2].1.contains("attach bbbbbbbb;"), "{:?}", got[2].1);
 
-        // The summary counts this process too, and is what the new image
-        // flashes once it is drawing.
+        // The summary counts this process too — it restarted first, by the
+        // better mechanism, which is why it is here to restart the rest.
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "restarted 2 sidebars, 2 panes"
+        );
+    }
+
+    /// THE KEYPRESS, and the ordering that keeps a bad binary survivable.
+    ///
+    /// `R` is reachable in the Normal keymap, and it authorises a restart
+    /// WITHOUT killing anything: the respawns belong to the image it execs
+    /// into. The recording stub is the proof — it saw no calls.
+    #[test]
+    fn r_authorises_the_restart_and_kills_nothing_yet() {
+        let mut a = app();
+        restartable(&mut a);
+
+        let act = a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(act, Action::Restart, "`R` is reachable in the Normal keymap");
+        assert!(
+            recorded().is_empty(),
+            "no pane may be killed before the new binary is proven to run: {:?}",
+            recorded()
+        );
         let p = a.pending_restart.take().expect("a restart was authorised");
-        assert_eq!(p.note, "restarted 2 sidebars, 2 panes");
-        assert!(p.exe.is_file(), "the binary is resolved before anything is killed");
+        assert!(p.exe.is_file(), "the binary is resolved before the exec");
+    }
+
+    /// THE REGRESSION TEST for a pre-check that only looked at a file mode.
+    ///
+    /// A candidate that cannot be run must stop the restart DEAD — no pending
+    /// exec, and above all no respawn. Before the `exec`-first ordering, this
+    /// case had already killed every other tab's sidebar by the time `execve`
+    /// returned ENOENT, and the survivor could only say "restart failed".
+    #[test]
+    fn a_binary_that_does_not_run_stops_the_restart_before_any_pane_dies() {
+        let mut a = app();
+        restartable(&mut a);
+        a.probe = |_| Err("the new ccmux will not start: bad interpreter".into());
+
+        let act = a.on_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+
+        assert_eq!(act, Action::Redraw, "the sidebar stays where it is");
+        assert!(a.pending_restart.is_none(), "nothing to exec");
+        assert!(
+            recorded().is_empty(),
+            "no pane is killed on the strength of a binary that cannot run: {:?}",
+            recorded()
+        );
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(
+            text,
+            "the new ccmux will not start: bad interpreter — not restarting"
+        );
+        assert_eq!(level, MsgLevel::Error);
+    }
+
+    /// THE REGRESSION TEST for planning off a stale snapshot.
+    ///
+    /// `%6` was opened moments ago: `act_open` put it in `self.map` and the
+    /// `@ccmux_tab_map` snapshot in `self.tabs` has not caught up — which is
+    /// the guaranteed state right after an `o`, since `act_open` refreshes
+    /// before it saves. Planning from the snapshot left `%6` running the
+    /// `claude` binary the operator had just replaced while the footer counted
+    /// it as restarted. The in-memory map is the authoritative record and is
+    /// what decides.
+    #[test]
+    fn a_pane_opened_since_the_last_snapshot_is_still_restarted() {
+        let mut a = app();
+        restartable(&mut a);
+        // Live, and in MY map, but not yet in the stored snapshot of it.
+        a.panes.push(pane("%6", 1, 3, 116, 40, false));
+        a.map = a.tabs[0].map.clone();
+        a.map.insert(
+            &PaneId::parse("%6").expect("pane id"),
+            PaneEntry {
+                session_id: "sid-c".into(),
+                short_id: "cccccccc".into(),
+                name: "c".into(),
+                opened_at: 0,
+            },
+        );
+        assert!(
+            a.tabs[0].map.get(&PaneId::parse("%6").expect("pane id")).is_none(),
+            "the snapshot is one write behind, which is the bug"
+        );
+
+        a.restart_others();
+
+        let panes: Vec<String> = recorded().into_iter().map(|(p, _)| p).collect();
+        assert!(panes.contains(&"%6".to_string()), "the new pane was skipped: {panes:?}");
+        assert!(!panes.contains(&"%3".to_string()), "still no unmanaged pane: {panes:?}");
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "restarted 2 sidebars, 3 panes",
+            "and it is counted, so the footer is not a lie"
+        );
+    }
+
+    /// The authoritative map is my own window's, and only my own window's. A
+    /// pane another tab dropped from ITS map is not resurrected by mine.
+    #[test]
+    fn my_map_overrides_only_my_own_window() {
+        let mut a = app();
+        restartable(&mut a);
+        a.map = PaneMap::new(); // I have closed everything I opened.
+
+        a.restart_others();
+
+        let panes: Vec<String> = recorded().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(panes, vec!["%4".to_string(), "%5".to_string()], "{panes:?}");
+        assert!(
+            !panes.contains(&"%2".to_string()),
+            "my window's stale snapshot must not outvote my own map"
+        );
     }
 
     /// `R` is a single keypress that kills processes, and deliberately has no
