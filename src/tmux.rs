@@ -47,6 +47,17 @@ pub const OPT_TAB_SIDEBAR: &str = "@ccmux_tab_sidebar";
 pub const OPT_TAB_MAP: &str = "@ccmux_tab_map";
 pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
 
+/// PANE-scoped, and the only ccmux option that is not written by ccmux: the
+/// attach pane's own command line sets it to `1` on the way out, just before it
+/// `exec`s the operator's shell (`agents::attach_pane_cmd`). ccmux only ever
+/// READS it, through `PANE_FMT`.
+///
+/// It is a pane option precisely because it must die with the pane and must not
+/// inherit: format expansion falls back pane -> window -> session -> global, so
+/// a value on a window would make every pane in it read as detached. Nothing
+/// ccmux writes ever sets this name at any other scope.
+pub const OPT_PANE_DETACHED: &str = "@ccmux_detached";
+
 /// The empty `@ccmux_map` value. Still written once at session creation, and
 /// re-written by the legacy migration, purely so `main.rs`'s "this session is
 /// not a ccmux session — refusing to modify it" ownership guard keeps working.
@@ -107,6 +118,19 @@ const HIDDEN_OPS_MAX: usize = 128;
 /// than dropping the field (verified on 3.4 with a nonsense format name), so
 /// the row still has its full field count and `window_viewers` parses as
 /// `None`, which is what routes such a build back onto the pair.
+///
+/// `#{@ccmux_detached}` is LAST for the same reason `TAB_FMT` puts its JSON
+/// blobs last: it is the one field whose value is not tmux's own, so a value
+/// that somehow held a tab could only append fields — which the `<` length
+/// check tolerates — never shift a fixed one. It is empty on every pane ccmux
+/// has not seen detach, including every pane it did not create, and it costs
+/// nothing: this listing already runs every tick and tmux answers a pane option
+/// locally. It is the ONLY thing that separates a pane still running
+/// `claude attach` from one that has fallen through to the operator's shell —
+/// `#{pane_current_command}` cannot, because tmux reports the pane's FOREGROUND
+/// PROCESS GROUP LEADER and the attach runs as a non-job-controlling
+/// `$SHELL -c`'s child. Verified on 3.4: `claude attach <id>; …` reports `zsh`,
+/// and so does the login shell that replaces it.
 const PANE_FMT: &str = concat!(
     "#{pane_id}\t",
     "#{pane_index}\t",
@@ -119,10 +143,11 @@ const PANE_FMT: &str = concat!(
     "#{window_id}\t",
     "#{window_active}\t",
     "#{session_attached}\t",
-    "#{window_active_clients}",
+    "#{window_active_clients}\t",
+    "#{@ccmux_detached}",
 );
 
-const PANE_FIELDS: usize = 12;
+const PANE_FIELDS: usize = 13;
 
 /// `-F` format for `list_tabs`. The two JSON blobs are LAST so a value that
 /// somehow contained a tab could only corrupt the final field, never shift a
@@ -305,6 +330,14 @@ pub struct PaneInfo {
     /// does not know the format, which is the only case where the two fields
     /// above are the better answer available.
     pub window_viewers: Option<u32>,
+    /// `#{@ccmux_detached} == "1"` — this pane HAD a ccmux attach and no longer
+    /// does: the attach exited and the pane command handed the terminal to an
+    /// interactive shell. A LATCH, never cleared: see `App::rebuild_open` for
+    /// why reattaching by hand does not un-set it.
+    ///
+    /// False for every pane ccmux did not create, and false on a tmux with no
+    /// pane options — the pre-existing behaviour, not a claim of attachment.
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,6 +742,10 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     // failing the whole enumeration, which `watchers()` would read as evidence
     // that nobody is looking.
     let window_viewers: Option<u32> = parts[11].parse().ok();
+    // Written by the pane itself, so anything but the exact latch value is
+    // "no latch" — an empty string on every pane that never detached, and on
+    // every tmux too old to carry pane options.
+    let detached = parts[12] == "1";
 
     Ok(PaneInfo {
         id,
@@ -723,6 +760,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         window_active,
         session_clients,
         window_viewers,
+        detached,
     })
 }
 
@@ -1881,6 +1919,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            detached: false,
         }
     }
 
@@ -1951,6 +1990,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            detached: false,
         }
     }
 
@@ -2366,7 +2406,7 @@ mod tests {
 
     #[test]
     fn parse_pane_line_reads_every_field() {
-        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2\t1";
+        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2\t1\t1";
         let p = parse_pane_line(line).expect("parses");
         assert_eq!(p.id.as_str(), "%25");
         assert_eq!(p.index, 2);
@@ -2380,16 +2420,20 @@ mod tests {
         assert!(p.window_active);
         assert_eq!(p.session_clients, 2);
         assert_eq!(p.window_viewers, Some(1));
+        assert!(p.detached);
     }
 
-    /// The visibility fields are what the poll gate reads, so a detached
-    /// session and a background tab must survive the parser as themselves.
+    /// The visibility fields are what the poll gate reads, so a tmux session
+    /// with no clients and a background tab must survive the parser as
+    /// themselves. ("Unwatched" here is about tmux CLIENTS; it is unrelated to
+    /// `PaneInfo::detached`, which is about the attach inside one pane.)
     #[test]
-    fn parse_pane_line_reads_a_detached_background_pane() {
-        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0\t0").expect("parses");
+    fn parse_pane_line_reads_an_unwatched_background_pane() {
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0\t0\t").expect("parses");
         assert!(!p.window_active);
         assert_eq!(p.session_clients, 0);
         assert_eq!(p.window_viewers, Some(0));
+        assert!(!p.detached, "an empty option is not a latch");
     }
 
     /// REGRESSION (grouped sessions). `tmux new-session -t ccmux` shares the
@@ -2400,7 +2444,7 @@ mod tests {
     /// `window_viewers` is the field that tells the truth there.
     #[test]
     fn parse_pane_line_reads_a_pane_watched_through_a_grouped_session() {
-        let p = parse_pane_line("%0\t0\t0\t0\t80\t24\t1\t1\t@0\t1\t0\t1").expect("parses");
+        let p = parse_pane_line("%0\t0\t0\t0\t80\t24\t1\t1\t@0\t1\t0\t1\t").expect("parses");
         assert!(p.window_active);
         assert_eq!(p.session_clients, 0, "the grouped client is invisible to the pair");
         assert_eq!(p.window_viewers, Some(1), "but it is rendering this window");
@@ -2411,7 +2455,7 @@ mod tests {
     /// answer" rather than failing the row: the gate falls back to the pair.
     #[test]
     fn an_unknown_viewer_count_is_none_and_not_an_error() {
-        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t").expect("parses");
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t\t").expect("parses");
         assert_eq!(p.window_viewers, None);
         assert!(p.window_active);
         assert_eq!(p.session_clients, 1);
@@ -2420,20 +2464,21 @@ mod tests {
     #[test]
     fn parse_pane_lines_rejects_short_and_malformed_rows() {
         assert!(parse_pane_line("%1\t1\t0").is_err());
-        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1").is_err());
-        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1").is_err());
+        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t").is_err());
+        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t").is_err());
         // The ninth field is the window id, and a bad one is fatal like the rest.
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1\t1").is_err());
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1\t1\t").is_err());
         // A non-numeric client count is fatal too: the poll gate must never
         // read a garbled field as "nobody is watching".
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx\t1").is_err());
-        // A row from the old nine- or eleven-field format is short, and short
-        // is fatal.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx\t1\t").is_err());
+        // A row from the old nine-, eleven- or twelve-field format is short,
+        // and short is fatal.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1").is_err());
         // Blank lines are skipped, not fatal.
-        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t1\n\n").expect("parses");
+        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t1\t\n\n").expect("parses");
         assert_eq!(panes.len(), 1);
         assert!(parse_pane_lines("").expect("empty is fine").is_empty());
     }
@@ -2563,10 +2608,20 @@ mod tests {
     #[test]
     fn reconcile_keeps_a_pane_whose_claude_session_vanished() {
         // The Claude session is gone from the poll, but its pane is still on
-        // screen showing "[ccmux] session exited"; `x` must still close it.
+        // screen showing "[ccmux] attach exited (rc=…)" above a live shell;
+        // `x` must still close it.
         let mut m = PaneMap::new();
         m.insert(&PaneId::parse("%25").expect("id"), entry("uuid-gone"));
         assert!(!m.reconcile(&[pane("%25", 2, 35)]));
+        assert_eq!(m.panes.len(), 1);
+
+        // And the same for the pane that latched `@ccmux_detached`: reconcile
+        // drops DEAD panes and nothing else. What stops claiming a detached
+        // pane is `App::open`, not this — the entry is what keeps `x` able to
+        // close the pane ccmux opened.
+        let mut live = pane("%25", 2, 35);
+        live.detached = true;
+        assert!(!m.reconcile(&[live]));
         assert_eq!(m.panes.len(), 1);
     }
 

@@ -3,9 +3,12 @@
 //! Everything that shells out to `claude`, plus the shell-command templates for
 //! panes. Builds strings; never runs tmux.
 //!
-//! Consumes `model::{Payload, ParseError}` and `tmux::sh_quote` (the pane
-//! command templates are the shell boundary of RULE Q2 and must quote through
-//! the same function the launcher uses). Nothing else from `tmux`.
+//! Consumes `model::{Payload, ParseError}`, `tmux::sh_quote` (the pane command
+//! templates are the shell boundary of RULE Q2 and must quote through the same
+//! function the launcher uses), and `tmux::OPT_PANE_DETACHED` — the name of the
+//! pane option `attach_pane_cmd` latches is single-sourced with the `PANE_FMT`
+//! field that reads it back, so the two can never drift apart. Nothing else
+//! from `tmux`.
 //!
 //! SPEC NOTE (polling): SPEC §4.2 pins polling as *synchronous, on the
 //! event-loop thread* — "No threads, no channels, no async runtime" — and §10.3
@@ -27,7 +30,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::model::{ParseError, Payload};
-use crate::tmux::sh_quote;
+use crate::tmux::{OPT_PANE_DETACHED, sh_quote};
 
 #[derive(Debug)]
 pub enum AgentsError {
@@ -415,22 +418,61 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
 // ── Pane command templates (shell strings; see §7) ──────────────────────────
 
 /// Shell command for a pane that attaches a background session.
-/// The trailing `read` keeps the pane alive with a readable message when the
-/// session has vanished between poll and open (§9.4).
+///
+/// `claude attach` is a raw-mode TUI, so `Ctrl+Z` reaches it as the byte 0x1A
+/// and it treats that as DETACH: it exits, rc 0, with no signal involved
+/// (PROBE-FINDINGS §2). The pane therefore outlives the attach on the operator's
+/// most ordinary keypress, and what it outlives it into is this template's
+/// business. It hands the pane to an interactive login shell — `exec`, so no
+/// wrapper process lingers behind the prompt — after one line naming the
+/// outcome and the command that resumes the session. Resume is re-running
+/// `claude attach <id>`; it is NOT `fg`, because nothing was ever stopped.
 ///
 /// Produces exactly:
-///   <claude> attach <id>; rc=$?; printf '\n[ccmux] session exited (rc=%s). press enter to close pane.\n' "$rc"; read _
+///   <claude> attach <id>; rc=$?; tmux set-option -p -t "$TMUX_PANE" @ccmux_detached 1 2>/dev/null; printf '\n[ccmux] attach exited (rc=%s). resume: %s attach %s\n' "$rc" <claude> <id>; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
 ///
-/// with `<claude>` and `<id>` passed through `sh_quote`.
+/// with `<claude>` and `<id>` passed through `sh_quote`. They are printf
+/// ARGUMENTS, never part of its format string: a `%` in an overridden
+/// `CCMUX_CLAUDE_BIN` would otherwise be read as a conversion.
+///
+/// THE `tmux set-option` IS THE LATCH, and it is why the map can stop lying.
+/// `#{pane_current_command}` cannot answer "is the attach still running":
+/// tmux reads the pane's FOREGROUND PROCESS GROUP LEADER (`tcgetpgrp`), and
+/// tmux runs this whole string as `$SHELL -c`, which — being non-interactive —
+/// never hands the terminal to its child. Verified on tmux 3.4: a pane running
+/// `claude attach <id>; …` reports `zsh`, exactly as the shell that replaces it
+/// afterwards does; only an `exec`ed command (`exec sleep 60` → `sleep`) is
+/// visible. So the pane states its own transition instead: a PANE-scoped user
+/// option, which dies with the pane, is written before the shell takes over and
+/// rides back to ccmux inside the `list-panes` of §5.3 at zero extra cost.
+///
+/// `-t "$TMUX_PANE"` is not optional. `set-option -p` with no target resolves
+/// to the session's ACTIVE pane — verified on 3.4, where it marked the sidebar
+/// instead of the pane that ran it — which would retire a live attach's
+/// mapping. `2>/dev/null` covers a tmux too old for pane options or a pane with
+/// no `$TMUX_PANE`; the latch simply does not fire, and ccmux keeps the entry it
+/// has today.
+///
+/// The shell inherits the pane's cwd; nothing `cd`s. That is the directory the
+/// operator launched ccmux from (tmux's split inherits it) and it certainly
+/// exists. The session's own cwd is deliberately NOT used: `restart::plan`
+/// rebuilds this exact string from a `PaneEntry` that carries only a short id,
+/// so a landing directory read off `model::Session` would differ depending on
+/// whether the pane came from `o`/`s`/`t` or from `R` — and a background
+/// session's real directory is a `.claude/worktrees/…` checkout the daemon
+/// owns, which is not somewhere to drop an operator with a live agent in it.
 pub fn attach_pane_cmd(id: &str) -> String {
+    let bin = sh_quote(&claude_bin());
+    let id = sh_quote(id);
     // The `\n` inside the printf format are LITERAL backslash-n for printf to
     // interpret, not Rust newlines.
     format!(
-        "{} attach {}; rc=$?; \
-         printf '\\n[ccmux] session exited (rc=%s). press enter to close pane.\\n' \"$rc\"; \
-         read _",
-        sh_quote(&claude_bin()),
-        sh_quote(id)
+        "{bin} attach {id}; rc=$?; \
+         tmux set-option -p -t \"$TMUX_PANE\" {opt} 1 2>/dev/null; \
+         printf '\\n[ccmux] attach exited (rc=%s). resume: %s attach %s\\n' \"$rc\" {bin} {id}; \
+         [ -x \"${{SHELL:-}}\" ] || SHELL=/bin/sh; \
+         exec \"$SHELL\" -l",
+        opt = OPT_PANE_DETACHED,
     )
 }
 
@@ -512,8 +554,71 @@ mod tests {
     fn attach_pane_cmd_matches_spec_template() {
         assert_eq!(
             attach_pane_cmd("1c45d64f"),
-            "claude attach 1c45d64f; rc=$?; printf '\\n[ccmux] session exited (rc=%s). press enter to close pane.\\n' \"$rc\"; read _"
+            "claude attach 1c45d64f; rc=$?; \
+             tmux set-option -p -t \"$TMUX_PANE\" @ccmux_detached 1 2>/dev/null; \
+             printf '\\n[ccmux] attach exited (rc=%s). resume: %s attach %s\\n' \"$rc\" claude 1c45d64f; \
+             [ -x \"${SHELL:-}\" ] || SHELL=/bin/sh; \
+             exec \"$SHELL\" -l"
         );
+    }
+
+    /// The template ends in `exec`, and that is the whole point: the pane must
+    /// hold the operator's shell, not a wrapper waiting behind it. A `read`,
+    /// a `wait`, or anything after the `exec` would leave the process the
+    /// attach ran under sitting on the pane forever.
+    #[test]
+    fn attach_pane_cmd_ends_by_execing_an_interactive_login_shell() {
+        let cmd = attach_pane_cmd("1c45d64f");
+        assert!(cmd.ends_with("exec \"$SHELL\" -l"), "{cmd}");
+        assert!(!cmd.contains("read _"), "the old close-the-pane trailer is gone: {cmd}");
+        // $SHELL, with a fallback that cannot be an empty program name.
+        assert!(cmd.contains("[ -x \"${SHELL:-}\" ] || SHELL=/bin/sh"), "{cmd}");
+    }
+
+    /// A failed attach must still be readable once the prompt is on screen —
+    /// §9.4's race puts a real `rc=1` here — so `$rc` is captured immediately
+    /// after the attach and printed verbatim.
+    #[test]
+    fn attach_pane_cmd_surfaces_the_exit_code() {
+        let cmd = attach_pane_cmd("1c45d64f");
+        assert!(cmd.contains("attach 1c45d64f; rc=$?;"), "{cmd}");
+        assert!(cmd.contains("(rc=%s)"), "{cmd}");
+        assert!(cmd.contains("\"$rc\""), "{cmd}");
+    }
+
+    /// The latch is what stops `@ccmux_tab_map` claiming the pane once the
+    /// attach is gone, so it must name the option `PANE_FMT` reads back, be
+    /// PANE-scoped, and target the pane it runs in — `set-option -p` with no
+    /// `-t` resolves to the session's ACTIVE pane.
+    #[test]
+    fn attach_pane_cmd_latches_the_pane_option_on_itself() {
+        let cmd = attach_pane_cmd("1c45d64f");
+        assert!(
+            cmd.contains(&format!(
+                "tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 1 2>/dev/null"
+            )),
+            "{cmd}"
+        );
+        // Before the exec, so a pane that reaches the shell has always latched.
+        let latch = cmd.find("set-option").expect("latch");
+        let exec = cmd.find("exec \"$SHELL\"").expect("exec");
+        assert!(latch < exec, "{cmd}");
+    }
+
+    /// RULE Q4 at the one boundary that has a shell on the other side. The id
+    /// reaches `printf` as an ARGUMENT, never inside its format string, so a
+    /// `%` in it is inert as well as unquoted-safe.
+    #[test]
+    fn attach_pane_cmd_quotes_a_hostile_id() {
+        let cmd = attach_pane_cmd("a'; rm -rf ~; echo '%s");
+        assert!(
+            cmd.starts_with("claude attach 'a'\\''; rm -rf ~; echo '\\''%s'; rc=$?"),
+            "{cmd}"
+        );
+        // The format string is a fixed literal: exactly three conversions.
+        let fmt_start = cmd.find("printf '").expect("printf") + "printf '".len();
+        let fmt_end = fmt_start + cmd[fmt_start..].find("' ").expect("format ends");
+        assert_eq!(cmd[fmt_start..fmt_end].matches("%s").count(), 3);
     }
 
     #[test]

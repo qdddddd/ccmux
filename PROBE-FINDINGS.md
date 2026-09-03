@@ -86,7 +86,7 @@ exclusion is why a `done` row carrying a stale status word is not hoisted.
 
 | Command | Behavior | Verified |
 |---|---|---|
-| `claude attach <id>` | Opens the background session in the current terminal, full TUI fidelity, transcript restored. `←` returns to agent view, `Ctrl+Z` drops back to shell. Session keeps running either way. | YES |
+| `claude attach <id>` | Opens the background session in the current terminal, full TUI fidelity, transcript restored. `←` returns to agent view, `Ctrl+Z` **exits the process** (see below). Session keeps running either way. | YES |
 | `claude logs <id>` | Prints recent terminal output as a **raw ANSI/PTY dump** (includes alt-screen setup, cursor moves). Needs VT stripping before it can be shown in a sidebar preview. | YES |
 | `claude stop <id>` | Stops the session; conversation kept; resume later with `claude attach <id>`. | YES |
 | `claude kill <id>` | Alias of `stop`. | YES |
@@ -134,8 +134,21 @@ unmistakable at the moment of the keypress.
 - **Double-attach is allowed.** The same session attached in two panes simultaneously
   works; both render live, no error, agent unaffected. So "jump to existing pane" is a
   UX preference, not a correctness requirement.
-- `Ctrl+Z` in an attached pane detaches cleanly, returns the pane to the shell, and
-  leaves the session running.
+- **`Ctrl+Z` in an attached pane is an EXIT, not a suspend.** Corrected 2026-09-03,
+  after the earlier wording ("drops back to shell", "detaches cleanly") was read as
+  a job-control suspend and was not. `claude attach` holds the tty in RAW MODE, so
+  the terminal never generates `SIGTSTP`: `Ctrl+Z` arrives as the byte `0x1A`, claude
+  treats it as detach, and the process **exits with rc 0**. Verified under a full
+  interactive shell with job control — no stopped job appears, `jobs` is empty, and
+  there is nothing for `fg` to resume. The session keeps running either way, and
+  `claude attach <id>` re-opens it with the transcript restored.
+  The signal path itself is fine and is not what is missing: sending `SIGTSTP`
+  directly DOES stop the process (state `T`), and `SIGCONT` resumes it. claude simply
+  never receives one.
+  **Consequence for ccmux**: whatever the pane command runs after the attach runs on
+  the operator's most ordinary keypress, not only on a crash or a vanished session.
+  It hands the pane to an interactive login shell (SPEC §3.3), and "resume" is
+  re-running `claude attach <id>` — never `fg`.
 
 ## 4. Session -> tmux pane resolution
 
@@ -145,6 +158,28 @@ unmistakable at the moment of the keypress.
   `/proc/<pid>/stat` ppid chain up and matching against `#{pane_pid}` from
   `tmux list-panes -a`. Verified: interactive session pid 2936154 resolved to pane
   `agents:3.1`.
+- **`#{pane_current_command}` cannot even see the attach.** tmux resolves it from
+  the pane's FOREGROUND PROCESS GROUP LEADER (`tcgetpgrp`), and tmux runs a pane
+  command as `$SHELL -c '<string>'`, which — being non-interactive — never hands the
+  terminal to its child. Measured on tmux 3.4, same window, same second:
+
+  | pane command | `#{pane_current_command}` |
+  |---|---|
+  | `claude attach <id>; rc=$?; …` (TUI live on screen) | `zsh` |
+  | `sleep 60; read _` | `zsh` |
+  | `exec sleep 60` | `sleep` |
+  | `exec /usr/bin/zsh -l` | `zsh` |
+
+  `set -m` does not rescue it: zsh puts the child in its own process group but never
+  `tcsetpgrp`s, so the child is stopped on `SIGTTIN` (observed `STAT=T`, `TPGID` still
+  the wrapper's) and the pane hangs blank. So a pane running `claude attach` and a
+  pane that has fallen through to a shell are INDISTINGUISHABLE by that format. What
+  distinguishes them is a PANE-scoped user option the pane sets about itself on the
+  way out (`@ccmux_detached`, SPEC §3.3/§5.3). `set-option -p` with no `-t` resolves
+  to the session's ACTIVE pane — verified, it marked the sidebar — so it must be
+  `-t "$TMUX_PANE"`.
+  An interactive shell DOES hand the terminal over, so a command the operator runs at
+  a prompt is visible there. ccmux still does not read it: see the next bullet.
 - **A pane's cmdline does NOT identify which session it displays.** Panes opened from
   the stock fleet view all show cmdline `claude agents` (one process that switches
   surfaces). Therefore **ccmux must own its own `pane_id -> session` map**, keyed on

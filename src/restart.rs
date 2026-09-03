@@ -104,6 +104,17 @@ pub struct Plan {
     /// `claude attach` to rebuild, so they are left running (§9.7's rule, one
     /// verb later). Counted, never respawned.
     pub unattachable: usize,
+    /// Mapped, live panes whose attach has already exited and handed the pane
+    /// to a shell (`#{@ccmux_detached}`). Counted, never respawned.
+    pub detached: usize,
+}
+
+impl Plan {
+    /// What `note` reports as "skipped": everything ccmux owns, found alive,
+    /// and deliberately left running.
+    pub fn skipped(&self) -> usize {
+        self.unattachable + self.detached
+    }
 }
 
 /// THE OWNERSHIP RULE, and the only place it is decided.
@@ -112,7 +123,19 @@ pub struct Plan {
 ///
 ///   * it is some window's `@ccmux_tab_sidebar`, and that marker names a live
 ///     pane OF THAT WINDOW, or
-///   * it appears in some window's `@ccmux_tab_map` and is still live.
+///   * it appears in some window's `@ccmux_tab_map` and is still live AND is
+///     still running the attach that put it there.
+///
+/// That last clause is not a refinement, it is the whole difference between `R`
+/// and a data-loss bug. A Claude pane now outlives its attach: `Ctrl+Z` exits
+/// `claude attach` and the pane command `exec`s an interactive shell in its
+/// place (`agents::attach_pane_cmd`), so a mapped, live pane is quite normally
+/// a shell the operator has been working in for an hour. Respawning that with
+/// `claude attach <id>` would destroy whatever was running in it, with no undo
+/// — the same harm the ownership rule exists to prevent, arriving through a
+/// record that used to be proof and no longer is. `#{@ccmux_detached}` is the
+/// pane's own statement that it made that transition, and it is checked here
+/// rather than at the call site so the rule stays one function.
 ///
 /// Anything else is the operator's. The ccmux session holds unmanaged panes
 /// right now — a shell, an editor, another agent — and respawning one would
@@ -160,6 +183,12 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
             if !live.contains(&pane) || seen.contains(&pane) {
                 continue;
             }
+            if panes.iter().any(|p| p.id == pane && p.detached) {
+                // Still ccmux's pane, still closable with `x` — but there is no
+                // attach in it to restart, and something else may be there.
+                out.detached += 1;
+                continue;
+            }
             if entry.short_id.is_empty() {
                 // Written by a build that had no `short_id` field. There is no
                 // command to rebuild, and guessing one is how a pane gets
@@ -185,7 +214,7 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
 ///
 /// Sized for the 34-column default: "restarted 3 sidebars, 4 panes" is 29
 /// columns, and the failure suffix only appears when there is a failure.
-pub fn note(sidebars: usize, panes: usize, failed: usize, unattachable: usize) -> String {
+pub fn note(sidebars: usize, panes: usize, failed: usize, skipped: usize) -> String {
     let mut s = format!(
         "restarted {sidebars} {}, {panes} {}",
         plural(sidebars, "sidebar"),
@@ -193,8 +222,8 @@ pub fn note(sidebars: usize, panes: usize, failed: usize, unattachable: usize) -
     );
     if failed > 0 {
         s.push_str(&format!(" ({failed} failed)"));
-    } else if unattachable > 0 {
-        s.push_str(&format!(" ({unattachable} skipped)"));
+    } else if skipped > 0 {
+        s.push_str(&format!(" ({skipped} skipped)"));
     }
     s
 }
@@ -421,6 +450,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            detached: false,
         }
     }
 
@@ -542,6 +572,41 @@ mod tests {
         assert_eq!(ids(&p), vec!["%1"]);
         assert_eq!(p.unattachable, 1);
         assert_eq!(note(1, 0, 0, p.unattachable), "restarted 1 sidebar, 0 panes (1 skipped)");
+    }
+
+    /// THE PANE THAT IS NO LONGER RUNNING WHAT THE MAP SAYS. `Ctrl+Z` exits
+    /// `claude attach` and the pane command `exec`s an interactive shell in its
+    /// place, so a mapped, live pane is quite normally a shell the operator has
+    /// been working in for an hour. Respawning it with `claude attach <id>`
+    /// destroys whatever was in it, with no undo — the exact harm the ownership
+    /// rule exists to prevent, reached through a record that used to be proof.
+    /// Skipped, counted, reported; never respawned.
+    #[test]
+    fn a_pane_whose_attach_exited_into_a_shell_is_never_respawned() {
+        let mut shell = pane("%2", "@1");
+        shell.detached = true;
+        let panes = vec![pane("%1", "@1"), shell, pane("%3", "@1")];
+        let tabs = vec![tab("@1", Some("%1"), &[("%2", "aaaaaaaa"), ("%3", "bbbbbbbb")])];
+        let p = plan(&tabs, &panes, None);
+        assert_eq!(ids(&p), vec!["%1", "%3"], "the shell is not a target");
+        assert_eq!((p.claude, p.detached, p.unattachable), (1, 1, 0));
+        assert_eq!(p.skipped(), 1);
+        assert_eq!(note(1, p.claude, 0, p.skipped()), "restarted 1 sidebar, 1 pane (1 skipped)");
+    }
+
+    /// A sidebar is restarted on the marker, not on the map, so the latch — a
+    /// PANE option a Claude pane writes about itself — can never reach one. If
+    /// it somehow did, `R` would stop being able to restart the sidebar that
+    /// runs it.
+    #[test]
+    fn the_latch_is_read_only_for_mapped_claude_panes() {
+        let mut sb = pane("%1", "@1");
+        sb.detached = true;
+        let panes = vec![sb, pane("%2", "@1")];
+        let tabs = vec![tab("@1", Some("%1"), &[("%2", "aaaaaaaa")])];
+        let p = plan(&tabs, &panes, None);
+        assert_eq!(ids(&p), vec!["%1", "%2"]);
+        assert_eq!((p.sidebars, p.claude, p.detached), (1, 1, 0));
     }
 
     /// One pane, one respawn, however many maps name it.

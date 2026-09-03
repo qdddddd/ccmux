@@ -1325,8 +1325,12 @@ fn pane_key_for(app: &App, session_id: &str) -> Option<String> {
     app.open.get(session_id).map(|o| o.pane.as_str().to_string())
 }
 
+/// Membership is not enough: `OpenPane::attached` is false for a pane whose
+/// attach exited and left an interactive shell behind, and a shell is not the
+/// session being "on screen". The `▌` would otherwise stay lit forever on a
+/// pane the operator has since been using for something else entirely.
 fn is_open(app: &App, session_id: &str) -> bool {
-    app.open.contains_key(session_id)
+    app.open.get(session_id).is_some_and(|o| o.attached)
 }
 
 /// Gutter column 2: the TAB the session's pane lives in, inked only when that
@@ -1350,7 +1354,7 @@ fn is_open(app: &App, session_id: &str) -> bool {
 /// When the sidebar cannot resolve its own window (degraded, or a no-panic
 /// fixture that sets no pane inventory) the digit is shown unconditionally.
 fn tab_badge_for(app: &App, session_id: &str) -> Option<u32> {
-    let open = app.open.get(session_id)?;
+    let open = app.open.get(session_id).filter(|o| o.attached)?;
     if open.window.is_some() && open.window == app.own_window {
         return None;
     }
@@ -1479,6 +1483,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            detached: false,
         }
     }
 
@@ -1693,6 +1698,46 @@ mod tests {
         term.draw(|f| draw(f, &app)).unwrap();
         let dump = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(dump.contains('▌'), "open marker must be drawn");
+    }
+
+    /// The pane outlives the attach now: `Ctrl+Z` exits `claude attach` and the
+    /// pane command `exec`s a shell in its place. The `▌` and the tab badge are
+    /// the sidebar's two claims that a session is ON SCREEN, and a shell is not
+    /// the session — so both must go dark the moment the pane latches
+    /// `@ccmux_detached`, while the row itself is otherwise unchanged.
+    #[test]
+    fn a_pane_that_fell_through_to_the_shell_is_no_longer_marked_open() {
+        let sessions = vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))];
+        let sid = sessions[0].session_id.clone();
+        let mut app = app_with(sessions);
+        app.selected = 1;
+        app.own_window = crate::tmux::WindowId::parse("@1");
+        app.panes = vec![pane_in("%1", 1, 0, 1), pane_in("%7", 2, 34, 2)];
+        app.map.panes.insert(
+            "%7".into(),
+            PaneEntry {
+                session_id: sid.clone(),
+                short_id: "00000001".into(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+        app.rebuild_open();
+        assert!(is_open(&app, &sid), "a live attach is open");
+        assert_eq!(tab_badge_for(&app, &sid), Some(2), "and it is in another tab");
+        let lit = rows_at(&app, 34, 8);
+        assert!(lit.iter().any(|r| r.contains('▌')), "{lit:?}");
+
+        // The attach exits; the pane is now the operator's shell.
+        app.panes[1].detached = true;
+        app.rebuild_open();
+        assert!(!is_open(&app, &sid), "a shell is not the session being on screen");
+        assert_eq!(tab_badge_for(&app, &sid), None, "and the badge must not point at it");
+        let dark = rows_at(&app, 34, 8);
+        assert!(!dark.iter().any(|r| r.contains('▌')), "{dark:?}");
+        assert!(!dark.iter().any(|r| r.contains('2')), "the tab digit is gone too: {dark:?}");
+        // Still ours, still in the map — `x` reaches it through `pane_of_any`.
+        assert_eq!(pane_key_for(&app, &sid).as_deref(), Some("%7"));
     }
 
     /// One string per terminal row, so a test can say "the age column is on the

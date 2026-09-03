@@ -110,11 +110,11 @@ environment-variable equivalent of `--socket`.
 | `Ctrl-u` | Up half a viewport | no |
 | `Tab` | First row of the next non-empty group | no |
 | `Shift-Tab` | Previous non-empty group | no |
-| `Enter` | Jump to the session's pane, or open it in a vertical split | no |
+| `Enter` | Jump to the session's pane, or open it in a vertical split. A pane you have detached from holds a shell, not the session, so `Enter` opens a fresh one instead of jumping there | no |
 | `o` | Open in a **vertical** split (vim geometry: side by side), then spread the panes evenly across the width | no |
 | `s` | Open in a **horizontal** split (vim geometry: stacked), then spread the panes evenly down the height | no |
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
-| `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane | no |
+| `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane. Still closes a pane you have detached from, even though nothing marks it as open any more | no |
 | `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
 | `n` | Dispatch a new background session with a typed task — the cwd field takes `~` paths, `Tab`-completes directories, and offers to create a missing directory (see below) | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
@@ -146,6 +146,36 @@ when `x` reaches across tabs to close a pane there.
 `Enter` and `x` reach across tabs: `Enter` on a session open in another tab
 switches to that window and selects its pane, and `x` closes a pane wherever it
 lives — except a sidebar, which no tab will let you close.
+
+### Detaching: `Ctrl-Z` leaves you in a shell
+
+`Ctrl+Z` inside an attached session is **not** a suspend. `claude attach` holds
+the terminal in raw mode, so the tty never generates `SIGTSTP`; claude reads the
+keystroke as "detach" and exits. There is no stopped job and nothing for `fg` to
+resume — the agent itself is unaffected, because it is daemon-owned and was
+never a child of the pane.
+
+So the pane is yours the moment you press it. Instead of dying, or sitting on a
+"press enter to close" prompt, it prints one line and hands you a login shell in
+the same pane, in the same directory:
+
+```
+[ccmux] attach exited (rc=0). resume: claude attach 1c45d64f
+~/projects/thing ❯
+```
+
+Copy the line to go back in — that is the resume, and it restores the whole
+transcript. The exit code is always shown, so an attach that failed for real
+(the session was stopped between the poll and the keypress, say) says `rc=1`
+above the same prompt instead of vanishing.
+
+The sidebar stops claiming that pane at the same moment. The `▌` goes out, the
+tab badge disappears, `Enter` opens a fresh pane rather than sending you back to
+a shell, and `R` will not respawn it. What does not change is ownership: it is
+still a pane ccmux opened, so `x` still closes it. Reattaching by hand in that
+shell does **not** hand the pane back to ccmux — from the outside a `claude`
+process does not say which session it is showing, so the pane stays yours, and
+`Enter` gives the session a pane of its own.
 
 ### Overlays and modes
 
@@ -248,13 +278,20 @@ What it restarts, and how:
 |---|---|---|
 | this sidebar | `exec(2)` — the process image is replaced | the pane, by construction: tmux is never told |
 | the other tabs' sidebars | `respawn-pane -k` | the pane id, its geometry, the layout |
-| the panes ccmux opened | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
+| the panes ccmux opened, still attached | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
+| a pane you detached from | nothing — skipped and counted | the shell you have been working in |
 
 **Nothing else is touched.** A pane is restarted only if ccmux can prove it
 created it — it is a tab's recorded sidebar, or it is in that tab's pane map. A
 pane you opened yourself inside the ccmux session, with `prefix-"` or
 `prefix-%`, is in neither, and `R` leaves it alone: whatever is running in it
 keeps running, with the same pid.
+
+A pane you **detached from** is skipped for the same reason, even though ccmux
+did open it. Once `Ctrl-Z` has left a shell in it, the map entry says who
+created the pane and nothing about what is in it — and respawning a shell you
+have been working in for an hour, with `claude attach`, would destroy it. The
+footer counts those: `restarted 2 sidebars, 1 pane (1 skipped)`.
 
 The footer then says what happened, from the new image: `restarted 3 sidebars,
 4 panes`. It is a count of what was actually restarted, not a plan announced in

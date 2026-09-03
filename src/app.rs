@@ -209,6 +209,21 @@ pub struct OpenPane {
     pub window_index: Option<u32>,
     /// Stable identity of that pane's tab, for "is this my tab" comparisons.
     pub window: Option<WindowId>,
+    /// Is `claude attach` still the thing in that pane?
+    ///
+    /// MAPPED BUT NOT ATTACHED is a real state, not a transient. Since the
+    /// attach hands its pane to a shell instead of ending with it
+    /// (`agents::attach_pane_cmd`), a pane ccmux opened now outlives the
+    /// session it opened — indefinitely, with the operator working in it. The
+    /// map still owns that pane, and must: `x` is the only way ccmux can close
+    /// what ccmux opened. But everything that means "this session is ON SCREEN"
+    /// — `ui::is_open`'s `▌`, the tab badge, `Enter`'s jump, and `R`'s licence
+    /// to respawn — has to read this flag, not mere membership, or the sidebar
+    /// keeps pointing at a shell.
+    ///
+    /// True with no pane inventory at all (degraded, or before the first
+    /// refresh), where the intersection that would prove otherwise is skipped.
+    pub attached: bool,
 }
 
 /// Who, if anyone, can see this sidebar right now — the poll gate's input.
@@ -1150,6 +1165,20 @@ impl App {
     /// `tmux_session`, so a `Some` result is always safe to pass to an R2-gated
     /// mutation — the session gate already spans every window (`list-panes -s`).
     pub fn pane_of(&self, session_id: &str) -> Option<PaneId> {
+        self.open
+            .get(session_id)
+            .filter(|o| o.attached)
+            .map(|o| o.pane.clone())
+    }
+
+    /// The pane `x` closes: `pane_of`, or — when the session's pane has fallen
+    /// through to a shell — that pane anyway.
+    ///
+    /// `x` is the one verb that acts on the PANE rather than on the session, so
+    /// it is the one verb that must still reach a detached one. ccmux opened it;
+    /// without this, the pane ccmux created would be unclosable from the sidebar
+    /// that created it, and the operator would have to go find it and `exit`.
+    pub fn pane_of_any(&self, session_id: &str) -> Option<PaneId> {
         self.open.get(session_id).map(|o| o.pane.clone())
     }
 
@@ -1505,7 +1534,10 @@ impl App {
         // interactive session, which IS a descendant of its pane's pid
         // (PROBE §4), can no longer be selected here at all.
         let session_id = sel.session_id.clone();
-        let Some(pane) = self.pane_of(&session_id) else {
+        // `pane_of_any`, not `pane_of`: a pane whose attach has exited into a
+        // shell is still a pane ccmux opened and still the operator's to close
+        // from here, even though nothing about the row says "open" any more.
+        let Some(pane) = self.pane_of_any(&session_id) else {
             self.flash("not open", MsgLevel::Warn);
             return;
         };
@@ -1513,8 +1545,9 @@ impl App {
             self.flash("refusing to close the sidebar", MsgLevel::Warn);
             return;
         }
-        // Read the index, the tab, and the window before the kill; afterwards
-        // the pane is gone.
+        // Read the index, the tab, the window, and whether it still held an
+        // attach before the kill; afterwards the pane is gone.
+        let detached = self.panes.iter().any(|p| p.id == pane && p.detached);
         let idx = self.pane_index_of(&pane);
         let where_ = self.tab_suffix(&pane);
         // §1.4: `pane_of` spans tabs, so the pane about to die may be in
@@ -1547,15 +1580,17 @@ impl App {
                 // §8.5's last step: this wording is the operator-facing statement of
                 // PROBE-FINDINGS §3, shown every time, so nobody confuses `x`
                 // with `S`.
+                // The §8.5 wording is the operator-facing statement of
+                // PROBE-FINDINGS §3 and is shown every time an ATTACH pane
+                // closes. A detached pane holds a shell, not an agent, so the
+                // sentence would be answering a question nobody asked; it says
+                // what was actually in the pane instead.
+                let tail = if detached { "shell" } else { "agent still running" };
                 match idx {
-                    Some(i) => self.flash(
-                        format!("closed pane {i}{where_} — agent still running"),
-                        MsgLevel::Info,
-                    ),
-                    None => self.flash(
-                        format!("closed pane{where_} — agent still running"),
-                        MsgLevel::Info,
-                    ),
+                    Some(i) => {
+                        self.flash(format!("closed pane {i}{where_} — {tail}"), MsgLevel::Info)
+                    }
+                    None => self.flash(format!("closed pane{where_} — {tail}"), MsgLevel::Info),
                 }
             }
             Err(e) => self.flash(format!("close failed: {}", tmux_msg(&e)), MsgLevel::Error),
@@ -2068,7 +2103,7 @@ impl App {
         // +1 for this process: it has already restarted, by the better
         // mechanism, which is why it is here to do the rest.
         self.flash(
-            restart::note(plan.sidebars + 1, plan.claude, failed, plan.unattachable),
+            restart::note(plan.sidebars + 1, plan.claude, failed, plan.skipped()),
             MsgLevel::Info,
         );
     }
@@ -2662,6 +2697,19 @@ impl App {
                 pane,
                 window_index: info.map(|i| i.window_index),
                 window: info.map(|i| i.window_id.clone()),
+                // The latch is ONE-WAY, and deliberately: a pane that has
+                // fallen through to the shell never returns to `attached`, not
+                // even when the operator reattaches in it by hand. tmux would
+                // report that as `#{pane_current_command} == claude`, and
+                // PROBE-FINDINGS §4 is exactly why ccmux must not believe it —
+                // a pane's command does not say WHICH session it is showing, so
+                // re-claiming on a process name would hand this row a pane that
+                // may be attached to another session entirely, or be a plain
+                // `claude` the operator started. It would also silently re-arm
+                // `R` on a pane the operator is now driving by hand. The
+                // reattached pane simply stays the operator's; `Enter` opens a
+                // fresh one, and double-attach is legal (PROBE §3).
+                attached: !info.is_some_and(|i| i.detached),
             };
             // MY tab wins outright; only then does §5.5's numeric tie-break
             // decide. A session double-attached in two tabs has a pane sitting
@@ -2673,11 +2721,23 @@ impl App {
             // with no pane inventory) both sides are equally foreign and the
             // rule collapses to exactly the numeric one.
             let here = |o: &OpenPane| o.window.is_some() && o.window == mine;
+            // ATTACHED OUTRANKS EVERYTHING, including "in my tab" and the
+            // numeric tie-break. Verified live: detach from a pane, press
+            // `Enter`, and the session has two mapped panes — the shell you
+            // left and the fresh attach beside it. Resolving that by pane
+            // number alone hands the row the shell, because it is the older
+            // and therefore lower-numbered pane, and the sidebar then reports
+            // a session it has just opened as not open, refuses to jump to it,
+            // and points `x` at the wrong pane. A pane that is still showing
+            // the session is the only honest answer to "where is this
+            // session"; only when none is does a detached one represent it, so
+            // that `x` can still close it.
+            let rank = |o: &OpenPane| (o.attached, here(o));
             match open.get(&session_id) {
                 Some(cur) => {
-                    let (cur_here, cand_here) = (here(cur), here(&cand));
-                    if (cand_here && !cur_here)
-                        || (cand_here == cur_here && cand.pane.num() < cur.pane.num())
+                    let (cur_rank, cand_rank) = (rank(cur), rank(&cand));
+                    if cand_rank > cur_rank
+                        || (cand_rank == cur_rank && cand.pane.num() < cur.pane.num())
                     {
                         open.insert(session_id, cand);
                     }
@@ -3895,6 +3955,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            detached: false,
         }
     }
 
@@ -5104,6 +5165,137 @@ mod tests {
         a.tabs = vec![tab("@1", 1, Some("%1")), theirs];
         a.rebuild_open();
         assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+    }
+
+    /// THE CONSEQUENCE OF THE SHELL HANDOFF. `claude attach` used to end with
+    /// the pane: `Ctrl+Z` exited it, the wrapper printed a notice and blocked on
+    /// `read`, and the operator's Enter closed the pane, taking the map entry
+    /// with it. Now the pane `exec`s an interactive shell instead and lives
+    /// indefinitely, so `@ccmux_tab_map` goes on naming a pane that stopped
+    /// showing the session — and every claim built on that map is wrong:
+    /// `is_open`'s marker, the tab badge, `Enter`'s jump, and `R`'s licence to
+    /// respawn. `#{@ccmux_detached}` is the pane saying it made the transition.
+    ///
+    /// It is reconciled to MAPPED BUT NOT ATTACHED, not to unmapped: the pane is
+    /// still one ccmux opened, and `x` is the only way ccmux can close what
+    /// ccmux opened.
+    #[test]
+    fn a_detached_pane_stops_being_reported_open_but_stays_ccmuxs_to_close() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%5", 1, 2, 34, 60, false)];
+        a.map.insert(&PaneId::parse("%5").expect("id"), entry("aaaaaaaa-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+        a.rebuild_open();
+        assert!(a.is_open("aaaaaaaa-uuid"), "a live attach is open");
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+
+        // Ctrl+Z: the attach exits, the pane latches and `exec`s a shell.
+        a.panes[1].detached = true;
+        a.rebuild_open();
+        assert!(!a.is_open("aaaaaaaa-uuid"), "the map may not go on claiming a shell");
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), None, "nothing jumps there any more");
+        assert_eq!(
+            a.pane_of_any("aaaaaaaa-uuid"),
+            PaneId::parse("%5"),
+            "`x` must still reach the pane ccmux opened"
+        );
+        assert!(
+            !a.open["aaaaaaaa-uuid"].attached,
+            "mapped but not attached — the entry is kept, the claim is not"
+        );
+
+        // `reconcile` drops DEAD panes and nothing else; a detached one is very
+        // much alive, so the entry survives every tick until the pane does not.
+        assert!(!a.map.reconcile(&a.panes), "a live pane is never reconciled away");
+        assert!(a.map.get(&PaneId::parse("%5").expect("id")).is_some());
+
+        // The latch is one-way. Reattaching by hand in that shell does not give
+        // the pane back: `#{pane_current_command}` would report `claude`, and
+        // PROBE-FINDINGS §4 says a pane's command never identifies WHICH
+        // session it is showing. `Enter` opens a fresh pane instead, which is
+        // legal (PROBE §3) and cannot mis-attribute anything.
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), None);
+    }
+
+    /// `act_enter` is `match self.pane_of(id) { Some(p) => jump, None => open }`
+    /// and `act_open` is the only branch that can reach a tmux server, so the
+    /// branch itself is what a hermetic test can assert. A detached pane must
+    /// take the OPEN arm: jumping the operator into a shell and calling it the
+    /// session would be worse than the second pane it costs.
+    #[test]
+    fn enter_opens_a_fresh_pane_rather_than_jumping_into_the_shell() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%5", 1, 2, 34, 60, false)];
+        a.map.insert(&PaneId::parse("%5").expect("id"), entry("aaaaaaaa-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+        a.panes[1].detached = true;
+        a.rebuild_open();
+        assert!(a.pane_of("aaaaaaaa-uuid").is_none(), "the jump arm is unreachable");
+
+        // And `Enter` on it reaches `act_open`, which refuses first when this
+        // process has no tmux — proving which arm ran without a server.
+        a.degraded = true;
+        load(&mut a, vec![bg("aaaaaaaa", "a", State::Working)]);
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "not inside tmux — open unavailable"
+        );
+    }
+
+    /// REGRESSION, found live. Detach from a pane and press `Enter`: the
+    /// session now has TWO mapped panes in one tab — the shell you left and the
+    /// fresh attach beside it — and the shell is the OLDER, lower-numbered one.
+    /// Resolving that by §5.5's numeric rule handed the row the shell, so the
+    /// sidebar reported a session it had just opened as not open, would not
+    /// jump to it, and pointed `x` at the wrong pane. Attached outranks
+    /// everything; a detached pane only represents the session when nothing
+    /// else does, and then only so `x` can reach it.
+    #[test]
+    fn a_live_attach_outranks_the_shell_left_behind_by_an_earlier_one() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![
+            pane("%1", 1, 1, 0, 34, false),
+            pane("%24", 1, 2, 34, 60, false),
+            pane("%25", 1, 3, 94, 60, false),
+        ];
+        a.map.insert(&PaneId::parse("%24").expect("id"), entry("aaaaaaaa-uuid"));
+        a.map.insert(&PaneId::parse("%25").expect("id"), entry("aaaaaaaa-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+
+        // %24 detached; %25 is the fresh attach `Enter` just opened.
+        a.panes[1].detached = true;
+        a.rebuild_open();
+        assert!(a.is_open("aaaaaaaa-uuid"), "the session IS on screen, in %25");
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%25"));
+        assert_eq!(
+            a.pane_of_any("aaaaaaaa-uuid"),
+            PaneId::parse("%25"),
+            "`x` closes the pane showing the session, not the shell beside it"
+        );
+
+        // Close the attach and the shell is what is left to represent the row.
+        a.panes.retain(|p| p.id.as_str() != "%25");
+        a.rebuild_open();
+        assert!(!a.is_open("aaaaaaaa-uuid"));
+        assert_eq!(a.pane_of_any("aaaaaaaa-uuid"), PaneId::parse("%24"));
+
+        // A pane in ANOTHER tab that is still attached beats a detached one of
+        // mine: "here" only decides between panes of equal standing.
+        a.panes = vec![
+            pane("%1", 1, 1, 0, 34, false),
+            pane("%24", 1, 2, 34, 60, false),
+            pane("%99", 2, 1, 0, 60, false),
+        ];
+        a.panes[1].detached = true;
+        let mut theirs = tab("@2", 2, Some("%99"));
+        theirs.map.insert(&PaneId::parse("%99").expect("id"), entry("aaaaaaaa-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1")), theirs];
+        a.rebuild_open();
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%99"));
     }
 
     /// REGRESSION. A session double-attached in two tabs used to resolve to the
@@ -7327,6 +7519,30 @@ mod tests {
             a.message.clone().unwrap_or_default_msg().0,
             "restarted 2 sidebars, 3 panes",
             "and it is counted, so the footer is not a lie"
+        );
+    }
+
+    /// `R` end to end, on the pane the operator is actually sitting in. The map
+    /// still names `%2` — correctly, ccmux opened it — but its attach exited
+    /// into a shell, so the respawn that would blow that shell away must not be
+    /// issued, and the footer must own up to the pane it left alone.
+    #[test]
+    fn r_leaves_a_pane_that_fell_through_to_the_shell_alone() {
+        let mut a = app();
+        restartable(&mut a);
+        if let Some(p) = a.panes.iter_mut().find(|p| p.id.as_str() == "%2") {
+            p.detached = true;
+        }
+
+        a.restart_others();
+
+        let panes: Vec<String> = recorded().into_iter().map(|(p, _)| p).collect();
+        assert!(!panes.contains(&"%2".to_string()), "the shell was respawned: {panes:?}");
+        assert!(panes.contains(&"%5".to_string()), "a live attach is still restarted: {panes:?}");
+        assert!(!panes.contains(&"%3".to_string()), "still no unmanaged pane: {panes:?}");
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "restarted 2 sidebars, 1 pane (1 skipped)"
         );
     }
 

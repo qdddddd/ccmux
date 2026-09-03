@@ -838,6 +838,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            detached: false,
         }
     }
 
@@ -1021,6 +1022,11 @@ mod tests {
             // under Idle in the first place.
             "[Group; 3]",
             "Working = 0",
+            // The attach pane's old trailer. The pane no longer waits to be
+            // closed; it hands itself to a shell, and a spec that still quotes
+            // the prompt is promising a keypress that does nothing.
+            "press enter to close pane",
+            "; read _",
         ] {
             assert!(
                 !SPEC.contains(needle),
@@ -1046,6 +1052,15 @@ mod tests {
         assert!(
             !SPEC.contains("permitted in exactly one place"),
             "R3 still carves out an exception for `list-panes -a`"
+        );
+        // The shell handoff and the latch that keeps the map honest about it.
+        assert!(
+            SPEC.contains("exec \"$SHELL\" -l"),
+            "SPEC.md does not declare the shell the attach pane hands over to"
+        );
+        assert!(
+            SPEC.contains("@ccmux_detached"),
+            "SPEC.md does not declare the pane option that retires a mapping"
         );
         // The other direction, for the two values that shipped unmodelled: the
         // spec must NAME them, because the glyph table and the state list are
