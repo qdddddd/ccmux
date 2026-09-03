@@ -605,9 +605,9 @@ pub struct PaneInfo {
     /// whichever session. `None` on a tmux that does not know the format.
     pub window_viewers: Option<u32>,
     /// `#{@ccmux_detached} == "1"` — this pane HAD a ccmux attach and no longer
-    /// does. A LATCH, set once by the pane itself (§3.3) and never cleared.
-    /// False for every pane ccmux did not create, and on a tmux with no pane
-    /// options.
+    /// does. A LATCH, written and cleared by the PANE (§3.3) and never by
+    /// ccmux, which only reads it. False for every pane ccmux did not create,
+    /// and on a tmux with no pane options.
     pub detached: bool,
 }
 
@@ -815,7 +815,7 @@ impl PaneMap {
 
     /// Drop entries whose pane id is not in `live`. Entries whose *Claude
     /// session* has vanished are KEPT as long as the pane exists, and so are
-    /// entries for a pane that has DETACHED into a shell (§5.3): the pane is
+    /// entries for a pane that has DETACHED (§5.3): the pane is
     /// still on screen, still one ccmux opened, and must remain closable with
     /// `x`. What stops claiming it is `App::open`, not this.
     /// Returns true when anything was removed.
@@ -965,18 +965,41 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
 /// `claude attach` is a raw-mode TUI, so `Ctrl+Z` reaches it as the byte 0x1A
 /// and it treats that as DETACH: it EXITS, rc 0, with no signal involved
 /// (PROBE-FINDINGS §2). The pane therefore outlives the attach on the
-/// operator's most ordinary keypress. It hands the pane to an interactive login
-/// shell — `exec`, so no wrapper lingers behind the prompt — after one line
-/// naming the outcome and the command that resumes the session. Resume is
+/// operator's most ordinary keypress. It latches `@ccmux_detached`, prints the
+/// outcome and the exact command that resumes the session, and PARKS on one
+/// `read`: enter (or anything unlisted) clears the latch and re-runs the same
+/// attach, `s` `exec`s the operator's login shell over the pane, `q` or EOF
+/// leaves with the attach's own rc and lets the pane close. Resume is
 /// re-running `claude attach <id>`; it is NOT `fg`, because nothing was
 /// stopped. The same line is what §9.4's vanished session leaves on screen.
 ///
-/// Produces exactly:
-///   <claude> attach <id>; rc=$?; tmux set-option -p -t "$TMUX_PANE" @ccmux_detached 1 2>/dev/null; printf '\n[ccmux] attach exited (rc=%s). resume: %s attach %s\n' "$rc" <claude> <id>; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
+/// Produces exactly this, as ONE line (wrapped here to be read):
+///   while :; do <claude> attach <id>; rc=$?;
+///   [ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @ccmux_detached 1 2>/dev/null;
+///   printf '\n[ccmux] attach exited (rc=%s). resume: %s attach %s\n' "$rc" <claude> <id>;
+///   printf '[ccmux] enter=resume  s=shell  q=close pane: ';
+///   read ans || ans=q;
+///   case "$ans" in s|S) break;; q|Q) exit "$rc";; esac;
+///   [ -n "$TMUX_PANE" ] && tmux set-option -p -u -t "$TMUX_PANE" @ccmux_detached 2>/dev/null;
+///   done; printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
 ///
-/// with `<claude>` and `<id>` passed through `sh_quote`, as printf ARGUMENTS
-/// and never inside its format string. The shell inherits the pane's cwd;
-/// nothing `cd`s (see §5.3).
+/// with `<claude>` and `<id>` passed through `sh_quote` — once for the attach,
+/// TWICE for the printed copy, because the shell strips one layer handing them
+/// to `printf` and the resume line has to survive being pasted back. Both reach
+/// `printf` as ARGUMENTS and never inside its format string.
+///
+/// NOTHING HERE STARTS AN INTERACTIVE SHELL UNASKED, which is why there is a
+/// loop rather than a straight `exec`. An interactive shell runs the operator's
+/// startup files in a pane whose `$TMUX` names the server ccmux is holding, and
+/// a startup file is under no obligation to be careful with it: measured on
+/// tmux 3.4, one unconditional `exec "$SHELL" -l` took a throwaway server from
+/// 1 session / 2 panes to 3 sessions / 15, restoring a saved workspace over the
+/// live ccmux session. ccmux cannot vet startup files, so it hands the pane
+/// over only when the operator presses `s` — the same consent as typing `zsh`.
+/// This is the only place the question arises: every other pane ccmux creates
+/// is created WITH a command. It is also where the blast radius (R1-R4) reaches
+/// one step past `assert_in_session`, since a shell ccmux started can name any
+/// session it likes through a tmux call ccmux never makes.
 ///
 /// The `set-option` is the LATCH that keeps `@ccmux_tab_map` honest (§5.3).
 /// `#{pane_current_command}` cannot serve: tmux reports the pane's FOREGROUND
@@ -984,8 +1007,14 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
 /// being non-interactive — never hands the terminal to its child. Verified on
 /// tmux 3.4: a pane running `claude attach <id>; …` reports `zsh`, exactly as
 /// the shell that replaces it does; only an `exec`ed command is visible.
-/// `-t "$TMUX_PANE"` is mandatory — `set-option -p` with no target resolves to
-/// the session's ACTIVE pane (verified: it marked the sidebar instead).
+/// `-t "$TMUX_PANE"` is mandatory — `set-option -p` with no target does NOT
+/// fail (rc 0, verified on 3.4); it resolves to the session's ACTIVE pane and
+/// would retire that pane's mapping instead. `[ -n "$TMUX_PANE" ]` is what
+/// makes an absent pane id mean "no latch"; `2>/dev/null` covers the other
+/// case, a tmux too old for pane options.
+///
+/// The parked prompt, and the shell after it, inherit the pane's cwd; nothing
+/// `cd`s (see §5.3).
 pub fn attach_pane_cmd(id: &str) -> String;
 
 // ── ANSI ────────────────────────────────────────────────────────────────────
@@ -1244,8 +1273,8 @@ impl App {
     pub fn selected_session(&self) -> Option<&Session>;
     /// First live pane STILL SHOWING `session_id`, from the reconciled `map`
     /// and nothing else. The map is ccmux-scoped, so a `Some` result is always
-    /// safe to pass to an R2-gated mutation. A pane whose attach has exited
-    /// into a shell is NOT one (`OpenPane::attached`).
+    /// safe to pass to an R2-gated mutation. A pane whose attach has exited is
+    /// NOT one (`OpenPane::attached`).
     pub fn pane_of(&self, session_id: &str) -> Option<PaneId>;
     /// `pane_of`, plus the detached case: the pane `x` closes. ccmux opened it,
     /// so ccmux must still be able to close it even once nothing about the row
@@ -1539,7 +1568,7 @@ at exactly two tmux calls (`list-panes`, `resize-pane`).
 2. changed = app.map.reconcile(&live)
       // drop every entry whose pane id is absent from `live`
       // KEEP entries whose Claude session is gone but whose pane still exists,
-      //   and entries for a pane that has DETACHED into a shell: both are on
+      //   and entries for a pane that has DETACHED: both are on
       //   screen, both are panes ccmux opened, and the operator must still be
       //   able to close them with `x`.
 3. app.map_dirty |= changed
@@ -1554,7 +1583,8 @@ at exactly two tmux calls (`list-panes`, `resize-pane`).
 
 **MAPPED BUT NOT ATTACHED.** A pane in the map whose `PaneInfo::detached` is
 true had a ccmux attach and no longer has one: `claude attach` exited and §3.3's
-pane command `exec`d an interactive shell in its place. The map entry stays —
+pane command parked the pane on its resume prompt, or handed it to the
+operator's shell from there. The map entry stays —
 ccmux opened that pane, `x` is the only way ccmux can close what ccmux opened,
 and `reconcile` still drops only DEAD panes. What stops is every claim built on
 the entry: `App::rebuild_open` marks it `attached: false`, so `is_open`'s `▌`
@@ -1569,18 +1599,25 @@ left and the fresh attach beside it, both mapped, with the shell the older and
 therefore lower-numbered pane. A detached pane represents the session only when
 no attached one does, and then only so `x` can still reach it.
 
-THE LATCH IS ONE-WAY. Reattaching by hand in that shell does not give the pane
-back. tmux would report it as `#{pane_current_command} == claude`, and
-PROBE-FINDINGS §4 is exactly why ccmux must not believe that: a pane's command
-never identifies WHICH session it is showing, so re-claiming on a process name
-could hand the row a pane attached to something else entirely — or a plain
-`claude` the operator started — and would silently re-arm `R` on a pane the
-operator is now driving by hand. `Enter` opens a fresh pane instead, which is
-legal (PROBE §3) and cannot mis-attribute anything.
+ONLY THE PANE MAY CLEAR THE LATCH. §3.3's resume path unsets the option before
+re-running the attach, and it is entitled to: the id it is about to re-attach is
+the one baked into its own command string. So a pane detached and resumed in
+place is `attached` again on the next tick, with its marker, its badge,
+`Enter`'s jump and `R` all restored.
 
-**Where the shell starts.** In the pane's own cwd; §3.3 never `cd`s. That is
-the directory the operator launched ccmux from (tmux's split inherits it) and it
-certainly exists. The session's cwd is deliberately not used: `restart::plan`
+ccmux never clears it from the outside, and could not. A pane the operator
+reattaches BY HAND — from the `s` shell, say — stays detached. tmux would report
+it as `#{pane_current_command} == claude`, and PROBE-FINDINGS §4 is exactly why
+that is not evidence: a pane's command never identifies WHICH session it is
+showing, so re-claiming on a process name could hand the row a pane attached to
+something else entirely — or a plain `claude` the operator started — and would
+silently re-arm `R` on a pane the operator is now driving by hand. `Enter` opens
+a fresh pane instead, which is legal (PROBE §3) and cannot mis-attribute
+anything.
+
+**Where the prompt and the shell start.** In the pane's own cwd; §3.3 never
+`cd`s. That is the directory the operator launched ccmux from (tmux's split
+inherits it) and it certainly exists. The session's cwd is deliberately not used: `restart::plan`
 rebuilds the same template from a `PaneEntry` carrying only a short id, so a
 landing directory read off `model::Session` would differ depending on whether
 the pane came from `o`/`s`/`t` or from `R`; and a background session's real
@@ -1921,7 +1958,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `Ctrl-u` | up half a viewport | no |
 | `Tab` | jump to the first row of the next non-empty group | no |
 | `BackTab` (`Shift-Tab`) | previous non-empty group | no |
-| `Enter` | **open or jump** — §8.3; a pane that detached into a shell is not a jump target | no |
+| `Enter` | **open or jump** — §8.3; a pane you have detached from is not a jump target | no |
 | `o` | open in a **vertical** split (vim `:vsplit`, side by side, tmux `-h`) | no |
 | `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`) | no |
 | `t` | open in a **new tab** — a window with its own sidebar — and go there (§8.10) | no |
@@ -2127,6 +2164,7 @@ sel = selected_session() or return
 if not sel.is_attachable():                   # no short id (§9.7)
     flash "no short id — cannot open this session" (Warn); return
 
+refresh_panes()                               # §5.3 steps 1-5, before deciding
 if let Some(pane) = app.pane_of(sel.session_id):   # ATTACHED panes only
     tmux::select_pane(session, pane)          # jump to the existing pane
     flash "jumped to pane <index>"
@@ -2138,10 +2176,24 @@ Jumping rather than re-splitting is a UX preference, not a correctness
 requirement — double-attach is legal (PROBE-FINDINGS §3). If the operator wants
 a second view of the same session, `o` and `s` always split unconditionally.
 
-`pane_of`, not `pane_of_any`: a pane whose attach has exited into a shell
-(§5.3) takes the `else` branch and gets a fresh pane. Jumping the operator into
-a shell and calling it the session would be worse than the second pane it costs,
-and the second pane is free — double-attach is legal.
+`pane_of`, not `pane_of_any`: a pane whose attach has exited (§5.3) takes the
+`else` branch and gets a fresh pane. Jumping the operator into the shell they
+just left and calling it the session would be worse than the second pane it
+costs, and the second pane is free — double-attach is legal.
+
+**The refresh is part of the verb, not an optimisation.** `open` is rebuilt by
+`tick`, and a keypress is not a tick, so between the two a `Ctrl+Z` can retire a
+mapping without this process hearing about it for a whole `tick_interval` —
+2.5 s by default and up to 10 s on §4.2's idle ladder. Measured: detach, then
+`Enter` within that window, and the sidebar jumped to the pane that had just
+latched `@ccmux_detached`. `finish_restart` (§8.11) re-reads before planning for
+the same reason, and `act_open` already refreshes on the other side of this
+branch, so the cost is one `list-panes` on a verb the operator asked for and
+nothing on a tick.
+
+`x` deliberately does NOT refresh: it acts on the pane rather than on the
+session, `pane_of_any` answers the same either way, and its flash says only what
+is true of both cases (§8.5).
 
 ### 8.4 `o` / `s` — opening into a split
 
@@ -2188,8 +2240,7 @@ sessions in a row without leaving the list.
    until then every process already hides it, because `open` is rebuilt as
    `union(maps) ∩ live panes` (§11.2).
 7. tmux::pin_sidebar(...)
-8. flash "closed pane <index>[ in tab <N>] — agent still running" (Info),
-   or "... — shell" when the pane had already detached (§5.3)
+8. flash "closed pane <index>[ in tab <N>] — agent still running" (Info)
 ```
 
 **`x` is unconditionally safe here, and only because of what is listed.**
@@ -2203,15 +2254,19 @@ so no such row can ever be selected, and the refusal had nothing left to fire
 on. This keeps `Ctrl+X` the only destructive binding in v1 (§8.2).
 
 Step 3 is `pane_of_any`, not `pane_of`, and that is the one place the two
-differ. A pane whose attach has exited into a shell is no longer "open" —
+differ. A pane whose attach has exited is no longer "open" —
 nothing marks it, `Enter` will not jump to it, `R` will not respawn it — but it
 is still a pane ccmux opened, and `x` is the only way ccmux can close what ccmux
 opened. Refusing there would leave the operator to go find the pane and `exit`.
 
 Step 8's wording matters: it is the operator-facing statement of
 PROBE-FINDINGS §3, shown every time, so nobody ever confuses `x` with `Ctrl+X`.
-It is shown for an ATTACH pane; a detached one holds a shell, not an agent, so
-it says "shell" rather than answering a question nobody asked.
+ONE wording, for attached and detached panes alike. A version that said
+"— shell" for a detached one read `PaneInfo::detached` out of an inventory
+`tick` refreshes and a keypress does not, so it announced the wrong thing for up
+to a `tick_interval` after a `Ctrl+Z`, and `x` has no other reason to re-read
+tmux. The sentence is true in both cases anyway: the agent is a background one,
+daemon-owned, and closing its pane never touched it.
 
 ### 8.6 `n` — dispatch a new background session
 
@@ -2483,14 +2538,16 @@ rebuild, so it is counted as skipped and left running rather than respawned into
 a guess.
 
 The `detached` clause is not a refinement; it is the difference between `R` and
-a data-loss bug. Since §3.3's attach pane hands itself to an interactive shell
-when the attach exits, a mapped, live pane is quite normally a shell the
-operator has been working in for an hour — the map entry is still correct about
-who created the pane and no longer says anything about what is in it.
-Respawning that with `claude attach <id>` destroys whatever was running there,
-which is the exact harm the ownership rule exists to prevent, arriving through a
-record that used to be proof. Such panes are counted as skipped alongside the
-`short_id`-less ones (`Plan::skipped()`), so the footer owns up to them.
+a data-loss bug. Since §3.3's attach pane outlives its attach — parked on the
+resume prompt, or handed on to the operator's shell from there — a mapped, live
+pane is quite normally a shell the operator has been working in for an hour. The
+map entry is still correct about who created the pane and no longer says
+anything about what is in it. Respawning that with `claude attach <id>` destroys
+whatever was running there, which is the exact harm the ownership rule exists to
+prevent, arriving through a record that used to be proof. Such panes are counted
+as skipped alongside the `short_id`-less ones (`Plan::skipped()`), so the footer
+owns up to them — once per PANE, however many tabs' maps name it, which is what
+`seen` is for in every arm and not only the respawning one.
 
 **Which file to exec.** `current_exe()` is the wrong answer here, and wrong in
 the worst way. `cargo install` renames a new file over the old path, so the
@@ -2623,13 +2680,13 @@ operator can bootstrap from zero sessions.
 Unavoidable: the poll is up to 2.5 s stale.
 
 - **`Enter`/`o`/`s`** — ccmux splits the pane anyway; `claude attach <id>` fails
-  inside it. The pane command's trailer keeps the pane alive and says so:
+  inside it. The pane command keeps the pane alive and says so:
   `[ccmux] attach exited (rc=1). resume: claude attach <id>`
-  and then hands the pane to a shell (§3.3), so the failure sits above a working
-  prompt rather than a dead-end `read`. The rc is on screen and unswallowed; the
-  map entry stays (§5.3) so `x` still closes the pane, though it is now a
-  detached one. ccmux does not pre-validate by polling again — the race is
-  unclosable and the readable pane is the correct handling.
+  above §3.3's prompt, where enter retries the attach, `s` gives a shell and `q`
+  closes the pane carrying that same rc out as its exit status. The rc is on
+  screen and unswallowed; the map entry stays (§5.3) so `x` still closes the
+  pane, though it is now a detached one. ccmux does not pre-validate by polling
+  again — the race is unclosable and the readable pane is the correct handling.
 - **`Ctrl-x`** — the first press may find the session already gone; `claude
   stop` fails and its stderr surfaces via `stop failed: <msg>`, and a failed
   stop does **not** open the delete window. The second press re-validates the
@@ -2750,9 +2807,14 @@ the CLI omits `id`, so a **listed** row can reach it.
 **agents.rs (Agents)**
 - `attach_pane_cmd("1c45d64f")` equals the §3.3 template exactly; it ends in
   `exec "$SHELL" -l` and contains no `read _`; `$rc` is captured immediately
-  after the attach and printed; the latch names `OPT_PANE_DETACHED`, targets
-  `"$TMUX_PANE"`, and comes BEFORE the `exec`; a hostile id is `sh_quote`d and
-  the printf format string stays a fixed literal with exactly three `%s`.
+  after the attach, printed, and carried out by `q`; the latch names
+  `OPT_PANE_DETACHED`, targets `"$TMUX_PANE"`, is guarded by
+  `[ -n "$TMUX_PANE" ]` at both the set and the unset, and comes BEFORE the
+  prompt; the resume path clears it before looping back into the attach; every
+  path from the attach's exit to the `exec` passes through the `read`; a hostile
+  id is `sh_quote`d and the printf format string stays a fixed literal with
+  exactly three `%s`; the PRINTED copy is quoted twice, so a value needing
+  quotes reaches the screen as a single shell word.
 - `strip_ansi` removes CSI/OSC/two-char escapes and keeps `\n`; a raw
   alt-screen preamble (`\x1b[?1049h\x1b[H\x1b[2J`) strips to empty.
 
@@ -2772,7 +2834,11 @@ the CLI omits `id`, so a **listed** row can reach it.
   NOT ATTACHED, §5.3.
 - `Enter` on such a session takes `act_open`'s branch, not the jump.
 - `R` does not respawn it: `restart::plan` skips it, counts it in
-  `Plan::detached`, and the footer reports it as skipped.
+  `Plan::detached`, and the footer reports it as skipped — once per pane, even
+  when two tabs' maps name it.
+- `Enter` re-reads the pane inventory before it chooses between jumping and
+  opening (§8.3), so a `Ctrl+Z` inside the poll interval cannot send it into the
+  shell the operator just left.
 - `Ctrl-x` on a row with no short id leaves `mode == Normal`, sets a Warn
   message, opens no delete window, and spawns nothing.
 - `on_key('c')` is inert: no mode change, no prompt, no message (§8.7).

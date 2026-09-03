@@ -128,9 +128,10 @@ impl Plan {
 ///
 /// That last clause is not a refinement, it is the whole difference between `R`
 /// and a data-loss bug. A Claude pane now outlives its attach: `Ctrl+Z` exits
-/// `claude attach` and the pane command `exec`s an interactive shell in its
-/// place (`agents::attach_pane_cmd`), so a mapped, live pane is quite normally
-/// a shell the operator has been working in for an hour. Respawning that with
+/// `claude attach` and the pane command parks the pane on its resume prompt, or
+/// hands it on to the operator's shell from there (`agents::attach_pane_cmd`),
+/// so a mapped, live pane is quite normally a shell the operator has been
+/// working in for an hour. Respawning that with
 /// `claude attach <id>` would destroy whatever was running in it, with no undo
 /// — the same harm the ownership rule exists to prevent, arriving through a
 /// record that used to be proof and no longer is. `#{@ccmux_detached}` is the
@@ -183,9 +184,14 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
             if !live.contains(&pane) || seen.contains(&pane) {
                 continue;
             }
+            // ONE COUNT PER PANE, in every arm. `seen` is what makes that
+            // true, and the skipped arms need it as much as the respawned one:
+            // a pane named by two tabs' maps would otherwise be counted twice
+            // in the footer's "(N skipped)" while being one pane.
             if panes.iter().any(|p| p.id == pane && p.detached) {
                 // Still ccmux's pane, still closable with `x` — but there is no
                 // attach in it to restart, and something else may be there.
+                seen.insert(pane);
                 out.detached += 1;
                 continue;
             }
@@ -193,6 +199,7 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
                 // Written by a build that had no `short_id` field. There is no
                 // command to rebuild, and guessing one is how a pane gets
                 // respawned into something it never ran.
+                seen.insert(pane);
                 out.unattachable += 1;
                 continue;
             }
@@ -575,9 +582,9 @@ mod tests {
     }
 
     /// THE PANE THAT IS NO LONGER RUNNING WHAT THE MAP SAYS. `Ctrl+Z` exits
-    /// `claude attach` and the pane command `exec`s an interactive shell in its
-    /// place, so a mapped, live pane is quite normally a shell the operator has
-    /// been working in for an hour. Respawning it with `claude attach <id>`
+    /// `claude attach` and the pane command parks the pane, and `s` from there
+    /// leaves the operator's shell in it, so a mapped, live pane is quite
+    /// normally a shell the operator has been working in for an hour. Respawning it with `claude attach <id>`
     /// destroys whatever was in it, with no undo — the exact harm the ownership
     /// rule exists to prevent, reached through a record that used to be proof.
     /// Skipped, counted, reported; never respawned.
@@ -592,6 +599,31 @@ mod tests {
         assert_eq!((p.claude, p.detached, p.unattachable), (1, 1, 0));
         assert_eq!(p.skipped(), 1);
         assert_eq!(note(1, p.claude, 0, p.skipped()), "restarted 1 sidebar, 1 pane (1 skipped)");
+    }
+
+    /// REGRESSION. One pane, one count, in the SKIPPED arms too. A pane named
+    /// by two tabs' maps reached `out.detached += 1` twice because the arm
+    /// `continue`d without recording the pane as seen, so the footer told the
+    /// operator it had skipped two panes when it had skipped one. The
+    /// `unattachable` arm had the same hole.
+    #[test]
+    fn a_skipped_pane_named_by_two_maps_is_counted_once() {
+        let mut shell = pane("%2", "@1");
+        shell.detached = true;
+        let panes = vec![pane("%1", "@1"), shell];
+        let tabs = vec![
+            tab("@1", Some("%1"), &[("%2", "aaaaaaaa")]),
+            tab("@2", None, &[("%2", "aaaaaaaa")]),
+        ];
+        let p = plan(&tabs, &panes, None);
+        assert_eq!((p.detached, p.skipped()), (1, 1), "one pane, one skip");
+        assert_eq!(note(1, 0, 0, p.skipped()), "restarted 1 sidebar, 0 panes (1 skipped)");
+
+        // Same for the entry with no `short_id` to rebuild from.
+        let panes = vec![pane("%1", "@1"), pane("%2", "@1")];
+        let tabs = vec![tab("@1", Some("%1"), &[("%2", "")]), tab("@2", None, &[("%2", "")])];
+        let p = plan(&tabs, &panes, None);
+        assert_eq!((p.unattachable, p.skipped()), (1, 1));
     }
 
     /// A sidebar is restarted on the marker, not on the map, so the latch — a

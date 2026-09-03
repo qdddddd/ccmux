@@ -147,8 +147,27 @@ unmistakable at the moment of the keypress.
   never receives one.
   **Consequence for ccmux**: whatever the pane command runs after the attach runs on
   the operator's most ordinary keypress, not only on a crash or a vanished session.
-  It hands the pane to an interactive login shell (SPEC §3.3), and "resume" is
+  It parks the pane on a prompt (SPEC §3.3) where enter re-runs the same attach,
+  `s` hands over to the operator's shell and `q` closes the pane; "resume" is
   re-running `claude attach <id>` — never `fg`.
+- **An interactive shell in a ccmux pane runs the operator's rc against CCMUX'S tmux
+  server.** Verified 2026-09-03 on tmux 3.4, throwaway socket: a server holding one
+  session and two panes was split once with `[ -x "${SHELL:-}" ] || SHELL=/bin/sh;
+  exec "$SHELL" -l` and, eight seconds later, held **three sessions and fifteen
+  panes**. The pane's `$TMUX` names ccmux's server, `~/.zshrc` reaches a helper that
+  runs `tmux new -s dev -d` followed by tmux-resurrect's `restore.sh`, and the saved
+  workspace was restored over the live session — window renamed, panes injected,
+  layout and size overwritten. Reproduced with `exec "$SHELL"` (no `-l`) too: an
+  interactive zsh reads `~/.zshrc` either way, so the login flag is not the trigger.
+  **Consequence for ccmux**: it does not start an interactive shell on its own
+  initiative anywhere. Every pane it creates is created WITH a command, and the one
+  handover to `$SHELL` is behind the operator's `s` (SPEC §3.3).
+- **A pane parked on `read` cannot be frozen by `Ctrl+Z`.** Verified on 3.4: the byte
+  reaches the tty in canonical mode, but the pane command's process group is orphaned
+  (its parent is the tmux server, in another session), and POSIX has the kernel
+  DISCARD stop signals for an orphaned process group. Measured `STAT=S`, never `T`,
+  and the following enter was read normally. So the resume prompt cannot be left
+  hung by the same key that reached it.
 
 ## 4. Session -> tmux pane resolution
 
@@ -177,7 +196,10 @@ unmistakable at the moment of the keypress.
   distinguishes them is a PANE-scoped user option the pane sets about itself on the
   way out (`@ccmux_detached`, SPEC §3.3/§5.3). `set-option -p` with no `-t` resolves
   to the session's ACTIVE pane — verified, it marked the sidebar — so it must be
-  `-t "$TMUX_PANE"`.
+  `-t "$TMUX_PANE"`. An EMPTY `-t` is the same case and, measured, does NOT fail:
+  `set-option -p -t "" @ccmux_detached 1` returns rc 0 and marks the active pane. A
+  `2>/dev/null` therefore hides nothing there, and the template guards the call with
+  `[ -n "$TMUX_PANE" ]` so that an absent pane id means no latch at all.
   An interactive shell DOES hand the terminal over, so a command the operator runs at
   a prompt is visible there. ccmux still does not read it: see the next bullet.
 - **A pane's cmdline does NOT identify which session it displays.** Panes opened from

@@ -1509,6 +1509,17 @@ impl App {
             return;
         }
         let session_id = sel.session_id.clone();
+        // FRESH EVIDENCE FIRST. `open` is rebuilt by `tick`, and a keypress is
+        // not a tick: between the two, `Ctrl+Z` in a pane can retire its
+        // mapping without this process hearing about it for a whole
+        // `tick_interval` (2.5 s by default, up to 10 s on the idle ladder).
+        // Jumping on that stale answer drops the operator back into the shell
+        // they just left and calls it the session — the one outcome this verb
+        // exists to avoid. `finish_restart` re-reads for the same reason, and
+        // `act_open` already pays for a refresh on the other side of the
+        // branch, so this costs one `list-panes` on a verb the operator asked
+        // for, never on a tick.
+        self.refresh_panes();
         match self.pane_of(&session_id) {
             // Already open: jump rather than re-split. A UX preference, not a
             // correctness requirement — double-attach is legal (PROBE §3).
@@ -1545,9 +1556,8 @@ impl App {
             self.flash("refusing to close the sidebar", MsgLevel::Warn);
             return;
         }
-        // Read the index, the tab, the window, and whether it still held an
-        // attach before the kill; afterwards the pane is gone.
-        let detached = self.panes.iter().any(|p| p.id == pane && p.detached);
+        // Read the index, the tab and the window before the kill; afterwards
+        // the pane is gone.
         let idx = self.pane_index_of(&pane);
         let where_ = self.tab_suffix(&pane);
         // §1.4: `pane_of` spans tabs, so the pane about to die may be in
@@ -1577,20 +1587,27 @@ impl App {
                     self.even_content(None);
                 }
                 self.pin_sidebar();
-                // §8.5's last step: this wording is the operator-facing statement of
-                // PROBE-FINDINGS §3, shown every time, so nobody confuses `x`
-                // with `S`.
-                // The §8.5 wording is the operator-facing statement of
-                // PROBE-FINDINGS §3 and is shown every time an ATTACH pane
-                // closes. A detached pane holds a shell, not an agent, so the
-                // sentence would be answering a question nobody asked; it says
-                // what was actually in the pane instead.
-                let tail = if detached { "shell" } else { "agent still running" };
+                // §8.5's last step: this wording is the operator-facing
+                // statement of PROBE-FINDINGS §3, shown every time, so nobody
+                // confuses `x` with `Ctrl+X`.
+                //
+                // ONE WORDING, and deliberately. A version that said "— shell"
+                // for a detached pane read `PaneInfo::detached` out of an
+                // inventory `tick` refreshes and a keypress does not, so it
+                // announced the wrong thing for up to a `tick_interval` after
+                // a `Ctrl+Z` — and `x` has no other reason to re-read tmux.
+                // The sentence below is true either way: the agent is a
+                // background one, daemon-owned, and closing its pane never
+                // touched it (§8.5).
                 match idx {
-                    Some(i) => {
-                        self.flash(format!("closed pane {i}{where_} — {tail}"), MsgLevel::Info)
-                    }
-                    None => self.flash(format!("closed pane{where_} — {tail}"), MsgLevel::Info),
+                    Some(i) => self.flash(
+                        format!("closed pane {i}{where_} — agent still running"),
+                        MsgLevel::Info,
+                    ),
+                    None => self.flash(
+                        format!("closed pane{where_} — agent still running"),
+                        MsgLevel::Info,
+                    ),
                 }
             }
             Err(e) => self.flash(format!("close failed: {}", tmux_msg(&e)), MsgLevel::Error),
@@ -2697,17 +2714,21 @@ impl App {
                 pane,
                 window_index: info.map(|i| i.window_index),
                 window: info.map(|i| i.window_id.clone()),
-                // The latch is ONE-WAY, and deliberately: a pane that has
-                // fallen through to the shell never returns to `attached`, not
-                // even when the operator reattaches in it by hand. tmux would
-                // report that as `#{pane_current_command} == claude`, and
-                // PROBE-FINDINGS §4 is exactly why ccmux must not believe it —
-                // a pane's command does not say WHICH session it is showing, so
-                // re-claiming on a process name would hand this row a pane that
-                // may be attached to another session entirely, or be a plain
-                // `claude` the operator started. It would also silently re-arm
-                // `R` on a pane the operator is now driving by hand. The
-                // reattached pane simply stays the operator's; `Enter` opens a
+                // ONLY THE PANE MAY CLEAR THIS. `agents::attach_pane_cmd`
+                // unsets the latch on its own resume path — it is entitled to,
+                // because the id it is about to re-attach is the one baked into
+                // its own command string — so a pane detached and resumed in
+                // place comes back here as attached on the next tick.
+                //
+                // ccmux never clears it from the outside, and could not. tmux
+                // would report a hand-reattached pane as
+                // `#{pane_current_command} == claude`, and PROBE-FINDINGS §4 is
+                // exactly why that is not evidence: a pane's command does not
+                // say WHICH session it is showing, so re-claiming on a process
+                // name would hand this row a pane attached to another session
+                // entirely, or a plain `claude` the operator started — and
+                // would silently re-arm `R` on a pane the operator is driving
+                // by hand. Such a pane stays the operator's; `Enter` opens a
                 // fresh one, and double-attach is legal (PROBE §3).
                 attached: !info.is_some_and(|i| i.detached),
             };
@@ -5170,8 +5191,9 @@ mod tests {
     /// THE CONSEQUENCE OF THE SHELL HANDOFF. `claude attach` used to end with
     /// the pane: `Ctrl+Z` exited it, the wrapper printed a notice and blocked on
     /// `read`, and the operator's Enter closed the pane, taking the map entry
-    /// with it. Now the pane `exec`s an interactive shell instead and lives
-    /// indefinitely, so `@ccmux_tab_map` goes on naming a pane that stopped
+    /// with it. Now the pane parks on a resume prompt instead — and holds the
+    /// operator's shell if they ask for one — so it lives indefinitely and
+    /// `@ccmux_tab_map` goes on naming a pane that stopped
     /// showing the session — and every claim built on that map is wrong:
     /// `is_open`'s marker, the tab badge, `Enter`'s jump, and `R`'s licence to
     /// respawn. `#{@ccmux_detached}` is the pane saying it made the transition.
@@ -5210,19 +5232,28 @@ mod tests {
         assert!(!a.map.reconcile(&a.panes), "a live pane is never reconciled away");
         assert!(a.map.get(&PaneId::parse("%5").expect("id")).is_some());
 
-        // The latch is one-way. Reattaching by hand in that shell does not give
-        // the pane back: `#{pane_current_command}` would report `claude`, and
-        // PROBE-FINDINGS §4 says a pane's command never identifies WHICH
-        // session it is showing. `Enter` opens a fresh pane instead, which is
-        // legal (PROBE §3) and cannot mis-attribute anything.
+        // ccmux never clears the latch itself. Reattaching by hand in that
+        // shell does not give the pane back: `#{pane_current_command}` would
+        // report `claude`, and PROBE-FINDINGS §4 says a pane's command never
+        // identifies WHICH session it is showing. `Enter` opens a fresh pane
+        // instead, which is legal (PROBE §3) and cannot mis-attribute anything.
         assert_eq!(a.pane_of("aaaaaaaa-uuid"), None);
+
+        // The pane itself may, and does: `attach_pane_cmd`'s resume path unsets
+        // the option before re-running the SAME attach, so a pane detached and
+        // resumed in place is `attached` again on the next tick, with its
+        // marker, its badge, `Enter`'s jump and `R` all restored.
+        a.panes[1].detached = false;
+        a.rebuild_open();
+        assert!(a.is_open("aaaaaaaa-uuid"));
+        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
     }
 
     /// `act_enter` is `match self.pane_of(id) { Some(p) => jump, None => open }`
     /// and `act_open` is the only branch that can reach a tmux server, so the
     /// branch itself is what a hermetic test can assert. A detached pane must
-    /// take the OPEN arm: jumping the operator into a shell and calling it the
-    /// session would be worse than the second pane it costs.
+    /// take the OPEN arm: jumping the operator into the prompt they just left
+    /// and calling it the session would be worse than the second pane it costs.
     #[test]
     fn enter_opens_a_fresh_pane_rather_than_jumping_into_the_shell() {
         let mut a = app();
@@ -5243,6 +5274,35 @@ mod tests {
             a.message.clone().unwrap_or_default_msg().0,
             "not inside tmux — open unavailable"
         );
+    }
+
+    /// REGRESSION, measured live: after `Ctrl+Z`, `Enter` went on jumping into
+    /// the shell for up to a whole `tick_interval` (2.5 s by default, up to
+    /// 10 s on the idle ladder), because `open` is rebuilt by `tick` and a
+    /// keypress is not a tick. Three runs of detach-then-Enter: the first
+    /// opened a pane, the second and third jumped to the pane that had just
+    /// latched `@ccmux_detached`. `Enter` re-reads the inventory first now, the
+    /// way `finish_restart` does.
+    ///
+    /// Hermetic because an invalid session name fails every tmux call at the
+    /// target check, before a process is spawned — and `panes_fresh` is exactly
+    /// the flag `refresh_panes` clears when the read did not come back, so it
+    /// is proof the verb tried to read.
+    #[test]
+    fn enter_re_reads_the_pane_inventory_before_it_decides() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%5", 1, 2, 34, 60, false)];
+        a.map.insert(&PaneId::parse("%5").expect("id"), entry("aaaaaaaa-uuid"));
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+        a.rebuild_open();
+        load(&mut a, vec![bg("aaaaaaaa", "a", State::Working)]);
+        assert!(a.pane_of("aaaaaaaa-uuid").is_some(), "the jump arm is the one under test");
+
+        a.tmux_session = "not a session name".into();
+        a.panes_fresh = true;
+        a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!a.panes_fresh, "`Enter` decided on whatever `tick` last left behind");
     }
 
     /// REGRESSION, found live. Detach from a pane and press `Enter`: the
@@ -7523,9 +7583,10 @@ mod tests {
     }
 
     /// `R` end to end, on the pane the operator is actually sitting in. The map
-    /// still names `%2` — correctly, ccmux opened it — but its attach exited
-    /// into a shell, so the respawn that would blow that shell away must not be
-    /// issued, and the footer must own up to the pane it left alone.
+    /// still names `%2` — correctly, ccmux opened it — but its attach is gone
+    /// and the operator's shell is in there, so the respawn that would blow it
+    /// away must not be issued, and the footer must own up to the pane it left
+    /// alone.
     #[test]
     fn r_leaves_a_pane_that_fell_through_to_the_shell_alone() {
         let mut a = app();

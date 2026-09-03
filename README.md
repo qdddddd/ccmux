@@ -110,7 +110,7 @@ environment-variable equivalent of `--socket`.
 | `Ctrl-u` | Up half a viewport | no |
 | `Tab` | First row of the next non-empty group | no |
 | `Shift-Tab` | Previous non-empty group | no |
-| `Enter` | Jump to the session's pane, or open it in a vertical split. A pane you have detached from holds a shell, not the session, so `Enter` opens a fresh one instead of jumping there | no |
+| `Enter` | Jump to the session's pane, or open it in a vertical split. A pane you have detached from is no longer showing the session, so `Enter` opens a fresh one instead of jumping there | no |
 | `o` | Open in a **vertical** split (vim geometry: side by side), then spread the panes evenly across the width | no |
 | `s` | Open in a **horizontal** split (vim geometry: stacked), then spread the panes evenly down the height | no |
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
@@ -147,7 +147,7 @@ when `x` reaches across tabs to close a pane there.
 switches to that window and selects its pane, and `x` closes a pane wherever it
 lives — except a sidebar, which no tab will let you close.
 
-### Detaching: `Ctrl-Z` leaves you in a shell
+### Detaching: `Ctrl-Z` parks the pane, enter puts you back
 
 `Ctrl+Z` inside an attached session is **not** a suspend. `claude attach` holds
 the terminal in raw mode, so the tty never generates `SIGTSTP`; claude reads the
@@ -156,25 +156,43 @@ resume — the agent itself is unaffected, because it is daemon-owned and was
 never a child of the pane.
 
 So the pane is yours the moment you press it. Instead of dying, or sitting on a
-"press enter to close" prompt, it prints one line and hands you a login shell in
-the same pane, in the same directory:
+"press enter to close" prompt, it prints one line and waits:
 
 ```
 [ccmux] attach exited (rc=0). resume: claude attach 1c45d64f
-~/projects/thing ❯
+[ccmux] enter=resume  s=shell  q=close pane:
 ```
 
-Copy the line to go back in — that is the resume, and it restores the whole
-transcript. The exit code is always shown, so an attach that failed for real
-(the session was stopped between the poll and the keypress, say) says `rc=1`
-above the same prompt instead of vanishing.
+- **enter** re-runs that exact attach, in the same pane, with the whole
+  transcript back. It is the closest thing to `fg` that is honest here, and it
+  is one key rather than a retyped command.
+- **`s`** hands the pane to your login shell (`$SHELL -l`), in the same
+  directory, with the resume command in the scrollback above the prompt.
+- **`q`** (or `Ctrl-D`) closes the pane, carrying out the attach's own exit
+  code.
 
-The sidebar stops claiming that pane at the same moment. The `▌` goes out, the
-tab badge disappears, `Enter` opens a fresh pane rather than sending you back to
-a shell, and `R` will not respawn it. What does not change is ownership: it is
-still a pane ccmux opened, so `x` still closes it. Reattaching by hand in that
-shell does **not** hand the pane back to ccmux — from the outside a `claude`
-process does not say which session it is showing, so the pane stays yours, and
+The exit code is always shown, so an attach that failed for real — the session
+was stopped between the poll and the keypress, say — says `rc=1` above the same
+prompt instead of vanishing.
+
+**Why the shell is behind a key.** An interactive shell runs your startup files,
+and it runs them in a pane whose `$TMUX` points at the tmux server ccmux is
+using. A startup file that touches tmux therefore touches *that* server: on the
+machine this was measured on, one unconditional login shell took a throwaway
+server from 1 session and 2 panes to 3 sessions and 15, because the rc chain
+ends up calling `tmux new -s dev -d` and tmux-resurrect's `restore.sh`, which
+restored a saved workspace straight over the live ccmux session. ccmux cannot
+vet your dotfiles, so it does not run them on its own initiative — `s` is your
+say-so, exactly like typing `zsh` would be. (If your own rc does something like
+that, guarding it with a check for `$TMUX` is worth doing anyway.)
+
+The sidebar stops claiming that pane the moment you detach. The `▌` goes out,
+the tab badge disappears, `Enter` opens a fresh pane rather than sending you
+back to a prompt you left, and `R` will not respawn it. What does not change is
+ownership: it is still a pane ccmux opened, so `x` still closes it. Resume it
+with **enter** and the sidebar takes it back — the pane says so itself. Attach
+by hand from the `s` shell and it does **not**: from the outside a `claude`
+process does not say which session it is showing, so that pane stays yours, and
 `Enter` gives the session a pane of its own.
 
 ### Overlays and modes
@@ -279,7 +297,7 @@ What it restarts, and how:
 | this sidebar | `exec(2)` — the process image is replaced | the pane, by construction: tmux is never told |
 | the other tabs' sidebars | `respawn-pane -k` | the pane id, its geometry, the layout |
 | the panes ccmux opened, still attached | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
-| a pane you detached from | nothing — skipped and counted | the shell you have been working in |
+| a pane you detached from | nothing — skipped and counted | whatever you have been doing in it |
 
 **Nothing else is touched.** A pane is restarted only if ccmux can prove it
 created it — it is a tab's recorded sidebar, or it is in that tab's pane map. A
@@ -288,10 +306,12 @@ pane you opened yourself inside the ccmux session, with `prefix-"` or
 keeps running, with the same pid.
 
 A pane you **detached from** is skipped for the same reason, even though ccmux
-did open it. Once `Ctrl-Z` has left a shell in it, the map entry says who
-created the pane and nothing about what is in it — and respawning a shell you
-have been working in for an hour, with `claude attach`, would destroy it. The
-footer counts those: `restarted 2 sidebars, 1 pane (1 skipped)`.
+did open it. Once `Ctrl-Z` has parked it — and especially once `s` has left a
+shell in it — the map entry says who created the pane and nothing about what is
+in it, and respawning a shell you have been working in for an hour with
+`claude attach` would destroy it. The footer counts those, one per pane:
+`restarted 2 sidebars, 1 pane (1 skipped)`. Resume the pane with enter and it
+becomes a restart target again.
 
 The footer then says what happened, from the new image: `restarted 3 sidebars,
 4 panes`. It is a count of what was actually restarted, not a plan announced in
