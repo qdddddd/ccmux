@@ -48,10 +48,13 @@ pub struct Palette {
     pub blue: Color,
     pub purple: Color,
     pub aqua: Color,
-    /// The open marker's EMPHASISED shade, for a session parked in another tab
-    /// (§6.4). Named for the role, not the shade: on the light ground it is a
-    /// deeper aqua and on the dark ground a paler one, because "more
-    /// prominent" inverts with the ground. `aqua` keeps the current tab.
+    /// The open marker's OTHER-TAB ink, for a session parked in a tab you are
+    /// not looking at (§6.4). Named for the role, and deliberately NOT a second
+    /// aqua: it is a gruvbox NEUTRAL, so the two markers separate by HUE —
+    /// green against warm grey — rather than by depth. Depth was tried and
+    /// failed; see `the_two_open_marker_shades_never_collapse`. The tone still
+    /// inverts with the ground, darker on the light theme and lighter on the
+    /// dark one, because "more prominent" does. `aqua` keeps the current tab.
     pub aqua_elsewhere: Color,
     pub orange: Color,
     pub sel_bg: Color,
@@ -73,9 +76,12 @@ impl Palette {
             blue: Color::Rgb(0x83, 0xa5, 0x98),
             purple: Color::Rgb(0xd3, 0x86, 0x9b),
             aqua: Color::Rgb(0x8e, 0xc0, 0x7c), // 7.01:1 ground, 5.51:1 band
-            // Lighter than `aqua` here: on a dark ground prominence is height,
-            // not depth. 11.25:1 ground, 8.85:1 band, 1.61:1 apart from `aqua`.
-            aqua_elsewhere: Color::Rgb(0xcf, 0xe8, 0xc8),
+            // gruvbox fg2, a neutral. Lighter than `aqua` here: on a dark
+            // ground prominence is height, not depth. The darkest neutral that
+            // still out-contrasts `aqua` — one step down, fg3 `#bdae93`, is
+            // 6.77:1 on a ground where `aqua` is already 7.01:1.
+            // 8.59:1 ground, 6.76:1 band, ΔE 31.9 from `aqua`.
+            aqua_elsewhere: Color::Rgb(0xd5, 0xc4, 0xa1),
             orange: Color::Rgb(0xfe, 0x80, 0x19),
             sel_bg: Color::Rgb(0x3c, 0x38, 0x36),
         }
@@ -103,11 +109,23 @@ impl Palette {
             purple: Color::Rgb(0x8f, 0x3f, 0x71), // 5.94:1
             aqua: Color::Rgb(0x3d, 0x71, 0x51),   // 5.03:1 ground, 4.16:1 band
             orange: Color::Rgb(0xaf, 0x3a, 0x03), // 5.40:1
-            // DARKER than `aqua`, the opposite of the dark theme's move: this
-            // ground has no headroom left going lighter — `#427b58` is already
-            // 3.64:1 on `sel_bg`, under the floor — so emphasis goes down.
-            // 10.95:1 ground, 9.05:1 band, 2.18:1 apart from `aqua`.
-            aqua_elsewhere: Color::Rgb(0x1d, 0x3a, 0x2a),
+            // gruvbox fg3, a neutral, and DARKER than `aqua` — the opposite
+            // of the dark theme's move, because this ground has no headroom
+            // left going lighter (`#427b58` is already 3.64:1 on `sel_bg`,
+            // under the floor). Its predecessor `#1d3a2a` went further down
+            // still and lost the hue doing it: at 10.95:1 it read as ordinary
+            // dark text rather than as a coloured marker. This is the LIGHTEST
+            // gruvbox neutral that clears the floor — one step up, fg4
+            // `#7c6f64`, is 3.55:1 on the band. That makes it the same ink as
+            // `dim`, and that is the price of a neutral on this ground: the
+            // gruvbox neutrals ARE the text ramp, so any of them is some tier
+            // of text. It is the cheapest such collision available: `dim` is
+            // the LIGHTEST of this theme's three text inks, so the marker lands
+            // at the shallow end of the range and not the deep end that broke
+            // it. The glyph is a solid block in column 0 either way, three
+            // columns clear of the nearest thing `dim` paints.
+            // 5.74:1 ground, 4.75:1 band, ΔE 28.8 from `aqua`.
+            aqua_elsewhere: Color::Rgb(0x66, 0x5c, 0x54),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
         }
     }
@@ -677,11 +695,13 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     // hairline where `▌` (U+258C) is a thick bar — different weight, not just
     // a different colour.
     //
-    // WHICH aqua says where. A session in this tab is already in front of you,
-    // so it keeps the established shade; one parked in another tab takes
-    // `aqua_elsewhere`, the emphasised one, because that is the row you have to
-    // go somewhere to see. The emphasis is the same fact the digit carries,
-    // said in the channel you read without counting.
+    // WHICH ink says where. A session in this tab is already in front of you,
+    // so it keeps the established aqua; one parked in another tab takes
+    // `aqua_elsewhere`, a neutral, because that is the row you have to go
+    // somewhere to see. The two differ in HUE and not merely in depth, which is
+    // what lets the second one read as a colour at all on the light ground.
+    // It is the same fact the digit carries, said in the channel you read
+    // without counting.
     if open {
         spans.push(Span::styled("▌".to_string(), base.fg(ink)));
     } else if selected {
@@ -3137,10 +3157,11 @@ mod tests {
         }
     }
 
-    /// WCAG relative luminance and the contrast ratio between two palette
-    /// entries. One copy, shared by the three colour tests below, so they
-    /// cannot drift into measuring different things.
-    fn lum(c: Color) -> f64 {
+    /// The sRGB transfer curve, undone: a palette entry's three 8-bit channels
+    /// as linear light in 0..1. One copy, shared by `lum` and `lab` below, so
+    /// the two ways this module measures colour cannot disagree about what the
+    /// bytes mean.
+    fn linear(c: Color) -> (f64, f64, f64) {
         let Color::Rgb(r, g, b) = c else {
             panic!("palette entries must be true-colour: {c:?}")
         };
@@ -3148,12 +3169,47 @@ mod tests {
             let v = v as f64 / 255.0;
             if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
         };
-        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        (f(r), f(g), f(b))
+    }
+
+    /// WCAG relative luminance and the contrast ratio between two palette
+    /// entries. One copy, shared by the three colour tests below, so they
+    /// cannot drift into measuring different things.
+    fn lum(c: Color) -> f64 {
+        let (r, g, b) = linear(c);
+        0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 
     fn ratio(a: Color, b: Color) -> f64 {
         let (x, y) = (lum(a), lum(b));
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// CIE L*a*b* under D65, the white point sRGB is defined against. Unlike
+    /// `lum` it keeps the two chromatic axes, so it can see a difference of HUE
+    /// at equal brightness — precisely what a contrast ratio is blind to.
+    /// (The luminance row here is the full-precision sRGB matrix; `lum` above
+    /// uses the coefficients WCAG rounds it to, which is what WCAG specifies.)
+    fn lab(c: Color) -> (f64, f64, f64) {
+        let (r, g, b) = linear(c);
+        // sRGB -> CIEXYZ, each axis normalised by the D65 white point.
+        let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
+        let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
+        let z = (0.019_333_9 * r + 0.119_192_0 * g + 0.950_304_1 * b) / 1.088_83;
+        let f = |t: f64| {
+            if t > 216.0 / 24389.0 { t.cbrt() } else { (841.0 / 108.0) * t + 4.0 / 29.0 }
+        };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    }
+
+    /// CIE76 ΔE — plain Euclidean distance in Lab. Crude next to CIEDE2000, and
+    /// entirely good enough for the only question asked of it: are these two
+    /// inks the same colour, or two colours?
+    fn delta_e(a: Color, b: Color) -> f64 {
+        let (l1, a1, b1) = lab(a);
+        let (l2, a2, b2) = lab(b);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
     }
 
     /// The accents carry facts — the status glyph, the open marker, the message
@@ -3214,10 +3270,27 @@ mod tests {
         }
     }
 
-    /// The two open-marker shades must stay two shades. Collapsing them — by
+    /// The two open-marker inks must stay two inks. Collapsing them — by
     /// pointing `aqua_elsewhere` back at `aqua`, or by nudging one until the
     /// pair is indistinguishable — would silently delete the whole signal while
     /// every contrast assertion above still passed.
+    ///
+    /// SEPARATION IS MEASURED IN LAB, NOT AS A LUMINANCE RATIO. This test used
+    /// to demand the pair sit >= 1.5:1 apart in WCAG contrast, and that metric
+    /// was the wrong axis — it is what broke the marker. A contrast ratio can
+    /// only see one ink being DARKER than the other, so the only way to satisfy
+    /// it was to keep pushing `aqua_elsewhere` down, until at `#1d3a2a` and
+    /// 10.95:1 on the light ground the marker had stopped reading as a colour
+    /// and read as ordinary dark text. It had cleared every number and lost the
+    /// thing the numbers were standing in for. Two inks that differ by HUE at
+    /// comparable brightness are obviously distinguishable and score barely
+    /// 1.14:1, which that assertion would have rejected.
+    ///
+    /// CIE76 ΔE sees all three axes. >= 20 is well clear of "the same colour",
+    /// and it is a RE-POINTING and not a loosening: the neutrals measure 28.8
+    /// light and 31.9 dark, but the aqua pair this replaced already scored 24.5
+    /// and 27.8, so the new floor would have passed the old palette too. Every
+    /// other assertion here is unchanged.
     ///
     /// The direction is asserted per theme because it INVERTS. "More
     /// prominent" on the light ground means darker and on the dark ground
@@ -3234,11 +3307,11 @@ mod tests {
             ("dark", Palette::dark(), dark_bg),
             ("light", Palette::light(), light_bg),
         ] {
-            assert_ne!(p.aqua, p.aqua_elsewhere, "{name}: the two marker shades collapsed");
-            // Far enough apart to read as two shades side by side, not as a
-            // rounding error. Measured: 2.18:1 light, 1.61:1 dark.
-            let apart = ratio(p.aqua, p.aqua_elsewhere);
-            assert!(apart >= 1.5, "{name}: the shades are only {apart:.2}:1 apart, needs >= 1.5:1");
+            assert_ne!(p.aqua, p.aqua_elsewhere, "{name}: the two marker inks collapsed");
+            // Far enough apart to read as two colours side by side, not as a
+            // rounding error. Measured: ΔE 28.8 light, 31.9 dark.
+            let apart = delta_e(p.aqua, p.aqua_elsewhere);
+            assert!(apart >= 20.0, "{name}: the inks are only ΔE {apart:.1} apart, needs >= 20");
             assert!(
                 ratio(p.aqua_elsewhere, bg) > ratio(p.aqua, bg),
                 "{name}: aqua_elsewhere must be the MORE prominent of the two on its own ground"

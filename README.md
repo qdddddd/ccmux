@@ -243,7 +243,7 @@ it, so it is the first thing on screen.
 | `■` gray | Stopped with `Ctrl-x`; the conversation is kept, `o` resumes it |
 | `?` purple | A status or state this build does not recognize |
 | `▌` aqua | Open in a ccmux pane in the tab you are looking at (column 1) |
-| `▌` emphasised aqua | Open, but in **another** tab. The emphasised shade is the theme's more prominent aqua — deeper on the light theme, paler on the dark one, since a dark ground emphasises upwards — because the pane you cannot see is the one worth pointing at |
+| `▌` neutral | Open, but in **another** tab. A gruvbox neutral rather than a second aqua, so the two markers differ in hue — warm grey against green — and not merely in depth, which is what lets this one still read as a colour on the light ground. It is the more prominent of the two either way: deeper on the light theme, paler on the dark one, since a dark ground emphasises upwards |
 | `5` | Which tab (column 2), in the same shade as the `▌` beside it, so `▌5` reads as one token. Blank means the tab you are looking at; `+` means a tab number of ten or more |
 
 When `claude agents` reports a `state` or `status` this build has no variant for,
@@ -268,14 +268,15 @@ The header says `tab 2` — tmux's own window number, so `prefix-2` goes there �
 once a second tab exists, and the badge in the second gutter column says which
 tab each open session is in. Nothing is shown while there is only one tab.
 
-The open marker `▌` says the same thing in colour: today's aqua for a session
-open in this tab, the emphasised aqua for one parked in another. Both cells take
-one ink, decided once from the badge, so the shade and the digit cannot end up
-disagreeing about where a session is.
+The open marker `▌` says the same thing in colour: aqua for a session open in
+this tab, a neutral warm grey for one parked in another. The two differ in hue
+and not just in weight, which is what keeps the second one legible as a colour
+rather than as dark text. Both cells take one ink, decided once from the badge,
+so the shade and the digit cannot end up disagreeing about where a session is.
 
 A session you open in two tabs is "here" in both: each tab's badge stays blank,
-its marker keeps the unemphasised aqua, `Enter` does not move you, and `x`
-closes the pane in the tab you are actually looking at.
+its marker keeps the aqua, `Enter` does not move you, and `x` closes the pane in
+the tab you are actually looking at.
 
 There is no close-tab key: a tab ends when its last pane does, the way tmux
 already ends windows. If you quit a tab's sidebar with `q` while its Claude
