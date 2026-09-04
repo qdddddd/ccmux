@@ -242,8 +242,9 @@ it, so it is the first thing on screen.
 | `✓` green | Completed |
 | `■` gray | Stopped with `Ctrl-x`; the conversation is kept, `o` resumes it |
 | `?` purple | A status or state this build does not recognize |
-| `▌` aqua | Open in a ccmux pane right now (column 1) |
-| `5` aqua | Open in **tab 5** (column 2). Blank means open in the tab you are looking at; `+` means a tab number of ten or more |
+| `▌` aqua | Open in a ccmux pane in the tab you are looking at (column 1) |
+| `▌` emphasised aqua | Open, but in **another** tab. The emphasised shade is the theme's more prominent aqua — deeper on the light theme, paler on the dark one, since a dark ground emphasises upwards — because the pane you cannot see is the one worth pointing at |
+| `5` | Which tab (column 2), in the same shade as the `▌` beside it, so `▌5` reads as one token. Blank means the tab you are looking at; `+` means a tab number of ten or more |
 
 When `claude agents` reports a `state` or `status` this build has no variant for,
 the row still renders (`?` purple) and still groups — and the footer says so by
@@ -267,9 +268,14 @@ The header says `tab 2` — tmux's own window number, so `prefix-2` goes there �
 once a second tab exists, and the badge in the second gutter column says which
 tab each open session is in. Nothing is shown while there is only one tab.
 
+The open marker `▌` says the same thing in colour: today's aqua for a session
+open in this tab, the emphasised aqua for one parked in another. Both cells take
+one ink, decided once from the badge, so the shade and the digit cannot end up
+disagreeing about where a session is.
+
 A session you open in two tabs is "here" in both: each tab's badge stays blank,
-`Enter` does not move you, and `x` closes the pane in the tab you are actually
-looking at.
+its marker keeps the unemphasised aqua, `Enter` does not move you, and `x`
+closes the pane in the tab you are actually looking at.
 
 There is no close-tab key: a tab ends when its last pane does, the way tmux
 already ends windows. If you quit a tab's sidebar with `q` while its Claude

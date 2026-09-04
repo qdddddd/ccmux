@@ -1054,6 +1054,7 @@ pub struct Palette {
     pub blue: Color,
     pub purple: Color,
     pub aqua: Color,
+    pub aqua_elsewhere: Color,   // the §6.4 open marker's emphasised shade
     pub orange: Color,
     pub sel_bg: Color,
 }
@@ -1748,11 +1749,12 @@ coloured `Blocked 2` alone, truncated to W. Header rows are never selectable;
 Fixed-width row, left to right:
 
 ```
-col 0        open marker
-col 1        status glyph
-col 2        space
-cols 3..     name (flexible, end-truncated)
-             right side: [pane badge] [age]
+col 0        open marker          ┐ the 4-column gutter, GUTTER
+col 1        tab badge            │
+col 2        status glyph         │
+col 3        space                ┘
+cols 4..     name (flexible, end-truncated)
+             right side: [age]
 ```
 
 **Open marker (col 0)** — this is the distinct mark for "currently open in a
@@ -1760,10 +1762,30 @@ pane" required by the brief:
 
 | Condition | Glyph | Colour |
 |---|---|---|
-| open in >= 1 ccmux pane | `▌` | `p.aqua` |
+| open in a pane in THIS tab | `▌` | `p.aqua` |
+| open in a pane in another tab | `▌` | `p.aqua_elsewhere` |
 | not open | ` ` | — |
 
-**Status glyph (col 1)**, derived from `Group` + `Status`:
+The shade is read off the col-1 badge — `p.aqua_elsewhere` exactly when the
+badge is a digit — and not from a second copy of the window comparison, so the
+two gutter columns cannot disagree about where a session is. Both take that one
+ink, which keeps `▌5` a single two-cell token.
+
+`aqua_elsewhere` is named for its ROLE. The emphasis inverts with the ground:
+`#1d3a2a` is DARKER than `p.aqua` on the light theme, where there is no headroom
+left going lighter (`#427b58` is already 3.64:1 on `sel_bg`, under the floor),
+while `#cfe8c8` is LIGHTER on the dark theme. A shade-derived name would be
+wrong in one of the two themes. Both clear 4.0:1 on their own ground AND on
+`sel_bg` — the marker is painted on the band whenever its row is selected — and
+the pair stays at least 1.5:1 apart so the distinction survives: light 10.95
+ground / 9.05 band, 2.18 apart; dark 11.25 / 8.85, 1.61 apart.
+
+**Tab badge (col 1)** — the tmux window index of the tab the pane showing this
+session lives in, inked only when that is NOT the tab being drawn; blank
+otherwise, and `+` at ten or more. It takes the same ink as the marker in
+col 0 — `p.aqua_elsewhere`, since a digit only ever means "another tab".
+
+**Status glyph (col 2)**, derived from `Group` + `Status`:
 
 Resolved top-down; every row is one display column wide.
 
@@ -1793,10 +1815,6 @@ Idle. An unrecognised value keeps `?` and keeps its group; what makes it loud is
 `App::note_drift`, which names it in the footer — and keeps naming it until the
 warning has actually been on screen with nothing covering it.
 
-**Pane badge** — the tmux `#{pane_index}` of the pane showing this session,
-right-aligned immediately left of the age, in `p.aqua`, formatted `%N` (e.g.
-`2`). Shown only when the session is open and `W >= 34`.
-
 **Age** — `model::format_age`, right-aligned in the final 4 columns, `p.dim`.
 
 **Selected row** — background `p.sel_bg`, foreground forced to `p.fg`, and the
@@ -1807,11 +1825,15 @@ keeps its own colour. No cursor character is drawn; the bar is the cursor.
 
 | `W` | Row content |
 |---|---|
-| `>= 34` | marker + glyph + name + pane badge + age |
-| `28..=33` | marker + glyph + name + age (no pane badge) |
-| `20..=27` | marker + glyph + name (no age, no badge) |
+| `>= 28` | the 4-column gutter (marker + tab badge + glyph) + name + age |
+| `20..=27` | the same gutter + name, no age |
 | `6..=19` | glyph + name, name truncated to `W-2` |
 | `< 6` | glyph only; if `W == 0`, nothing |
+
+The gutter is all-or-nothing at `MARGIN_MIN` (20) and the age appears at
+`RAIL_MIN` (28); nothing else keys off the 34-column default. The badge never
+widens the gutter — a tab index of ten or more degrades to `+` rather than
+taking a second column and shifting every name on the row.
 
 Name budget is always computed as `W.saturating_sub(fixed_cols)` and passed to
 `model::truncate_end`. When the budget is 0 the name is omitted, not panicked on.

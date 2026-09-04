@@ -48,6 +48,11 @@ pub struct Palette {
     pub blue: Color,
     pub purple: Color,
     pub aqua: Color,
+    /// The open marker's EMPHASISED shade, for a session parked in another tab
+    /// (§6.4). Named for the role, not the shade: on the light ground it is a
+    /// deeper aqua and on the dark ground a paler one, because "more
+    /// prominent" inverts with the ground. `aqua` keeps the current tab.
+    pub aqua_elsewhere: Color,
     pub orange: Color,
     pub sel_bg: Color,
 }
@@ -67,7 +72,10 @@ impl Palette {
             yellow: Color::Rgb(0xfa, 0xbd, 0x2f),
             blue: Color::Rgb(0x83, 0xa5, 0x98),
             purple: Color::Rgb(0xd3, 0x86, 0x9b),
-            aqua: Color::Rgb(0x8e, 0xc0, 0x7c),
+            aqua: Color::Rgb(0x8e, 0xc0, 0x7c), // 7.01:1 ground, 5.51:1 band
+            // Lighter than `aqua` here: on a dark ground prominence is height,
+            // not depth. 11.25:1 ground, 8.85:1 band, 1.61:1 apart from `aqua`.
+            aqua_elsewhere: Color::Rgb(0xcf, 0xe8, 0xc8),
             orange: Color::Rgb(0xfe, 0x80, 0x19),
             sel_bg: Color::Rgb(0x3c, 0x38, 0x36),
         }
@@ -93,8 +101,13 @@ impl Palette {
             yellow: Color::Rgb(0x8d, 0x5c, 0x10), // 5.04:1
             blue: Color::Rgb(0x07, 0x66, 0x78),   // 5.82:1
             purple: Color::Rgb(0x8f, 0x3f, 0x71), // 5.94:1
-            aqua: Color::Rgb(0x3d, 0x71, 0x51),   // 5.03:1
+            aqua: Color::Rgb(0x3d, 0x71, 0x51),   // 5.03:1 ground, 4.16:1 band
             orange: Color::Rgb(0xaf, 0x3a, 0x03), // 5.40:1
+            // DARKER than `aqua`, the opposite of the dark theme's move: this
+            // ground has no headroom left going lighter — `#427b58` is already
+            // 3.64:1 on `sel_bg`, under the floor — so emphasis goes down.
+            // 10.95:1 ground, 9.05:1 band, 2.18:1 apart from `aqua`.
+            aqua_elsewhere: Color::Rgb(0x1d, 0x3a, 0x2a),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
         }
     }
@@ -650,25 +663,38 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     let name_budget = w.saturating_sub(GUTTER + right + m);
     let name = truncate_end(&sess.name, name_budget);
 
+    // The gutter's ONE ink, shared by both its columns. `badge.is_some()` is
+    // already the "not in the tab you are looking at" test — it is what makes
+    // column 2 a digit rather than a blank — so reading the shade off it, and
+    // not off a second copy of the window comparison, is what stops the colour
+    // and the digit from ever disagreeing about where a session is.
+    let ink = if badge.is_some() { p.aqua_elsewhere } else { p.aqua };
+
     let mut spans: Vec<Span> = Vec::with_capacity(8);
     // Column 1. Open wins over selected: the aqua `▌` is the one thing that
     // says "this session is on screen", and the selected row is already carried
     // by the band, the BOLD name and the promoted age. `▏` (U+258F) is a
     // hairline where `▌` (U+258C) is a thick bar — different weight, not just
     // a different colour.
+    //
+    // WHICH aqua says where. A session in this tab is already in front of you,
+    // so it keeps the established shade; one parked in another tab takes
+    // `aqua_elsewhere`, the emphasised one, because that is the row you have to
+    // go somewhere to see. The emphasis is the same fact the digit carries,
+    // said in the channel you read without counting.
     if open {
-        spans.push(Span::styled("▌".to_string(), base.fg(p.aqua)));
+        spans.push(Span::styled("▌".to_string(), base.fg(ink)));
     } else if selected {
         spans.push(Span::styled("▏".to_string(), base.fg(p.fg)));
     } else {
         spans.push(Span::styled(" ".to_string(), base));
     }
     // Column 2. Blank means "open, and open HERE"; a digit sends you to a tab.
-    // It takes `p.aqua`, the same hue as the `▌` beside it, so `▌3` reads as
-    // one two-cell token — and adds no contrast surface, because aqua is
-    // already painted in column 1 on both grounds and on `sel_bg`.
+    // It takes `ink`, the same colour as the `▌` beside it, so `▌3` still
+    // reads as one two-cell token — and adds no contrast surface, because that
+    // colour is already painted in column 1 on both grounds and on `sel_bg`.
     match badge {
-        Some(b) => spans.push(Span::styled(b.to_string(), base.fg(p.aqua))),
+        Some(b) => spans.push(Span::styled(b.to_string(), base.fg(ink))),
         None => spans.push(Span::styled(" ".to_string(), base)),
     }
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
@@ -1353,6 +1379,11 @@ fn is_open(app: &App, session_id: &str) -> bool {
 ///
 /// When the sidebar cannot resolve its own window (degraded, or a no-panic
 /// fixture that sets no pane inventory) the digit is shown unconditionally.
+///
+/// This is also THE "is it elsewhere?" test for the whole gutter: `session_line`
+/// picks the open marker's shade from `is_some()` rather than repeating the
+/// window comparison, so whatever this returns, the colour and the digit agree
+/// by construction. Change the rule here and both cells follow.
 fn tab_badge_for(app: &App, session_id: &str) -> Option<u32> {
     let open = app.open.get(session_id).filter(|o| o.attached)?;
     if open.window.is_some() && open.window == app.own_window {
@@ -3095,6 +3126,25 @@ mod tests {
         }
     }
 
+    /// WCAG relative luminance and the contrast ratio between two palette
+    /// entries. One copy, shared by the three colour tests below, so they
+    /// cannot drift into measuring different things.
+    fn lum(c: Color) -> f64 {
+        let Color::Rgb(r, g, b) = c else {
+            panic!("palette entries must be true-colour: {c:?}")
+        };
+        let f = |v: u8| {
+            let v = v as f64 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+
+    fn ratio(a: Color, b: Color) -> f64 {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
     /// The accents carry facts — the status glyph, the open marker, the message
     /// level — and on the LIGHT ground, which ships by default, six of the seven
     /// used to fail the same 4.0:1 floor `palette_contrast_is_readable` enforces
@@ -3107,22 +3157,12 @@ mod tests {
     /// the dark band) and `p.red` (3.37:1) do not — which is exactly why
     /// `session_line` promotes the selected row's age dim -> gray and forces the
     /// selected name to `p.fg`, and why red never appears on a list row.
+    ///
+    /// `aqua_elsewhere` is held to both halves like any other accent: the open
+    /// marker it paints is drawn on the band whenever its row is selected, so
+    /// clearing the ground alone would not be enough.
     #[test]
     fn light_accents_are_readable_and_the_band_is_safe() {
-        fn lum(c: Color) -> f64 {
-            let Color::Rgb(r, g, b) = c else {
-                panic!("palette entries must be true-colour: {c:?}")
-            };
-            let f = |v: u8| {
-                let v = v as f64 / 255.0;
-                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
-        }
-        fn ratio(a: Color, b: Color) -> f64 {
-            let (x, y) = (lum(a), lum(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        }
         let dark_bg = Color::Rgb(0x28, 0x28, 0x28);
         let light_bg = Color::Rgb(0xfb, 0xf1, 0xc7);
 
@@ -3137,6 +3177,7 @@ mod tests {
                 ("blue", p.blue),
                 ("purple", p.purple),
                 ("aqua", p.aqua),
+                ("aqua_elsewhere", p.aqua_elsewhere),
                 ("orange", p.orange),
             ] {
                 let r = ratio(c, bg);
@@ -3149,6 +3190,7 @@ mod tests {
                 ("fg", p.fg),
                 ("gray", p.gray),
                 ("aqua", p.aqua),
+                ("aqua_elsewhere", p.aqua_elsewhere),
                 ("green", p.green),
                 ("blue", p.blue),
                 ("purple", p.purple),
@@ -3161,6 +3203,101 @@ mod tests {
         }
     }
 
+    /// The two open-marker shades must stay two shades. Collapsing them — by
+    /// pointing `aqua_elsewhere` back at `aqua`, or by nudging one until the
+    /// pair is indistinguishable — would silently delete the whole signal while
+    /// every contrast assertion above still passed.
+    ///
+    /// The direction is asserted per theme because it INVERTS. "More
+    /// prominent" on the light ground means darker and on the dark ground
+    /// means lighter, so the portable statement is the one made against the
+    /// ground itself: whatever the hex, `aqua_elsewhere` must out-contrast
+    /// `aqua` there. That is why the field is named for its role and not for
+    /// its shade — `aqua_dark` would be a lie in one of the two themes.
+    #[test]
+    fn the_two_open_marker_shades_never_collapse() {
+        let dark_bg = Color::Rgb(0x28, 0x28, 0x28);
+        let light_bg = Color::Rgb(0xfb, 0xf1, 0xc7);
+
+        for (name, p, bg) in [
+            ("dark", Palette::dark(), dark_bg),
+            ("light", Palette::light(), light_bg),
+        ] {
+            assert_ne!(p.aqua, p.aqua_elsewhere, "{name}: the two marker shades collapsed");
+            // Far enough apart to read as two shades side by side, not as a
+            // rounding error. Measured: 2.18:1 light, 1.61:1 dark.
+            let apart = ratio(p.aqua, p.aqua_elsewhere);
+            assert!(apart >= 1.5, "{name}: the shades are only {apart:.2}:1 apart, needs >= 1.5:1");
+            assert!(
+                ratio(p.aqua_elsewhere, bg) > ratio(p.aqua, bg),
+                "{name}: aqua_elsewhere must be the MORE prominent of the two on its own ground"
+            );
+            assert!(
+                ratio(p.aqua_elsewhere, p.sel_bg) > ratio(p.aqua, p.sel_bg),
+                "{name}: the emphasis must survive onto the selection band"
+            );
+        }
+        // The inversion, stated as the fact it is: the emphasised shade is
+        // darker than `aqua` on the light theme and lighter on the dark one.
+        assert!(lum(Palette::light().aqua_elsewhere) < lum(Palette::light().aqua));
+        assert!(lum(Palette::dark().aqua_elsewhere) > lum(Palette::dark().aqua));
+    }
+
+    /// The gutter's two columns answer the same question, so they must never
+    /// answer it differently: a blank badge takes today's `aqua` and a digit
+    /// takes `aqua_elsewhere`, in column 1 and column 2 alike. Asserted on the
+    /// rendered spans, selected and unselected, in both themes — the marker is
+    /// painted on the band when its row is selected, which is the case the
+    /// shade is easiest to lose.
+    #[test]
+    fn the_marker_shade_and_the_tab_badge_always_agree() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.sessions[0].name = "alpha/opt".into();
+        let sid = app.sessions[0].session_id.clone();
+        app.own_pane = PaneId::parse("%1");
+        app.own_window = crate::tmux::WindowId::parse("@2");
+        app.map.panes.insert("%7".into(), PaneEntry {
+            session_id: sid,
+            short_id: "00000001".into(),
+            name: "n".into(),
+            opened_at: 0,
+        });
+
+        for p in [Palette::light(), Palette::dark()] {
+            for selected in [false, true] {
+                // Open in MY tab (window @2): today's aqua, blank column 2.
+                app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 2)];
+                app.rebuild_open();
+                let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+                let cols = line_cols(&l);
+                assert_eq!(cols[0], '▌');
+                assert_eq!(cols[1], ' ', "the current tab shows no digit");
+                assert_eq!(l.spans[0].style.fg, Some(p.aqua), "selected={selected}");
+
+                // Open in tab 5: the emphasised shade, and the digit that
+                // names where. Both gutter columns carry the same ink.
+                app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 5)];
+                app.rebuild_open();
+                let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+                let cols = line_cols(&l);
+                assert_eq!(cols[0], '▌');
+                assert_eq!(cols[1], '5', "another tab shows its digit");
+                assert_eq!(l.spans[0].style.fg, Some(p.aqua_elsewhere), "selected={selected}");
+                assert_eq!(
+                    l.spans[1].style.fg, l.spans[0].style.fg,
+                    "`▌5` must read as one two-cell token"
+                );
+
+                // The shade is the ONLY thing that changed: the grid is
+                // untouched from column 2 rightwards.
+                app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 2)];
+                app.rebuild_open();
+                let here = line_cols(&session_line(&app, &app.sessions[0], selected, 34, &p));
+                assert_eq!(here[2..], cols[2..], "the shade moved the rest of the row");
+            }
+        }
+    }
+
     /// Guards the fix for "the grey in the session list is too light". Every
     /// palette colour that carries text must clear a readable ratio against its
     /// OWN ground, and the ladder must descend fg > gray > dim. Before this,
@@ -3168,20 +3305,6 @@ mod tests {
     /// the light ladder inverted — `dim` was darker than `gray`.
     #[test]
     fn palette_contrast_is_readable() {
-        fn lum(c: Color) -> f64 {
-            let Color::Rgb(r, g, b) = c else {
-                panic!("palette entries must be true-colour: {c:?}")
-            };
-            let f = |v: u8| {
-                let v = v as f64 / 255.0;
-                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
-        }
-        fn ratio(a: Color, b: Color) -> f64 {
-            let (x, y) = (lum(a), lum(b));
-            (x.max(y) + 0.05) / (x.min(y) + 0.05)
-        }
         // The grounds these palettes are actually drawn on.
         let dark_bg = Color::Rgb(0x28, 0x28, 0x28);
         let light_bg = Color::Rgb(0xfb, 0xf1, 0xc7);
