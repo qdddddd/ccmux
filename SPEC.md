@@ -1790,6 +1790,18 @@ where `p.aqua` is already 7.01:1. Both clear 4.0:1 on their own ground AND on
 `sel_bg`, since the marker is painted on the band whenever its row is selected:
 light 5.74 ground / 4.75 band, dark 8.59 / 6.76.
 
+On the light theme that neutral is byte-identical to `p.dim`. It has to be:
+the gruvbox neutrals ARE that theme's text ramp, so a neutral clearing the band
+floor has nowhere to stand that is not already a text tier. The cost is a real
+one and is not hidden — an UNSELECTED other-tab Completed row paints marker,
+badge, name and age in one RGB, and only the glyph shapes separate them. Two
+bounds hold it there. The collision must be EXACT or CLEAR, never a few ΔE off
+a text tier, which would read as a rendering fault rather than as either a
+colour or a tier; and the SELECTED row, the one being read, keeps the marker
+off every ink beside it, because the selected name is forced to `p.fg` and the
+selected age promotes dim -> gray. Both are asserted in
+`the_neutral_marker_never_half_matches_the_text_ramp`.
+
 Separation is held in Lab, at CIE76 ΔE >= 20 (measured 28.8 light, 31.9 dark),
 and not as a luminance ratio. That ratio is blind to hue and scores this pair at
 1.14:1, and it is the measurement that drove the old marker down into the text
@@ -1801,7 +1813,7 @@ otherwise, and `+` at ten or more. It takes the same ink as the marker in
 col 0 — `p.aqua_elsewhere`, since a digit only ever means "another tab".
 
 A sidebar that cannot resolve its own window shows the digit unconditionally,
-and therefore the emphasised marker with it. Both are still true: `$TMUX_PANE`
+and therefore the neutral marker with it. Both are still true: `$TMUX_PANE`
 is accepted only when `list-panes -t <session> -s` returned it, so a sidebar
 that fails to place itself is one drawn outside every window that listing
 covers, and everything open really is a tab away. With no inventory at all the

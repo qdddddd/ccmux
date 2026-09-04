@@ -119,11 +119,20 @@ impl Palette {
             // `#7c6f64`, is 3.55:1 on the band. That makes it the same ink as
             // `dim`, and that is the price of a neutral on this ground: the
             // gruvbox neutrals ARE the text ramp, so any of them is some tier
-            // of text. It is the cheapest such collision available: `dim` is
-            // the LIGHTEST of this theme's three text inks, so the marker lands
-            // at the shallow end of the range and not the deep end that broke
-            // it. The glyph is a solid block in column 0 either way, three
-            // columns clear of the nearest thing `dim` paints.
+            // of text. `dim` is the LIGHTEST of this theme's three text inks,
+            // so the marker lands at the shallow end of that ramp and not the
+            // deep end that broke it. But the collision is TOTAL, not
+            // glancing: column 1's badge takes this same ink by construction,
+            // and a Completed row paints its name and age in `dim`, so an
+            // UNSELECTED other-tab row of that group renders marker, badge,
+            // name and age in one RGB, with only the glyph shapes separating
+            // them. Nothing here is three columns clear of anything.
+            //
+            // What IS bounded is the SELECTED row, the one actually being
+            // read: `session_line` forces its name to `p.fg` and promotes its
+            // age dim -> gray, two gruvbox ramp steps off this ink and one
+            // (ΔE 16.5 and 8.6). Pinned by
+            // `the_neutral_marker_never_half_matches_the_text_ramp`.
             // 5.74:1 ground, 4.75:1 band, ΔE 28.8 from `aqua`.
             aqua_elsewhere: Color::Rgb(0x66, 0x5c, 0x54),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
@@ -1399,8 +1408,8 @@ fn is_open(app: &App, session_id: &str) -> bool {
 ///
 /// When the sidebar cannot resolve its own window (degraded, or a no-panic
 /// fixture that sets no pane inventory) the digit is shown unconditionally —
-/// and so, since the shade follows the digit, is the emphasised marker. That is
-/// not the emphasis over-reaching. `App::resolve_identity` accepts `$TMUX_PANE`
+/// and so, since the shade follows the digit, is the neutral marker. That is
+/// not the marker over-reaching. `App::resolve_identity` accepts `$TMUX_PANE`
 /// only when it names a pane `list_panes_in_session` returned, and that listing
 /// covers every window of the managed session, so a failure to resolve proves
 /// this sidebar is being drawn somewhere the inventory does not reach —
@@ -3318,13 +3327,124 @@ mod tests {
             );
             assert!(
                 ratio(p.aqua_elsewhere, p.sel_bg) > ratio(p.aqua, p.sel_bg),
-                "{name}: the emphasis must survive onto the selection band"
+                "{name}: the neutral must stay the more prominent one on the band"
             );
         }
-        // The inversion, stated as the fact it is: the emphasised shade is
+        // The inversion, stated as the fact it is: the neutral shade is
         // darker than `aqua` on the light theme and lighter on the dark one.
         assert!(lum(Palette::light().aqua_elsewhere) < lum(Palette::light().aqua));
         assert!(lum(Palette::dark().aqua_elsewhere) > lum(Palette::dark().aqua));
+    }
+
+    /// The price of a NEUTRAL marker on the light ground, bounded and pinned.
+    /// `p.aqua_elsewhere` there is `#665c54`, byte-identical to `p.dim`: the
+    /// gruvbox neutrals ARE that theme's text ramp, so a neutral clearing the
+    /// 4.0:1 band floor has nowhere to stand that is not already a text tier
+    /// (fg4, the one step lighter, is 3.55:1 on the band). The consequence is
+    /// real and is not a rounding error — an UNSELECTED other-tab Completed row
+    /// paints marker, badge, name and age in one RGB, and only the glyph shapes
+    /// separate them. This test does not pretend otherwise. It pins the two
+    /// bounds that make the trade survivable, neither of which any other test
+    /// covers.
+    ///
+    /// ONE: the collision must be EXACT or CLEAR, never in between. An ink a
+    /// few ΔE off a text tier is the one outcome nobody would choose — it reads
+    /// as a rendering fault rather than as either a colour or a tier. gruvbox's
+    /// own neighbouring text tiers sit ~8 ΔE apart (light fg->gray 7.9,
+    /// gray->dim 8.6), so one ramp step is the natural floor: ΔE 0, or >= 7.5.
+    ///
+    /// TWO: the SELECTED row — the one actually being read — must keep the
+    /// marker off every ink beside it, and does, but not by luck. It holds only
+    /// because `session_line` forces the selected name to `p.fg` and promotes
+    /// the selected age dim -> gray, two promotions made for contrast reasons of
+    /// their own (`p.dim` is 3.16:1 on the dark band). Drop either and the light
+    /// theme's selected row goes flat too, which is the failure this bounds; the
+    /// palette-level assertions above would all still pass.
+    ///
+    /// Asserted on the rendered spans, not on the palette, because what matters
+    /// is the ink that actually reaches the row.
+    #[test]
+    fn the_neutral_marker_never_half_matches_the_text_ramp() {
+        // One gruvbox ramp step, the smallest gap the theme itself ever asks a
+        // reader to see between two text tiers.
+        const STEP: f64 = 7.5;
+
+        for (name, p) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            for (field, c) in [("fg", p.fg), ("gray", p.gray), ("dim", p.dim)] {
+                let d = delta_e(p.aqua_elsewhere, c);
+                assert!(
+                    d == 0.0 || d >= STEP,
+                    "{name}: aqua_elsewhere is ΔE {d:.1} from {field} — neither the same \
+                     ink nor a distinguishable one"
+                );
+            }
+        }
+
+        // Completed is the worst case on purpose: its name tier IS `p.dim`, so
+        // on the light theme every ink in the unselected row is the marker's.
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Idle, Some(State::Done))]);
+        let sid = app.sessions[0].session_id.clone();
+        app.own_pane = PaneId::parse("%1");
+        app.own_window = crate::tmux::WindowId::parse("@2");
+        app.map.panes.insert("%7".into(), PaneEntry {
+            session_id: sid,
+            short_id: "00000001".into(),
+            name: "n".into(),
+            opened_at: 0,
+        });
+        // Open in tab 5, i.e. NOT the tab being drawn: the elsewhere ink.
+        app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 5)];
+        app.rebuild_open();
+
+        for (name, p) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            for selected in [false, true] {
+                let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+                assert_eq!(line_cols(&l)[1], '5', "the fixture must be an other-tab row");
+                let ink = l.spans[0].style.fg.expect("the marker is inked");
+                assert_eq!(ink, p.aqua_elsewhere, "{name}: the fixture must take the neutral");
+
+                // Span 4 is the name (marker, badge, glyph, space, name); the
+                // age is the last span carrying text. Both are checked rather
+                // than trusted, so a layout change fails here loudly instead of
+                // silently measuring a pad span.
+                assert!(
+                    l.spans[4].content.starts_with("session"),
+                    "span 4 is no longer the name: {:?}",
+                    l.spans[4].content
+                );
+                let name_ink = l.spans[4].style.fg.expect("the name is inked");
+                let age_ink = l
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|s| !s.content.trim().is_empty())
+                    .and_then(|s| s.style.fg)
+                    .expect("the age is inked at 34 columns");
+
+                for (what, c) in [("name", name_ink), ("age", age_ink)] {
+                    let d = delta_e(ink, c);
+                    if selected {
+                        assert!(
+                            d >= STEP,
+                            "{name}: the SELECTED row's {what} is only ΔE {d:.1} from the \
+                             marker — the promotion that keeps them apart is gone"
+                        );
+                    } else {
+                        assert!(
+                            d == 0.0 || d >= STEP,
+                            "{name}: the unselected row's {what} is ΔE {d:.1} from the marker"
+                        );
+                    }
+                }
+                // The reason the selected row can promote at all: `p.gray` is
+                // safe on the band where `p.dim` is not. Asserted where the
+                // promotion is relied on, not only in the palette sweep.
+                if selected {
+                    let r = ratio(age_ink, p.sel_bg);
+                    assert!(r >= 4.0, "{name}: the promoted age is {r:.2}:1 on sel_bg");
+                }
+            }
+        }
     }
 
     /// The gutter's two columns answer the same question, so they must never
@@ -3358,7 +3478,7 @@ mod tests {
                 assert_eq!(cols[1], ' ', "the current tab shows no digit");
                 assert_eq!(l.spans[0].style.fg, Some(p.aqua), "selected={selected}");
 
-                // Open in tab 5: the emphasised shade, and the digit that
+                // Open in tab 5: the neutral shade, and the digit that
                 // names where. Both gutter columns carry the same ink.
                 app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 5)];
                 app.rebuild_open();
@@ -3386,20 +3506,20 @@ mod tests {
     /// drift. The shade reads off `tab_badge_for`, so it inherits whatever that
     /// helper answers when the sidebar cannot place itself — two states, which
     /// behave differently, and both are asserted because only the pairing of
-    /// them says the emphasis is doing the right thing.
+    /// them says the shade is doing the right thing.
     ///
     /// With no pane inventory the row is open but placed nowhere:
     /// `rebuild_open` stamps neither window nor index, `tab_badge_for` has no
     /// index to return, and the row renders exactly what it rendered before the
     /// second shade existed — blank column 2, today's `aqua`. This is the shape
     /// every no-panic fixture in this module has, and the shape of the first
-    /// tick before any enumeration has landed. The emphasis stays out of a
+    /// tick before any enumeration has landed. The neutral stays out of a
     /// question the process cannot answer. (Degraded mode proper is quieter
     /// still: `refresh_panes` returns early, so `adopt_own_state` never runs and
     /// there is no map to make the row open at all — no marker, no digit.)
     ///
     /// With an inventory but still no `own_window`, every open row shows its
-    /// digit, and the emphasised marker goes with it. That is not the emphasis
+    /// digit, and the neutral marker goes with it. That is not the marker
     /// over-reaching: `App::resolve_identity` accepts `$TMUX_PANE` only if it
     /// appears in `list_panes_in_session`, which lists every pane of every
     /// window of the managed session, so a sidebar that fails to place itself is
@@ -3434,7 +3554,7 @@ mod tests {
                 assert_eq!(
                     l.spans[0].style.fg,
                     Some(p.aqua),
-                    "an unplaceable pane must not be emphasised (selected={selected})"
+                    "an unplaceable pane must not take the elsewhere ink (selected={selected})"
                 );
 
                 // Inventory, still no own window: the documented digit, and
