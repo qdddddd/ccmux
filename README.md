@@ -340,9 +340,18 @@ becomes a restart target again.
 The footer then says what happened, from the new image: `restarted 3 sidebars,
 4 panes, 2 agents (1 busy, 1 skipped)`. Successes are in the head, exceptions in
 the parenthesis, and each gets its own word — `failed` is a pane that did not
-come back, `not restarted` an agent still on the old binary, `busy` an agent
-deliberately left alone, `skipped` a pane deliberately left alone. A line too
-wide for the sidebar wraps rather than truncating. It is a count of what was
+come back, `not restarted` an agent still on the old binary, `left stopped` an
+agent that was stopped and whose pane never came back to resume it, `busy` an
+agent deliberately left alone, `skipped` a pane deliberately left alone. A line
+too wide for the sidebar wraps rather than truncating.
+
+`left stopped` is the only one of those that asks anything of you, and it is
+rare: it needs a pane to be killed or to fail its respawn in the moment between
+the stop and the re-attach. The agent is halted and ccmux has nothing left that
+would resume it, so press `Enter` on the row to open it again. An agent is
+counted as restarted only once a pane has actually come back holding it — a
+stop is half a restart, and the footer does not claim the other half before it
+has happened. It is a count of what was
 actually restarted, not a plan announced in advance — the sidebar you pressed
 `R` in restarts first, and the image that comes up is the one that restarts
 everything else.
@@ -352,6 +361,13 @@ attempted for each in turn, a failure is counted, and the pass carries on. Every
 stop lands **before** any pane is respawned, because the respawned
 `claude attach` is what resumes the session — the other order would leave you
 looking at a pane whose agent had just been halted underneath it.
+
+The pass is not instant — about a second per agent, and up to 75 s against a
+`claude` that has wedged — so the restarted sidebar **draws a frame first** and
+says `restarting the session…` while it works. Keys struck at it during that
+window are discarded rather than replayed when it finishes: they were aimed at
+a screen that had not been updated yet, and one of them could be a `Ctrl-x`
+landing on a row you never chose.
 
 That order is the safety property. `respawn-pane -k` has no undo: it kills the
 pane, runs the new command, and if that command exits the pane closes and the
@@ -445,9 +461,10 @@ that is known to have lost rows concludes nothing at all.
   is kept and the pane's own `claude attach` resumes it a moment later. A busy
   agent keeps its old version until it finishes, which is the whole reason `R`
   is safe to press at any moment.
-- `Ctrl-x` is the only verb that stops a session, and the only one that can
-  delete one. The first press **stops** — recoverable: the conversation is kept
-  and `Enter` resumes it. Only a **second press within two seconds** deletes: it
+- `Ctrl-x` is the only verb that can **delete** a session, and the only stop
+  that reaches a **working or blocked** one — `R`'s stop refuses those, and puts
+  everything it does stop straight back. The first press **stops** —
+  recoverable: the conversation is kept and `Enter` resumes it. Only a **second press within two seconds** deletes: it
   runs `claude rm <id>`, which removes the session **and its git worktree**, so
   uncommitted work in that worktree goes with it. Nothing undoes that; `u`
   undoes a dismissal, never a delete.

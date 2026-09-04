@@ -183,11 +183,29 @@ impl Plan {
 /// must never be got wrong. A blocked session is not always `state: "blocked"`:
 /// on 2026-08-31 one of two live blocked sessions reported `status: "idle"` and
 /// the other `status: "waiting"` with no agreement between them, and
-/// `Session::group` answers Blocked from EITHER axis. Reading `state` alone
-/// would stop a session that is sitting on a permission prompt, mid-task, with
-/// a half-applied edit on disk — which is precisely the interruption `R` exists
-/// to avoid. The same belt covers a CLI that invents a new busy-ish word: an
-/// unmodelled state with `status: "busy"` groups as Working and is skipped.
+/// `Session::group` answers Blocked from either axis AT EVERY STATE THAT IS
+/// STILL RUNNING. Reading `state` alone would stop a session that is sitting on
+/// a permission prompt, mid-task, with a half-applied edit on disk — which is
+/// precisely the interruption `R` exists to avoid. The same belt covers a CLI
+/// that invents a new busy-ish word: an unmodelled state with `status: "busy"`
+/// groups as Working and is skipped.
+///
+/// WHERE THE BELT STOPS, exactly, and it is not "nowhere": a TERMINAL state
+/// outranks the waiting status, so `done`/`stopped` + `status: "waiting"`
+/// groups as Completed and IS stopped. That is the terminal-exclusion rule of
+/// `Session::group` (PROBE-FINDINGS §1) and it is deliberate — a finished
+/// session is waiting on nobody, and a stale status word on a `done` row is a
+/// live shape rather than a hypothetical one: 5 of the 14 `done` rows in the
+/// fleet on 2026-08-31 carried a status of their own. Refusing those would
+/// report real finished sessions as `busy`, leave them on the old binary, and
+/// give the operator a count they cannot account for from the screen. What the
+/// belt does NOT cover, therefore, is a CLI that reports a HUMAN-BLOCKED
+/// session as `done`; nothing here can, because such a build would file that
+/// row under Completed on screen too and every other verb — `x`, `Ctrl+X`,
+/// `Tab` — would follow it there. The cost is bounded either way: `claude stop`
+/// on a session that has already finished exits 0, changes nothing and leaves
+/// `state` as it was (PROBE-FINDINGS §2, verified), and the pane re-attaches it.
+/// `only_a_row_under_idle_or_completed_may_be_stopped` pins both halves.
 ///
 /// The residual case is an unmodelled state with an idle-looking status: it
 /// groups as Idle and is restarted. That is deliberate — it is where every
@@ -300,13 +318,19 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
 
 /// WHAT THE AGENT PASS DID, counted by the image that did it.
 ///
-/// Three buckets, and the line between them is what the operator can act on:
-/// `restarted` needs nothing, `busy` needs only patience, and `failed` is the
-/// one that may need a human.
+/// Four buckets, and the line between them is what the operator can act on:
+/// `restarted` needs nothing, `busy` needs only patience, `failed` may need a
+/// human, and `stranded` DEFINITELY does — it is the one state `R` can leave
+/// behind that does not fix itself.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Agents {
-    /// Stopped, so the pane's `claude attach` brings the worker back as a new
-    /// process on the `claude` that is installed NOW (PROBE-FINDINGS §2).
+    /// Stopped, AND a pane came back up on `claude attach <id>` to resume it —
+    /// so the worker is running again, as a new process on the `claude` that is
+    /// installed NOW (PROBE-FINDINGS §2).
+    ///
+    /// Counted after PHASE 2, never at the stop. A stop is only half of a
+    /// restart; the resume is the other half, and it is the half that can fail
+    /// independently. See `stranded`.
     pub restarted: usize,
     /// Deliberately left on the old binary because the row was under Working or
     /// Blocked. THE INTENDED TRADE, not a failure: a busy agent keeps its
@@ -318,13 +342,34 @@ pub struct Agents {
     /// same thing to the operator — that agent is still on the old binary and
     /// ccmux could not change it — so they are one number, and it is reported
     /// rather than swallowed.
+    ///
+    /// EVERY ONE OF THESE LEFT THE AGENT RUNNING. Nothing was stopped, so
+    /// nothing needs resuming; the trade is identical to `busy`, one cause
+    /// along.
     pub failed: usize,
+    /// STOPPED, AND NOT RESUMED: the `claude stop` succeeded and then no pane
+    /// came back up holding that session, because its respawn failed or the
+    /// pane was gone by the time PHASE 2 reached it.
+    ///
+    /// Its own word because it is its own outcome, and the only one `R` can
+    /// produce that an operator must act on: the agent is halted, ccmux has
+    /// nothing left that will resume it, and the conversation sits there until
+    /// somebody presses `Enter` on the row or runs `claude attach <id>`. Rolled
+    /// into `restarted` it would be a plain lie — the footer would report an
+    /// upgrade for a worker that is not running — and rolled into `failed` it
+    /// would read as "still on the old binary", which is the one thing it is
+    /// not.
+    ///
+    /// It needs a pane respawn to fail to happen at all, which is why it is
+    /// rare rather than impossible: `tmux kill-pane` on a Claude pane in the
+    /// seconds between PHASE 1 and PHASE 2 reproduces it exactly.
+    pub stranded: usize,
 }
 
 impl Agents {
     /// Did the agent pass have anything at all to say?
     fn spoke(&self) -> bool {
-        self.restarted + self.busy + self.failed > 0
+        self.restarted + self.busy + self.failed + self.stranded > 0
     }
 }
 
@@ -352,10 +397,13 @@ pub struct Report {
 ///
 /// SUCCESSES IN THE HEAD, EXCEPTIONS IN THE PARENTHESIS, and every exception
 /// gets its own word: `failed` is a pane that did not come back, `not
-/// restarted` an agent still on the old binary, `busy` an agent deliberately
-/// left alone, `skipped` a pane deliberately left alone. Two of those could
-/// have shared the word "failed" and must not: "a pane is gone" and "an agent
-/// kept its version" are different problems with different answers.
+/// restarted` an agent still on the old binary, `left stopped` an agent that
+/// was stopped and that no pane came back to resume, `busy` an agent
+/// deliberately left alone, `skipped` a pane deliberately left alone. They
+/// could have shared the word "failed" and must not: "a pane is gone", "an
+/// agent kept its version" and "an agent is halted with nothing to resume it"
+/// are three different problems with three different answers, and only the
+/// last one needs the operator to do something.
 ///
 /// The agent clause is omitted entirely when the pass had nothing to say —
 /// no session ccmux opened was in scope — so a session with no Claude panes
@@ -386,6 +434,9 @@ pub fn note(r: &Report) -> String {
     }
     if r.agents.failed > 0 {
         ex.push(format!("{} not restarted", r.agents.failed));
+    }
+    if r.agents.stranded > 0 {
+        ex.push(format!("{} left stopped", r.agents.stranded));
     }
     if r.agents.busy > 0 {
         ex.push(format!("{} busy", r.agents.busy));
@@ -885,17 +936,31 @@ mod tests {
         assert_eq!(p.agent_ids(), vec!["aaaaaaaa"], "one session, one stop");
     }
 
-    /// THE STATE RULE, across the whole state x status matrix. Working and
-    /// Blocked are refused from EITHER axis; everything else is restartable.
-    /// The row that matters most is the last pair: a CLI that stops emitting
-    /// `state: "blocked"` and leaves `status: "waiting"` behind must still be
-    /// refused, because that shape has already shipped once.
+    /// THE STATE RULE, across the whole state x status matrix — every state
+    /// this build models, and the unmodelled one, against every status.
+    ///
+    /// Working and Blocked are refused from either axis at every state that is
+    /// STILL RUNNING. The row that matters most is the `waiting`-without-
+    /// `blocked` group at the end: a CLI that stops emitting `state:
+    /// "blocked"` and leaves `status: "waiting"` behind must still be refused,
+    /// because that shape has already shipped once.
+    ///
+    /// And the two rows the rule does NOT reach are here too, spelled out
+    /// rather than left to be discovered: a TERMINAL state outranks the waiting
+    /// status, so `done`/`stopped` + `waiting` is Completed and IS stopped.
+    /// That is `Session::group`'s terminal-exclusion rule (PROBE-FINDINGS §1),
+    /// it is what keeps the 5-of-14 live `done` rows that carry a status of
+    /// their own out of the `busy` count, and pinning it here is what stops the
+    /// prose above quietly overstating the belt again.
     #[test]
     fn only_a_row_under_idle_or_completed_may_be_stopped() {
         let cases: &[(Option<State>, Status, bool)] = &[
             (Some(State::Done), Status::Idle, true),
             (Some(State::Done), Status::Busy, true),
             (Some(State::Stopped), Status::Idle, true),
+            // TERMINAL OUTRANKS WAITING. Deliberate, and the limit of the belt.
+            (Some(State::Done), Status::Waiting, true),
+            (Some(State::Stopped), Status::Waiting, true),
             (None, Status::Idle, true),
             (Some(State::Unknown("napping".into())), Status::Idle, true),
             (Some(State::Working), Status::Busy, false),
@@ -987,7 +1052,21 @@ mod tests {
             }),
             "restarted 1 sidebar, 1 pane, 0 agents (1 busy)"
         );
-        // Four exceptions, four words, worst first — and the two "failed"
+        // THE ONE THAT ASKS FOR SOMETHING: an agent stopped whose pane never
+        // came back. It is neither a restart nor a stale binary, and saying so
+        // is the difference between "press Enter on that row" and "nothing to
+        // do here".
+        assert_eq!(
+            note(&Report {
+                sidebars: 1,
+                panes: 2,
+                failed: 1,
+                agents: Agents { restarted: 2, stranded: 1, ..Agents::default() },
+                ..Report::default()
+            }),
+            "restarted 1 sidebar, 2 panes, 2 agents (1 failed, 1 left stopped)"
+        );
+        // Five exceptions, five words, worst first — and the three "failed"
         // populations stay distinguishable.
         assert_eq!(
             note(&Report {
@@ -995,9 +1074,12 @@ mod tests {
                 panes: 3,
                 failed: 1,
                 skipped: 4,
-                agents: Agents { restarted: 1, busy: 2, failed: 3 },
+                agents: Agents { restarted: 1, busy: 2, failed: 3, stranded: 5 },
             }),
-            "restarted 2 sidebars, 3 panes, 1 agent (1 failed, 3 not restarted, 2 busy, 4 skipped)"
+            concat!(
+                "restarted 2 sidebars, 3 panes, 1 agent ",
+                "(1 failed, 3 not restarted, 5 left stopped, 2 busy, 4 skipped)"
+            )
         );
     }
 

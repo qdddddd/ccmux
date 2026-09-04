@@ -2495,7 +2495,11 @@ THE IMAGE THAT PRESSES `R` KILLS NOTHING.
    is still exactly as it was, because none of them was touched.
 
 THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
-7. main::run_sidebar, when restart::is_handoff():
+7. main::run_sidebar, when restart::is_handoff(), in this order and no other
+   (main::finish_handoff):
+       flash "restarting the session…" (Info) and DRAW ONE FRAME
+           the pass below blocks for ~0.9 s per in-scope agent and reads no
+           input; without this the pane is blank for all of it
        app.finish_restart():
            refresh_panes()                     fresh panes + every tab's records
            tabs := list-windows, with MY window's map replaced by self.map
@@ -2517,8 +2521,16 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
            PHASE 2 — the panes, unconditional on phase 1:
            for t in plan.targets:
                tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))  [R2-gated]
+                   Ok on a Claude target -> that short_id is RESUMED
+                   Err -> failed += 1
+
+           PHASE 3 — close phase 1's books, which only phase 2 can:
+           for id in stopped:
+               resumed  -> restarted += 1
+               not      -> stranded += 1        # halted, nothing will resume it
 
            flash restart::note(Report { sidebars+1, panes, failed, skipped, agents })  (Info)
+       drain buffered input   (every key struck at the frozen pane above)
 8. event_loop draws ONE frame before its first tick, so that note is on screen
    before `claude agents --json` blocks the loop.
 ```
@@ -2555,8 +2567,22 @@ never one under **Working** or **Blocked**. The rule is stated in `Group`, not
 in `State`, so it reads the same verdict `Session::group` drew the heading with:
 the footer's counts are explainable from the screen, "idle" (which is not a
 `state` the CLI emits) is expressible at all, and a blocked session is refused
-from EITHER axis — `status: "waiting"` under any state groups as Blocked, which
-is the belt that catches a CLI that stops emitting `state: "blocked"`.
+from EITHER axis — `status: "waiting"` groups as Blocked under any state THAT IS
+STILL RUNNING, which is the belt that catches a CLI that stops emitting
+`state: "blocked"`.
+
+Where that belt stops is `Session::group`'s terminal-exclusion rule, and it is
+in the matrix rather than left to be found: `done`/`stopped` outrank the waiting
+status, so a terminal row with `status: "waiting"` groups as **Completed** and
+IS stopped. Deliberate. A finished session is waiting on nobody, and a stale
+status on a `done` row is a live shape — 5 of the 14 `done` rows on 2026-08-31
+carried one — so refusing them would report real finished sessions as `busy` and
+leave them on the old binary. The uncovered case is therefore a CLI that reports
+a HUMAN-BLOCKED session as `done`; no rule here can catch that, because such a
+build would file the row under Completed on screen too and `x`, `Ctrl+X` and
+`Tab` would all follow it there. The cost is bounded: `claude stop` on a session
+that has already finished exits 0 and changes nothing (PROBE-FINDINGS §2), and
+its pane re-attaches it.
 
 *The race* — the state is a SNAPSHOT and `claude` has no conditional stop, so
 the window cannot be closed, only narrowed. `App::sessions` is up to a poll
@@ -2573,8 +2599,32 @@ wide instead of one poll interval wide.
 else: it is counted and the pass continues. A failed POLL ends the pass instead,
 because without it ccmux cannot tell working from idle and every later stop
 would be a guess. `AGENT_BUDGET` (60 s) caps the whole pass — the per-call
-bounds multiply, and the pane pass must not be lost to a wedged daemon. In every
+bounds multiply, and the pane pass must not be lost to a wedged daemon. It is a
+START GATE: the deadline is checked before each poll+stop pair and neither call
+can be cut short once begun, so the true worst case is
+`AGENT_BUDGET + POLL_TIMEOUT + STOP_TIMEOUT` = **75 s**, once per pass. In every
 one of those cases PHASE 2 still runs.
+
+*Counting the restarts* — a `claude stop` that returned Ok is HALF a restart.
+The resume is the pane's respawned `claude attach`, and it can fail on its own:
+kill that pane between the phases and the agent is halted with nothing left to
+resume it. So PHASE 3 counts, not PHASE 1: a stopped session whose pane came
+back is `restarted`, and one whose pane did not is `stranded` — reported as
+`N left stopped`, its own word because it is the only outcome of `R` that asks
+the operator to do something (press `Enter` on the row). Rolled into
+`restarted` it would claim an upgrade for a worker that is not running; rolled
+into `not restarted` it would read as "still on the old binary", which is the
+one thing it is not.
+
+*The blocking window* — the pass reads no input, so the restarted sidebar draws
+ONE FRAME under a `restarting the session…` note before it starts, and DRAINS
+buffered input after it ends. Without the frame the pane is blank for the whole
+pass (measured: 1.5 s for two agents, 30.5 s against a `claude stop` that hung)
+— the exact failure `main::first_frame` exists to prevent. Without the drain
+every key struck at that frozen pane is replayed against a list the operator
+never saw: a buffered `Ctrl+X` arrives with `cx_last_press == None`, so the
+burst guard does not fire, and it stops whatever is on row 0 — the top of the
+Blocked group, which is the agent `R` had just refused to touch.
 
 *Ordering* — every stop lands before ANY respawn. `claude attach` is what
 resumes a stopped session, so `stop` then `attach` composes (the pane comes up
@@ -2705,9 +2755,12 @@ requires the pane to be live.
 it: `restarted 3 sidebars, 4 panes, 2 agents (1 busy, 1 skipped)`. Successes in
 the head, exceptions in one parenthesis, and every exception has its own word —
 `N failed` (a pane that did not come back), `N not restarted` (an agent still on
-the old binary), `N busy` (an agent deliberately left alone), `N skipped` (a
-pane deliberately left alone). Two of those could have shared "failed" and must
-not: a lost pane and a stale agent are different problems. The agent clause is
+the old binary), `N left stopped` (an agent that was stopped and whose pane
+never came back to resume it), `N busy` (an agent deliberately left alone),
+`N skipped` (a pane deliberately left alone). Those could have shared "failed"
+and must not: a lost pane, a stale agent and a halted agent with nothing to
+resume it are three different problems, and only the last one needs the operator
+to act. The agent clause is
 omitted entirely when nothing was in scope, so a session with no Claude panes
 reads exactly as it did before agents were part of `R`. A line wider than the
 sidebar wraps into §6.8's overflow carve rather than truncating. The count
