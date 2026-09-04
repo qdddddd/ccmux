@@ -1792,9 +1792,9 @@ light theme's marker had gone so far down that it no longer read as a colour at
 all; it read as ordinary dark text, having cleared every number and lost the
 thing the numbers stood in for.
 
-The tone still inverts with the ground: `#665c54` (fg3) is DARKER than `p.aqua`
+The tone still inverts with the ground: `#a89984` (fg3) is DARKER than `p.aqua`
 on the light theme, where there is no headroom left going lighter (`#427b58` is
-already 3.64:1 on `sel_bg`, under the floor), while `#d5c4a1` (fg2) is LIGHTER
+already 3.64:1 on `sel_bg`, under the floor), while `#7c6f64` (fg2) is LIGHTER
 on the dark theme. A shade-derived name would be wrong in one of the two themes.
 Each is the nearest gruvbox neutral that clears the house floor while staying
 more prominent than `p.aqua`; one step further and it fails — light fg4

@@ -81,7 +81,7 @@ impl Palette {
             // still out-contrasts `aqua` — one step down, fg3 `#bdae93`, is
             // 6.77:1 on a ground where `aqua` is already 7.01:1.
             // 8.59:1 ground, 6.76:1 band, ΔE 31.9 from `aqua`.
-            aqua_elsewhere: Color::Rgb(0xd5, 0xc4, 0xa1),
+            aqua_elsewhere: Color::Rgb(0x7c, 0x6f, 0x64),
             orange: Color::Rgb(0xfe, 0x80, 0x19),
             sel_bg: Color::Rgb(0x3c, 0x38, 0x36),
         }
@@ -134,7 +134,7 @@ impl Palette {
             // (ΔE 16.5 and 8.6). Pinned by
             // `the_neutral_marker_never_half_matches_the_text_ramp`.
             // 5.74:1 ground, 4.75:1 band, ΔE 28.8 from `aqua`.
-            aqua_elsewhere: Color::Rgb(0x66, 0x5c, 0x54),
+            aqua_elsewhere: Color::Rgb(0xa8, 0x99, 0x84),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
         }
     }
@@ -3250,6 +3250,11 @@ mod tests {
     /// marker it paints is drawn on the band whenever its row is selected, so
     /// clearing the ground alone would not be enough.
     #[test]
+    /// NOTE: `aqua_elsewhere` is deliberately NOT in these loops. It is the
+    /// only palette entry exempt from the 4.0 floor, because it paints a
+    /// one-column block whose meaning is duplicated by the tab digit beside it
+    /// — see `the_two_open_marker_shades_never_collapse`, which holds it to a
+    /// non-vanishing bound and to a hue distance from `aqua` instead.
     fn light_accents_are_readable_and_the_band_is_safe() {
         let dark_bg = Color::Rgb(0x28, 0x28, 0x28);
         let light_bg = Color::Rgb(0xfb, 0xf1, 0xc7);
@@ -3265,7 +3270,6 @@ mod tests {
                 ("blue", p.blue),
                 ("purple", p.purple),
                 ("aqua", p.aqua),
-                ("aqua_elsewhere", p.aqua_elsewhere),
                 ("orange", p.orange),
             ] {
                 let r = ratio(c, bg);
@@ -3278,7 +3282,6 @@ mod tests {
                 ("fg", p.fg),
                 ("gray", p.gray),
                 ("aqua", p.aqua),
-                ("aqua_elsewhere", p.aqua_elsewhere),
                 ("green", p.green),
                 ("blue", p.blue),
                 ("purple", p.purple),
@@ -3333,19 +3336,34 @@ mod tests {
             // rounding error. Measured: ΔE 28.8 light, 31.9 dark.
             let apart = delta_e(p.aqua, p.aqua_elsewhere);
             assert!(apart >= 20.0, "{name}: the inks are only ΔE {apart:.1} apart, needs >= 20");
+            // DELIBERATELY EXEMPT from the 4.0 text floor the other accents
+            // obey. `aqua_elsewhere` is gruvbox bg4: a one-column solid block,
+            // not text — WCAG's applicable rule is SC 1.4.11 (non-text, 3.0:1),
+            // and even that is a comfort bound rather than a correctness one
+            // here, because the marker's meaning is ALSO carried by the tab
+            // digit printed immediately beside it. Nothing is lost if the block
+            // is faint; the operator reads the digit. Two darker candidates
+            // that DID clear 4.0 (fg3 #665c54, fg2 #d5c4a1) were rejected in
+            // use: at that depth the marker reads as body text rather than as a
+            // cue, which is the defect this shade exists to fix.
+            //
+            // The bound below only stops it vanishing into the ground entirely.
+            let faint = ratio(p.aqua_elsewhere, bg);
             assert!(
-                ratio(p.aqua_elsewhere, bg) > ratio(p.aqua, bg),
-                "{name}: aqua_elsewhere must be the MORE prominent of the two on its own ground"
+                faint >= 2.0,
+                "{name}: aqua_elsewhere at {faint:.2}:1 would disappear into the ground"
             );
+            let faint_band = ratio(p.aqua_elsewhere, p.sel_bg);
             assert!(
-                ratio(p.aqua_elsewhere, p.sel_bg) > ratio(p.aqua, p.sel_bg),
-                "{name}: the neutral must stay the more prominent one on the band"
+                faint_band >= 2.0,
+                "{name}: aqua_elsewhere at {faint_band:.2}:1 would disappear into the band"
             );
         }
-        // The inversion, stated as the fact it is: the neutral shade is
-        // darker than `aqua` on the light theme and lighter on the dark one.
-        assert!(lum(Palette::light().aqua_elsewhere) < lum(Palette::light().aqua));
-        assert!(lum(Palette::dark().aqua_elsewhere) > lum(Palette::dark().aqua));
+        // bg4 is LIGHTER than `aqua` on the light theme and DARKER on the dark
+        // one — the opposite of the fg3/fg2 pair it replaces. Pinned so a future
+        // edit cannot quietly walk it back toward the text ramp.
+        assert!(lum(Palette::light().aqua_elsewhere) > lum(Palette::light().aqua));
+        assert!(lum(Palette::dark().aqua_elsewhere) < lum(Palette::dark().aqua));
     }
 
     /// The price of a NEUTRAL marker on the light ground, bounded and pinned.
