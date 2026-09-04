@@ -468,7 +468,19 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
             // respawns, so they happen HERE — and only when the handoff token
             // is this process's own pid, which only an `exec` can arrange.
             if restart::is_handoff() {
-                app.finish_restart();
+                finish_handoff(&mut |s| match s {
+                    // A draw failure must not cost the session its restart:
+                    // the frame is a courtesy to the operator's eyes, the
+                    // restart is the verb they pressed.
+                    HandoffStep::FirstFrame => {
+                        app.flash("restarting the session…", MsgLevel::Info);
+                        let _ = first_frame(&mut terminal, &mut app);
+                    }
+                    HandoffStep::FinishRestart => app.finish_restart(),
+                    HandoffStep::DrainInput => {
+                        let _ = drain_pending_input();
+                    }
+                });
             }
             event_loop(&mut terminal, &mut app)
         });
@@ -626,6 +638,58 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// THE OTHER END OF AN `R`: the steps the image that comes UP runs, before its
+/// event loop, in the order they MUST happen. `RestartStep` is this list's
+/// mirror image on the far side of the `exec`, and it is a list for the same
+/// reason: so the order is a property a test can drive rather than a comment
+/// three call sites have to keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffStep {
+    /// DRAW BEFORE ACTING, and this is the step that was missing.
+    ///
+    /// `finish_restart` blocks: one `claude agents --json` plus one
+    /// `claude stop` per in-scope agent, ~0.9 s each measured, and up to
+    /// `AGENT_BUDGET` + one poll + one stop against a wedged daemon. All of it
+    /// used to happen between entering the alternate screen and the first
+    /// `draw`, so the pane was BLANK for the whole pass — measured at 1.5 s for
+    /// two agents and 30.5 s against a `claude stop` that hung. That is the
+    /// precise failure `first_frame` was written to prevent ("the pane stays
+    /// blank for that whole wait"), reintroduced one caller earlier and an
+    /// order of magnitude longer. Drawing first costs one frame of an empty
+    /// list under a `restarting the session…` note, and the operator can see
+    /// that ccmux is alive and working.
+    FirstFrame,
+    /// `App::finish_restart` — the agents, then the panes, then the footer.
+    FinishRestart,
+    /// TYPE-AHEAD, and it is not a tidiness step.
+    ///
+    /// Nothing reads the tty for the whole of `FinishRestart`, so every key
+    /// struck at that frozen sidebar is buffered by the terminal and replayed
+    /// the instant the loop starts — against a screen the operator never saw,
+    /// and (after the first tick) against a fully populated session list they
+    /// did not aim at. A buffered `Ctrl+X` arrives in a process whose
+    /// `cx_last_press` is `None`, so the burst guard does not fire and it stops
+    /// whatever row 0 happens to be — which after a restart is the top of the
+    /// Blocked group, exactly the agent `R` refused to touch a second earlier.
+    /// A buffered `x` closes a pane. The rule is already settled everywhere
+    /// else a blocking call can outlast a keystroke — `SLOW_TICK`, `SLOW_KEY`,
+    /// and `RestartStep::DrainInput` on the other side of the `exec` — and it
+    /// is the same rule here: those keystrokes were aimed at a frozen UI,
+    /// execute none of them.
+    ///
+    /// AFTER the pass, never before: a drain before it would leave the whole
+    /// blocking window undefended, which is the entire point.
+    DrainInput,
+}
+
+/// The handoff's tail, as a function so the order is testable without a
+/// terminal, a tmux server or a `claude`.
+fn finish_handoff(step: &mut dyn FnMut(HandoffStep)) {
+    step(HandoffStep::FirstFrame);
+    step(HandoffStep::FinishRestart);
+    step(HandoffStep::DrainInput);
 }
 
 /// The steps `R` runs before it stops being this process, in the order they
@@ -943,6 +1007,44 @@ mod tests {
         );
     }
 
+    /// THE REGRESSION TEST for a blocking pass nobody could see or interrupt.
+    ///
+    /// `finish_restart` used to be called bare, between entering the alternate
+    /// screen and the loop's first `draw`. Once it grew the agent pass — one
+    /// `claude agents --json` and one `claude stop` per in-scope agent, ~0.9 s
+    /// each, up to `AGENT_BUDGET` + one poll + one stop against a wedged
+    /// `claude` — that gap became a pane that was BLANK and DEAF for the whole
+    /// pass: measured at 1.5 s for two agents and 30.5 s with a hanging stop.
+    ///
+    /// Blank is the failure `first_frame` exists to prevent. Deaf is worse:
+    /// keys struck at the frozen sidebar sit in the tty and are replayed the
+    /// moment the loop starts, against a list the operator never saw. A `?`
+    /// typed mid-pass was observed replacing the `restarted …` footer — `R`'s
+    /// only feedback — 27 s later, and a buffered `Ctrl+X` would reach
+    /// `act_ctrl_x` with `cx_last_press == None`, so the burst guard would not
+    /// fire and it would stop whatever sits on row 0: the top of the Blocked
+    /// group, the very population the agent pass had just refused to touch.
+    ///
+    /// So: frame FIRST, drain AFTER, and neither is optional. A drain before
+    /// the pass would leave the whole blocking window undefended, which is why
+    /// the order is asserted and not just the membership.
+    #[test]
+    fn the_handoff_draws_before_the_pass_and_drains_after_it() {
+        let seen: std::cell::RefCell<Vec<HandoffStep>> = std::cell::RefCell::new(Vec::new());
+
+        finish_handoff(&mut |s| seen.borrow_mut().push(s));
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                HandoffStep::FirstFrame,
+                HandoffStep::FinishRestart,
+                HandoffStep::DrainInput
+            ],
+            "the restarted sidebar must draw before it blocks and drain after it"
+        );
+    }
+
     /// THE REGRESSION TEST for a restart note nobody ever saw.
     ///
     /// `R`'s summary is armed before the event loop, and the loop's first act
@@ -1078,6 +1180,33 @@ mod tests {
                 "SPEC.md does not declare {needle:?}, which the crate has"
             );
         }
+    }
+
+    /// SAFETY IS THE SECTION AN OPERATOR READS TO LEARN WHAT CAN HALT THEIR
+    /// WORK, so it must not carry a stale "only".
+    ///
+    /// `R` runs `claude stop` too, on every in-scope agent under Idle or
+    /// Completed. The Safety list said so in one bullet and, three lines below,
+    /// still said `Ctrl-x` was "the only verb that stops a session" — the two
+    /// bullets contradicting each other in the one place a reader is looking
+    /// for the rule. What is actually unique to `Ctrl-x` is DELETE, and the
+    /// fact that its stop is the only one that reaches a working or blocked
+    /// row; both survive the correction, and this pins them.
+    #[test]
+    fn the_readme_does_not_call_ctrl_x_the_only_verb_that_stops() {
+        const README: &str = include_str!("../README.md");
+        assert!(
+            !README.contains("the only verb that stops a session"),
+            "README's Safety section still claims Ctrl-x is the only stop, but R runs `claude stop`"
+        );
+        assert!(
+            README.contains("`R` also runs `claude stop`"),
+            "README's Safety section does not disclose that R stops agents"
+        );
+        assert!(
+            README.contains("the only verb that can **delete** a session"),
+            "README no longer says what IS unique to Ctrl-x"
+        );
     }
 
     /// The README's glyph table is what an operator reads to find out what a

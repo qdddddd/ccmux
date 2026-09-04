@@ -1116,7 +1116,7 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "filter"),
     ("a", "toggle Completed group"),
     ("r", "force refresh"),
-    ("R", "restart ccmux + panes"),
+    ("R", "restart ccmux + agents"),
     ("?", "this help"),
     ("q", "quit sidebar"),
     ("Esc", "cancel window/filter"),
@@ -1506,6 +1506,12 @@ mod tests {
             respawn: |_, _, _| panic!("ui test reached respawn_pane"),
             probe: |_| panic!("ui test reached restart::probe"),
             dispatch: |_, _| panic!("ui test reached dispatch_background"),
+            // `ui` draws; it never restarts anything. Both `R` seams panic so
+            // a rendering test that somehow reached the agent pass would say
+            // so rather than shelling out to the operator's live `claude`.
+            agents_poll: || panic!("ui test reached agents::poll"),
+            agents_stop: |_| panic!("ui test reached agents::stop"),
+            agent_budget: Duration::from_secs(60),
         }
     }
 
@@ -2859,6 +2865,12 @@ mod tests {
     #[test]
     fn the_help_overlay_and_footer_document_the_restart_key() {
         assert!(KEYS.iter().any(|(k, a)| *k == "R" && a.contains("restart")));
+        // The agents are the population `R` used to miss, and the overlay is
+        // where an operator finds out that pressing it touches them at all.
+        assert!(
+            KEYS.iter().any(|(k, a)| *k == "R" && a.contains("agents")),
+            "the help overlay does not say `R` restarts agents"
+        );
         assert!(HINTS.iter().any(|(k, a)| *k == "R" && *a == "restart"));
         assert_eq!(HINTS.last().map(|(k, _)| *k), Some("R"), "`R` is the last pair");
 
@@ -2866,13 +2878,13 @@ mod tests {
         app.mode = Mode::Help;
         app.help_lines = help_line_count();
         let dump = rows_at(&app, 40, 34).join("\n");
-        assert!(dump.contains("restart ccmux + panes"), "{dump}");
+        assert!(dump.contains("restart ccmux + agents"), "{dump}");
 
         // The label survives the 34-column overlay uncut: the key column is 10
-        // wide and the body 32, which leaves 22 for a 21-column label.
+        // wide and the body 32, which leaves 22 for a 22-column label.
         app.mode = Mode::Help;
         let narrow = rows_at(&app, 34, 34).join("\n");
-        assert!(narrow.contains("restart ccmux + panes"), "{narrow}");
+        assert!(narrow.contains("restart ccmux + agents"), "{narrow}");
     }
 
     /// Column 1 is the marker's, not the selection's: an open row keeps its
