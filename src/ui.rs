@@ -1378,7 +1378,18 @@ fn is_open(app: &App, session_id: &str) -> bool {
 /// The aqua `▌` in column 1 already says "this session is on screen".
 ///
 /// When the sidebar cannot resolve its own window (degraded, or a no-panic
-/// fixture that sets no pane inventory) the digit is shown unconditionally.
+/// fixture that sets no pane inventory) the digit is shown unconditionally —
+/// and so, since the shade follows the digit, is the emphasised marker. That is
+/// not the emphasis over-reaching. `App::resolve_identity` accepts `$TMUX_PANE`
+/// only when it names a pane `list_panes_in_session` returned, and that listing
+/// covers every window of the managed session, so a failure to resolve proves
+/// this sidebar is being drawn somewhere the inventory does not reach —
+/// `ccmux sidebar --session X` run by hand from another tmux session — and
+/// every pane in it really is a tab away. With no inventory at all the question
+/// does not arise: `rebuild_open` stamps no `window_index`, so this returns
+/// `None` and the marker keeps today's `aqua` — and degraded mode does not even
+/// get that far, since `refresh_panes` returns before `adopt_own_state` can put
+/// a pane in the map for a row to be open by.
 ///
 /// This is also THE "is it elsewhere?" test for the whole gutter: `session_line`
 /// picks the open marker's shade from `is_some()` rather than repeating the
@@ -3294,6 +3305,77 @@ mod tests {
                 app.rebuild_open();
                 let here = line_cols(&session_line(&app, &app.sessions[0], selected, 34, &p));
                 assert_eq!(here[2..], cols[2..], "the shade moved the rest of the row");
+            }
+        }
+    }
+
+    /// The gutter with NO `own_window`, pinned deliberately rather than left to
+    /// drift. The shade reads off `tab_badge_for`, so it inherits whatever that
+    /// helper answers when the sidebar cannot place itself — two states, which
+    /// behave differently, and both are asserted because only the pairing of
+    /// them says the emphasis is doing the right thing.
+    ///
+    /// With no pane inventory the row is open but placed nowhere:
+    /// `rebuild_open` stamps neither window nor index, `tab_badge_for` has no
+    /// index to return, and the row renders exactly what it rendered before the
+    /// second shade existed — blank column 2, today's `aqua`. This is the shape
+    /// every no-panic fixture in this module has, and the shape of the first
+    /// tick before any enumeration has landed. The emphasis stays out of a
+    /// question the process cannot answer. (Degraded mode proper is quieter
+    /// still: `refresh_panes` returns early, so `adopt_own_state` never runs and
+    /// there is no map to make the row open at all — no marker, no digit.)
+    ///
+    /// With an inventory but still no `own_window`, every open row shows its
+    /// digit, and the emphasised marker goes with it. That is not the emphasis
+    /// over-reaching: `App::resolve_identity` accepts `$TMUX_PANE` only if it
+    /// appears in `list_panes_in_session`, which lists every pane of every
+    /// window of the managed session, so a sidebar that fails to place itself is
+    /// one drawn outside that listing — `ccmux sidebar --session X` run by hand
+    /// from another tmux session — and every pane in the inventory really is a
+    /// tab away. What is asserted here is the weaker, unconditional promise:
+    /// whatever `tab_badge_for` answers, both gutter cells answer it together. A
+    /// shade that went neutral while the digit stayed would be exactly the drift
+    /// the single `ink` exists to make impossible.
+    #[test]
+    fn the_degraded_gutter_never_says_two_things_at_once() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        let sid = app.sessions[0].session_id.clone();
+        app.map.panes.insert("%7".into(), PaneEntry {
+            session_id: sid,
+            short_id: "00000001".into(),
+            name: "n".into(),
+            opened_at: 0,
+        });
+        // The state under test: this process cannot say which tab it is in.
+        app.own_pane = None;
+        app.own_window = None;
+
+        for p in [Palette::light(), Palette::dark()] {
+            for selected in [false, true] {
+                // Degraded: no inventory. Open, but placed nowhere.
+                app.panes = Vec::new();
+                app.rebuild_open();
+                let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+                assert_eq!(line_cols(&l)[0], '▌', "the row is still open");
+                assert_eq!(line_cols(&l)[1], ' ', "no inventory names no tab");
+                assert_eq!(
+                    l.spans[0].style.fg,
+                    Some(p.aqua),
+                    "an unplaceable pane must not be emphasised (selected={selected})"
+                );
+
+                // Inventory, still no own window: the documented digit, and
+                // the shade that goes with it.
+                app.panes = vec![pane_in("%7", 2, 34, 6)];
+                app.rebuild_open();
+                let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+                assert_eq!(line_cols(&l)[1], '6', "the documented degraded digit");
+                assert_eq!(l.spans[0].style.fg, Some(p.aqua_elsewhere));
+                assert_eq!(
+                    l.spans[1].style.fg,
+                    l.spans[0].style.fg,
+                    "the two gutter cells must never disagree, degraded or not"
+                );
             }
         }
     }

@@ -1027,6 +1027,13 @@ mod tests {
             // the prompt is promising a keypress that does nothing.
             "press enter to close pane",
             "; read _",
+            // §6.5's pane-index suffix, deleted from `draw_detail` when the
+            // gutter took over saying where a session is open. The spec kept
+            // appending it long after the crate stopped drawing it, and the
+            // cost of that drift went up when the marker gained a second
+            // shade: a promised third place for "where is this open" is a
+            // third place that has to be kept in step with the other two.
+            "· pane",
         ] {
             assert!(
                 !SPEC.contains(needle),

@@ -1785,6 +1785,15 @@ session lives in, inked only when that is NOT the tab being drawn; blank
 otherwise, and `+` at ten or more. It takes the same ink as the marker in
 col 0 — `p.aqua_elsewhere`, since a digit only ever means "another tab".
 
+A sidebar that cannot resolve its own window shows the digit unconditionally,
+and therefore the emphasised marker with it. Both are still true: `$TMUX_PANE`
+is accepted only when `list-panes -t <session> -s` returned it, so a sidebar
+that fails to place itself is one drawn outside every window that listing
+covers, and everything open really is a tab away. With no inventory at all the
+question does not arise: no window index reaches the row, so col 1 is blank and
+the marker keeps `p.aqua` — and in degraded mode there is no marker either,
+since `refresh_panes` returns before the stored map is ever adopted.
+
 **Status glyph (col 2)**, derived from `Group` + `Status`:
 
 Resolved top-down; every row is one display column wide.
@@ -1850,7 +1859,12 @@ Three lines describing the **selected** session, all `p.gray` except values:
 
 - `cwd` uses `model::shorten_cwd(cwd, app.home.as_deref(), W - 9)`.
 - A session with no short id reads `id      —  background  busy` (§9.7).
-- When a session is open, append ` · pane 2` to line 2 in `p.aqua`.
+- Openness is NOT restated here. The pane-index suffix line 2 used to append
+  for an open session is gone: it spent 9 columns repeating what the row's own
+  gutter (§6.4) already says at every width the gutter exists — `▌` for open,
+  and which tab in both the shade and the digit — and those 9 columns are what
+  keep the id line from truncating at the 34-column default. `draw_detail`
+  reads no open state at all; `p.aqua` appears nowhere in this block.
 - Empty selection (no sessions, or all filtered out) renders three blank lines.
 
 ### 6.6 Truncation and unicode
