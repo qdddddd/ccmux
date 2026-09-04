@@ -117,9 +117,25 @@ fn run(args: &[&str]) -> Result<std::process::Output, AgentsError> {
 /// included, while the header still showed a healthy indicator. The synchronous
 /// contract is kept; only the wait is now bounded, and a timeout is reported as
 /// an ordinary `Cmd` error so §9.1's red indicator and footer fire.
-const POLL_TIMEOUT: Duration = Duration::from_secs(5);
+pub const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 /// `try_wait` granularity inside `run_bounded`.
 const POLL_STEP: Duration = Duration::from_millis(20);
+
+/// Wall-clock ceiling on one `claude stop <id>`.
+///
+/// `stop` is bounded and `delete` is not, and the asymmetry is the whole
+/// point. A bound is a KILL: `run_bounded` sends SIGKILL to the `claude` it is
+/// waiting on. Doing that to `claude rm` — which is removing a git worktree —
+/// could interrupt it halfway through, and there is no undo for whatever it
+/// half-did. `stop` asks the daemon to halt a session; killing the client that
+/// asked leaves the daemon's own answer to that request unaffected, and if the
+/// stop did land, the next poll says so.
+///
+/// The number is 15x the measured 0.66s, so it fires only for a `claude` that
+/// is genuinely wedged. It matters most to `R`, which issues one of these per
+/// in-scope agent with no operator between them: unbounded, one hung `claude`
+/// would freeze the whole restart pass, and the sidebar with it.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `run`, with a deadline. On expiry the child is killed and reaped, and the
 /// call reports `Cmd { code: -1, stderr: "timed out after Ns" }`.
@@ -223,8 +239,11 @@ pub fn poll() -> Result<Payload, AgentsError> {
 /// boundary is closed in test builds by construction. `logs` and `poll` keep
 /// spawning: they are read-only.
 #[cfg(not(test))]
-fn run_checked(args: &[&str]) -> Result<(), AgentsError> {
-    let out = run(args)?;
+fn run_checked(args: &[&str], timeout: Option<Duration>) -> Result<(), AgentsError> {
+    let out = match timeout {
+        Some(t) => run_bounded(args, t)?,
+        None => run(args)?,
+    };
     if out.status.success() {
         return Ok(());
     }
@@ -255,7 +274,7 @@ fn failure_text(stderr: &str, stdout: &str) -> String {
 }
 
 #[cfg(test)]
-fn run_checked(args: &[&str]) -> Result<(), AgentsError> {
+fn run_checked(args: &[&str], _timeout: Option<Duration>) -> Result<(), AgentsError> {
     test_spawn::intercept(args)
 }
 
@@ -328,6 +347,15 @@ pub mod test_spawn {
 /// and `claude attach <id>` resumes it (PROBE-FINDINGS §2). `id` is the 8-hex
 /// short id; a session without one cannot be stopped, so
 /// `Session::is_attachable()` must be checked first.
+///
+/// STOP-THEN-ATTACH IS ALSO HOW AN AGENT CHANGES VERSION, which is the second
+/// caller's whole reason for existing. The resumed worker is a genuinely NEW
+/// process, and it resolves `claude` at launch, so it comes up on whatever the
+/// CLI is now rather than the version the session was dispatched with
+/// (PROBE-FINDINGS §2, measured). `Ctrl+X` calls this to halt a session; `R`
+/// calls it to refresh one, and the pane's own `claude attach` is the resume.
+///
+/// Bounded by `STOP_TIMEOUT` — see the constant for why `delete` is not.
 pub fn stop(id: &str) -> Result<(), AgentsError> {
     // Fail closed rather than invoking `claude stop ''`: an empty id is what an
     // unchecked `Option<String>` collapses to, and this is the destructive verb
@@ -335,7 +363,7 @@ pub fn stop(id: &str) -> Result<(), AgentsError> {
     if id.is_empty() {
         return Err(AgentsError::NotAttachable);
     }
-    run_checked(&["stop", id])
+    run_checked(&["stop", id], Some(STOP_TIMEOUT))
 }
 
 /// `claude rm <id>` — IRREVERSIBLE. PROBE-FINDINGS §2, verbatim from
@@ -353,7 +381,9 @@ pub fn delete(id: &str) -> Result<(), AgentsError> {
     if id.is_empty() {
         return Err(AgentsError::NotAttachable);
     }
-    run_checked(&["rm", id])
+    // Deliberately UNBOUNDED — see `STOP_TIMEOUT`. A kill halfway through a
+    // worktree removal is not a timeout, it is damage.
+    run_checked(&["rm", id], None)
 }
 
 /// `claude logs <id>`. Output is a RAW ANSI/PTY DUMP including alt-screen setup
@@ -459,13 +489,14 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
 /// `<claude>` and `<id>` through `sh_quote` — twice over for the two that are
 /// printed rather than run:
 ///
-///   while :; do <claude> attach <id>; rc=$?;
+///   while :; do
+///   [ -n "$TMUX_PANE" ] && tmux set-option -p -u -t "$TMUX_PANE" @ccmux_detached 2>/dev/null;
+///   <claude> attach <id>; rc=$?;
 ///   [ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @ccmux_detached 1 2>/dev/null;
 ///   printf '\n[ccmux] attach exited (rc=%s). resume: %s attach %s\n' "$rc" <claude> <id>;
 ///   printf '[ccmux] enter=resume  s=shell  q=close pane: ';
 ///   read ans || ans=q;
 ///   case "$ans" in s|S) break;; q|Q) exit "$rc";; esac;
-///   [ -n "$TMUX_PANE" ] && tmux set-option -p -u -t "$TMUX_PANE" @ccmux_detached 2>/dev/null;
 ///   done; printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
 ///
 /// The two values reach `printf` as ARGUMENTS, never inside its format string,
@@ -487,13 +518,28 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
 /// option, which dies with the pane, is written before the pane parks and rides
 /// back to ccmux inside the `list-panes` of §5.3 at zero extra cost.
 ///
-/// The latch is CLEARED again on the resume path, and only there. ccmux itself
-/// never clears it — it cannot, because `#{pane_current_command}` would say
-/// `claude` for an attach to any session at all (PROBE-FINDINGS §4) — but this
-/// template knows which session it is about to re-attach, because it is the one
-/// baked into the string. So a pane detached and resumed in place gets its
-/// mapping back; a pane the operator hand-attaches from the `s` shell does not,
-/// and must not.
+/// THE LATCH IS CLEARED AT THE TOP OF THE LOOP, immediately before the attach,
+/// and nowhere else. ccmux itself never clears it — it cannot, because
+/// `#{pane_current_command}` would say `claude` for an attach to any session at
+/// all (PROBE-FINDINGS §4) — but this template knows which session it is about
+/// to attach, because it is the one baked into the string. The rule it enforces
+/// is therefore exact: **while this wrapper is running its attach, the pane is
+/// attached**, and the latch says so.
+///
+/// The clear USED to sit after the `read`, on the resume path. Same effect for
+/// the operator's enter, and wrong for the other way a fresh attach reaches a
+/// latched pane: `R` respawns this command into a pane it has just stopped the
+/// agent of, and `respawn-pane -k` keeps PANE OPTIONS. So the wrapper R killed
+/// had latched the pane on its way out, the new wrapper attached perfectly
+/// well, and the pane was left permanently marked as parked — with no open
+/// marker in the sidebar and, next `R`, skipped as "the operator's shell".
+/// Measured live: after an `R` that restarted its agent, `%1` held a healthy
+/// `claude attach` and `#{@ccmux_detached}` was `1`. Clearing on the way IN
+/// closes that by construction, whoever started the wrapper.
+///
+/// A pane the operator hand-attaches from the `s` shell still does not get its
+/// mapping back, and must not: `s` breaks OUT of the loop, so the clear is
+/// never reached again and the latch stands for the life of that shell.
 ///
 /// `[ -n "$TMUX_PANE" ]` is not belt and braces. `set-option -p` with an EMPTY
 /// `-t` does not fail — verified on 3.4, rc 0 — it resolves to the session's
@@ -524,13 +570,13 @@ pub fn attach_pane_cmd(id: &str) -> String {
     // interpret, not Rust newlines.
     format!(
         "while :; do \
+         [ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" {opt} 2>/dev/null; \
          {bin} attach {id}; rc=$?; \
          [ -n \"$TMUX_PANE\" ] && tmux set-option -p -t \"$TMUX_PANE\" {opt} 1 2>/dev/null; \
          printf '\\n[ccmux] attach exited (rc=%s). resume: %s attach %s\\n' \"$rc\" {bin_shown} {id_shown}; \
          printf '[ccmux] enter=resume  s=shell  q=close pane: '; \
          read ans || ans=q; \
          case \"$ans\" in s|S) break;; q|Q) exit \"$rc\";; esac; \
-         [ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" {opt} 2>/dev/null; \
          done; \
          printf '\\n'; \
          [ -x \"${{SHELL:-}}\" ] || SHELL=/bin/sh; \
@@ -618,13 +664,13 @@ mod tests {
         assert_eq!(
             attach_pane_cmd("1c45d64f"),
             "while :; do \
+             [ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" @ccmux_detached 2>/dev/null; \
              claude attach 1c45d64f; rc=$?; \
              [ -n \"$TMUX_PANE\" ] && tmux set-option -p -t \"$TMUX_PANE\" @ccmux_detached 1 2>/dev/null; \
              printf '\\n[ccmux] attach exited (rc=%s). resume: %s attach %s\\n' \"$rc\" claude 1c45d64f; \
              printf '[ccmux] enter=resume  s=shell  q=close pane: '; \
              read ans || ans=q; \
              case \"$ans\" in s|S) break;; q|Q) exit \"$rc\";; esac; \
-             [ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" @ccmux_detached 2>/dev/null; \
              done; \
              printf '\\n'; \
              [ -x \"${SHELL:-}\" ] || SHELL=/bin/sh; \
@@ -669,24 +715,36 @@ mod tests {
         assert_eq!(cmd.matches("exec \"$SHELL\"").count(), 1, "one shell handover only: {cmd}");
     }
 
-    /// Enter is the resume, and it is the whole reason a detached pane is worth
-    /// parking rather than closing. It must re-run the SAME attach — the loop
-    /// is what does that — and must clear the latch first, so the pane it hands
-    /// back to ccmux is one the sidebar can call open again.
+    /// THE INVARIANT: while this wrapper is running its attach, the pane is not
+    /// latched. The clear sits at the TOP of the loop, before the attach, so it
+    /// holds on every path that reaches an attach — the first launch, the
+    /// operator's enter, and an `R` that respawned this command into a pane a
+    /// previous wrapper had latched on its way out (`respawn-pane -k` keeps
+    /// pane options, so that latch would otherwise stand over a healthy
+    /// attach). Enter still re-runs the SAME attach; the loop is what does that.
     #[test]
-    fn attach_pane_cmd_resumes_the_same_session_and_clears_the_latch() {
+    fn attach_pane_cmd_clears_the_latch_before_every_attach() {
         let cmd = attach_pane_cmd("1c45d64f");
-        assert!(cmd.starts_with("while :; do claude attach 1c45d64f;"), "{cmd}");
         let clear = cmd
             .find(&format!(
                 "[ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 2>/dev/null"
             ))
             .expect("latch clear");
+        let attach = cmd.find("claude attach 1c45d64f;").expect("attach");
         let read = cmd.find("read ans || ans=q").expect("read");
         let done = cmd.find("; done; ").expect("loop end");
-        // Read the key, then clear, then loop back into the attach: a pane that
-        // reaches the attach a second time has always cleared the latch first.
-        assert!(read < clear && clear < done, "{cmd}");
+        // Clear, then attach — first thing in the body, so it runs however the
+        // wrapper got here.
+        assert!(cmd.starts_with("while :; do [ -n \"$TMUX_PANE\""), "{cmd}");
+        assert!(clear < attach, "{cmd}");
+        // And nothing clears it after the prompt: `s` breaks out of the loop,
+        // so a pane handed to the operator's shell stays latched forever.
+        assert!(read < done, "{cmd}");
+        assert_eq!(
+            cmd.matches("set-option -p -u").count(),
+            1,
+            "one clear, in one place: {cmd}"
+        );
     }
 
     /// A failed attach must still be readable once the prompt is on screen —
@@ -714,8 +772,13 @@ mod tests {
             )),
             "{cmd}"
         );
-        // Before the prompt, so a pane that is parked has always latched.
-        let latch = cmd.find("set-option").expect("latch");
+        // Before the prompt, so a pane that is parked has always latched. The
+        // clear is also a `set-option`, so the latch is found by its own text.
+        let latch = cmd
+            .find(&format!(
+                "tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 1 2>/dev/null"
+            ))
+            .expect("latch");
         let prompt = cmd.find("printf '[ccmux] enter=resume").expect("prompt");
         assert!(latch < prompt, "{cmd}");
     }
@@ -748,7 +811,7 @@ mod tests {
     fn attach_pane_cmd_quotes_a_hostile_id() {
         let cmd = attach_pane_cmd("a'; rm -rf ~; echo '%s");
         assert!(
-            cmd.starts_with("while :; do claude attach 'a'\\''; rm -rf ~; echo '\\''%s'; rc=$?"),
+            cmd.contains("; claude attach 'a'\\''; rm -rf ~; echo '\\''%s'; rc=$?"),
             "{cmd}"
         );
         // The format string is a fixed literal: exactly three conversions.
@@ -773,7 +836,7 @@ mod tests {
     fn attach_pane_cmd_prints_a_resume_line_that_can_be_pasted_back() {
         let cmd = attach_pane_cmd("a b");
         // Run: one layer, so the shell sees `attach 'a b'`.
-        assert!(cmd.starts_with("while :; do claude attach 'a b'; rc=$?"), "{cmd}");
+        assert!(cmd.contains("; claude attach 'a b'; rc=$?"), "{cmd}");
         // Printed: two, so the shell hands `printf` the literal text `'a b'`.
         assert!(cmd.contains(r#""$rc" claude ''\''a b'\''';"#), "{cmd}");
         assert_eq!(sh_quote(&sh_quote("a b")), r"''\''a b'\'''");

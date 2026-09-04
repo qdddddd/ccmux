@@ -112,6 +112,53 @@ sentence that says the work is safe. Read stdout when stderr is blank. A `rm`
 whose worktree is clean (or which has none) deletes the session and removes the
 worktree from `git worktree list`, verified both ways.
 
+**`stop` + `attach` IS HOW AN AGENT CHANGES VERSION, and it is the only way there
+is.** Verified 2026-09-04 on 2.1.260. A background worker is a separate,
+daemon-owned process (§3) and it keeps the `claude` it was launched with for its
+whole life; restarting the attach CLIENT changes nothing about it. `claude stop`
+followed by `claude attach` respawns it as a genuinely NEW process, which
+resolves `claude` at launch and therefore comes up on whatever the CLI is now:
+
+```
+before stop : pid=1941112 replPid=1941127 cliVersion=2.1.260
+after stop  : (absent from the roster)
+after attach: pid=1956984 replPid=1957001 cliVersion=2.1.260   <- new process
+```
+
+**Agents go stale, and by a lot.** Measured on this host with 2.1.258 / 2.1.259 /
+2.1.260 installed and 2.1.260 current: of 7 live workers, 4 were on 2.1.251 and 1
+on 2.1.247 — only 2 were current. Corroborated from `ps` alone on 2026-09-04: a
+`claude bg-pty-host … -- ~/.local/share/claude/versions/2.1.247 --bg-spare …`
+started eight days earlier was still hosting a session that was actively running
+shell tools, while the CLI on `PATH` was 2.1.260.
+
+**A worker's pid and version are visible without touching any internal file.**
+The daemon spawns `claude bg-pty-host … -- <…/versions/X.Y.Z> [--resume <jsonl>|
+--bg-spare …]` with the worker as its child, and the worker's `/proc/<pid>/cwd`
+is the session's own directory. So `ps` + `/proc` answer both "which process is
+this session's worker" and "which version was it launched from". Use that for
+verification. `~/.claude/daemon/roster.json` answers the same questions and is
+still banned by §5: it is an internal file, and the CLI moved through six
+versions in five days.
+
+**`claude stop` on a session that has already finished is a no-op that SUCCEEDS.**
+Verified 2026-09-04 on a `state: "done"` session: `claude stop <id>` printed
+`stopped <id>`, exited **0**, took 0.60 s, and the session's `state` stayed
+`done` — it did not become `stopped`. So a caller that stops a finished session
+gets no error to report and nothing changes; `state: "stopped"` is only ever
+produced by stopping a session that was RUNNING.
+
+**Stopping a session KILLS its attach clients.** Verified 2026-09-04 in a ccmux
+pane: `claude stop <id>` against a session with a live `claude attach` made the
+attach print `Session <id> has exited.` and exit rc 0, exactly as `Ctrl+Z` does.
+Two consequences. First, anything that stops a session must expect the pane
+command wrapped around the attach to run its post-attach path. Second, combined
+with the next finding, **`state: "stopped"` and a live `claude attach` cannot
+coexist**: attaching a stopped session RESUMES it, so it is `working` or `done`
+by the time the pane has drawn. Measured both ways — a session stopped mid-tool
+came back `working` on attach, and one stopped after its task had finished came
+back `done`.
+
 `rm` is hidden from `claude --help`'s Commands list exactly as the other four are.
 It was added to this table on 2026-08-27, after four implementers had already built
 against a version of §2 that listed only `attach`/`logs`/`stop`/`kill`: that list was

@@ -123,7 +123,7 @@ environment-variable equivalent of `--socket`.
 | `/` | Filter by name, cwd, or short id | no |
 | `a` | Toggle visibility of the Completed group | no |
 | `r` | Force refresh | no |
-| `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, and every pane ccmux opened. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
+| `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, every pane ccmux opened, and the **agents** behind those panes that are not busy. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
 | `?` | Help overlay | no |
 | `q` | Quit the sidebar. Sessions and panes are untouched | no |
 | `Esc` | Close an open delete window if there is one; else clear the filter if one is active; otherwise does nothing | no |
@@ -286,7 +286,9 @@ revert the other.
 
 `cargo install --path .` replaces the binary on disk, but the sidebar you are
 looking at is still the old image, and so is every `claude attach` client in
-every pane. `R` restarts all of them **in place**: every window, every pane,
+every pane. A `claude` upgrade is worse: a background agent keeps the version it
+was launched with for its whole life, so it can be days behind the CLI you just
+installed. `R` restarts all of them **in place**: every window, every pane,
 every pane id and the whole layout stay exactly as they are — only the processes
 change. There is no confirmation, and none is needed (see *Safety*).
 
@@ -297,6 +299,8 @@ What it restarts, and how:
 | this sidebar | `exec(2)` — the process image is replaced | the pane, by construction: tmux is never told |
 | the other tabs' sidebars | `respawn-pane -k` | the pane id, its geometry, the layout |
 | the panes ccmux opened, still attached | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
+| the **agents** behind those panes, when idle, done or stopped | `claude stop <id>`, and the pane's own `claude attach` is the resume | the conversation and the transcript |
+| an agent that is **working** or **blocked** | nothing — skipped and counted | the work in flight |
 | a pane you detached from | nothing — skipped and counted | whatever you have been doing in it |
 
 **Nothing else is touched.** A pane is restarted only if ccmux can prove it
@@ -304,6 +308,26 @@ created it — it is a tab's recorded sidebar, or it is in that tab's pane map. 
 pane you opened yourself inside the ccmux session, with `prefix-"` or
 `prefix-%`, is in neither, and `R` leaves it alone: whatever is running in it
 keeps running, with the same pid.
+
+**The agents.** Restarting an attach client changes nothing about the version
+doing the work: the agent is a separate, daemon-owned process, and it runs
+whatever `claude` was current when it was dispatched until it dies. `R` refreshes
+it the only way there is — `claude stop <id>`, after which the pane's respawned
+`claude attach <id>` resumes it as a genuinely new process on the binary that is
+installed now. The conversation is kept; the transcript comes back.
+
+It only ever touches sessions **ccmux has open in a pane** — the same ownership
+rule the panes follow. A session you never opened here is none of ccmux's
+business, and it could not be resumed anyway: the pane's attach is the resume,
+so ccmux stops only what it is about to re-attach.
+
+And it never touches an agent that is **working** or **blocked** — the two top
+groups in the list. A working agent is mid-task, a blocked one is holding a
+question for you, and `claude stop` would take either. Those keep their old
+version until they finish, which is the trade that lets `R` stay safe to press
+at any moment. The footer names them: `2 busy`. State is re-read from
+`claude agents --json` immediately before each stop, so a session that picks up
+work while `R` is running is left alone from the next one onwards.
 
 A pane you **detached from** is skipped for the same reason, even though ccmux
 did open it. Once `Ctrl-Z` has parked it — and especially once `s` has left a
@@ -314,9 +338,20 @@ in it, and respawning a shell you have been working in for an hour with
 becomes a restart target again.
 
 The footer then says what happened, from the new image: `restarted 3 sidebars,
-4 panes`. It is a count of what was actually restarted, not a plan announced in
-advance — the sidebar you pressed `R` in restarts first, and the image that
-comes up is the one that restarts everything else.
+4 panes, 2 agents (1 busy, 1 skipped)`. Successes are in the head, exceptions in
+the parenthesis, and each gets its own word — `failed` is a pane that did not
+come back, `not restarted` an agent still on the old binary, `busy` an agent
+deliberately left alone, `skipped` a pane deliberately left alone. A line too
+wide for the sidebar wraps rather than truncating. It is a count of what was
+actually restarted, not a plan announced in advance — the sidebar you pressed
+`R` in restarts first, and the image that comes up is the one that restarts
+everything else.
+
+One agent that will not stop does not cost the others theirs: the stop is
+attempted for each in turn, a failure is counted, and the pass carries on. Every
+stop lands **before** any pane is respawned, because the respawned
+`claude attach` is what resumes the session — the other order would leave you
+looking at a pane whose agent had just been halted underneath it.
 
 That order is the safety property. `respawn-pane -k` has no undo: it kills the
 pane, runs the new command, and if that command exits the pane closes and the
@@ -399,12 +434,17 @@ that is known to have lost rows concludes nothing at all.
   daemon-owned and outlive their pane. Only background sessions are listed, so
   `x` can never reach a process that dies with its pane.
 - `R` restarts processes but destroys nothing: it only respawns panes ccmux
-  itself created, the agents outlive their attach clients, and every pane comes
-  straight back. Nothing is killed until the new binary is proven to run — it is
-  run, and then it is the process doing the respawning — so a failed upgrade
-  costs a message rather than your sidebars. That is why it has no confirmation:
-  an arm belongs on a verb with no undo, and `Ctrl-x`'s second press is the only
-  one of those.
+  itself created, and every pane comes straight back. Nothing is killed until
+  the new binary is proven to run — it is run, and then it is the process doing
+  the respawning — so a failed upgrade costs a message rather than your
+  sidebars. That is why it has no confirmation: an arm belongs on a verb with no
+  undo, and `Ctrl-x`'s second press is the only one of those.
+- `R` also runs `claude stop` — the same **recoverable** verb `Ctrl-x`'s first
+  press runs, and never `claude rm`. It reaches only sessions ccmux has open in
+  a pane, and only those that are neither working nor blocked; the conversation
+  is kept and the pane's own `claude attach` resumes it a moment later. A busy
+  agent keeps its old version until it finishes, which is the whole reason `R`
+  is safe to press at any moment.
 - `Ctrl-x` is the only verb that stops a session, and the only one that can
   delete one. The first press **stops** — recoverable: the conversation is kept
   and `Enter` resumes it. Only a **second press within two seconds** deletes: it

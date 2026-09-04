@@ -33,6 +33,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::model::{Group, Session};
 use crate::tmux::{self, PaneId, PaneInfo, TabInfo};
 
 /// The env var that tells a fresh sidebar it is the second half of an `R`, and
@@ -114,6 +115,89 @@ impl Plan {
     /// and deliberately left running.
     pub fn skipped(&self) -> usize {
         self.unattachable + self.detached
+    }
+
+    /// THE AGENT SCOPE: the short ids whose AGENT `R` may restart, in the order
+    /// the panes will be respawned.
+    ///
+    /// It is derived from `targets`, and that is the whole rule: an agent is in
+    /// scope **exactly when this same plan is about to respawn a pane with
+    /// `claude attach <id>`**. Nothing else is, and the reason is composition
+    /// rather than tidiness. Restarting an agent is `claude stop` followed by
+    /// something that resumes it, and the only thing ccmux has that resumes one
+    /// is that pane's attach. Stop a session no pane is about to attach and
+    /// ccmux has not restarted it — it has STOPPED it, permanently, on a
+    /// keypress whose name is "restart". So the set that may be stopped is the
+    /// set that will be resumed, by construction.
+    ///
+    /// That answers the two populations `plan` counts but does not target:
+    ///
+    ///   * a pane parked after `Ctrl+Z` (`@ccmux_detached`) is NOT re-attached
+    ///     — the operator's shell is in it and respawning would destroy their
+    ///     work — so nothing would resume its session, and it is out of scope.
+    ///     The session keeps running the old binary, which is the same trade
+    ///     `R` already makes for a busy one.
+    ///   * a mapped pane with no `short_id` has neither an attach to rebuild
+    ///     nor an id to stop.
+    ///
+    /// DEDUPED BY SESSION, not by pane: double-attach is legal (PROBE-FINDINGS
+    /// §3) and two panes may hold the same id, but `claude stop` on a session
+    /// already stopped a moment ago is a second destructive call for one
+    /// restart, and it would be counted twice in the footer. Both panes still
+    /// re-attach; the resume just happens twice, which is exactly what
+    /// double-attach means.
+    pub fn agent_ids(&self) -> Vec<&str> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        self.targets
+            .iter()
+            .filter_map(|t| match &t.role {
+                Role::Claude { short_id } => Some(short_id.as_str()),
+                Role::Sidebar => None,
+            })
+            .filter(|id| seen.insert(id))
+            .collect()
+    }
+}
+
+/// THE STATE RULE: may `R` stop this session's agent?
+///
+/// Yes for a row under **Idle** or **Completed**; no for one under **Working**
+/// or **Blocked**. That is the operator's rule stated in the operator's own
+/// vocabulary, and stating it in `Group` rather than in `State` is deliberate
+/// on three counts.
+///
+/// FIRST, it is what the screen says. The sidebar files every session under one
+/// of four headings, and this reads the same verdict from the same function
+/// (`Session::group`) that drew the heading. An operator looking at two rows
+/// under Working and pressing `R` gets `2 busy` in the footer, and can point at
+/// the two rows that account for it. A private rule here — a state whitelist,
+/// say — would produce counts that cannot be explained from the screen.
+///
+/// SECOND, there is no `State::Idle` to whitelist. The CLI's `state` vocabulary
+/// is `working` / `done` / `stopped` / `blocked`; "idle" is a row that has no
+/// state this build models and no busy status, and it is `group()` that makes
+/// that a group. A rule written against `State` alone could not express the
+/// operator's "idle" at all.
+///
+/// THIRD, `group()` carries the belt AND the braces for the one verdict that
+/// must never be got wrong. A blocked session is not always `state: "blocked"`:
+/// on 2026-08-31 one of two live blocked sessions reported `status: "idle"` and
+/// the other `status: "waiting"` with no agreement between them, and
+/// `Session::group` answers Blocked from EITHER axis. Reading `state` alone
+/// would stop a session that is sitting on a permission prompt, mid-task, with
+/// a half-applied edit on disk — which is precisely the interruption `R` exists
+/// to avoid. The same belt covers a CLI that invents a new busy-ish word: an
+/// unmodelled state with `status: "busy"` groups as Working and is skipped.
+///
+/// The residual case is an unmodelled state with an idle-looking status: it
+/// groups as Idle and is restarted. That is deliberate — it is where every
+/// other verb in ccmux files it, `Ctrl+X` included, and `note_drift` is already
+/// shouting about the word. Inventing a stricter private rule here would make
+/// `R` disagree with the heading the operator is reading.
+pub fn agent_restartable(s: &Session) -> bool {
+    match s.group() {
+        Group::Idle | Group::Completed => true,
+        Group::Working | Group::Blocked => false,
     }
 }
 
@@ -214,23 +298,103 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
     out
 }
 
+/// WHAT THE AGENT PASS DID, counted by the image that did it.
+///
+/// Three buckets, and the line between them is what the operator can act on:
+/// `restarted` needs nothing, `busy` needs only patience, and `failed` is the
+/// one that may need a human.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Agents {
+    /// Stopped, so the pane's `claude attach` brings the worker back as a new
+    /// process on the `claude` that is installed NOW (PROBE-FINDINGS §2).
+    pub restarted: usize,
+    /// Deliberately left on the old binary because the row was under Working or
+    /// Blocked. THE INTENDED TRADE, not a failure: a busy agent keeps its
+    /// version until it finishes, and `R` stays safe to press at any moment.
+    pub busy: usize,
+    /// Everything that stopped ccmux doing the job: a `claude stop` that
+    /// errored, a state that could not be read, a session no longer in the
+    /// fleet, or an agent the pass ran out of budget for. All of them mean the
+    /// same thing to the operator — that agent is still on the old binary and
+    /// ccmux could not change it — so they are one number, and it is reported
+    /// rather than swallowed.
+    pub failed: usize,
+}
+
+impl Agents {
+    /// Did the agent pass have anything at all to say?
+    fn spoke(&self) -> bool {
+        self.restarted + self.busy + self.failed > 0
+    }
+}
+
+/// Everything one `R` did, as the restarted sidebar counts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Report {
+    /// Sidebars restarted, INCLUDING this process — it restarted first, by the
+    /// better mechanism, which is why it is here to do the rest.
+    pub sidebars: usize,
+    /// Claude panes respawned.
+    pub panes: usize,
+    /// Pane respawns that failed.
+    pub failed: usize,
+    /// Panes ccmux owns, found alive, and deliberately left running
+    /// (`Plan::skipped`).
+    pub skipped: usize,
+    /// The agent pass.
+    pub agents: Agents,
+}
+
 /// The footer line the restarted sidebar shows. `sidebars` counts THIS process
 /// too — it is restarting, by the better mechanism — because the operator asked
 /// for a restart of the session and wants to read what happened to it, not a
 /// census of which mechanism did what.
 ///
-/// Sized for the 34-column default: "restarted 3 sidebars, 4 panes" is 29
-/// columns, and the failure suffix only appears when there is a failure.
-pub fn note(sidebars: usize, panes: usize, failed: usize, skipped: usize) -> String {
+/// SUCCESSES IN THE HEAD, EXCEPTIONS IN THE PARENTHESIS, and every exception
+/// gets its own word: `failed` is a pane that did not come back, `not
+/// restarted` an agent still on the old binary, `busy` an agent deliberately
+/// left alone, `skipped` a pane deliberately left alone. Two of those could
+/// have shared the word "failed" and must not: "a pane is gone" and "an agent
+/// kept its version" are different problems with different answers.
+///
+/// The agent clause is omitted entirely when the pass had nothing to say —
+/// no session ccmux opened was in scope — so a session with no Claude panes
+/// reads exactly as it did before agents were part of `R`.
+///
+/// Sized for the 34-column default: `restarted 3 sidebars, 4 panes` is 29
+/// columns and the clauses only appear when they apply. A line that outgrows
+/// the sidebar is not truncated — §6.8's overflow carve wraps it into the
+/// detail block — so the counts survive at any width.
+pub fn note(r: &Report) -> String {
     let mut s = format!(
-        "restarted {sidebars} {}, {panes} {}",
-        plural(sidebars, "sidebar"),
-        plural(panes, "pane")
+        "restarted {} {}, {} {}",
+        r.sidebars,
+        plural(r.sidebars, "sidebar"),
+        r.panes,
+        plural(r.panes, "pane")
     );
-    if failed > 0 {
-        s.push_str(&format!(" ({failed} failed)"));
-    } else if skipped > 0 {
-        s.push_str(&format!(" ({skipped} skipped)"));
+    if r.agents.spoke() {
+        s.push_str(&format!(
+            ", {} {}",
+            r.agents.restarted,
+            plural(r.agents.restarted, "agent")
+        ));
+    }
+    let mut ex: Vec<String> = Vec::new();
+    if r.failed > 0 {
+        ex.push(format!("{} failed", r.failed));
+    }
+    if r.agents.failed > 0 {
+        ex.push(format!("{} not restarted", r.agents.failed));
+    }
+    if r.agents.busy > 0 {
+        ex.push(format!("{} busy", r.agents.busy));
+    }
+    if r.skipped > 0 {
+        ex.push(format!("{} skipped", r.skipped));
+    }
+    if !ex.is_empty() {
+        s.push_str(&format!(" ({})", ex.join(", ")));
     }
     s
 }
@@ -441,6 +605,7 @@ pub struct Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{State, Status};
     use crate::tmux::{HiddenLog, PaneEntry, PaneMap, WindowId};
 
     fn pane(id: &str, window: &str) -> PaneInfo {
@@ -578,7 +743,10 @@ mod tests {
         let p = plan(&tabs, &panes, None);
         assert_eq!(ids(&p), vec!["%1"]);
         assert_eq!(p.unattachable, 1);
-        assert_eq!(note(1, 0, 0, p.unattachable), "restarted 1 sidebar, 0 panes (1 skipped)");
+        assert_eq!(
+            note(&Report { sidebars: 1, skipped: p.unattachable, ..Report::default() }),
+            "restarted 1 sidebar, 0 panes (1 skipped)"
+        );
     }
 
     /// THE PANE THAT IS NO LONGER RUNNING WHAT THE MAP SAYS. `Ctrl+Z` exits
@@ -598,7 +766,10 @@ mod tests {
         assert_eq!(ids(&p), vec!["%1", "%3"], "the shell is not a target");
         assert_eq!((p.claude, p.detached, p.unattachable), (1, 1, 0));
         assert_eq!(p.skipped(), 1);
-        assert_eq!(note(1, p.claude, 0, p.skipped()), "restarted 1 sidebar, 1 pane (1 skipped)");
+        assert_eq!(
+            note(&Report { sidebars: 1, panes: p.claude, skipped: p.skipped(), ..Report::default() }),
+            "restarted 1 sidebar, 1 pane (1 skipped)"
+        );
     }
 
     /// REGRESSION. One pane, one count, in the SKIPPED arms too. A pane named
@@ -617,7 +788,10 @@ mod tests {
         ];
         let p = plan(&tabs, &panes, None);
         assert_eq!((p.detached, p.skipped()), (1, 1), "one pane, one skip");
-        assert_eq!(note(1, 0, 0, p.skipped()), "restarted 1 sidebar, 0 panes (1 skipped)");
+        assert_eq!(
+            note(&Report { sidebars: 1, skipped: p.skipped(), ..Report::default() }),
+            "restarted 1 sidebar, 0 panes (1 skipped)"
+        );
 
         // Same for the entry with no `short_id` to rebuild from.
         let panes = vec![pane("%1", "@1"), pane("%2", "@1")];
@@ -654,14 +828,176 @@ mod tests {
         assert_eq!(p.claude, 1);
     }
 
+    // ── the agent scope and the state rule ──────────────────────────────────
+
+    fn sess(short: &str, state: Option<State>, status: Status) -> Session {
+        Session {
+            id: Some(short.to_string()),
+            session_id: format!("{short}-uuid"),
+            cwd: "/home/dev/projects".into(),
+            kind: crate::model::Kind::Background,
+            started_at: 0,
+            name: short.to_string(),
+            status,
+            state,
+        }
+    }
+
+    /// THE SCOPE. An agent is in scope exactly when this plan is about to
+    /// respawn a pane with `claude attach <id>` — so the ids are the Claude
+    /// targets, in target order, and nothing else. A sidebar is not a session,
+    /// a pane parked after `Ctrl+Z` has no attach to resume its session, and a
+    /// mapped pane with no short id has no id to stop.
+    #[test]
+    fn the_agent_scope_is_exactly_the_panes_that_will_re_attach() {
+        let panes = vec![
+            pane("%1", "@1"),
+            pane("%2", "@1"),
+            PaneInfo { detached: true, ..pane("%3", "@1") },
+            pane("%4", "@1"),
+        ];
+        let tabs = vec![tab(
+            "@1",
+            Some("%1"),
+            &[("%2", "aaaaaaaa"), ("%3", "cccccccc"), ("%4", "")],
+        )];
+        let p = plan(&tabs, &panes, None);
+
+        assert_eq!(p.agent_ids(), vec!["aaaaaaaa"]);
+        assert_eq!(p.detached, 1, "the parked pane is still counted as skipped");
+        assert_eq!(p.unattachable, 1);
+    }
+
+    /// One session in two panes is one stop. Both panes still re-attach —
+    /// double-attach is legal (PROBE-FINDINGS §3) — but a second `claude stop`
+    /// for the same restart is a second destructive call and a double count.
+    #[test]
+    fn a_session_named_by_two_panes_yields_one_agent() {
+        let panes = vec![pane("%1", "@1"), pane("%2", "@1"), pane("%3", "@1")];
+        let tabs = vec![tab(
+            "@1",
+            Some("%1"),
+            &[("%2", "aaaaaaaa"), ("%3", "aaaaaaaa")],
+        )];
+        let p = plan(&tabs, &panes, None);
+
+        assert_eq!(p.claude, 2, "both panes are respawned");
+        assert_eq!(p.agent_ids(), vec!["aaaaaaaa"], "one session, one stop");
+    }
+
+    /// THE STATE RULE, across the whole state x status matrix. Working and
+    /// Blocked are refused from EITHER axis; everything else is restartable.
+    /// The row that matters most is the last pair: a CLI that stops emitting
+    /// `state: "blocked"` and leaves `status: "waiting"` behind must still be
+    /// refused, because that shape has already shipped once.
+    #[test]
+    fn only_a_row_under_idle_or_completed_may_be_stopped() {
+        let cases: &[(Option<State>, Status, bool)] = &[
+            (Some(State::Done), Status::Idle, true),
+            (Some(State::Done), Status::Busy, true),
+            (Some(State::Stopped), Status::Idle, true),
+            (None, Status::Idle, true),
+            (Some(State::Unknown("napping".into())), Status::Idle, true),
+            (Some(State::Working), Status::Busy, false),
+            (Some(State::Working), Status::Idle, false),
+            (Some(State::Blocked), Status::Idle, false),
+            (Some(State::Blocked), Status::Waiting, false),
+            (None, Status::Busy, false),
+            (Some(State::Unknown("compacting".into())), Status::Busy, false),
+            // The belt, without the braces: a waiting status alone.
+            (Some(State::Working), Status::Waiting, false),
+            (Some(State::Unknown("halted".into())), Status::Waiting, false),
+            (None, Status::Waiting, false),
+        ];
+        for (state, status, want) in cases {
+            let s = sess("aaaaaaaa", state.clone(), status.clone());
+            assert_eq!(
+                agent_restartable(&s),
+                *want,
+                "state {state:?} / status {status:?} grouped as {:?}",
+                s.group()
+            );
+            // And it never disagrees with the heading the operator is reading.
+            assert_eq!(
+                agent_restartable(&s),
+                matches!(s.group(), Group::Idle | Group::Completed),
+                "the rule drifted from the group it claims to read"
+            );
+        }
+    }
+
     #[test]
     fn the_note_names_what_happened_and_fits_the_default_width() {
-        assert_eq!(note(3, 4, 0, 0), "restarted 3 sidebars, 4 panes");
-        assert_eq!(note(1, 1, 0, 0), "restarted 1 sidebar, 1 pane");
-        assert_eq!(note(2, 3, 1, 0), "restarted 2 sidebars, 3 panes (1 failed)");
+        let r = |sidebars, panes, failed, skipped| Report {
+            sidebars,
+            panes,
+            failed,
+            skipped,
+            agents: Agents::default(),
+        };
+        assert_eq!(note(&r(3, 4, 0, 0)), "restarted 3 sidebars, 4 panes");
+        assert_eq!(note(&r(1, 1, 0, 0)), "restarted 1 sidebar, 1 pane");
+        assert_eq!(note(&r(2, 3, 1, 0)), "restarted 2 sidebars, 3 panes (1 failed)");
         assert!(
-            crate::model::display_width(&note(3, 4, 0, 0)) <= 34,
-            "the summary must fit the 34-column default"
+            crate::model::display_width(&note(&r(3, 4, 0, 0))) <= 34,
+            "the ordinary note must fit the 34-column default"
+        );
+    }
+
+    /// THE AGENT CLAUSE. It appears only when the agent pass had something to
+    /// say, so a session with no Claude panes reads exactly as it did before
+    /// `R` learned about agents — and every exception gets its own word, so a
+    /// pane that did not come back is never confused with an agent left on the
+    /// old binary.
+    #[test]
+    fn the_note_reports_the_agents_without_rewriting_the_old_line() {
+        // Nothing in scope: byte-for-byte the pre-agents line.
+        assert_eq!(
+            note(&Report { sidebars: 3, panes: 4, ..Report::default() }),
+            "restarted 3 sidebars, 4 panes"
+        );
+        // All of them restarted.
+        assert_eq!(
+            note(&Report {
+                sidebars: 1,
+                panes: 2,
+                agents: Agents { restarted: 2, ..Agents::default() },
+                ..Report::default()
+            }),
+            "restarted 1 sidebar, 2 panes, 2 agents"
+        );
+        // The intended trade, named as such.
+        assert_eq!(
+            note(&Report {
+                sidebars: 1,
+                panes: 5,
+                agents: Agents { restarted: 2, busy: 3, ..Agents::default() },
+                ..Report::default()
+            }),
+            "restarted 1 sidebar, 5 panes, 2 agents (3 busy)"
+        );
+        // Zero restarted still reports the pass, rather than going quiet on the
+        // one outcome the operator most needs to know about.
+        assert_eq!(
+            note(&Report {
+                sidebars: 1,
+                panes: 1,
+                agents: Agents { busy: 1, ..Agents::default() },
+                ..Report::default()
+            }),
+            "restarted 1 sidebar, 1 pane, 0 agents (1 busy)"
+        );
+        // Four exceptions, four words, worst first — and the two "failed"
+        // populations stay distinguishable.
+        assert_eq!(
+            note(&Report {
+                sidebars: 2,
+                panes: 3,
+                failed: 1,
+                skipped: 4,
+                agents: Agents { restarted: 1, busy: 2, failed: 3 },
+            }),
+            "restarted 2 sidebars, 3 panes, 1 agent (1 failed, 3 not restarted, 2 busy, 4 skipped)"
         );
     }
 

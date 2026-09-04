@@ -967,20 +967,33 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
 /// (PROBE-FINDINGS §2). The pane therefore outlives the attach on the
 /// operator's most ordinary keypress. It latches `@ccmux_detached`, prints the
 /// outcome and the exact command that resumes the session, and PARKS on one
-/// `read`: enter (or anything unlisted) clears the latch and re-runs the same
-/// attach, `s` `exec`s the operator's login shell over the pane, `q` or EOF
-/// leaves with the attach's own rc and lets the pane close. Resume is
-/// re-running `claude attach <id>`; it is NOT `fg`, because nothing was
-/// stopped. The same line is what §9.4's vanished session leaves on screen.
+/// `read`: enter (or anything unlisted) re-runs the same attach, `s` `exec`s
+/// the operator's login shell over the pane, `q` or EOF leaves with the
+/// attach's own rc and lets the pane close. Resume is re-running
+/// `claude attach <id>`; it is NOT `fg`, because nothing was stopped. The same
+/// line is what §9.4's vanished session leaves on screen.
+///
+/// THE LATCH IS CLEARED AT THE TOP OF THE LOOP, immediately before the attach,
+/// so the invariant is exact: while this wrapper is running its attach, the
+/// pane is not latched — however the wrapper got there. It used to be cleared
+/// after the `read`, which is the same thing for the operator's enter and wrong
+/// for the other way a fresh attach reaches a latched pane: §8.11's `R` stops
+/// the agent (latching the pane as its attach exits) and then respawns THIS
+/// command into the same pane, and `respawn-pane -k` keeps pane options — so a
+/// pane holding a healthy attach was left permanently marked as parked.
+/// Measured live before the fix: after an `R` that restarted its agent, `%1`
+/// ran `claude attach` normally and `#{@ccmux_detached}` was `1`. `s` still
+/// leaves the latch standing forever, because it breaks OUT of the loop.
 ///
 /// Produces exactly this, as ONE line (wrapped here to be read):
-///   while :; do <claude> attach <id>; rc=$?;
+///   while :; do
+///   [ -n "$TMUX_PANE" ] && tmux set-option -p -u -t "$TMUX_PANE" @ccmux_detached 2>/dev/null;
+///   <claude> attach <id>; rc=$?;
 ///   [ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @ccmux_detached 1 2>/dev/null;
 ///   printf '\n[ccmux] attach exited (rc=%s). resume: %s attach %s\n' "$rc" <claude> <id>;
 ///   printf '[ccmux] enter=resume  s=shell  q=close pane: ';
 ///   read ans || ans=q;
 ///   case "$ans" in s|S) break;; q|Q) exit "$rc";; esac;
-///   [ -n "$TMUX_PANE" ] && tmux set-option -p -u -t "$TMUX_PANE" @ccmux_detached 2>/dev/null;
 ///   done; printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
 ///
 /// with `<claude>` and `<id>` passed through `sh_quote` — once for the attach,
@@ -1970,7 +1983,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `/` | enter filter mode | no |
 | `a` | toggle visibility of the Completed group | no |
 | `r` | force refresh | no |
-| `R` | **restart ccmux in place** — this sidebar, every other tab's sidebar and every ccmux-opened Claude pane, keeping every window, pane and layout (§8.11) | no |
+| `R` | **restart ccmux in place** — this sidebar, every other tab's sidebar, every ccmux-opened Claude pane, and the agents behind those panes that are neither working nor blocked, keeping every window, pane and layout (§8.11) | no |
 | `?` | help overlay | no |
 | `q` | quit the sidebar (sessions and panes untouched) | no |
 | `Esc` | clear the filter if one is active, otherwise quit (§8.8) | no |
@@ -2460,8 +2473,9 @@ own bindings remain.
 ### 8.11 `R` — restart the binaries in place
 
 For the moment after `cargo install` replaced `ccmux` or `claude` on disk: every
-ccmux process in the session restarts, and nothing else changes. Windows, panes,
-pane ids, geometry and the layout are all preserved.
+ccmux process in the session restarts, every AGENT that is not busy is brought
+onto the `claude` that is installed now, and nothing else changes. Windows,
+panes, pane ids, geometry and the layout are all preserved.
 
 ```
 THE IMAGE THAT PRESSES `R` KILLS NOTHING.
@@ -2485,21 +2499,90 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
        app.finish_restart():
            refresh_panes()                     fresh panes + every tab's records
            tabs := list-windows, with MY window's map replaced by self.map
-           for t in restart::plan(tabs, panes, own_pane):
+           plan := restart::plan(tabs, panes, own_pane)
+
+           PHASE 1 — the agents, before any pane is respawned:
+           deadline := now + AGENT_BUDGET (60 s)
+           for id in plan.agent_ids():          # the Claude targets, deduped
+               past the deadline -> count the rest as failed, stop
+               agents::poll()                   # RE-READ, immediately before this stop
+                   Err  -> count the rest as failed, stop the pass
+                   id absent -> count as failed, continue
+               restart::agent_restartable(session)?      # Idle | Completed
+                   no   -> busy += 1
+                   yes  -> agents::stop(id)     # bounded by STOP_TIMEOUT (10 s)
+                             Ok  -> restarted += 1
+                             Err -> failed += 1, CONTINUE
+
+           PHASE 2 — the panes, unconditional on phase 1:
+           for t in plan.targets:
                tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))  [R2-gated]
-           flash restart::note(sidebars + 1, panes, failed, skipped)  (Info)
+
+           flash restart::note(Report { sidebars+1, panes, failed, skipped, agents })  (Info)
 8. event_loop draws ONE frame before its first tick, so that note is on screen
    before `claude agents --json` blocks the loop.
 ```
 
-**Three populations, three mechanisms.** This sidebar is replaced by `exec(2)`,
+**Four populations, four mechanisms.** This sidebar is replaced by `exec(2)`,
 which keeps the pane by construction — tmux is never told anything happened, so
 there is no geometry to restore and no layout to rebuild. The other tabs'
 sidebars are separate processes this one cannot `exec`, so they are restarted
 with `respawn-pane -k`, which keeps the pane id and the layout. The Claude panes
 are respawned the same way; the AGENT survives, because every session ccmux
 lists is a daemon-owned background one (PROBE-FINDINGS §3) and an attach client
-is disposable.
+is disposable. And the AGENTS themselves are restarted by `claude stop <id>`,
+whose resume is that pane's own respawned `claude attach <id>` — see *The
+agents* below.
+
+**THE AGENTS.** An agent surviving its attach client is exactly why restarting
+the client changes nothing about the version doing the work: a background worker
+is a separate, daemon-owned process, and it keeps the `claude` it was launched
+with until it dies. Measured on the author's host with 2.1.258 / 2.1.259 /
+2.1.260 installed and 2.1.260 current: of 7 live workers, 4 were on 2.1.251 and
+1 on 2.1.247. `R` closes that, and the mechanism is `stop` + `attach`
+(PROBE-FINDINGS §2) — the resumed worker is a genuinely NEW process that
+resolves `claude` at launch.
+
+*Scope* — `Plan::agent_ids`: exactly the panes this same plan is about to
+respawn with `claude attach <id>`, deduped by session. An agent is stopped only
+when something is about to resume it; the pane's attach IS the resume, and ccmux
+has no other. A session ccmux never opened is out of scope, as is a pane parked
+after `Ctrl+Z` (`@ccmux_detached`) — that pane is not respawned, so nothing
+would re-attach its session and the "restart" would be a permanent stop.
+
+*State* — `restart::agent_restartable`: a row under **Idle** or **Completed**,
+never one under **Working** or **Blocked**. The rule is stated in `Group`, not
+in `State`, so it reads the same verdict `Session::group` drew the heading with:
+the footer's counts are explainable from the screen, "idle" (which is not a
+`state` the CLI emits) is expressible at all, and a blocked session is refused
+from EITHER axis — `status: "waiting"` under any state groups as Blocked, which
+is the belt that catches a CLI that stops emitting `state: "blocked"`.
+
+*The race* — the state is a SNAPSHOT and `claude` has no conditional stop, so
+the window cannot be closed, only narrowed. `App::sessions` is up to a poll
+interval old and is EMPTY in the process that runs this pass (`finish_restart`
+precedes the first `tick`), and one snapshot taken at the top of the loop would
+age by ~0.66 s per session ahead of the current one. So the fleet is re-read
+immediately before EVERY stop: each decision rests on data at most one
+`claude agents --json` round trip old (~0.21 s measured), and what remains is a
+session that goes idle -> working inside that window. It is stopped, and the
+work in flight is lost — the same exposure `Ctrl+X` has always had, one poll
+wide instead of one poll interval wide.
+
+*Failure* — one failed `claude stop` costs that agent its upgrade and nothing
+else: it is counted and the pass continues. A failed POLL ends the pass instead,
+because without it ccmux cannot tell working from idle and every later stop
+would be a guess. `AGENT_BUDGET` (60 s) caps the whole pass — the per-call
+bounds multiply, and the pane pass must not be lost to a wedged daemon. In every
+one of those cases PHASE 2 still runs.
+
+*Ordering* — every stop lands before ANY respawn. `claude attach` is what
+resumes a stopped session, so `stop` then `attach` composes (the pane comes up
+holding a live session on the new binary) while `attach` then `stop` does not
+(the pane re-attaches the old worker, draws it, and is then halted underneath
+itself). Not merely "each stop before its own pane": two panes may hold one
+session, so the whole-phase boundary is the only version of the rule with no
+ordering left to get wrong.
 
 **NOTHING IS KILLED UNTIL THE NEW IMAGE IS RUNNING.** `respawn-pane -k` has no
 undo: the pane is killed, the replacement command runs, and if that command
@@ -2585,10 +2668,13 @@ ordering above a refusal costs one flash.
 
 **No confirmation and no arm.** `Ctrl+X` has a two-press window because its
 second press deletes a session and its git worktree, which has no undo. `R`
-kills only attach clients whose agents outlive them and sidebars whose entire
-state is in tmux window options, and it puts every one of them straight back
-into the same pane; the worst an accidental `R` costs is the panes' scrollback
-and about a second. An arm on a recoverable verb is a tax on the common case,
+kills attach clients, sidebars whose entire state is in tmux window options, and
+workers that are provably not working — and it puts every one of them straight
+back into the same pane. The verb it runs on an agent is `claude stop`, the
+RECOVERABLE one: the conversation is kept and the pane's attach resumes it
+(PROBE-FINDINGS §2). `claude rm` is `Ctrl+X`'s second press and is reachable
+from nowhere else. The worst an accidental `R` costs is the panes' scrollback
+and a few seconds. An arm on a recoverable verb is a tax on the common case,
 and the confirm modal it would revive was deleted outright (§8.2). `R` also
 requires Shift, so no adjacent binding reaches it by a slip — `Ctrl-R` falls to
 the `_ if ctrl` catch-all and stays inert.
@@ -2616,8 +2702,16 @@ counted it as restarted. This does not widen ownership: every entry in
 requires the pane to be live.
 
 **What the operator sees.** The new image counts what it restarts and flashes
-it: `restarted 3 sidebars, 4 panes`, plus `(N failed)` or `(N skipped)` when
-either applies. The count includes this sidebar. It is a report, not a promise
+it: `restarted 3 sidebars, 4 panes, 2 agents (1 busy, 1 skipped)`. Successes in
+the head, exceptions in one parenthesis, and every exception has its own word —
+`N failed` (a pane that did not come back), `N not restarted` (an agent still on
+the old binary), `N busy` (an agent deliberately left alone), `N skipped` (a
+pane deliberately left alone). Two of those could have shared "failed" and must
+not: a lost pane and a stale agent are different problems. The agent clause is
+omitted entirely when nothing was in scope, so a session with no Claude panes
+reads exactly as it did before agents were part of `R`. A line wider than the
+sidebar wraps into §6.8's overflow carve rather than truncating. The count
+includes this sidebar. It is a report, not a promise
 made before the fact — which is only possible because the respawns happen after
 the `exec` rather than before it. `event_loop` draws one frame before its first
 tick so that the note cannot expire against `MSG_TTL` while `claude agents
