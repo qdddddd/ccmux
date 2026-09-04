@@ -1067,7 +1067,7 @@ pub struct Palette {
     pub blue: Color,
     pub purple: Color,
     pub aqua: Color,
-    pub aqua_elsewhere: Color,   // the §6.4 open marker's emphasised shade
+    pub aqua_elsewhere: Color,   // the §6.4 open marker's other-tab ink
     pub orange: Color,
     pub sel_bg: Color,
 }
@@ -1784,14 +1784,41 @@ badge is a digit — and not from a second copy of the window comparison, so the
 two gutter columns cannot disagree about where a session is. Both take that one
 ink, which keeps `▌5` a single two-cell token.
 
-`aqua_elsewhere` is named for its ROLE. The emphasis inverts with the ground:
-`#1d3a2a` is DARKER than `p.aqua` on the light theme, where there is no headroom
-left going lighter (`#427b58` is already 3.64:1 on `sel_bg`, under the floor),
-while `#cfe8c8` is LIGHTER on the dark theme. A shade-derived name would be
-wrong in one of the two themes. Both clear 4.0:1 on their own ground AND on
-`sel_bg` — the marker is painted on the band whenever its row is selected — and
-the pair stays at least 1.5:1 apart so the distinction survives: light 10.95
-ground / 9.05 band, 2.18 apart; dark 11.25 / 8.85, 1.61 apart.
+`aqua_elsewhere` is named for its ROLE, and it is deliberately NOT a second
+aqua: it is a gruvbox NEUTRAL, so the two markers separate by HUE — green
+against warm grey — and not by depth. Depth was tried and failed. A darker ink
+is the only thing a contrast ratio can reward, and at `#1d3a2a` / 10.95:1 the
+light theme's marker had gone so far down that it no longer read as a colour at
+all; it read as ordinary dark text, having cleared every number and lost the
+thing the numbers stood in for.
+
+The tone still inverts with the ground: `#665c54` (fg3) is DARKER than `p.aqua`
+on the light theme, where there is no headroom left going lighter (`#427b58` is
+already 3.64:1 on `sel_bg`, under the floor), while `#d5c4a1` (fg2) is LIGHTER
+on the dark theme. A shade-derived name would be wrong in one of the two themes.
+Each is the nearest gruvbox neutral that clears the house floor while staying
+more prominent than `p.aqua`; one step further and it fails — light fg4
+`#7c6f64` is 3.55:1 on the band, and dark fg3 `#bdae93` is 6.77:1 on a ground
+where `p.aqua` is already 7.01:1. Both clear 4.0:1 on their own ground AND on
+`sel_bg`, since the marker is painted on the band whenever its row is selected:
+light 5.74 ground / 4.75 band, dark 8.59 / 6.76.
+
+On the light theme that neutral is byte-identical to `p.dim`. It has to be:
+the gruvbox neutrals ARE that theme's text ramp, so a neutral clearing the band
+floor has nowhere to stand that is not already a text tier. The cost is a real
+one and is not hidden — an UNSELECTED other-tab Completed row paints marker,
+badge, name and age in one RGB, and only the glyph shapes separate them. Two
+bounds hold it there. The collision must be EXACT or CLEAR, never a few ΔE off
+a text tier, which would read as a rendering fault rather than as either a
+colour or a tier; and the SELECTED row, the one being read, keeps the marker
+off every ink beside it, because the selected name is forced to `p.fg` and the
+selected age promotes dim -> gray. Both are asserted in
+`the_neutral_marker_never_half_matches_the_text_ramp`.
+
+Separation is held in Lab, at CIE76 ΔE >= 20 (measured 28.8 light, 31.9 dark),
+and not as a luminance ratio. That ratio is blind to hue and scores this pair at
+1.14:1, and it is the measurement that drove the old marker down into the text
+in the first place.
 
 **Tab badge (col 1)** — the tmux window index of the tab the pane showing this
 session lives in, inked only when that is NOT the tab being drawn; blank
@@ -1799,7 +1826,7 @@ otherwise, and `+` at ten or more. It takes the same ink as the marker in
 col 0 — `p.aqua_elsewhere`, since a digit only ever means "another tab".
 
 A sidebar that cannot resolve its own window shows the digit unconditionally,
-and therefore the emphasised marker with it. Both are still true: `$TMUX_PANE`
+and therefore the neutral marker with it. Both are still true: `$TMUX_PANE`
 is accepted only when `list-panes -t <session> -s` returned it, so a sidebar
 that fails to place itself is one drawn outside every window that listing
 covers, and everything open really is a tab away. With no inventory at all the

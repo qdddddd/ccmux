@@ -48,10 +48,13 @@ pub struct Palette {
     pub blue: Color,
     pub purple: Color,
     pub aqua: Color,
-    /// The open marker's EMPHASISED shade, for a session parked in another tab
-    /// (§6.4). Named for the role, not the shade: on the light ground it is a
-    /// deeper aqua and on the dark ground a paler one, because "more
-    /// prominent" inverts with the ground. `aqua` keeps the current tab.
+    /// The open marker's OTHER-TAB ink, for a session parked in a tab you are
+    /// not looking at (§6.4). Named for the role, and deliberately NOT a second
+    /// aqua: it is a gruvbox NEUTRAL, so the two markers separate by HUE —
+    /// green against warm grey — rather than by depth. Depth was tried and
+    /// failed; see `the_two_open_marker_shades_never_collapse`. The tone still
+    /// inverts with the ground, darker on the light theme and lighter on the
+    /// dark one, because "more prominent" does. `aqua` keeps the current tab.
     pub aqua_elsewhere: Color,
     pub orange: Color,
     pub sel_bg: Color,
@@ -73,9 +76,12 @@ impl Palette {
             blue: Color::Rgb(0x83, 0xa5, 0x98),
             purple: Color::Rgb(0xd3, 0x86, 0x9b),
             aqua: Color::Rgb(0x8e, 0xc0, 0x7c), // 7.01:1 ground, 5.51:1 band
-            // Lighter than `aqua` here: on a dark ground prominence is height,
-            // not depth. 11.25:1 ground, 8.85:1 band, 1.61:1 apart from `aqua`.
-            aqua_elsewhere: Color::Rgb(0xcf, 0xe8, 0xc8),
+            // gruvbox fg2, a neutral. Lighter than `aqua` here: on a dark
+            // ground prominence is height, not depth. The darkest neutral that
+            // still out-contrasts `aqua` — one step down, fg3 `#bdae93`, is
+            // 6.77:1 on a ground where `aqua` is already 7.01:1.
+            // 8.59:1 ground, 6.76:1 band, ΔE 31.9 from `aqua`.
+            aqua_elsewhere: Color::Rgb(0xd5, 0xc4, 0xa1),
             orange: Color::Rgb(0xfe, 0x80, 0x19),
             sel_bg: Color::Rgb(0x3c, 0x38, 0x36),
         }
@@ -103,11 +109,32 @@ impl Palette {
             purple: Color::Rgb(0x8f, 0x3f, 0x71), // 5.94:1
             aqua: Color::Rgb(0x3d, 0x71, 0x51),   // 5.03:1 ground, 4.16:1 band
             orange: Color::Rgb(0xaf, 0x3a, 0x03), // 5.40:1
-            // DARKER than `aqua`, the opposite of the dark theme's move: this
-            // ground has no headroom left going lighter — `#427b58` is already
-            // 3.64:1 on `sel_bg`, under the floor — so emphasis goes down.
-            // 10.95:1 ground, 9.05:1 band, 2.18:1 apart from `aqua`.
-            aqua_elsewhere: Color::Rgb(0x1d, 0x3a, 0x2a),
+            // gruvbox fg3, a neutral, and DARKER than `aqua` — the opposite
+            // of the dark theme's move, because this ground has no headroom
+            // left going lighter (`#427b58` is already 3.64:1 on `sel_bg`,
+            // under the floor). Its predecessor `#1d3a2a` went further down
+            // still and lost the hue doing it: at 10.95:1 it read as ordinary
+            // dark text rather than as a coloured marker. This is the LIGHTEST
+            // gruvbox neutral that clears the floor — one step up, fg4
+            // `#7c6f64`, is 3.55:1 on the band. That makes it the same ink as
+            // `dim`, and that is the price of a neutral on this ground: the
+            // gruvbox neutrals ARE the text ramp, so any of them is some tier
+            // of text. `dim` is the LIGHTEST of this theme's three text inks,
+            // so the marker lands at the shallow end of that ramp and not the
+            // deep end that broke it. But the collision is TOTAL, not
+            // glancing: column 1's badge takes this same ink by construction,
+            // and a Completed row paints its name and age in `dim`, so an
+            // UNSELECTED other-tab row of that group renders marker, badge,
+            // name and age in one RGB, with only the glyph shapes separating
+            // them. Nothing here is three columns clear of anything.
+            //
+            // What IS bounded is the SELECTED row, the one actually being
+            // read: `session_line` forces its name to `p.fg` and promotes its
+            // age dim -> gray, two gruvbox ramp steps off this ink and one
+            // (ΔE 16.5 and 8.6). Pinned by
+            // `the_neutral_marker_never_half_matches_the_text_ramp`.
+            // 5.74:1 ground, 4.75:1 band, ΔE 28.8 from `aqua`.
+            aqua_elsewhere: Color::Rgb(0x66, 0x5c, 0x54),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
         }
     }
@@ -677,11 +704,13 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     // hairline where `▌` (U+258C) is a thick bar — different weight, not just
     // a different colour.
     //
-    // WHICH aqua says where. A session in this tab is already in front of you,
-    // so it keeps the established shade; one parked in another tab takes
-    // `aqua_elsewhere`, the emphasised one, because that is the row you have to
-    // go somewhere to see. The emphasis is the same fact the digit carries,
-    // said in the channel you read without counting.
+    // WHICH ink says where. A session in this tab is already in front of you,
+    // so it keeps the established aqua; one parked in another tab takes
+    // `aqua_elsewhere`, a neutral, because that is the row you have to go
+    // somewhere to see. The two differ in HUE and not merely in depth, which is
+    // what lets the second one read as a colour at all on the light ground.
+    // It is the same fact the digit carries, said in the channel you read
+    // without counting.
     if open {
         spans.push(Span::styled("▌".to_string(), base.fg(ink)));
     } else if selected {
@@ -1379,8 +1408,8 @@ fn is_open(app: &App, session_id: &str) -> bool {
 ///
 /// When the sidebar cannot resolve its own window (degraded, or a no-panic
 /// fixture that sets no pane inventory) the digit is shown unconditionally —
-/// and so, since the shade follows the digit, is the emphasised marker. That is
-/// not the emphasis over-reaching. `App::resolve_identity` accepts `$TMUX_PANE`
+/// and so, since the shade follows the digit, is the neutral marker. That is
+/// not the marker over-reaching. `App::resolve_identity` accepts `$TMUX_PANE`
 /// only when it names a pane `list_panes_in_session` returned, and that listing
 /// covers every window of the managed session, so a failure to resolve proves
 /// this sidebar is being drawn somewhere the inventory does not reach —
@@ -3149,10 +3178,11 @@ mod tests {
         }
     }
 
-    /// WCAG relative luminance and the contrast ratio between two palette
-    /// entries. One copy, shared by the three colour tests below, so they
-    /// cannot drift into measuring different things.
-    fn lum(c: Color) -> f64 {
+    /// The sRGB transfer curve, undone: a palette entry's three 8-bit channels
+    /// as linear light in 0..1. One copy, shared by `lum` and `lab` below, so
+    /// the two ways this module measures colour cannot disagree about what the
+    /// bytes mean.
+    fn linear(c: Color) -> (f64, f64, f64) {
         let Color::Rgb(r, g, b) = c else {
             panic!("palette entries must be true-colour: {c:?}")
         };
@@ -3160,12 +3190,47 @@ mod tests {
             let v = v as f64 / 255.0;
             if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
         };
-        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+        (f(r), f(g), f(b))
+    }
+
+    /// WCAG relative luminance and the contrast ratio between two palette
+    /// entries. One copy, shared by the three colour tests below, so they
+    /// cannot drift into measuring different things.
+    fn lum(c: Color) -> f64 {
+        let (r, g, b) = linear(c);
+        0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 
     fn ratio(a: Color, b: Color) -> f64 {
         let (x, y) = (lum(a), lum(b));
         (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// CIE L*a*b* under D65, the white point sRGB is defined against. Unlike
+    /// `lum` it keeps the two chromatic axes, so it can see a difference of HUE
+    /// at equal brightness — precisely what a contrast ratio is blind to.
+    /// (The luminance row here is the full-precision sRGB matrix; `lum` above
+    /// uses the coefficients WCAG rounds it to, which is what WCAG specifies.)
+    fn lab(c: Color) -> (f64, f64, f64) {
+        let (r, g, b) = linear(c);
+        // sRGB -> CIEXYZ, each axis normalised by the D65 white point.
+        let x = (0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b) / 0.950_47;
+        let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
+        let z = (0.019_333_9 * r + 0.119_192_0 * g + 0.950_304_1 * b) / 1.088_83;
+        let f = |t: f64| {
+            if t > 216.0 / 24389.0 { t.cbrt() } else { (841.0 / 108.0) * t + 4.0 / 29.0 }
+        };
+        let (fx, fy, fz) = (f(x), f(y), f(z));
+        (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+    }
+
+    /// CIE76 ΔE — plain Euclidean distance in Lab. Crude next to CIEDE2000, and
+    /// entirely good enough for the only question asked of it: are these two
+    /// inks the same colour, or two colours?
+    fn delta_e(a: Color, b: Color) -> f64 {
+        let (l1, a1, b1) = lab(a);
+        let (l2, a2, b2) = lab(b);
+        ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
     }
 
     /// The accents carry facts — the status glyph, the open marker, the message
@@ -3226,10 +3291,27 @@ mod tests {
         }
     }
 
-    /// The two open-marker shades must stay two shades. Collapsing them — by
+    /// The two open-marker inks must stay two inks. Collapsing them — by
     /// pointing `aqua_elsewhere` back at `aqua`, or by nudging one until the
     /// pair is indistinguishable — would silently delete the whole signal while
     /// every contrast assertion above still passed.
+    ///
+    /// SEPARATION IS MEASURED IN LAB, NOT AS A LUMINANCE RATIO. This test used
+    /// to demand the pair sit >= 1.5:1 apart in WCAG contrast, and that metric
+    /// was the wrong axis — it is what broke the marker. A contrast ratio can
+    /// only see one ink being DARKER than the other, so the only way to satisfy
+    /// it was to keep pushing `aqua_elsewhere` down, until at `#1d3a2a` and
+    /// 10.95:1 on the light ground the marker had stopped reading as a colour
+    /// and read as ordinary dark text. It had cleared every number and lost the
+    /// thing the numbers were standing in for. Two inks that differ by HUE at
+    /// comparable brightness are obviously distinguishable and score barely
+    /// 1.14:1, which that assertion would have rejected.
+    ///
+    /// CIE76 ΔE sees all three axes. >= 20 is well clear of "the same colour",
+    /// and it is a RE-POINTING and not a loosening: the neutrals measure 28.8
+    /// light and 31.9 dark, but the aqua pair this replaced already scored 24.5
+    /// and 27.8, so the new floor would have passed the old palette too. Every
+    /// other assertion here is unchanged.
     ///
     /// The direction is asserted per theme because it INVERTS. "More
     /// prominent" on the light ground means darker and on the dark ground
@@ -3246,24 +3328,135 @@ mod tests {
             ("dark", Palette::dark(), dark_bg),
             ("light", Palette::light(), light_bg),
         ] {
-            assert_ne!(p.aqua, p.aqua_elsewhere, "{name}: the two marker shades collapsed");
-            // Far enough apart to read as two shades side by side, not as a
-            // rounding error. Measured: 2.18:1 light, 1.61:1 dark.
-            let apart = ratio(p.aqua, p.aqua_elsewhere);
-            assert!(apart >= 1.5, "{name}: the shades are only {apart:.2}:1 apart, needs >= 1.5:1");
+            assert_ne!(p.aqua, p.aqua_elsewhere, "{name}: the two marker inks collapsed");
+            // Far enough apart to read as two colours side by side, not as a
+            // rounding error. Measured: ΔE 28.8 light, 31.9 dark.
+            let apart = delta_e(p.aqua, p.aqua_elsewhere);
+            assert!(apart >= 20.0, "{name}: the inks are only ΔE {apart:.1} apart, needs >= 20");
             assert!(
                 ratio(p.aqua_elsewhere, bg) > ratio(p.aqua, bg),
                 "{name}: aqua_elsewhere must be the MORE prominent of the two on its own ground"
             );
             assert!(
                 ratio(p.aqua_elsewhere, p.sel_bg) > ratio(p.aqua, p.sel_bg),
-                "{name}: the emphasis must survive onto the selection band"
+                "{name}: the neutral must stay the more prominent one on the band"
             );
         }
-        // The inversion, stated as the fact it is: the emphasised shade is
+        // The inversion, stated as the fact it is: the neutral shade is
         // darker than `aqua` on the light theme and lighter on the dark one.
         assert!(lum(Palette::light().aqua_elsewhere) < lum(Palette::light().aqua));
         assert!(lum(Palette::dark().aqua_elsewhere) > lum(Palette::dark().aqua));
+    }
+
+    /// The price of a NEUTRAL marker on the light ground, bounded and pinned.
+    /// `p.aqua_elsewhere` there is `#665c54`, byte-identical to `p.dim`: the
+    /// gruvbox neutrals ARE that theme's text ramp, so a neutral clearing the
+    /// 4.0:1 band floor has nowhere to stand that is not already a text tier
+    /// (fg4, the one step lighter, is 3.55:1 on the band). The consequence is
+    /// real and is not a rounding error — an UNSELECTED other-tab Completed row
+    /// paints marker, badge, name and age in one RGB, and only the glyph shapes
+    /// separate them. This test does not pretend otherwise. It pins the two
+    /// bounds that make the trade survivable, neither of which any other test
+    /// covers.
+    ///
+    /// ONE: the collision must be EXACT or CLEAR, never in between. An ink a
+    /// few ΔE off a text tier is the one outcome nobody would choose — it reads
+    /// as a rendering fault rather than as either a colour or a tier. gruvbox's
+    /// own neighbouring text tiers sit ~8 ΔE apart (light fg->gray 7.9,
+    /// gray->dim 8.6), so one ramp step is the natural floor: ΔE 0, or >= 7.5.
+    ///
+    /// TWO: the SELECTED row — the one actually being read — must keep the
+    /// marker off every ink beside it, and does, but not by luck. It holds only
+    /// because `session_line` forces the selected name to `p.fg` and promotes
+    /// the selected age dim -> gray, two promotions made for contrast reasons of
+    /// their own (`p.dim` is 3.16:1 on the dark band). Drop either and the light
+    /// theme's selected row goes flat too, which is the failure this bounds; the
+    /// palette-level assertions above would all still pass.
+    ///
+    /// Asserted on the rendered spans, not on the palette, because what matters
+    /// is the ink that actually reaches the row.
+    #[test]
+    fn the_neutral_marker_never_half_matches_the_text_ramp() {
+        // One gruvbox ramp step, the smallest gap the theme itself ever asks a
+        // reader to see between two text tiers.
+        const STEP: f64 = 7.5;
+
+        for (name, p) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            for (field, c) in [("fg", p.fg), ("gray", p.gray), ("dim", p.dim)] {
+                let d = delta_e(p.aqua_elsewhere, c);
+                assert!(
+                    d == 0.0 || d >= STEP,
+                    "{name}: aqua_elsewhere is ΔE {d:.1} from {field} — neither the same \
+                     ink nor a distinguishable one"
+                );
+            }
+        }
+
+        // Completed is the worst case on purpose: its name tier IS `p.dim`, so
+        // on the light theme every ink in the unselected row is the marker's.
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Idle, Some(State::Done))]);
+        let sid = app.sessions[0].session_id.clone();
+        app.own_pane = PaneId::parse("%1");
+        app.own_window = crate::tmux::WindowId::parse("@2");
+        app.map.panes.insert("%7".into(), PaneEntry {
+            session_id: sid,
+            short_id: "00000001".into(),
+            name: "n".into(),
+            opened_at: 0,
+        });
+        // Open in tab 5, i.e. NOT the tab being drawn: the elsewhere ink.
+        app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 5)];
+        app.rebuild_open();
+
+        for (name, p) in [("dark", Palette::dark()), ("light", Palette::light())] {
+            for selected in [false, true] {
+                let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+                assert_eq!(line_cols(&l)[1], '5', "the fixture must be an other-tab row");
+                let ink = l.spans[0].style.fg.expect("the marker is inked");
+                assert_eq!(ink, p.aqua_elsewhere, "{name}: the fixture must take the neutral");
+
+                // Span 4 is the name (marker, badge, glyph, space, name); the
+                // age is the last span carrying text. Both are checked rather
+                // than trusted, so a layout change fails here loudly instead of
+                // silently measuring a pad span.
+                assert!(
+                    l.spans[4].content.starts_with("session"),
+                    "span 4 is no longer the name: {:?}",
+                    l.spans[4].content
+                );
+                let name_ink = l.spans[4].style.fg.expect("the name is inked");
+                let age_ink = l
+                    .spans
+                    .iter()
+                    .rev()
+                    .find(|s| !s.content.trim().is_empty())
+                    .and_then(|s| s.style.fg)
+                    .expect("the age is inked at 34 columns");
+
+                for (what, c) in [("name", name_ink), ("age", age_ink)] {
+                    let d = delta_e(ink, c);
+                    if selected {
+                        assert!(
+                            d >= STEP,
+                            "{name}: the SELECTED row's {what} is only ΔE {d:.1} from the \
+                             marker — the promotion that keeps them apart is gone"
+                        );
+                    } else {
+                        assert!(
+                            d == 0.0 || d >= STEP,
+                            "{name}: the unselected row's {what} is ΔE {d:.1} from the marker"
+                        );
+                    }
+                }
+                // The reason the selected row can promote at all: `p.gray` is
+                // safe on the band where `p.dim` is not. Asserted where the
+                // promotion is relied on, not only in the palette sweep.
+                if selected {
+                    let r = ratio(age_ink, p.sel_bg);
+                    assert!(r >= 4.0, "{name}: the promoted age is {r:.2}:1 on sel_bg");
+                }
+            }
+        }
     }
 
     /// The gutter's two columns answer the same question, so they must never
@@ -3297,7 +3490,7 @@ mod tests {
                 assert_eq!(cols[1], ' ', "the current tab shows no digit");
                 assert_eq!(l.spans[0].style.fg, Some(p.aqua), "selected={selected}");
 
-                // Open in tab 5: the emphasised shade, and the digit that
+                // Open in tab 5: the neutral shade, and the digit that
                 // names where. Both gutter columns carry the same ink.
                 app.panes = vec![pane_in("%1", 1, 0, 2), pane_in("%7", 2, 34, 5)];
                 app.rebuild_open();
@@ -3325,20 +3518,20 @@ mod tests {
     /// drift. The shade reads off `tab_badge_for`, so it inherits whatever that
     /// helper answers when the sidebar cannot place itself — two states, which
     /// behave differently, and both are asserted because only the pairing of
-    /// them says the emphasis is doing the right thing.
+    /// them says the shade is doing the right thing.
     ///
     /// With no pane inventory the row is open but placed nowhere:
     /// `rebuild_open` stamps neither window nor index, `tab_badge_for` has no
     /// index to return, and the row renders exactly what it rendered before the
     /// second shade existed — blank column 2, today's `aqua`. This is the shape
     /// every no-panic fixture in this module has, and the shape of the first
-    /// tick before any enumeration has landed. The emphasis stays out of a
+    /// tick before any enumeration has landed. The neutral stays out of a
     /// question the process cannot answer. (Degraded mode proper is quieter
     /// still: `refresh_panes` returns early, so `adopt_own_state` never runs and
     /// there is no map to make the row open at all — no marker, no digit.)
     ///
     /// With an inventory but still no `own_window`, every open row shows its
-    /// digit, and the emphasised marker goes with it. That is not the emphasis
+    /// digit, and the neutral marker goes with it. That is not the marker
     /// over-reaching: `App::resolve_identity` accepts `$TMUX_PANE` only if it
     /// appears in `list_panes_in_session`, which lists every pane of every
     /// window of the managed session, so a sidebar that fails to place itself is
@@ -3373,7 +3566,7 @@ mod tests {
                 assert_eq!(
                     l.spans[0].style.fg,
                     Some(p.aqua),
-                    "an unplaceable pane must not be emphasised (selected={selected})"
+                    "an unplaceable pane must not take the elsewhere ink (selected={selected})"
                 );
 
                 // Inventory, still no own window: the documented digit, and
