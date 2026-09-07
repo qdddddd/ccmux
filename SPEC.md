@@ -983,7 +983,11 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
 /// pane holding a healthy attach was left permanently marked as parked.
 /// Measured live before the fix: after an `R` that restarted its agent, `%1`
 /// ran `claude attach` normally and `#{@ccmux_detached}` was `1`. `s` still
-/// leaves the latch standing forever, because it breaks OUT of the loop.
+/// leaves the latch standing forever, because it breaks OUT of the loop — and
+/// RE-WRITES it as `shell` on the way out, after `done` and before the `exec`,
+/// the one place only `s` reaches. That value still reads as detached to every
+/// reader of the latch; it exists for one more, §8.2's delete, which closes a
+/// pane parked on a prompt whose resume cannot work and leaves a shell alone.
 ///
 /// Produces exactly this, as ONE line (wrapped here to be read):
 ///   while :; do
@@ -994,7 +998,9 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
 ///   printf '[ccmux] enter=resume  s=shell  q=close pane: ';
 ///   read ans || ans=q;
 ///   case "$ans" in s|S) break;; q|Q) exit "$rc";; esac;
-///   done; printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
+///   done;
+///   [ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @ccmux_detached shell 2>/dev/null;
+///   printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
 ///
 /// with `<claude>` and `<id>` passed through `sh_quote` — once for the attach,
 /// TWICE for the printed copy, because the shell strips one layer handing them
@@ -1664,7 +1670,7 @@ The section number is kept so §5.5 does not move.
 | `x` closes a pane | `map.remove(pane)`; `map_dirty = true` |
 | pane disappears (user killed it, or `claude attach` exited and the pane closed) | dropped by `reconcile` |
 | `Ctrl+X` stops a session | no map change; its pane stays until the operator closes it |
-| `Ctrl+X` deletes a session (second press) | no map change; the pane stays and its trailer reports the exit |
+| `Ctrl+X` deletes a session (second press) | `claude rm` Ok: every pane mapped to it, in every tab, is killed through `x`'s own path — own-window entries `map.remove(pane)`; `map_dirty = true`; another tab's entry is left to its owner (§8.2) — except a pane whose latch reads `shell`: the operator's shell stays, entry and all, until the shell exits and `reconcile` drops it like any other pane. `claude rm` refused: no map change; the pane stays, showing the refusal |
 
 Double-attach is legal (PROBE-FINDINGS §3), so a session may legitimately map to
 several panes — including one per tab. `pane_for_session` returns the one in the
@@ -2091,7 +2097,9 @@ not through the inner function, for exactly this reason.
    just-stopped session undeletable.
 4. Otherwise `claude stop <short_id>`.
    - Ok → force a refresh, open the window, flash `stopped <label>` (Info). The
-     pane, if any, is **left open** — closing it is the operator's separate `x`.
+     pane, if any, is **left open** — parked on its resume prompt, which is
+     correct for a session that still exists. Closing it is the operator's
+     separate `x`, or the second press below.
    - Err → flash `stop failed: <stderr first line>` (Error) and open **no**
      window. The escalation is only ever an escalation of a stop that happened.
 
@@ -2124,14 +2132,52 @@ spent inside the shell-out.
 - The press SCHEDULES the delete; it does not run it (see the settle below).
 - Before `claude rm`, the CAPTURED short id is re-validated against
   `app.sessions`. Absent → flash `session <id> is gone — not deleted` (Warn).
-- Ok → flash `deleted <label> + worktree` (Warn) and force a refresh.
+- Ok → **close every pane ccmux has the captured `session_id` open in**, in
+  every tab, a pane the wrapper has already parked (`@ccmux_detached` = `1`)
+  for it included. The session is gone, so the prompt such a pane parks on
+  (`enter=resume  s=shell  q=close pane`) offers a resume that cannot work,
+  and leaving it meant the operator pressing `q` in a pane with nothing to
+  show — the pane this step exists for. **A pane the operator answered `s` in
+  is not closed.** The wrapper re-wrote its latch as `shell` on the way into
+  the operator's shell (§3.3), `PaneInfo::shell` carries that back, and
+  `panes_showing` drops any pane whose inventory row says so: the kill exists
+  for a prompt whose resume cannot work, and a shell is not a prompt — it may
+  hold a foreground job, or a hand-attached OTHER session (measured: both died
+  with the pane before this rule). It stays mapped, as every live pane does;
+  the operator closes it as they would any shell, and `x` still reaches it
+  while a row does. The set is
+  `union(every map's panes_for_session) ∩ live panes − shell panes`, read the
+  way `rebuild_open` reads (`App::panes_showing`), after one `refresh_panes`,
+  because the settle runs from the tick and the inventory can be a
+  `tick_interval` old. Each pane goes through `kill_owned_pane`, the ONE kill
+  path in the crate and the one `x` uses (§8.5): a sidebar is skipped and not
+  counted, the kill is R2-gated on a validated `PaneId`, an own-window entry is
+  `map.remove`d and the map dirtied, another tab's entry is left to its owner.
+  `settle_after_kill` then runs once — refresh, map flush, `even_content` only
+  if MY window lost a pane, pin. A pane tmux refuses to kill is left on screen
+  for `x`. Degraded mode closes nothing and touches no tmux.
+
+  The rm comes FIRST, then the kills, never the other way round: `rm` is what
+  makes the attach exit, so by the time it returns the wrapper is parked and
+  killing it is clean — and a refused rm reaches no kill at all, so a pane
+  showing a session that still exists is never destroyed on the strength of a
+  delete that did not happen.
+
+  Then flash `deleted <label> + worktree` (Warn), with ` · closed N panes`
+  (`· closed 1 pane` for one) appended when anything closed, and force a
+  refresh. With the count the line is ~50 columns, so at the 34-column
+  default it wraps through §6.8's overflow path like the arm hint does. The
+  `cx_last_press` re-stamp below stays LAST: the kills are one more blocking
+  shell-out on this path.
 - Err → flash `delete failed: <first line>` (Error). The line comes from stderr,
   or from **stdout when stderr is blank**: `claude rm` refuses to delete a
   worktree holding unpushed commits or uncommitted changes, and it prints that
   refusal on stdout while exiting 1 (PROBE-FINDINGS §2). Reading stderr alone
   renders `delete failed: exit 1` and drops the sentence that says the work is
   safe. This is the ONE case where a failure is good news, so it must be
-  legible.
+  legible. **No pane is touched**: it still shows a live or parked session and
+  the refusal text, and killing it would hide the one line that says the work
+  is safe.
 
 A press after the window has lapsed is a FIRST press again: it stops, it never
 deletes.
@@ -2318,6 +2364,14 @@ sessions in a row without leaving the list.
 7. tmux::pin_sidebar(...)
 8. flash "closed pane <index>[ in tab <N>] — agent still running" (Info)
 ```
+
+Steps 4–6 are `App::kill_owned_pane` and step 7 — with the refresh and the
+map flush around it — `App::settle_after_kill`. Those two ARE the kill path:
+§8.2's delete closes a session's panes through the same pair, once per pane and
+one settle, so the sidebar refusal, the R2 gate, the own-window-only unmap and
+the `killed_here` gate on the even-layout are written exactly once in the crate.
+Both verbs reach `tmux::kill_pane` through `App::kill_pane`, a seam of the
+`respawn` kind, so a hermetic test can prove WHICH panes a verb kills.
 
 **`x` is unconditionally safe here, and only because of what is listed.**
 PROBE-FINDINGS §3 verified that killing a pane leaves the agent running — *for
@@ -3011,16 +3065,21 @@ the CLI omits `id`, so a **listed** row can reach it.
 - `PaneMap::reconcile` drops absent panes, keeps present ones, returns the right
   `changed` flag; round-trips through serde byte-identically.
 - `SplitDir::Vertical.tmux_flag() == "-h"`, `Horizontal → "-v"`.
-- `parse_pane_line` reads all THIRTEEN fields, including `#{@ccmux_detached}`;
-  an empty value is "no latch", and a twelve-field row is short and fatal.
+- `parse_pane_line` reads all THIRTEEN fields, including `#{@ccmux_detached}`:
+  `1` reads as `detached`, `shell` as `detached` AND `shell`, an empty or any
+  other value is "no latch"; a twelve-field row is short and fatal.
+- A unit test that has not called `set_socket` cannot spawn `tmux` at all —
+  `$CCMUX_TMUX_SOCKET` in the environment does not open the gate.
 
 **agents.rs (Agents)**
 - `attach_pane_cmd("1c45d64f")` equals the §3.3 template exactly; it ends in
   `exec "$SHELL" -l` and contains no `read _`; `$rc` is captured immediately
   after the attach, printed, and carried out by `q`; the latch names
   `OPT_PANE_DETACHED`, targets `"$TMUX_PANE"`, is guarded by
-  `[ -n "$TMUX_PANE" ]` at both the set and the unset, and comes BEFORE the
-  prompt; the resume path clears it before looping back into the attach; every
+  `[ -n "$TMUX_PANE" ]` at the set, the unset and the `shell` re-write, and
+  comes BEFORE the prompt; the `shell` re-write sits after `done` and before
+  the `exec`, exactly once, and is a different value from the parked `1`; the
+  resume path clears it before looping back into the attach; every
   path from the attach's exit to the `exec` passes through the `read`; a hostile
   id is `sh_quote`d and the printf format string stays a fixed literal with
   exactly three `%s`; the PRINTED copy is quoted twice, so a value needing
