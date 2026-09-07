@@ -1562,6 +1562,7 @@ mod tests {
             session_clients: 1,
             window_viewers: Some(1),
             detached: false,
+            shell: false,
         }
     }
 

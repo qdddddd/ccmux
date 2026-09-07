@@ -1737,8 +1737,9 @@ impl App {
     /// showing a session that still exists, refusal text and all.
     ///
     /// A pane this cannot kill is simply left where it is, on screen, for
-    /// `x`; a sidebar is skipped and never counted. Degraded mode has no
-    /// panes to close and touches no tmux.
+    /// `x`; a sidebar is skipped and never counted, and so is a pane the
+    /// operator has taken to the `s` shell (`panes_showing`). Degraded mode
+    /// has no panes to close and touches no tmux.
     fn close_panes_of(&mut self, session_id: &str) -> usize {
         if self.degraded {
             return 0;
@@ -1761,8 +1762,9 @@ impl App {
         closed
     }
 
-    /// Every live pane mapped to `session_id`, across every tab, ascending.
-    /// Double-attach is legal (PROBE-FINDINGS §3), so this may be several.
+    /// Every live pane mapped to `session_id`, across every tab, ascending,
+    /// minus any the operator has taken to a shell. Double-attach is legal
+    /// (PROBE-FINDINGS §3), so this may be several.
     ///
     /// Read the way `rebuild_open` reads: my window's map is `self.map`, the
     /// record this process writes, and the copy under my own `TabInfo` is a
@@ -1770,6 +1772,19 @@ impl App {
     /// tab's map is read from its window. Intersected with the live inventory
     /// when there is one, exactly as `open` is — a pane a map still names but
     /// tmux no longer has is not a target, and R2 would only refuse it.
+    ///
+    /// A SHELL PANE IS NOT A TARGET. The map still names it — `reconcile`
+    /// keeps an entry while its pane lives, and `x` still closes it — but the
+    /// wrapper re-wrote its latch as `shell` when the operator answered `s`
+    /// (`PaneInfo::shell`), and that is the one fact this verb needs: the
+    /// kill exists for a prompt whose resume can no longer work, and a shell
+    /// is not a prompt. Measured before the check: a `sleep 600` started from
+    /// the `s` shell died with the pane on the session's delete, and so did a
+    /// pane hand-attached to a DIFFERENT session from that shell. A PARKED
+    /// pane (`detached` without `shell`) stays a target — it is the pane the
+    /// verb exists for. With no inventory nothing can be told apart and the
+    /// map is taken as read; `close_panes_of` refreshes first, and a refresh
+    /// that failed leaves R2 refusing every kill anyway.
     fn panes_showing(&self, session_id: &str) -> Vec<PaneId> {
         let mine = self.own_window.as_ref();
         let mut out = self.map.panes_for_session(session_id);
@@ -1782,7 +1797,7 @@ impl App {
         out.sort_by_key(PaneId::num);
         out.dedup();
         if !self.panes.is_empty() {
-            out.retain(|p| self.panes.iter().any(|i| &i.id == p));
+            out.retain(|p| self.panes.iter().any(|i| &i.id == p && !i.shell));
         }
         out
     }
@@ -4356,6 +4371,7 @@ mod tests {
             session_clients: 1,
             window_viewers: Some(1),
             detached: false,
+            shell: false,
         }
     }
 
@@ -4619,6 +4635,92 @@ mod tests {
         delete_twice(&mut a);
 
         assert_eq!(kills(), vec!["%2"]);
+    }
+
+    /// Mark a pane of the fixture the way the wrapper marks it: parked
+    /// (`Ctrl+Z`, latch `1`) or handed to the operator's shell (`s`, latch
+    /// `shell`, which reads as detached too).
+    fn latch(a: &mut App, id: &str, shell: bool) {
+        let p = a.panes.iter_mut().find(|p| p.id.as_str() == id).expect("fixture pane");
+        p.detached = true;
+        p.shell = shell;
+    }
+
+    /// THE PARKED PANE — the one the operator complained about. `Ctrl+Z` left
+    /// it on `enter=resume  s=shell  q=close pane`, `claude rm` made that
+    /// resume impossible, and it is closed with the rest.
+    #[test]
+    fn a_parked_pane_is_closed_by_the_delete() {
+        let mut a = app();
+        deletable(&mut a, true);
+        latch(&mut a, "%2", false);
+        a.rebuild_open();
+
+        delete_twice(&mut a);
+
+        assert_eq!(kills(), vec!["%2", "%5"]);
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree · closed 2 panes");
+    }
+
+    /// REGRESSION. A pane the operator answered `s` in is their shell now —
+    /// with, measured live, a `sleep 600` or a hand-attached OTHER session in
+    /// it — and the map still names it, because `reconcile` keeps an entry
+    /// while its pane lives. Deleting the session it used to show killed it,
+    /// foreground job and all. The wrapper's `shell` mark is what tells it
+    /// from a parked pane: the parked one in the other tab still closes, the
+    /// shell survives, stays mapped for `x`, and is not counted.
+    #[test]
+    fn a_pane_the_operator_took_to_a_shell_survives_the_delete() {
+        let mut a = app();
+        deletable(&mut a, true);
+        latch(&mut a, "%2", true);
+        latch(&mut a, "%5", false);
+        a.rebuild_open();
+
+        delete_twice(&mut a);
+
+        assert_eq!(kills(), vec!["%5"], "the shell is not a kill target");
+        assert!(a.map.get(&pid("%2")).is_some(), "still mapped, still `x`'s to close");
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree · closed 1 pane");
+        assert!(a.pending_delete.is_none());
+    }
+
+    /// The same when the shell is the ONLY pane: nothing is killed and the
+    /// flash is the bare line — the pane is on screen, saying for itself
+    /// what is in it.
+    #[test]
+    fn a_delete_whose_only_pane_is_a_shell_closes_nothing() {
+        let mut a = app();
+        deletable(&mut a, false);
+        latch(&mut a, "%2", true);
+        a.rebuild_open();
+
+        delete_twice(&mut a);
+
+        assert!(kills().is_empty(), "{:?}", kills());
+        assert!(a.map.get(&pid("%2")).is_some());
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree");
+    }
+
+    /// `x` is the operator's say-so, and it still closes a shell pane: the
+    /// README's "it is still a pane ccmux opened, so `x` still closes it"
+    /// holds for the shell exactly as it does for the parked prompt.
+    #[test]
+    fn x_still_closes_a_pane_the_operator_took_to_a_shell() {
+        let mut a = app();
+        deletable(&mut a, false);
+        latch(&mut a, "%2", true);
+        a.rebuild_open();
+
+        a.on_key(press('x'));
+
+        assert_eq!(kills(), vec!["%2"]);
+        assert!(a.map.get(&pid("%2")).is_none());
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "closed pane 1 — agent still running");
     }
 
     /// The re-stamp of `cx_last_press` must survive, and it must come AFTER

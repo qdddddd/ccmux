@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::model::{ParseError, Payload};
-use crate::tmux::{OPT_PANE_DETACHED, sh_quote};
+use crate::tmux::{LATCH_SHELL, OPT_PANE_DETACHED, sh_quote};
 
 #[derive(Debug)]
 pub enum AgentsError {
@@ -497,7 +497,9 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
 ///   printf '[ccmux] enter=resume  s=shell  q=close pane: ';
 ///   read ans || ans=q;
 ///   case "$ans" in s|S) break;; q|Q) exit "$rc";; esac;
-///   done; printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
+///   done;
+///   [ -n "$TMUX_PANE" ] && tmux set-option -p -t "$TMUX_PANE" @ccmux_detached shell 2>/dev/null;
+///   printf '\n'; [ -x "${SHELL:-}" ] || SHELL=/bin/sh; exec "$SHELL" -l
 ///
 /// The two values reach `printf` as ARGUMENTS, never inside its format string,
 /// so a `%` in an overridden `CCMUX_CLAUDE_BIN` is inert. They are `sh_quote`d
@@ -541,6 +543,21 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
 /// mapping back, and must not: `s` breaks OUT of the loop, so the clear is
 /// never reached again and the latch stands for the life of that shell.
 ///
+/// THE LATCH IS RE-WRITTEN AS `shell` ON THE WAY OUT OF THE LOOP, after `done`
+/// and before the `exec` — the one place that is reached by `s` and by nothing
+/// else, since `q` exits and enter loops. It is the pane's statement that it
+/// is no longer a prompt but the operator's shell, and it exists for one
+/// reader: `Ctrl+X`'s delete (§8.2) closes every pane still parked on a prompt
+/// whose resume can no longer work, and a shell is not that — the operator
+/// may be running something in it, or have hand-attached another session
+/// from it, and killing it would take their foreground job with it. Measured
+/// before this mark existed: a `sleep 600` started from the `s` shell of a
+/// session's pane died with the pane on that session's delete, and so did a
+/// pane hand-attached to a DIFFERENT session from the same shell. Both
+/// values still read as detached to everything else — the marker, the badge
+/// and `R`'s skip are unchanged — and `x` still closes a shell pane on the
+/// operator's say-so.
+///
 /// `[ -n "$TMUX_PANE" ]` is not belt and braces. `set-option -p` with an EMPTY
 /// `-t` does not fail — verified on 3.4, rc 0 — it resolves to the session's
 /// ACTIVE pane, so an absent `$TMUX_PANE` would latch whichever pane the
@@ -578,10 +595,12 @@ pub fn attach_pane_cmd(id: &str) -> String {
          read ans || ans=q; \
          case \"$ans\" in s|S) break;; q|Q) exit \"$rc\";; esac; \
          done; \
+         [ -n \"$TMUX_PANE\" ] && tmux set-option -p -t \"$TMUX_PANE\" {opt} {shell} 2>/dev/null; \
          printf '\\n'; \
          [ -x \"${{SHELL:-}}\" ] || SHELL=/bin/sh; \
          exec \"$SHELL\" -l",
         opt = OPT_PANE_DETACHED,
+        shell = LATCH_SHELL,
     )
 }
 
@@ -672,10 +691,32 @@ mod tests {
              read ans || ans=q; \
              case \"$ans\" in s|S) break;; q|Q) exit \"$rc\";; esac; \
              done; \
+             [ -n \"$TMUX_PANE\" ] && tmux set-option -p -t \"$TMUX_PANE\" @ccmux_detached shell 2>/dev/null; \
              printf '\\n'; \
              [ -x \"${SHELL:-}\" ] || SHELL=/bin/sh; \
              exec \"$SHELL\" -l"
         );
+    }
+
+    /// THE SHELL MARK. The only way past `done` is the operator's `s` (`q`
+    /// exits, enter loops), so a write there says exactly "this pane is now a
+    /// shell" — and it must sit AFTER the loop, so a resumed attach never
+    /// carries it, and BEFORE the `exec`, so the shell never starts unmarked.
+    /// It is the value §8.2's delete reads to leave the pane alone, and it is
+    /// written once: a second write anywhere would be a second opinion.
+    #[test]
+    fn attach_pane_cmd_marks_the_pane_as_a_shell_on_the_way_out_of_the_loop() {
+        let cmd = attach_pane_cmd("1c45d64f");
+        let mark = format!("tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} {LATCH_SHELL} 2>/dev/null");
+        let at = cmd.find(&mark).expect("shell mark");
+        let done = cmd.find("; done; ").expect("loop end");
+        let exec = cmd.find("exec \"$SHELL\"").expect("exec");
+        assert!(done < at && at < exec, "{cmd}");
+        assert_eq!(cmd.matches(&mark).count(), 1, "one mark, in one place: {cmd}");
+        // And the parked value is still what the loop writes, before the
+        // prompt — the two are different states and stay different values.
+        assert!(cmd.contains(&format!("{OPT_PANE_DETACHED} 1 2>/dev/null")), "{cmd}");
+        assert_ne!(LATCH_SHELL, "1");
     }
 
     /// The template ends in `exec`, and that is the whole point: once the
@@ -794,6 +835,7 @@ mod tests {
         for op in [
             format!("tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 1"),
             format!("tmux set-option -p -u -t \"$TMUX_PANE\" {OPT_PANE_DETACHED}"),
+            format!("tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} {LATCH_SHELL}"),
         ] {
             let at = cmd.find(&op).unwrap_or_else(|| panic!("{op} missing from {cmd}"));
             assert!(
@@ -801,7 +843,7 @@ mod tests {
                 "unguarded {op} in {cmd}"
             );
         }
-        assert_eq!(cmd.matches("tmux set-option").count(), 2, "{cmd}");
+        assert_eq!(cmd.matches("tmux set-option").count(), 3, "{cmd}");
     }
 
     /// RULE Q4 at the one boundary that has a shell on the other side. The id

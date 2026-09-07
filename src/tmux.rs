@@ -56,7 +56,21 @@ pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
 /// inherit: format expansion falls back pane -> window -> session -> global, so
 /// a value on a window would make every pane in it read as detached. Nothing
 /// ccmux writes ever sets this name at any other scope.
+///
+/// It takes two values, both written by the wrapper and read by nothing but
+/// `parse_pane_line`: `LATCH_PARKED` the moment the attach exits, when the
+/// pane is parked on the `enter=resume  s=shell  q=close pane` prompt, and
+/// `LATCH_SHELL` on the way OUT of that prompt into the operator's shell —
+/// the `s` answer, the one path past the loop. Both read as `detached`; only
+/// the second reads as `shell`. The distinction exists for one reader:
+/// `Ctrl+X`'s delete closes a parked pane, whose resume can no longer work,
+/// and leaves a shell pane alone, because a shell is not a prompt and the
+/// operator may be in the middle of something there (§8.2).
 pub const OPT_PANE_DETACHED: &str = "@ccmux_detached";
+/// `OPT_PANE_DETACHED`'s value while the pane is parked on the prompt.
+pub const LATCH_PARKED: &str = "1";
+/// `OPT_PANE_DETACHED`'s value once the pane has become the operator's shell.
+pub const LATCH_SHELL: &str = "shell";
 
 /// The empty `@ccmux_map` value. Still written once at session creation, and
 /// re-written by the legacy migration, purely so `main.rs`'s "this session is
@@ -338,6 +352,12 @@ pub struct PaneInfo {
     /// False for every pane ccmux did not create, and false on a tmux with no
     /// pane options — the pre-existing behaviour, not a claim of attachment.
     pub detached: bool,
+    /// `#{@ccmux_detached} == "shell"` — the operator answered `s` at the
+    /// parked prompt and the pane is now their interactive shell. Implies
+    /// `detached`; every reader of that flag (`R`'s skip, `rebuild_open`)
+    /// treats the two states alike. Only §8.2's delete tells them apart: a
+    /// parked pane is closed, a shell pane is left for `x`.
+    pub shell: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +396,13 @@ impl SplitDir {
 /// Outer `None` = not yet initialized. Inner `None` = the default socket.
 static SOCKET: Mutex<Option<Option<String>>> = Mutex::new(None);
 
+/// Whether `set_socket` has chosen a socket, as opposed to `socket()` having
+/// seeded one from the environment. Read by `refuse_default_socket_under_test`
+/// and by nothing else: it is the test suite's proof that a spawn was asked
+/// for by a test, not inherited from the operator's shell.
+#[cfg(test)]
+static EXPLICIT_SOCKET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn lock_socket() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
     SOCKET.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -383,7 +410,10 @@ fn lock_socket() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
 /// Override the tmux socket for the rest of the process. `None` restores the
 /// default socket. Call before any other function in this module.
 pub fn set_socket(name: Option<&str>) {
-    *lock_socket() = Some(name.map(str::to_string).filter(|s| !s.is_empty()));
+    let chosen = name.map(str::to_string).filter(|s| !s.is_empty());
+    #[cfg(test)]
+    EXPLICIT_SOCKET.store(chosen.is_some(), std::sync::atomic::Ordering::Relaxed);
+    *lock_socket() = Some(chosen);
 }
 
 /// The socket in force: `set_socket`'s value, else `$CCMUX_TMUX_SOCKET`, else
@@ -475,14 +505,21 @@ fn full_argv(args: &[&str]) -> Result<Vec<String>, TmuxError> {
 /// until now that was discipline: a fixture with `degraded: false` reaching
 /// `refresh_panes` would run `list-panes` against the operator's socket and
 /// merely happen to be harmless. Under `cfg(test)` a spawn is refused outright
-/// unless a socket has been chosen explicitly — the ignored live tests all
-/// call `set_socket` first, and nothing hermetic ever does. `full_argv` runs
-/// before this so its `BadTarget` refusals keep their variant.
+/// unless `set_socket` chose a socket IN THIS PROCESS — the ignored live tests
+/// all call it first, and nothing hermetic ever does. `full_argv` runs before
+/// this so its `BadTarget` refusals keep their variant.
+///
+/// The gate reads `EXPLICIT_SOCKET`, not `socket()`: the latter also honours
+/// `$CCMUX_TMUX_SOCKET`, and an operator who exports that for their own
+/// sidebars would have re-opened every `degraded: false` fixture to real
+/// `list-panes` spawns — read-only, against a session that exists on no
+/// server, but spawns all the same. An environment variable is not a choice
+/// a test made.
 #[cfg(test)]
 fn refuse_default_socket_under_test() -> Result<(), TmuxError> {
-    if socket().is_none() {
+    if !EXPLICIT_SOCKET.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(TmuxError::NotFound(
-            "unit test reached the default tmux socket".into(),
+            "unit test reached tmux without an explicit socket".into(),
         ));
     }
     Ok(())
@@ -768,10 +805,14 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     // failing the whole enumeration, which `watchers()` would read as evidence
     // that nobody is looking.
     let window_viewers: Option<u32> = parts[11].parse().ok();
-    // Written by the pane itself, so anything but the exact latch value is
+    // Written by the pane itself, so anything but the two latch values is
     // "no latch" — an empty string on every pane that never detached, and on
-    // every tmux too old to carry pane options.
-    let detached = parts[12] == "1";
+    // every tmux too old to carry pane options. `shell` MUST keep implying
+    // `detached`: `R` skips a pane on `detached` alone, and a shell pane that
+    // stopped reading as detached would be respawned over the operator's
+    // live shell (`restart::plan`).
+    let shell = parts[12] == LATCH_SHELL;
+    let detached = parts[12] == LATCH_PARKED || shell;
 
     Ok(PaneInfo {
         id,
@@ -787,6 +828,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         session_clients,
         window_viewers,
         detached,
+        shell,
     })
 }
 
@@ -1946,6 +1988,7 @@ mod tests {
             session_clients: 1,
             window_viewers: Some(1),
             detached: false,
+            shell: false,
         }
     }
 
@@ -2017,6 +2060,7 @@ mod tests {
             session_clients: 1,
             window_viewers: Some(1),
             detached: false,
+            shell: false,
         }
     }
 
@@ -2428,6 +2472,24 @@ mod tests {
         assert_eq!(sh_join(&["", "x"]), "'' x");
     }
 
+    // ── the unit suite's spawn gate ─────────────────────────────────────────
+
+    /// A hermetic test never reaches a tmux server. The gate is the explicit
+    /// `set_socket` choice and ONLY that: `$CCMUX_TMUX_SOCKET` in the
+    /// operator's environment does not open it, which is why this asserts on
+    /// the gate's own error rather than on the argv `full_argv` built — with
+    /// the variable exported the argv carries `-L`, and the spawn is refused
+    /// all the same. Not to be run alongside the ignored live tests, which
+    /// choose a socket for the whole process.
+    #[test]
+    fn a_test_that_chose_no_socket_cannot_spawn_tmux() {
+        let err = tmux(&["list-panes", "-t", "=ccmux-test:", "-s"]).expect_err("refused");
+        assert!(
+            matches!(&err, TmuxError::NotFound(m) if m.contains("explicit socket")),
+            "{err:?}"
+        );
+    }
+
     // ── pane line parsing ───────────────────────────────────────────────────
 
     #[test]
@@ -2460,6 +2522,30 @@ mod tests {
         assert_eq!(p.session_clients, 0);
         assert_eq!(p.window_viewers, Some(0));
         assert!(!p.detached, "an empty option is not a latch");
+    }
+
+    /// The latch's SECOND value. `s` at the parked prompt writes `shell` on
+    /// the way into the operator's shell, and it must read as BOTH: `shell`,
+    /// so §8.2's delete leaves the pane alone, and still `detached`, because
+    /// `R` skips on that flag alone and a shell pane that stopped reading as
+    /// detached would be respawned over the operator's live shell
+    /// (`restart::plan`). Parked is detached and not shell; anything else is
+    /// no latch, exactly as before.
+    #[test]
+    fn parse_pane_line_reads_the_shell_value_as_detached_too() {
+        let row = |v: &str| {
+            parse_pane_line(&format!("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t{v}"))
+                .expect("parses")
+        };
+        let shell = row(LATCH_SHELL);
+        assert!(shell.detached, "a shell pane is a detached pane");
+        assert!(shell.shell);
+        let parked = row(LATCH_PARKED);
+        assert!(parked.detached && !parked.shell, "parked is detached, not shell");
+        let never = row("");
+        assert!(!never.detached && !never.shell);
+        let other = row("2");
+        assert!(!other.detached && !other.shell, "an unknown value is no latch");
     }
 
     /// REGRESSION (grouped sessions). `tmux new-session -t ccmux` shares the

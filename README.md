@@ -115,7 +115,7 @@ environment-variable equivalent of `--socket`.
 | `s` | Open in a **horizontal** split (vim geometry: stacked), then spread the panes evenly down the height | no |
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane. Still closes a pane you have detached from, even though nothing marks it as open any more | no |
-| `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree, and close every pane ccmux had it open in. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
+| `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree, and close every pane ccmux still had parked on it — a pane you took to the `s` shell is yours and stays. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
 | `n` | Dispatch a new background session with a typed task — the cwd field takes `~` paths, `Tab`-completes directories, and offers to create a missing directory (see below) | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
 | `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
@@ -190,12 +190,15 @@ The sidebar stops claiming that pane the moment you detach. The `▌` goes out,
 the tab badge disappears, `Enter` opens a fresh pane rather than sending you
 back to a prompt you left, and `R` will not respawn it. What does not change is
 ownership: it is still a pane ccmux opened, so `x` still closes it — and a
-session you **delete** (`Ctrl-x` twice) has its panes closed for you, parked or
-not, rather than left offering a resume that cannot work. Resume it
+session you **delete** (`Ctrl-x` twice) has its parked panes closed for you
+rather than left offering a resume that cannot work. Resume it
 with **enter** and the sidebar takes it back — the pane says so itself. Attach
 by hand from the `s` shell and it does **not**: from the outside a `claude`
 process does not say which session it is showing, so that pane stays yours, and
-`Enter` gives the session a pane of its own.
+`Enter` gives the session a pane of its own. The `s` shell is yours in the
+same way: the pane tells ccmux it has become a shell, a delete leaves it alone
+whatever you are running in it, and you close it yourself — `x` while its row
+is still listed, or `exit`, like any shell.
 
 ### Overlays and modes
 
@@ -478,14 +481,18 @@ that is known to have lost rows concludes nothing at all.
   uncommitted work in that worktree goes with it. Nothing undoes that; `u`
   undoes a dismissal, never a delete.
 - A delete that went through also **closes every pane** ccmux had that session
-  open in — in every tab, a pane you had already detached from included. The
-  prompt those panes park on offers a resume, and after `claude rm` there is
-  nothing left to resume; leaving them meant pressing `q` in a pane with
-  nothing to show. Only the delete does this. The first press leaves its pane
-  parked on purpose: a stopped session is still there, and **enter** resumes
-  it. The panes are closed the way `x` closes one — never a sidebar, never a
-  pane outside ccmux's own session — and only after `claude rm` has returned
-  success, so a refusal reaches no pane at all.
+  open in — in every tab, a pane you had already detached from and left parked
+  included. The prompt those panes park on offers a resume, and after
+  `claude rm` there is nothing left to resume; leaving them meant pressing `q`
+  in a pane with nothing to show. A pane you answered `s` in is **not** closed:
+  it is your shell now, whatever is running in it or attached from it, and
+  the pane itself tells ccmux so; you close it yourself, with `x` while its
+  row is still listed or with `exit` like any shell. Only the delete does
+  this. The first press leaves its pane parked on purpose: a stopped session
+  is still there, and **enter** resumes it. The panes are closed the way `x`
+  closes one — never a sidebar, never a pane outside ccmux's own session — and
+  only after `claude rm` has returned success, so a refusal reaches no pane at
+  all.
 - `claude rm` refuses rather than destroying unpushed work: a worktree holding
   unpushed commits or uncommitted changes is **kept**, and ccmux shows the
   refusal in full. The pane is left exactly as it was, still showing the

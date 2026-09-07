@@ -674,6 +674,7 @@ mod tests {
             session_clients: 1,
             window_viewers: Some(1),
             detached: false,
+            shell: false,
         }
     }
 
@@ -849,6 +850,25 @@ mod tests {
         let tabs = vec![tab("@1", Some("%1"), &[("%2", "")]), tab("@2", None, &[("%2", "")])];
         let p = plan(&tabs, &panes, None);
         assert_eq!((p.unattachable, p.skipped()), (1, 1));
+    }
+
+    /// The latch's second value. `s` re-writes it as `shell`, which the parser
+    /// reads as `detached` too (`tmux::parse_pane_line`), so the operator's
+    /// shell is skipped here on the same flag as the parked prompt: there is
+    /// no attach in it to restart, and respawning it would destroy whatever
+    /// they are running. §8.2's delete is the only reader that tells the two
+    /// apart, and it is not this one.
+    #[test]
+    fn a_pane_marked_as_the_operators_shell_is_skipped_like_a_parked_one() {
+        let mut shell = pane("%2", "@1");
+        shell.detached = true;
+        shell.shell = true;
+        let panes = vec![pane("%1", "@1"), shell];
+        let tabs = vec![tab("@1", Some("%1"), &[("%2", "aaaaaaaa")])];
+        let p = plan(&tabs, &panes, None);
+        assert_eq!(ids(&p), vec!["%1"], "the shell is not a target");
+        assert_eq!((p.claude, p.detached), (0, 1));
+        assert!(p.agent_ids().is_empty(), "and nothing would stop its agent");
     }
 
     /// A sidebar is restarted on the marker, not on the map, so the latch — a
