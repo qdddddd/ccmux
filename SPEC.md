@@ -1664,7 +1664,7 @@ The section number is kept so §5.5 does not move.
 | `x` closes a pane | `map.remove(pane)`; `map_dirty = true` |
 | pane disappears (user killed it, or `claude attach` exited and the pane closed) | dropped by `reconcile` |
 | `Ctrl+X` stops a session | no map change; its pane stays until the operator closes it |
-| `Ctrl+X` deletes a session (second press) | no map change; the pane stays and its trailer reports the exit |
+| `Ctrl+X` deletes a session (second press) | `claude rm` Ok: every pane mapped to it, in every tab, is killed through `x`'s own path — own-window entries `map.remove(pane)`; `map_dirty = true`; another tab's entry is left to its owner (§8.2). `claude rm` refused: no map change; the pane stays, showing the refusal |
 
 Double-attach is legal (PROBE-FINDINGS §3), so a session may legitimately map to
 several panes — including one per tab. `pane_for_session` returns the one in the
@@ -2091,7 +2091,9 @@ not through the inner function, for exactly this reason.
    just-stopped session undeletable.
 4. Otherwise `claude stop <short_id>`.
    - Ok → force a refresh, open the window, flash `stopped <label>` (Info). The
-     pane, if any, is **left open** — closing it is the operator's separate `x`.
+     pane, if any, is **left open** — parked on its resume prompt, which is
+     correct for a session that still exists. Closing it is the operator's
+     separate `x`, or the second press below.
    - Err → flash `stop failed: <stderr first line>` (Error) and open **no**
      window. The escalation is only ever an escalation of a stop that happened.
 
@@ -2124,14 +2126,44 @@ spent inside the shell-out.
 - The press SCHEDULES the delete; it does not run it (see the settle below).
 - Before `claude rm`, the CAPTURED short id is re-validated against
   `app.sessions`. Absent → flash `session <id> is gone — not deleted` (Warn).
-- Ok → flash `deleted <label> + worktree` (Warn) and force a refresh.
+- Ok → **close every pane ccmux has the captured `session_id` open in**, in
+  every tab, a pane the wrapper has already parked (`@ccmux_detached`) for it
+  included. The session is gone, so the prompt such a pane parks on
+  (`enter=resume  s=shell  q=close pane`) offers a resume that cannot work,
+  and leaving it meant the operator pressing `q` in a pane with nothing to
+  show — the pane this step exists for. The set is
+  `union(every map's panes_for_session) ∩ live panes`, read the way
+  `rebuild_open` reads (`App::panes_showing`), after one `refresh_panes`,
+  because the settle runs from the tick and the inventory can be a
+  `tick_interval` old. Each pane goes through `kill_owned_pane`, the ONE kill
+  path in the crate and the one `x` uses (§8.5): a sidebar is skipped and not
+  counted, the kill is R2-gated on a validated `PaneId`, an own-window entry is
+  `map.remove`d and the map dirtied, another tab's entry is left to its owner.
+  `settle_after_kill` then runs once — refresh, map flush, `even_content` only
+  if MY window lost a pane, pin. A pane tmux refuses to kill is left on screen
+  for `x`. Degraded mode closes nothing and touches no tmux.
+
+  The rm comes FIRST, then the kills, never the other way round: `rm` is what
+  makes the attach exit, so by the time it returns the wrapper is parked and
+  killing it is clean — and a refused rm reaches no kill at all, so a pane
+  showing a session that still exists is never destroyed on the strength of a
+  delete that did not happen.
+
+  Then flash `deleted <label> + worktree` (Warn), with ` · closed N panes`
+  (`· closed 1 pane` for one) appended when anything closed, and force a
+  refresh. With the count the line is ~50 columns, so at the 34-column
+  default it wraps through §6.8's overflow path like the arm hint does. The
+  `cx_last_press` re-stamp below stays LAST: the kills are one more blocking
+  shell-out on this path.
 - Err → flash `delete failed: <first line>` (Error). The line comes from stderr,
   or from **stdout when stderr is blank**: `claude rm` refuses to delete a
   worktree holding unpushed commits or uncommitted changes, and it prints that
   refusal on stdout while exiting 1 (PROBE-FINDINGS §2). Reading stderr alone
   renders `delete failed: exit 1` and drops the sentence that says the work is
   safe. This is the ONE case where a failure is good news, so it must be
-  legible.
+  legible. **No pane is touched**: it still shows a live or parked session and
+  the refusal text, and killing it would hide the one line that says the work
+  is safe.
 
 A press after the window has lapsed is a FIRST press again: it stops, it never
 deletes.
@@ -2318,6 +2350,14 @@ sessions in a row without leaving the list.
 7. tmux::pin_sidebar(...)
 8. flash "closed pane <index>[ in tab <N>] — agent still running" (Info)
 ```
+
+Steps 4–6 are `App::kill_owned_pane` and step 7 — with the refresh and the
+map flush around it — `App::settle_after_kill`. Those two ARE the kill path:
+§8.2's delete closes a session's panes through the same pair, once per pane and
+one settle, so the sidebar refusal, the R2 gate, the own-window-only unmap and
+the `killed_here` gate on the even-layout are written exactly once in the crate.
+Both verbs reach `tmux::kill_pane` through `App::kill_pane`, a seam of the
+`respawn` kind, so a hermetic test can prove WHICH panes a verb kills.
 
 **`x` is unconditionally safe here, and only because of what is listed.**
 PROBE-FINDINGS §3 verified that killing a pane leaves the agent running — *for

@@ -1533,6 +1533,7 @@ mod tests {
             // reaching into `agents`, which must be impossible.
             pending_restart: None,
             respawn: |_, _, _| panic!("ui test reached respawn_pane"),
+            kill_pane: |_, _| panic!("ui test reached kill_pane"),
             probe: |_| panic!("ui test reached restart::probe"),
             dispatch: |_, _| panic!("ui test reached dispatch_background"),
             // `ui` draws; it never restarts anything. Both `R` seams panic so
@@ -2072,6 +2073,31 @@ mod tests {
         let rows = rows_at(&app, 34, 24);
         assert!(rows[23].contains("stopped af/reg"), "{:?}", rows[23]);
         assert!(rows[20].contains("name"), "detail block lost: {:?}", rows[20]);
+    }
+
+    /// `Ctrl+X`'s delete flash grew a pane count (§8.2). With it the line is
+    /// ~50 columns, over the 34-column default, so it has to wrap through the
+    /// same overflow path as the arm hint — and every word has to survive,
+    /// because the tail is the half that says what happened to the panes.
+    #[test]
+    fn the_counted_delete_flash_wraps_at_the_default_width() {
+        let mut app = app_with(many(3));
+        // Verbatim from `App::run_delete`.
+        const FLASH: &str = "deleted bt/reg-update + worktree · closed 2 panes";
+        assert!(
+            display_width(FLASH) > 34,
+            "fixture is no longer over-width, so it proves nothing: {FLASH:?}"
+        );
+        app.message = Some((FLASH.into(), MsgLevel::Warn));
+        let rows = rows_at(&app, 34, 24);
+        let tail = rows[20..].join(" ");
+        let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(FLASH),
+            "the message was clipped instead of wrapped: {tail:?}"
+        );
+        // The count is the tail, and the tail is what the wrap exists for.
+        assert!(flat.ends_with("closed 2 panes"), "{flat:?}");
     }
 
     #[test]

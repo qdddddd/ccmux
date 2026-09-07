@@ -469,10 +469,35 @@ fn full_argv(args: &[&str]) -> Result<Vec<String>, TmuxError> {
     Ok(argv)
 }
 
+/// STRUCTURAL hermeticity for the unit suite. `cargo test` runs on the same
+/// machine as the operator's live tmux server, and the default socket IS that
+/// server. Every hermetic test therefore has to stop short of a spawn, and
+/// until now that was discipline: a fixture with `degraded: false` reaching
+/// `refresh_panes` would run `list-panes` against the operator's socket and
+/// merely happen to be harmless. Under `cfg(test)` a spawn is refused outright
+/// unless a socket has been chosen explicitly — the ignored live tests all
+/// call `set_socket` first, and nothing hermetic ever does. `full_argv` runs
+/// before this so its `BadTarget` refusals keep their variant.
+#[cfg(test)]
+fn refuse_default_socket_under_test() -> Result<(), TmuxError> {
+    if socket().is_none() {
+        return Err(TmuxError::NotFound(
+            "unit test reached the default tmux socket".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn refuse_default_socket_under_test() -> Result<(), TmuxError> {
+    Ok(())
+}
+
 /// The only place `std::process::Command::new("tmux")` appears for a captured
 /// command. Always argv; never `sh -c`; never a formatted shell string.
 pub fn tmux(args: &[&str]) -> Result<String, TmuxError> {
     let argv = full_argv(args)?;
+    refuse_default_socket_under_test()?;
     let out = Command::new("tmux")
         .args(&argv)
         .stdin(Stdio::null())
@@ -505,6 +530,7 @@ pub fn tmux_ok(args: &[&str]) -> bool {
 /// tmux spawning still lives in `tmux.rs`.
 fn tmux_inherit(args: &[&str]) -> Result<(), TmuxError> {
     let argv = full_argv(args)?;
+    refuse_default_socket_under_test()?;
     let status = Command::new("tmux")
         .args(&argv)
         .stdin(Stdio::inherit())

@@ -169,6 +169,15 @@ pub struct PendingDelete {
     pub at: Instant,
 }
 
+/// Why `App::kill_owned_pane` left a pane standing.
+#[derive(Debug)]
+enum KillRefused {
+    /// The pane is some tab's sidebar. Never a kill target, from any verb.
+    Sidebar,
+    /// tmux refused — R2's gate, or the pane was already gone.
+    Tmux(TmuxError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
     /// `n` — two fields: 0 = cwd, 1 = task text.
@@ -479,6 +488,14 @@ pub struct App {
     /// a tmux server. Production (`App::new`) points it at the real command.
     pub respawn: fn(&str, &PaneId, &str) -> Result<(), TmuxError>,
 
+    /// Seam for `tmux::kill_pane`, for the same reason `respawn` is one: `x`
+    /// and `Ctrl+X`'s second press both kill panes through `kill_owned_pane`,
+    /// and a hermetic test of WHICH panes a delete closes must be able to run
+    /// that path without a tmux server. R2 lives inside the real function —
+    /// `assert_in_session` on a validated `PaneId` — so the seam narrows
+    /// nothing. Production (`App::new`) points it at the real command.
+    pub kill_pane: fn(&str, &PaneId) -> Result<(), TmuxError>,
+
     /// Seam for `restart::probe`. The real one SPAWNS the candidate binary,
     /// and in a unit test the candidate is the test harness — `--version` is
     /// not a thing libtest answers, so every `R` test would exercise the
@@ -610,6 +627,7 @@ impl App {
 
             pending_restart: None,
             respawn: tmux::respawn_pane,
+            kill_pane: tmux::kill_pane,
             probe: restart::probe,
             dispatch: agents::dispatch_background,
             agents_poll: agents::poll,
@@ -1610,41 +1628,13 @@ impl App {
             self.flash("not open", MsgLevel::Warn);
             return;
         };
-        if self.is_any_sidebar(&pane) {
-            self.flash("refusing to close the sidebar", MsgLevel::Warn);
-            return;
-        }
-        // Read the index, the tab and the window before the kill; afterwards
-        // the pane is gone.
+        // Read the index and the tab before the kill; afterwards the pane is
+        // gone.
         let idx = self.pane_index_of(&pane);
         let where_ = self.tab_suffix(&pane);
-        // §1.4: `pane_of` spans tabs, so the pane about to die may be in
-        // ANOTHER window. Only the window that actually lost a pane is uneven,
-        // and only its own sidebar process lays it out — evening mine on
-        // someone else's kill would snap a layout my operator may have dragged
-        // by hand, which is the same fight the tick is kept out of.
-        let killed_here = self.sidebar_window().is_some()
-            && tmux::window_of(&self.panes, &pane) == self.sidebar_window();
-        match tmux::kill_pane(&self.tmux_session, &pane) {
-            Ok(()) => {
-                // A pane in ANOTHER tab is not mine to unmap: that window's
-                // option has exactly one writer and it is not this process. Its
-                // owner reconciles the entry away on its next tick, and until
-                // then every process already hides it, because `open` is
-                // rebuilt as `union(maps) ∩ live panes`.
-                if self.map.get(&pane).is_some() {
-                    self.map.remove(&pane);
-                    self.map_dirty = true;
-                }
-                self.refresh_panes();
-                self.save_map_now();
-                // §1.4: a kill leaves the survivors uneven. No `SplitDir` is in
-                // play here, so whatever clean shape they still form is the
-                // axis.
-                if killed_here {
-                    self.even_content(None);
-                }
-                self.pin_sidebar();
+        match self.kill_owned_pane(&pane) {
+            Ok(killed_here) => {
+                self.settle_after_kill(killed_here);
                 // §8.5's last step: this wording is the operator-facing
                 // statement of PROBE-FINDINGS §3, shown every time, so nobody
                 // confuses `x` with `Ctrl+X`.
@@ -1668,8 +1658,133 @@ impl App {
                     ),
                 }
             }
-            Err(e) => self.flash(format!("close failed: {}", tmux_msg(&e)), MsgLevel::Error),
+            Err(KillRefused::Sidebar) => {
+                self.flash("refusing to close the sidebar", MsgLevel::Warn);
+            }
+            Err(KillRefused::Tmux(e)) => {
+                self.flash(format!("close failed: {}", tmux_msg(&e)), MsgLevel::Error);
+            }
         }
+    }
+
+    /// THE kill. `x` and `Ctrl+X`'s second press both close panes through
+    /// here and nowhere else, so every rule a kill carries is written once:
+    ///
+    /// - a sidebar is never a target — with a sidebar per tab, "the sidebar"
+    ///   is no longer one pane, and closing another tab's would leave that
+    ///   tab blind until the next launch;
+    /// - the kill itself is R2-gated inside `tmux::kill_pane` (through the
+    ///   `kill_pane` seam), `assert_in_session` on a validated `PaneId`;
+    /// - a pane in ANOTHER tab is killed but NOT unmapped from here: that
+    ///   window's option has exactly one writer and it is not this process.
+    ///   Its owner reconciles the entry away on its next tick, and until then
+    ///   every process already hides it, because `open` is rebuilt as
+    ///   `union(maps) ∩ live panes`.
+    ///
+    /// Returns whether the pane was in the sidebar's own window — the one
+    /// fact `settle_after_kill` needs and cannot re-derive, because by then
+    /// the pane is gone from the inventory. §1.4: only the window that
+    /// actually lost a pane is uneven, and only its own sidebar process lays
+    /// it out — evening mine on someone else's kill would snap a layout my
+    /// operator may have dragged by hand, which is the same fight the tick is
+    /// kept out of.
+    ///
+    /// SAFE with respect to Claude sessions: PROBE-FINDINGS §3 proves the
+    /// agent survives a `kill-pane`, because every session ccmux lists is a
+    /// daemon-owned background one.
+    fn kill_owned_pane(&mut self, pane: &PaneId) -> Result<bool, KillRefused> {
+        if self.is_any_sidebar(pane) {
+            return Err(KillRefused::Sidebar);
+        }
+        let killed_here = self.sidebar_window().is_some()
+            && tmux::window_of(&self.panes, pane) == self.sidebar_window();
+        (self.kill_pane)(&self.tmux_session, pane).map_err(KillRefused::Tmux)?;
+        if self.map.get(pane).is_some() {
+            self.map.remove(pane);
+            self.map_dirty = true;
+        }
+        Ok(killed_here)
+    }
+
+    /// What follows a kill — or a run of them — exactly once: re-inventory,
+    /// flush my window's map, even my window if it is the one that lost a
+    /// pane, and re-pin the sidebar. `killed_here` is the OR of every
+    /// `kill_owned_pane` answer this settle is for. A kill leaves the
+    /// survivors uneven; no `SplitDir` is in play, so whatever clean shape
+    /// they still form is the axis.
+    ///
+    /// Callers flash AFTER this, not before: `save_map_now` has a flash of
+    /// its own on failure, and the verb's own message must be the one left
+    /// standing.
+    fn settle_after_kill(&mut self, killed_here: bool) {
+        self.refresh_panes();
+        self.save_map_now();
+        if killed_here {
+            self.even_content(None);
+        }
+        self.pin_sidebar();
+    }
+
+    /// `Ctrl+X`'s second press, after `claude rm` returned Ok: close every
+    /// pane ccmux has `session_id` open in — in every tab, and including one
+    /// the wrapper has already parked (`@ccmux_detached`) for this session,
+    /// which is the exact pane that used to be left behind. Returns how many
+    /// closed.
+    ///
+    /// AFTER the rm, never before. `rm` is what makes the attach exit, so by
+    /// the time it returns the pane is parked and killing the wrapper is
+    /// clean; and if `rm` refuses, nothing here runs and the pane keeps
+    /// showing a session that still exists, refusal text and all.
+    ///
+    /// A pane this cannot kill is simply left where it is, on screen, for
+    /// `x`; a sidebar is skipped and never counted. Degraded mode has no
+    /// panes to close and touches no tmux.
+    fn close_panes_of(&mut self, session_id: &str) -> usize {
+        if self.degraded {
+            return 0;
+        }
+        // The inventory can be a `tick_interval` old: this runs from the
+        // event-loop tick, not from a keypress that just refreshed.
+        self.refresh_panes();
+        let targets = self.panes_showing(session_id);
+        let mut closed = 0usize;
+        let mut killed_here = false;
+        for pane in &targets {
+            if let Ok(here) = self.kill_owned_pane(pane) {
+                closed += 1;
+                killed_here |= here;
+            }
+        }
+        if closed > 0 {
+            self.settle_after_kill(killed_here);
+        }
+        closed
+    }
+
+    /// Every live pane mapped to `session_id`, across every tab, ascending.
+    /// Double-attach is legal (PROBE-FINDINGS §3), so this may be several.
+    ///
+    /// Read the way `rebuild_open` reads: my window's map is `self.map`, the
+    /// record this process writes, and the copy under my own `TabInfo` is a
+    /// stored shadow that may lag it, so that one is skipped; every other
+    /// tab's map is read from its window. Intersected with the live inventory
+    /// when there is one, exactly as `open` is — a pane a map still names but
+    /// tmux no longer has is not a target, and R2 would only refuse it.
+    fn panes_showing(&self, session_id: &str) -> Vec<PaneId> {
+        let mine = self.own_window.as_ref();
+        let mut out = self.map.panes_for_session(session_id);
+        for tab in &self.tabs {
+            if Some(&tab.window) == mine {
+                continue;
+            }
+            out.extend(tab.map.panes_for_session(session_id));
+        }
+        out.sort_by_key(PaneId::num);
+        out.dedup();
+        if !self.panes.is_empty() {
+            out.retain(|p| self.panes.iter().any(|i| &i.id == p));
+        }
+        out
     }
 
     // ── `Ctrl+X` — stop, and again inside the window to delete (§8.2) ───────
@@ -1881,7 +1996,19 @@ impl App {
         }
         match agents::delete(&arm.short_id) {
             Ok(()) => {
-                self.flash(format!("deleted {label} + worktree"), MsgLevel::Warn);
+                // The session is gone, so every pane showing it has nothing
+                // left to resume: its wrapper has parked on a prompt whose
+                // `enter` cannot work. Close them — all of them, across tabs.
+                // A STOP leaves its pane parked on purpose (resume is valid
+                // there); only a delete gets this far.
+                let closed = self.close_panes_of(&arm.session_id);
+                let mut msg = format!("deleted {label} + worktree");
+                match closed {
+                    0 => {}
+                    1 => msg.push_str(" · closed 1 pane"),
+                    n => msg.push_str(&format!(" · closed {n} panes")),
+                }
+                self.flash(msg, MsgLevel::Warn);
                 self.act_force_refresh();
             }
             Err(e) => self.flash(
@@ -1890,8 +2017,9 @@ impl App {
             ),
         }
         // Same re-stamp, same reason as `act_ctrl_x`'s, for the other blocking
-        // shell-out on this path: `claude rm` plus the forced refresh freezes
-        // the UI for about as long as `claude stop` does, and this one runs
+        // shell-outs on this path: `claude rm`, the pane kills and the forced
+        // refresh freeze the UI for at least as long as `claude stop` does —
+        // which is why this stays the LAST thing here — and this one runs
         // from the event-loop tick where no keypress stamped anything at all.
         // Without it a `Ctrl+X` buffered during the freeze dequeues with a
         // stale gap, reads as a fresh FIRST press, and stops whatever row the
@@ -3881,6 +4009,9 @@ mod tests {
             // the operator's live server. A test that exercises `R` installs
             // its own recording stub.
             respawn: |_, _, _| panic!("unit test reached respawn_pane"),
+            // Same rule, same shape: the delete path kills panes, and a test
+            // of which ones installs its own recording stub.
+            kill_pane: |_, _| panic!("unit test reached kill_pane"),
             // The test harness is what argv[0] names here, and it answers no
             // `--version`. Tests that want the refusal path install their own.
             probe: |_| Ok(()),
@@ -4249,6 +4380,305 @@ mod tests {
     const BEAT: Duration = Duration::from_millis(1000);
     const _: () = assert!(BEAT.as_millis() > CX_MIN_GAP.as_millis());
     const _: () = assert!(BEAT.as_millis() < CX_WINDOW.as_millis());
+
+    // ── `Ctrl+X` twice closes the session's panes ───────────────────────────
+
+    thread_local! {
+        /// Every pane `kill_pane` was asked to kill, in order, with the tmux
+        /// session it was asked to kill it in.
+        static KILLS: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        /// Panes the stub refuses to kill, the way R2 refuses a dead one.
+        static KILL_REFUSED: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+        /// When the LAST kill returned — the re-stamp must come after it.
+        static LAST_KILL_AT: std::cell::RefCell<Option<Instant>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn recording_kill(session: &str, pane: &PaneId) -> Result<(), TmuxError> {
+        KILLS.with(|k| k.borrow_mut().push((session.to_string(), pane.to_string())));
+        LAST_KILL_AT.with(|t| *t.borrow_mut() = Some(Instant::now()));
+        let refused = KILL_REFUSED.with(|r| r.borrow().iter().any(|p| p == pane.as_str()));
+        if refused {
+            return Err(TmuxError::BadTarget(format!("pane {pane} is not in tmux session")));
+        }
+        Ok(())
+    }
+
+    /// The pane ids handed to `kill_pane`, in order.
+    fn kills() -> Vec<String> {
+        KILLS.with(|k| k.borrow().iter().map(|(_, p)| p.clone()).collect())
+    }
+
+    fn refuse_kill(pane: &str) {
+        KILL_REFUSED.with(|r| r.borrow_mut().push(pane.to_string()));
+    }
+
+    fn pid(s: &str) -> PaneId {
+        PaneId::parse(s).expect("pane id")
+    }
+
+    /// The shape of the live session this exists for. Tab 1 is mine: `%1` my
+    /// sidebar, `%2` beside it showing `1c45d64f`. Tab 2 has its own sidebar
+    /// `%4` and a content pane `%5`, held in THAT window's map — which also
+    /// shows `1c45d64f` when `double` is set (double-attach is legal, PROBE
+    /// §3). `1c45d64f` is loaded and selected.
+    fn deletable(a: &mut App, double: bool) {
+        own(a, "%1", "@1");
+        a.sidebar_pane = PaneId::parse("%1");
+        a.panes = vec![
+            pane("%1", 1, 0, 0, 34, false),
+            pane("%2", 1, 1, 35, 85, true),
+            pane("%4", 2, 0, 0, 34, false),
+            pane("%5", 2, 1, 35, 85, false),
+        ];
+        a.map.insert(&pid("%2"), entry("1c45d64f-uuid"));
+        let mut t1 = tab("@1", 1, Some("%1"));
+        t1.map = a.map.clone();
+        let mut t2 = tab("@2", 2, Some("%4"));
+        if double {
+            t2.map.insert(&pid("%5"), entry("1c45d64f-uuid"));
+        }
+        a.tabs = vec![t1, t2];
+        a.rebuild_open();
+        a.kill_pane = recording_kill;
+        KILLS.with(|k| k.borrow_mut().clear());
+        KILL_REFUSED.with(|r| r.borrow_mut().clear());
+        LAST_KILL_AT.with(|t| *t.borrow_mut() = None);
+        agents::test_spawn::reset();
+        load(a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        assert_eq!(a.selected_key.as_deref(), Some("1c45d64f-uuid"));
+    }
+
+    /// The deliberate gesture: press, a clear beat, press, and the settle.
+    fn delete_twice(a: &mut App) {
+        a.on_key(ctrl('x'));
+        after(a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(settle(a), "the settled delete must ask for a redraw");
+    }
+
+    /// THE bug. `claude rm` made the attach exit, the wrapper parked the pane
+    /// on `enter=resume  s=shell  q=close pane`, and the operator had to press
+    /// `q` in a pane with nothing left to resume. A successful delete now
+    /// closes the pane — through the seam `x` kills through, in ccmux's own
+    /// session, and unmaps it from my window's map.
+    #[test]
+    fn a_successful_delete_closes_the_sessions_pane() {
+        let mut a = app();
+        deletable(&mut a, false);
+
+        delete_twice(&mut a);
+
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
+        assert_eq!(kills(), vec!["%2"]);
+        KILLS.with(|k| {
+            assert!(
+                k.borrow().iter().all(|(s, _)| s == "ccmux-test"),
+                "every kill names ccmux's own session: {:?}",
+                k.borrow()
+            );
+        });
+        assert!(a.map.get(&pid("%2")).is_none(), "an own-window pane is unmapped, as `x` does");
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree · closed 1 pane");
+        assert_eq!(level, MsgLevel::Warn);
+        assert!(a.pending_delete.is_none());
+    }
+
+    /// Double-attach across tabs: BOTH panes close. The one in tab 2 is
+    /// killed but NOT unmapped from here — that window's option has one
+    /// writer and it is not this process; its owner reconciles it away.
+    #[test]
+    fn a_session_open_in_two_tabs_has_both_panes_closed() {
+        let mut a = app();
+        deletable(&mut a, true);
+
+        delete_twice(&mut a);
+
+        assert_eq!(kills(), vec!["%2", "%5"]);
+        assert!(a.map.get(&pid("%2")).is_none(), "mine: unmapped");
+        assert!(
+            a.tabs[1].map.get(&pid("%5")).is_some(),
+            "tab 2's entry is its owner's to remove, never this process's"
+        );
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree · closed 2 panes");
+    }
+
+    /// A refused `claude rm` — a worktree with unpushed work — closes NOTHING.
+    /// The pane still shows a session that exists, plus the one line saying
+    /// the work is safe, and killing it would hide that line.
+    #[test]
+    fn a_failed_delete_closes_nothing() {
+        let mut a = app();
+        deletable(&mut a, true);
+
+        a.on_key(ctrl('x'));
+        after(&mut a, BEAT);
+        // Queued AFTER the first press: `fail_next` takes the next intercepted
+        // call, and the first press's `claude stop` has already gone by.
+        agents::test_spawn::fail_next(
+            "Session 1c45d64f has a worktree with unpushed commits; not removing",
+        );
+        a.on_key(ctrl('x'));
+        settle(&mut a);
+
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
+        assert!(kills().is_empty(), "a refused rm reaches no kill: {:?}", kills());
+        assert!(a.map.get(&pid("%2")).is_some(), "the pane is still mapped");
+        assert!(a.tabs[1].map.get(&pid("%5")).is_some());
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(
+            text,
+            "delete failed: Session 1c45d64f has a worktree with unpushed commits; not removing"
+        );
+        assert_eq!(level, MsgLevel::Error);
+    }
+
+    /// The FIRST press is a stop, and a stopped session is still there to
+    /// resume, so its pane stays parked on the prompt where `enter` resumes
+    /// it. Unchanged.
+    #[test]
+    fn the_first_ctrl_x_still_parks_the_pane_and_closes_nothing() {
+        let mut a = app();
+        deletable(&mut a, true);
+
+        a.on_key(ctrl('x'));
+
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f"]);
+        assert!(kills().is_empty(), "{:?}", kills());
+        assert!(a.map.get(&pid("%2")).is_some());
+        assert!(a.stop_arm.is_some(), "and the delete window is open");
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "stopped bt/reg-update");
+    }
+
+    /// A map that names a sidebar — the shape a corrupt or hand-edited option
+    /// could produce — never turns the sidebar into a kill target. It is
+    /// skipped, not counted, and left mapped for its owner to sort out.
+    #[test]
+    fn the_sidebar_is_never_a_delete_kill_target() {
+        let mut a = app();
+        deletable(&mut a, false);
+        a.map.insert(&pid("%1"), entry("1c45d64f-uuid"));
+        a.tabs[1].map.insert(&pid("%4"), entry("1c45d64f-uuid"));
+        a.rebuild_open();
+
+        delete_twice(&mut a);
+
+        assert_eq!(kills(), vec!["%2"], "neither tab's sidebar is killed");
+        assert!(a.map.get(&pid("%1")).is_some(), "a refused kill unmaps nothing");
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree · closed 1 pane");
+    }
+
+    /// A pane tmux refuses to kill — R2, or already gone — is left where it
+    /// is, still mapped, and the count says only what actually closed.
+    #[test]
+    fn a_refused_kill_is_left_mapped_and_not_counted() {
+        let mut a = app();
+        deletable(&mut a, true);
+        refuse_kill("%2");
+
+        delete_twice(&mut a);
+
+        assert_eq!(kills(), vec!["%2", "%5"], "the refusal does not stop the run");
+        assert!(a.map.get(&pid("%2")).is_some(), "a pane that did not die stays mapped");
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree · closed 1 pane");
+    }
+
+    /// No pane at all: the flash is exactly what it was — the count is only
+    /// appended when there is one to report.
+    #[test]
+    fn a_delete_with_no_pane_flashes_the_bare_line() {
+        let mut a = app();
+        deletable(&mut a, false);
+        a.map = PaneMap::new();
+        a.tabs[0].map = PaneMap::new();
+        a.rebuild_open();
+
+        delete_twice(&mut a);
+
+        assert!(kills().is_empty());
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted bt/reg-update + worktree");
+    }
+
+    /// A pane a map still names but the inventory no longer has is not a
+    /// target: `x`'s R2 gate would only refuse it, at the cost of a spawn.
+    #[test]
+    fn a_dead_pane_in_a_map_is_not_a_kill_target() {
+        let mut a = app();
+        deletable(&mut a, true);
+        a.panes.retain(|p| p.id.as_str() != "%5");
+        a.rebuild_open();
+
+        delete_twice(&mut a);
+
+        assert_eq!(kills(), vec!["%2"]);
+    }
+
+    /// The re-stamp of `cx_last_press` must survive, and it must come AFTER
+    /// the kills: they are one more blocking shell-out on this path, and a
+    /// `Ctrl+X` buffered through them has to read as the burst it is.
+    #[test]
+    fn the_re_stamp_after_a_delete_comes_after_the_kills() {
+        let mut a = app();
+        deletable(&mut a, true);
+
+        delete_twice(&mut a);
+
+        let killed_at = LAST_KILL_AT.with(|t| *t.borrow()).expect("something was killed");
+        let stamped = a.cx_last_press.expect("run_delete re-stamps");
+        assert!(stamped >= killed_at, "the re-stamp must follow the last kill");
+        // And it does what it is for: a press dequeued now is a burst.
+        assert_eq!(a.on_key(ctrl('x')), Action::Redraw);
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "too fast — press Ctrl+X again"
+        );
+        assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
+    }
+
+    /// `x` goes through the SAME path, and is unchanged by it: one pane, the
+    /// one beside this sidebar, unmapped and announced as before.
+    #[test]
+    fn x_closes_one_pane_through_the_shared_path() {
+        let mut a = app();
+        deletable(&mut a, true);
+
+        a.on_key(press('x'));
+
+        assert_eq!(kills(), vec!["%2"], "`x` closes the pane in MY tab, and only it");
+        assert!(a.map.get(&pid("%2")).is_none());
+        assert!(a.tabs[1].map.get(&pid("%5")).is_some(), "tab 2's pane is untouched");
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "closed pane 1 — agent still running");
+        assert_eq!(level, MsgLevel::Info);
+        assert!(agents::test_spawn::joined().is_empty(), "`x` never reaches `claude`");
+    }
+
+    /// `x` on a session open only in ANOTHER tab kills that pane and unmaps
+    /// nothing here — the rule the shared path carries for the delete too.
+    #[test]
+    fn x_in_another_tab_kills_but_does_not_unmap() {
+        let mut a = app();
+        deletable(&mut a, true);
+        a.map = PaneMap::new();
+        a.tabs[0].map = PaneMap::new();
+        a.rebuild_open();
+
+        a.on_key(press('x'));
+
+        assert_eq!(kills(), vec!["%5"]);
+        assert!(a.tabs[1].map.get(&pid("%5")).is_some());
+        assert!(!a.map_dirty, "nothing of mine changed");
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "closed pane 1 in tab 2 — agent still running");
+    }
 
     /// THE placement test. `key_normal` matches top-down and ends its Ctrl
     /// block with `_ if ctrl => Action::None`; a `Ctrl+X` arm below that line
