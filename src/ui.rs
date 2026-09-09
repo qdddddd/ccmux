@@ -1513,6 +1513,7 @@ mod tests {
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
+            pending_jump: None,
             message: None,
             msg_deadline: None,
             poll_error: None,

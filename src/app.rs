@@ -169,6 +169,64 @@ pub struct PendingDelete {
     pub at: Instant,
 }
 
+/// Polls a `PendingJump` gets to find its session before it is dropped.
+///
+/// Counted in POLLS, not seconds, and that is the point: the sidebar's poll
+/// cadence is not a constant. The idle ladder stretches it toward `IDLE_MAX`,
+/// a failure streak adds `BACKOFF`, and the §4.2 gate stops it dead while
+/// nobody is looking at this tab — so any wall-clock deadline would expire the
+/// intent during a gap in which the sidebar learned NOTHING. A poll budget only
+/// burns down on evidence: eight consecutive complete answers from
+/// `claude agents` that do not mention the id are eight refutations, whatever
+/// they took in wall time.
+///
+/// Eight is generous against the one thing it has to cover. `dispatch_and_close`
+/// forces a poll immediately, and the daemon lists a `--bg` session on that poll
+/// or the next; the remaining slack absorbs a couple of failed polls without
+/// spending the operator's jump on them.
+const JUMP_POLLS: u32 = 8;
+
+/// `n`'s cursor intent: move the selection onto the session just dispatched,
+/// once it appears (§8.6).
+///
+/// It has to be an intent rather than a move because the row does not exist
+/// yet. `claude --bg` returns as soon as the daemon accepts the task, and the
+/// forced poll that follows usually runs before the session is listed — so a
+/// one-shot "select it now" would miss, and pointing `selected_key` at an
+/// absent key would hand the cursor to `reanchor_selection`'s nearest-index
+/// fallback and park it on an unrelated row. Exactly the trap
+/// `act_undo_dismiss` documents.
+///
+/// THE INTENT IS CANCELLED THE MOMENT THE OPERATOR MOVES THE CURSOR, by
+/// `cancel_pending_jump` at the three places that move it deliberately:
+/// `set_selected` (`j` `k` `g` `G` `Ctrl-d` `Ctrl-u` `Tab` all funnel through
+/// it), `act_dismiss` (`d` re-points at a neighbour) and `act_undo_dismiss`
+/// (`u` follows the restored row). A jump that yanks the selection out from
+/// under a keypress is worse than no jump at all.
+///
+/// An EAGER cancel, deliberately, and not a `selected_key` snapshot compared at
+/// fire time. A snapshot cannot tell the operator apart from
+/// `reanchor_selection`, which re-points `selected_key` by itself whenever the
+/// row under the cursor leaves the list — and, worse, whenever the cursor had
+/// no key to start with. Dispatch from an EMPTY list is exactly that: the
+/// snapshot would be `None`, the first arriving poll would park the cursor on
+/// the first row through the nearest-index fallback, and the comparison would
+/// read that as "the operator moved" and cancel the jump on the one screen
+/// where it is most obviously wanted. The three sites above are the complete
+/// set of deliberate moves (nothing else assigns `selected` or `selected_key`),
+/// so naming them is both narrower and correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingJump {
+    /// The 8-hex short id `claude --bg` printed. Matched against `Session::id`,
+    /// because that is the only identifier the dispatch gets back; the cursor
+    /// is then driven with the row's `session_id`, which is what `key_at`
+    /// returns and what `reanchor_selection` searches for. THE KEY MISMATCH is
+    /// the whole reason this is a lookup and not an assignment.
+    pub short_id: String,
+    /// Polls left before the intent is dropped. See `JUMP_POLLS`.
+    pub polls_left: u32,
+}
+
 /// Why `App::kill_owned_pane` left a pane standing.
 #[derive(Debug)]
 enum KillRefused {
@@ -416,6 +474,11 @@ pub struct App {
     pub cx_last_press: Option<Instant>,
     /// A qualifying second press, waiting out `CX_SETTLE`; see the constant.
     pub pending_delete: Option<PendingDelete>,
+    /// `n`'s cursor intent, waiting for the dispatched session to be listed.
+    /// See `PendingJump`. `None` is the normal state — at most one is ever
+    /// live, and a second `n` replaces the first (the newest dispatch is the
+    /// one the operator is watching for).
+    pub pending_jump: Option<PendingJump>,
 
     pub message: Option<(String, MsgLevel)>,
     pub msg_deadline: Option<Instant>,
@@ -508,7 +571,7 @@ pub struct App {
     /// operator's real `claude` — `CCMUX_CLAUDE_BIN` cannot serve, because
     /// `claude_bin()` is a process-wide `OnceLock` that other tests may have
     /// already resolved to `claude`.
-    pub dispatch: fn(&str, &str) -> Result<(), AgentsError>,
+    pub dispatch: fn(&str, &str) -> Result<Option<String>, AgentsError>,
 
     /// Seam for `agents::poll`, for `R`'s agent pass ONLY — `tick` still hands
     /// `poll_step` the real function directly.
@@ -591,6 +654,7 @@ impl App {
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
+            pending_jump: None,
 
             message: None,
             msg_deadline: None,
@@ -672,6 +736,9 @@ impl App {
     ///      — 4 and 4b are `apply_poll`, which is where their whole policy
     ///      lives so it can be tested without shelling out to `claude`
     ///   5. rebuild rows, re-anchor selection by selected_key
+    ///      5b. settle `n`'s pending cursor jump against the rebuilt rows —
+    ///      `tick_pending_jump`, which needs both the fresh `sessions` and the
+    ///      rows the filters just decided
     ///   6. flush the map if map_dirty, and the dismissed set if hidden_dirty
     ///   7. pin_sidebar (unconditional, §1.3)
     ///   8. last_poll = Instant::now()
@@ -696,10 +763,13 @@ impl App {
         // touches `poll_error`, `fail_streak`, or `reconcile_hidden`'s
         // two-strike debounce, so the header stays healthy and no dismissal
         // ages toward being dropped on the strength of a poll never taken.
-        self.poll_step(agents::poll);
+        let polled = self.poll_step(agents::poll);
 
         // 5
         self.rebuild_rows();
+
+        // 5b — `n`'s cursor intent, once the rows it asks about are rebuilt.
+        self.tick_pending_jump(polled);
 
         // 6
         self.save_map_now();
@@ -1402,6 +1472,64 @@ impl App {
         self.selected = nearest;
         self.selected_key = self.key_at(nearest);
         self.clamp_scroll();
+    }
+
+    /// Step 5b of `tick`: settle `pending_jump` against the list as it now
+    /// stands (§8.6). `polled` is `poll_step`'s answer — did `claude agents`
+    /// actually run this tick.
+    ///
+    /// Runs AFTER `rebuild_rows`, because both questions it asks are about the
+    /// rebuilt list: is the session listed at all (`sessions`), and does it have
+    /// a ROW (`is_visible` — `/`, `a` and `d` all decide that).
+    pub fn tick_pending_jump(&mut self, polled: bool) {
+        let Some(jump) = self.pending_jump.clone() else {
+            return;
+        };
+        let found = self
+            .sessions
+            .iter()
+            .find(|s| s.id.as_deref() == Some(jump.short_id.as_str()));
+        let Some(sess) = found else {
+            // Not listed yet. Only a poll that actually ran is evidence of
+            // absence, so only a poll spends budget: a tick whose gate was shut
+            // learned nothing and must not be allowed to time the intent out.
+            if polled {
+                let left = jump.polls_left.saturating_sub(1);
+                // Dropped SILENTLY at zero. The dispatch already flashed, and
+                // it was telling the truth — the agent is running either way,
+                // and only the cursor move is owed. A warning arriving eight
+                // polls later would land on a screen the operator has long
+                // since moved on from, attached to no keypress of theirs.
+                self.pending_jump = if left == 0 {
+                    None
+                } else {
+                    Some(PendingJump { polls_left: left, ..jump })
+                };
+            }
+            return;
+        };
+        // THE KEY MISMATCH resolved: `--bg` named it by short id, the cursor is
+        // keyed by uuid. Everything from here is the ordinary `selected_key` /
+        // `reanchor_selection` path — there is no second selection mechanism.
+        let session_id = sess.session_id.clone();
+        let label = session_label(sess);
+        self.pending_jump = None;
+        if self.is_visible(&session_id) {
+            self.selected_key = Some(session_id);
+            self.reanchor_selection();
+        } else {
+            // `/` or `a` is hiding it. Clearing the operator's filter to chase
+            // a row they did not ask to see would be a far bigger surprise than
+            // a cursor that stayed put, so say so instead — the precedent `u`
+            // set with `restored X — filtered out`.
+            self.flash(format!("dispatched {label} — filtered out"), MsgLevel::Warn);
+        }
+    }
+
+    /// Drop `n`'s cursor intent because the operator just moved the cursor.
+    /// Called from every deliberate move; see `PendingJump`.
+    fn cancel_pending_jump(&mut self) {
+        self.pending_jump = None;
     }
 
     pub fn clamp_scroll(&mut self) {
@@ -2112,6 +2240,7 @@ impl App {
         // absence rather than two.
         self.hidden_absent.remove(&id);
         self.selected_key = neighbour;
+        self.cancel_pending_jump();
         self.hidden_dirty = true;
         self.rebuild_rows();
         if owns_pane {
@@ -2151,6 +2280,7 @@ impl App {
         let visible = self.is_visible(&id);
         if visible {
             self.selected_key = Some(id.clone());
+            self.cancel_pending_jump();
             self.reanchor_selection();
         }
 
@@ -2667,14 +2797,26 @@ impl App {
     /// so the flash names what now exists on disk even if dispatch then fails.
     fn dispatch_and_close(&mut self, cwd: &str, task: &str, created: Option<String>) {
         match (self.dispatch)(cwd, task) {
-            Ok(()) => {
+            Ok(short_id) => {
                 self.prompt = None;
                 self.mode = Mode::Normal;
                 match created {
                     Some(c) => self.flash(format!("created {c} — dispatched background session"), MsgLevel::Info),
                     None => self.flash("dispatched background session", MsgLevel::Info),
                 }
-                // ccmux does NOT auto-open it — the operator decides.
+                // The CURSOR follows the new session; the PANE does not. ccmux
+                // still does NOT auto-open it — the operator decides with
+                // `Enter` — but it no longer makes the operator hunt for the row
+                // their own keypress just created.
+                //
+                // ARMED here rather than acted on here, because the row does not
+                // exist yet: see `PendingJump`. `short_id` is `None` when the
+                // CLI's banner could not be parsed, and then this is exactly the
+                // old behaviour — flash, refresh, cursor untouched.
+                self.pending_jump = short_id.map(|short_id| PendingJump {
+                    short_id,
+                    polls_left: JUMP_POLLS,
+                });
                 self.act_force_refresh();
             }
             Err(e) => {
@@ -2741,6 +2883,9 @@ impl App {
     }
 
     fn set_selected(&mut self, i: usize) {
+        // The funnel every cursor verb goes through, which makes it the one
+        // place `n`'s pending jump has to be cancelled from (see `PendingJump`).
+        self.cancel_pending_jump();
         self.selected = i;
         self.selected_key = self.key_at(i);
         self.clamp_scroll();
@@ -3998,6 +4143,7 @@ mod tests {
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
+            pending_jump: None,
             message: None,
             msg_deadline: None,
             poll_error: None,
@@ -6417,9 +6563,19 @@ mod tests {
             const { std::cell::RefCell::new(Vec::new()) };
     }
 
-    fn recording_dispatch(cwd: &str, task: &str) -> Result<(), AgentsError> {
+    /// The seam as the CLI behaved BEFORE it was parsed for an id — and as it
+    /// behaves again whenever the banner changes shape. `Ok(None)` is the
+    /// degraded case, and every pre-existing §8.6 test runs through it, which
+    /// is what proves the degradation is exactly today's behaviour.
+    fn recording_dispatch(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
         DISPATCHED.with(|d| d.borrow_mut().push((cwd.to_string(), task.to_string())));
-        Ok(())
+        Ok(None)
+    }
+
+    /// The seam as the real CLI behaves: it hands back the short id.
+    fn recording_dispatch_with_id(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+        DISPATCHED.with(|d| d.borrow_mut().push((cwd.to_string(), task.to_string())));
+        Ok(Some("e44654bf".to_string()))
     }
 
     fn dispatched() -> Vec<(String, String)> {
@@ -6901,6 +7057,353 @@ mod tests {
             "the backoff outranked the visibility edge"
         );
         assert_eq!(a.fail_streak, 0, "the forced poll did not clear the streak");
+    }
+
+    // ── §8.6: `n` moves the cursor onto the session it dispatched ───────────
+
+    /// The three rows the fixture starts with, cursor on the first.
+    fn three() -> Vec<Session> {
+        vec![
+            bg("aaaaaaaa", "one", State::Working),
+            bg("bbbbbbbb", "two", State::Working),
+            bg("cccccccc", "three", State::Working),
+        ]
+    }
+
+    /// Those three plus the session `n` just dispatched, in `group`. It is the
+    /// NEWEST, so within its group it sorts to the top — which is exactly why
+    /// its row index is not something the dispatch could have predicted.
+    fn three_plus_new(state: State) -> Vec<Session> {
+        let mut fresh = bg("e44654bf", "fresh task", state);
+        fresh.started_at = 1_787_700_000_000;
+        let mut all = three();
+        all.push(fresh);
+        all
+    }
+
+    /// An app with `three()` on screen, the cursor on the first row, and `n`'s
+    /// cursor intent armed for a session the daemon has not listed yet.
+    ///
+    /// Armed through the REAL keypath — `n`, the task text, `Enter` — against a
+    /// seam that answers the way the real CLI does.
+    fn armed(fixture: &str) -> (App, std::path::PathBuf) {
+        let tmp = fs_fixture(fixture);
+        let mut a = app();
+        load(&mut a, three());
+        a.dispatch = recording_dispatch_with_id;
+        prompt_with(&mut a, &tmp.to_string_lossy(), "do it");
+        enter(&mut a);
+        assert_eq!(a.mode, Mode::Normal, "the dispatch closed the prompt");
+        assert_eq!(
+            a.pending_jump.as_ref().map(|j| j.short_id.as_str()),
+            Some("e44654bf"),
+            "the short id off `--bg` armed the intent"
+        );
+        assert_eq!(
+            a.selected_key.as_deref(),
+            Some("aaaaaaaa-uuid"),
+            "`n` itself still never moves the cursor"
+        );
+        (a, tmp)
+    }
+
+    /// One tick's worth of the only three steps the cursor intent can see: the
+    /// poll (4), the rebuild (5) and the settle (5b). Deliberately NOT `tick()`
+    /// — that also shells out to tmux, and this suite may not touch the
+    /// operator's live socket. The poll goes through `poll_step`, so `polled`
+    /// is the real gate's answer and not a literal.
+    fn poll_and_settle(a: &mut App, sessions: Vec<Session>) {
+        age(a, Duration::from_secs(60));
+        let polled = a.poll_step(|| complete(sessions));
+        assert!(polled, "the fixture's gate must let this poll through");
+        a.rebuild_rows();
+        a.tick_pending_jump(polled);
+    }
+
+    /// A tick whose poll gate was SHUT — the quiesced sidebar. Rows still
+    /// rebuild; nothing was learned, so nothing may be charged to the budget.
+    fn settle_without_polling(a: &mut App) {
+        a.rebuild_rows();
+        a.tick_pending_jump(false);
+    }
+
+    /// THE CASE THE WHOLE DESIGN EXISTS FOR: the row does not exist on the poll
+    /// the dispatch forces, so a one-shot "select it now" would miss it.
+    #[test]
+    fn the_cursor_follows_the_new_session_when_it_arrives_on_a_later_poll() {
+        let (mut a, tmp) = armed("jump-later");
+
+        // Poll 1 — the daemon has not listed it. The cursor must not wander,
+        // and the intent must survive.
+        poll_and_settle(&mut a, three());
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"), "nothing moved");
+        assert!(a.pending_jump.is_some(), "a poll that missed it is not a refusal");
+
+        // Poll 2 — it appears, in the group that sorts FIRST.
+        poll_and_settle(&mut a, three_plus_new(State::Blocked));
+        assert_eq!(
+            a.selected_key.as_deref(),
+            Some("e44654bf-uuid"),
+            "the cursor is keyed by the UUID, and `--bg` only gave a short id"
+        );
+        assert_eq!(
+            a.selected_session().and_then(|s| s.id.clone()).as_deref(),
+            Some("e44654bf"),
+            "and it is the row for the session that was just dispatched"
+        );
+        assert!(
+            matches!(a.rows.get(a.selected), Some(Row::Session { .. })),
+            "selection landed on {:?}",
+            a.rows.get(a.selected)
+        );
+        assert_eq!(a.pending_jump, None, "spent once it fires");
+
+        // Still only the CURSOR: `n` opens nothing.
+        assert!(a.map.pane_for_session("e44654bf-uuid").is_none(), "no pane was opened");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A `--bg` banner this build cannot parse degrades to exactly the
+    /// behaviour that shipped before the jump existed — and the dispatch itself
+    /// still succeeds, which is the half that matters.
+    #[test]
+    fn a_dispatch_with_no_parseable_id_still_dispatches_and_leaves_the_cursor() {
+        let tmp = fs_fixture("jump-degraded");
+        let mut a = app();
+        load(&mut a, three());
+        // `Ok(None)` — the seam as the CLI behaved before, and as it behaves
+        // again the day the banner changes shape.
+        a.dispatch = recording_dispatch;
+        prompt_with(&mut a, &tmp.to_string_lossy(), "do it");
+        enter(&mut a);
+
+        assert_eq!(
+            dispatched(),
+            vec![(tmp.to_string_lossy().into_owned(), "do it".into())],
+            "the session was dispatched"
+        );
+        assert_eq!(a.mode, Mode::Normal);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!((text.as_str(), level), ("dispatched background session", MsgLevel::Info));
+        assert_eq!(a.pending_jump, None, "no id, no intent");
+
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"), "today's behaviour, exactly");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The intent is bounded. It must not sit there for the life of the process
+    /// waiting to re-arm on some unrelated future row.
+    #[test]
+    fn the_pending_jump_expires_after_a_bounded_number_of_polls() {
+        let (mut a, tmp) = armed("jump-expiry");
+        for i in 0..JUMP_POLLS {
+            assert!(a.pending_jump.is_some(), "poll {i} is still inside the budget");
+            poll_and_settle(&mut a, three());
+        }
+        assert_eq!(a.pending_jump, None, "the intent does not outlive its budget");
+
+        // A session that finally lists long afterwards is NOT chased.
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"));
+
+        // And the expiry was SILENT: the last thing said is still the flash the
+        // dispatch itself put up, which was true — the agent is running.
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "dispatched background session");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The budget is counted in POLLS, not ticks and not seconds. A quiesced
+    /// sidebar ticks on without spawning `claude agents`; those ticks learn
+    /// nothing about the id and must refute nothing.
+    #[test]
+    fn a_tick_that_did_not_poll_spends_none_of_the_jumps_budget() {
+        let (mut a, tmp) = armed("jump-quiesced");
+        let before = a.pending_jump.clone();
+        for _ in 0..(JUMP_POLLS * 4) {
+            settle_without_polling(&mut a);
+        }
+        assert_eq!(a.pending_jump, before, "a shut gate refutes nothing");
+
+        // And the intent is still good when the polls resume.
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert_eq!(a.selected_key.as_deref(), Some("e44654bf-uuid"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A jump that yanks the selection out from under a keypress is worse than
+    /// no jump. Every deliberate cursor move cancels it.
+    ///
+    /// The `j` then `k` case is the one a `selected_key` snapshot compared at
+    /// fire time would have got wrong: the cursor ends up back on the key it
+    /// started from, and the operator has still had their say.
+    #[test]
+    fn a_jump_never_fires_after_the_operator_moved_the_cursor() {
+        /// One named cursor move, as the operator would make it.
+        type Move = (&'static str, fn(&mut App));
+        let moves: [Move; 6] = [
+            ("j", |a| {
+                a.on_key(press('j'));
+            }),
+            ("j then k", |a| {
+                a.on_key(press('j'));
+                a.on_key(press('k'));
+            }),
+            ("G", |a| {
+                a.on_key(press('G'));
+            }),
+            ("Tab", |a| {
+                a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+            }),
+            ("d", |a| {
+                a.on_key(press('d'));
+            }),
+            ("d then u", |a| {
+                a.on_key(press('d'));
+                a.on_key(press('u'));
+            }),
+        ];
+        for (label, mv) in moves {
+            let (mut a, tmp) = armed("jump-operator");
+            mv(&mut a);
+            assert_eq!(a.pending_jump, None, "{label} must cancel the intent on the spot");
+            poll_and_settle(&mut a, three_plus_new(State::Blocked));
+            assert_ne!(
+                a.selected_key.as_deref(),
+                Some("e44654bf-uuid"),
+                "{label}: the cursor was the operator's, and stayed theirs"
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    /// `/` is the operator's, not ccmux's. A new session the filter excludes is
+    /// SAID, never chased by clearing the filter — the precedent `u` set with
+    /// `restored X — filtered out`.
+    #[test]
+    fn a_filtered_out_new_session_flashes_and_leaves_the_filter_standing() {
+        let (mut a, tmp) = armed("jump-filtered");
+        a.filter = "one".into();
+        a.rebuild_rows();
+        let before = a.selected_key.clone();
+
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+
+        assert_eq!(a.filter, "one", "the filter is not ccmux's to clear");
+        assert_eq!(a.selected_key, before, "there is no row to move to");
+        assert!(
+            matches!(a.rows.get(a.selected), Some(Row::Session { .. })),
+            "and the cursor is still on a session row"
+        );
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!((text.as_str(), level), ("dispatched fresh task — filtered out", MsgLevel::Warn));
+        assert_eq!(a.pending_jump, None, "said once, then spent");
+
+        // Clearing the filter later does NOT resurrect the jump: it was spent,
+        // and moving the cursor on a later, unrelated keystroke would be the
+        // stale-intent bug in a different coat.
+        a.filter.clear();
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert_eq!(a.selected_key, before);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `a` hides Completed. Confirming rather than assuming that a freshly
+    /// dispatched session is visible under it — and that the one shape which is
+    /// NOT (a task that finished before the next poll) takes the filtered-out
+    /// path rather than moving the cursor to a row that is not on screen.
+    #[test]
+    fn a_freshly_dispatched_session_is_visible_with_completed_hidden() {
+        // Working, and Idle — the two states a just-dispatched session can be
+        // in — both have rows while `a` is off.
+        let mut idle = bg("e44654bf", "fresh task", State::Working);
+        idle.status = Status::Idle;
+        idle.state = None;
+        for (label, fresh) in [
+            ("working", bg("e44654bf", "fresh task", State::Working)),
+            ("blocked", bg("e44654bf", "fresh task", State::Blocked)),
+            ("idle", idle),
+        ] {
+            let (mut a, tmp) = armed("jump-hide-completed");
+            a.show_completed = false;
+            a.rebuild_rows();
+            let mut all = three();
+            all.push(fresh);
+            poll_and_settle(&mut a, all);
+            assert_eq!(
+                a.selected_key.as_deref(),
+                Some("e44654bf-uuid"),
+                "{label} is not Completed, so `a` does not hide it"
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        // The exception, stated: a session that is already Done when it lands
+        // has no row while `a` is off, so it is announced, not chased.
+        let (mut a, tmp) = armed("jump-hide-completed-done");
+        a.show_completed = false;
+        a.rebuild_rows();
+        let mut all = three();
+        all.push(bg("e44654bf", "fresh task", State::Done));
+        poll_and_settle(&mut a, all);
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"));
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!((text.as_str(), level), ("dispatched fresh task — filtered out", MsgLevel::Warn));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The selection contract: only ever a `Row::Session`, never a Header and
+    /// never a Spacer — whichever group the new session lands in, including the
+    /// one that sits directly under a Header and the one that sits after a
+    /// Spacer.
+    #[test]
+    fn the_jump_only_ever_lands_on_a_session_row() {
+        for state in [State::Working, State::Blocked, State::Done] {
+            let (mut a, tmp) = armed("jump-rowkind");
+            poll_and_settle(&mut a, three_plus_new(state.clone()));
+            assert_eq!(a.selected_key.as_deref(), Some("e44654bf-uuid"), "{state:?}");
+            match a.rows.get(a.selected) {
+                Some(Row::Session { idx }) => {
+                    assert_eq!(a.sessions[*idx].id.as_deref(), Some("e44654bf"), "{state:?}");
+                }
+                other => panic!("{state:?}: selection landed on {other:?}"),
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    /// Dispatch from an EMPTY list — the corner a `selected_key` snapshot could
+    /// not survive. The cursor has no key to anchor to, so the first arriving
+    /// poll parks it on some other session through `reanchor_selection`'s
+    /// nearest-index fallback. That is the list changing under a stationary
+    /// cursor, not the operator moving it, and the jump still lands.
+    #[test]
+    fn a_dispatch_from_an_empty_list_still_lands_on_its_row() {
+        let tmp = fs_fixture("jump-empty");
+        let mut a = app();
+        a.rebuild_rows();
+        assert_eq!(a.selected_key, None, "nothing to select yet");
+        a.dispatch = recording_dispatch_with_id;
+        prompt_with(&mut a, &tmp.to_string_lossy(), "do it");
+        enter(&mut a);
+        assert!(a.pending_jump.is_some());
+
+        // Two unrelated sessions land first.
+        poll_and_settle(&mut a, vec![
+            bg("aaaaaaaa", "one", State::Blocked),
+            bg("bbbbbbbb", "two", State::Working),
+        ]);
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"), "the fallback parked it");
+        assert!(a.pending_jump.is_some(), "which is not the operator moving the cursor");
+
+        poll_and_settle(&mut a, vec![
+            bg("aaaaaaaa", "one", State::Blocked),
+            bg("bbbbbbbb", "two", State::Working),
+            bg("e44654bf", "fresh task", State::Working),
+        ]);
+        assert_eq!(a.selected_key.as_deref(), Some("e44654bf-uuid"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // ── the poll gate: nobody watching, nothing spawned (SPEC §4.2) ─────────

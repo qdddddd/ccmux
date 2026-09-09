@@ -116,7 +116,7 @@ environment-variable equivalent of `--socket`.
 | `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
 | `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane. Still closes a pane you have detached from, even though nothing marks it as open any more | no |
 | `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree, and close every pane ccmux still had parked on it — a pane you took to the `s` shell is yours and stays. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
-| `n` | Dispatch a new background session with a typed task — the cwd field takes `~` paths, `Tab`-completes directories, and offers to create a missing directory (see below) | no |
+| `n` | Dispatch a new background session with a typed task — the cwd field takes `~` paths, `Tab`-completes directories, and offers to create a missing directory (see below). The cursor moves onto the new session as soon as it is listed; it is still not opened | no |
 | `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
 | `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
 | `u` | Undo the most recent `d` | no |
@@ -230,6 +230,16 @@ refused (`parent does not exist: …`) rather than materialised as a tree.
 Anything already occupying the name — a file, a dangling symlink — is refused,
 never overwritten. Editing either field, `Esc`, or leaving the prompt drops
 the offer. This `mkdir` is the only write ccmux ever makes to the filesystem.
+
+Either way the cursor follows the session you just dispatched. It does not
+happen at submit time — `claude --bg` returns before the daemon lists the
+session — so ccmux remembers the short id it printed and moves the selection
+onto the row the moment the row appears, however the list has re-sorted by
+then. Nothing is opened: `Enter` is still yours to press. If you move the
+cursor yourself first, the jump is dropped rather than yanking the selection
+back; if `/` is hiding the new session, the footer says
+`dispatched <name> — filtered out` and your filter is left alone; and if the
+session never turns up within a few polls, the cursor simply stays put.
 
 ## Reading the list
 
