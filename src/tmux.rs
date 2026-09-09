@@ -158,10 +158,11 @@ const PANE_FMT: &str = concat!(
     "#{window_active}\t",
     "#{session_attached}\t",
     "#{window_active_clients}\t",
+    "#{window_zoomed_flag}\t",
     "#{@ccmux_detached}",
 );
 
-const PANE_FIELDS: usize = 13;
+const PANE_FIELDS: usize = 14;
 
 /// `-F` format for `list_tabs`. The two JSON blobs are LAST so a value that
 /// somehow contained a tab could only corrupt the final field, never shift a
@@ -349,6 +350,16 @@ pub struct PaneInfo {
     /// interactive shell. A LATCH, never cleared: see `App::rebuild_open` for
     /// why reattaching by hand does not un-set it.
     ///
+    /// `#{window_zoomed_flag}` — the pane's WINDOW has a zoomed pane in it.
+    /// Window-scoped, so every row of one window carries the same value and
+    /// any row of that window answers for it (`window_zoomed`).
+    ///
+    /// This is the operator's own geometry, asserted with the tmux prefix and
+    /// `z`, and it is the one state in which ccmux must not re-assert its own:
+    /// `resize-pane` un-zooms the window (verified on 3.4), so the §1.3 pin
+    /// would undo a zoom within one tick. False on a tmux that does not know
+    /// the format, which is the pre-existing behaviour.
+    pub window_zoomed: bool,
     /// False for every pane ccmux did not create, and false on a tmux with no
     /// pane options — the pre-existing behaviour, not a claim of attachment.
     pub detached: bool,
@@ -805,14 +816,18 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     // failing the whole enumeration, which `watchers()` would read as evidence
     // that nobody is looking.
     let window_viewers: Option<u32> = parts[11].parse().ok();
+    // Lenient for the same reason as the field above: a tmux that does not
+    // know the format answers with an empty string, and "not zoomed" is the
+    // pre-existing behaviour — the pin keeps working, as it always did.
+    let window_zoomed = parts[12] == "1";
     // Written by the pane itself, so anything but the two latch values is
     // "no latch" — an empty string on every pane that never detached, and on
     // every tmux too old to carry pane options. `shell` MUST keep implying
     // `detached`: `R` skips a pane on `detached` alone, and a shell pane that
     // stopped reading as detached would be respawned over the operator's
     // live shell (`restart::plan`).
-    let shell = parts[12] == LATCH_SHELL;
-    let detached = parts[12] == LATCH_PARKED || shell;
+    let shell = parts[13] == LATCH_SHELL;
+    let detached = parts[13] == LATCH_PARKED || shell;
 
     Ok(PaneInfo {
         id,
@@ -827,6 +842,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         window_active,
         session_clients,
         window_viewers,
+        window_zoomed,
         detached,
         shell,
     })
@@ -996,6 +1012,23 @@ pub fn pin_sidebar(session: &str, sidebar: &PaneId, cols: u16) {
 /// `#{window_index}` of the window holding `pane`.
 pub fn window_of(panes: &[PaneInfo], pane: &PaneId) -> Option<u32> {
     panes.iter().find(|p| &p.id == pane).map(|p| p.window_index)
+}
+
+/// Does the window holding `pane` have a zoomed pane in it?
+///
+/// THE GATE ON EVERY GEOMETRY WRITE ccmux makes on a timer. A zoom is the
+/// operator saying "this pane, full window, until I say otherwise", and both
+/// `resize-pane` and `select-layout` clear it — so a pin that ran regardless
+/// would give the window back two and a half seconds later, which is exactly
+/// the bug. `window_zoomed_flag` is window-scoped, so the sidebar's own row
+/// answers for the whole window.
+///
+/// FALSE WHEN THE PANE IS UNKNOWN, not "unknown so don't touch it": an absent
+/// sidebar is the degraded case ccmux already handles by other means, and
+/// failing closed here would silently stop the pin whenever a snapshot raced a
+/// pane's creation.
+pub fn window_zoomed(panes: &[PaneInfo], pane: &PaneId) -> bool {
+    panes.iter().any(|p| &p.id == pane && p.window_zoomed)
 }
 
 /// The subset of `panes` in `window`.
@@ -1987,6 +2020,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            window_zoomed: false,
             detached: false,
             shell: false,
         }
@@ -2059,6 +2093,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            window_zoomed: false,
             detached: false,
             shell: false,
         }
@@ -2494,7 +2529,7 @@ mod tests {
 
     #[test]
     fn parse_pane_line_reads_every_field() {
-        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2\t1\t1";
+        let line = "%25\t2\t35\t0\t239\t76\t1\t1\t@0\t1\t2\t1\t1\t1";
         let p = parse_pane_line(line).expect("parses");
         assert_eq!(p.id.as_str(), "%25");
         assert_eq!(p.index, 2);
@@ -2508,6 +2543,7 @@ mod tests {
         assert!(p.window_active);
         assert_eq!(p.session_clients, 2);
         assert_eq!(p.window_viewers, Some(1));
+        assert!(p.window_zoomed);
         assert!(p.detached);
     }
 
@@ -2517,7 +2553,7 @@ mod tests {
     /// `PaneInfo::detached`, which is about the attach inside one pane.)
     #[test]
     fn parse_pane_line_reads_an_unwatched_background_pane() {
-        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0\t0\t").expect("parses");
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t3\t@7\t0\t0\t0\t0\t").expect("parses");
         assert!(!p.window_active);
         assert_eq!(p.session_clients, 0);
         assert_eq!(p.window_viewers, Some(0));
@@ -2534,7 +2570,7 @@ mod tests {
     #[test]
     fn parse_pane_line_reads_the_shell_value_as_detached_too() {
         let row = |v: &str| {
-            parse_pane_line(&format!("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t{v}"))
+            parse_pane_line(&format!("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t0\t{v}"))
                 .expect("parses")
         };
         let shell = row(LATCH_SHELL);
@@ -2556,7 +2592,7 @@ mod tests {
     /// `window_viewers` is the field that tells the truth there.
     #[test]
     fn parse_pane_line_reads_a_pane_watched_through_a_grouped_session() {
-        let p = parse_pane_line("%0\t0\t0\t0\t80\t24\t1\t1\t@0\t1\t0\t1\t").expect("parses");
+        let p = parse_pane_line("%0\t0\t0\t0\t80\t24\t1\t1\t@0\t1\t0\t1\t0\t").expect("parses");
         assert!(p.window_active);
         assert_eq!(p.session_clients, 0, "the grouped client is invisible to the pair");
         assert_eq!(p.window_viewers, Some(1), "but it is rendering this window");
@@ -2567,7 +2603,7 @@ mod tests {
     /// answer" rather than failing the row: the gate falls back to the pair.
     #[test]
     fn an_unknown_viewer_count_is_none_and_not_an_error() {
-        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t\t").expect("parses");
+        let p = parse_pane_line("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t\t0\t").expect("parses");
         assert_eq!(p.window_viewers, None);
         assert!(p.window_active);
         assert_eq!(p.session_clients, 1);
@@ -2576,23 +2612,41 @@ mod tests {
     #[test]
     fn parse_pane_lines_rejects_short_and_malformed_rows() {
         assert!(parse_pane_line("%1\t1\t0").is_err());
-        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t").is_err());
-        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t").is_err());
+        assert!(parse_pane_line("nope\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t0\t").is_err());
+        assert!(parse_pane_line("%1\tx\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t0\t").is_err());
         // The ninth field is the window id, and a bad one is fatal like the rest.
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1\t1\t").is_err());
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t1\t1\t1\t1\t0\t").is_err());
         // A non-numeric client count is fatal too: the poll gate must never
         // read a garbled field as "nobody is watching".
-        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx\t1\t").is_err());
-        // A row from the old nine-, eleven- or twelve-field format is short,
-        // and short is fatal.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\tx\t1\t0\t").is_err());
+        // A row from an older field count is short, and short is fatal —
+        // including the thirteen-field format that predates the zoom flag.
+        assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1\t").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1\t1").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0\t1\t1").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1\t@0").is_err());
         assert!(parse_pane_line("%1\t1\t0\t0\t80\t24\t0\t1").is_err());
         // Blank lines are skipped, not fatal.
-        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t1\t\n\n").expect("parses");
+        let panes = parse_pane_lines("%1\t1\t0\t0\t80\t24\t1\t1\t@0\t1\t1\t1\t0\t\n\n").expect("parses");
         assert_eq!(panes.len(), 1);
         assert!(parse_pane_lines("").expect("empty is fine").is_empty());
+    }
+
+    /// `window_zoomed` answers for the WINDOW the pane is in, and only that
+    /// one: a zoom in another window must not stop the sidebar's pin. An
+    /// unknown pane is `false`, not "assume zoomed" — see the function.
+    #[test]
+    fn window_zoomed_is_scoped_to_the_panes_own_window() {
+        let zoomed = |id: &str, window: u32| PaneInfo {
+            window_zoomed: true,
+            ..pane_in(id, 0, 0, window)
+        };
+        let panes = vec![zoomed("%0", 1), zoomed("%2", 1), pane_in("%1", 0, 0, 2)];
+        assert!(window_zoomed(&panes, &PaneId::parse("%0").unwrap()));
+        assert!(window_zoomed(&panes, &PaneId::parse("%2").unwrap()));
+        assert!(!window_zoomed(&panes, &PaneId::parse("%1").unwrap()), "window 2 is not zoomed");
+        assert!(!window_zoomed(&panes, &PaneId::parse("%9").unwrap()), "an unknown pane is not zoomed");
+        assert!(!window_zoomed(&[], &PaneId::parse("%0").unwrap()), "and neither is an empty listing");
     }
 
     #[test]
