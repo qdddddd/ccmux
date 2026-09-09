@@ -1105,6 +1105,12 @@ mod tests {
             "pub fn interactive_pane_cmd",
             // struct fields
             "pub interactive_panes",
+            // The pid as an IDENTITY, which is what the bare `i32` was: a value
+            // the /proc ancestry walk compared and remembered. That reading is
+            // still banned (PROBE-FINDINGS §1) and no spec may declare it back.
+            // `Session::pid` is an `Option`, read ONLY through `has_worker()`
+            // for its presence, and is a different field with a different type
+            // — which is exactly why this needle stays spelled `i32`.
             "pub pid: i32",
             "pub session_name: String",
             // the `NewInteractive` prompt variant, as a variant and not as prose
@@ -1137,6 +1143,14 @@ mod tests {
             // shade: a promised third place for "where is this open" is a
             // third place that has to be kept in step with the other two.
             "· pane",
+            // `R`'s state rule. The one-bit `agent_restartable` could not
+            // express the three outcomes the pass now reports — restart, busy,
+            // and "not running, so nothing to say" — and folding `stopped` back
+            // into a bool is exactly how a keypress named "restart" started
+            // undoing the operator's `Ctrl+X` in the first place. The rule is
+            // `agent_verdict` and a spec that still names the old one is
+            // promising a function the crate does not have.
+            "restart::agent_restartable",
         ] {
             assert!(
                 !SPEC.contains(needle),

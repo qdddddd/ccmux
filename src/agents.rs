@@ -137,6 +137,21 @@ const POLL_STEP: Duration = Duration::from_millis(20);
 /// would freeze the whole restart pass, and the sidebar with it.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Wall-clock ceiling on one `claude --bg --resume <sessionId>`.
+///
+/// Bounded for the same reason `stop` is, and it is the same trade: `R` issues
+/// one of these per paneless agent with no operator between them, so an
+/// unbounded wait would let a single wedged `claude` freeze the restart pass
+/// and the sidebar with it. A kill here is as recoverable as a kill on `stop`
+/// — the daemon owns the resume it was asked for, and the next poll says
+/// whether it landed — unlike `rm`, which is removing a worktree.
+///
+/// Same 10 s as `STOP_TIMEOUT` and for the same reason: the measured call
+/// returns as soon as the daemon has accepted the session (it prints
+/// `backgrounded · <id> (idle — send a prompt to start)` and exits), so ten
+/// seconds fires only for a `claude` that is genuinely stuck.
+pub const RESUME_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// `run`, with a deadline. On expiry the child is killed and reaped, and the
 /// call reports `Cmd { code: -1, stderr: "timed out after Ns" }`.
 ///
@@ -364,6 +379,37 @@ pub fn stop(id: &str) -> Result<(), AgentsError> {
         return Err(AgentsError::NotAttachable);
     }
     run_checked(&["stop", id], Some(STOP_TIMEOUT))
+}
+
+/// `claude --bg --resume <sessionId>` — THE RESUME THAT NEEDS NO PANE.
+///
+/// `stop` + `attach` is how an agent changes version, and until now `attach`
+/// was the only resume ccmux had — which is why `R`'s agent scope could never
+/// be wider than the panes it was about to respawn. This is the other resume:
+/// `--bg --resume` hands the session back to the daemon as a background worker
+/// with no client at all, so a session ccmux has NOT got open in a pane can be
+/// stopped and brought back on the current binary (PROBE-FINDINGS §2).
+///
+/// IT TAKES THE UUID, NOT THE SHORT ID. `stop` takes the 8-hex `id`; this
+/// takes `sessionId`. They are both on every row, and passing the wrong one
+/// gets a session that does not exist rather than an error you would notice —
+/// so the parameter is named for the field it wants and the empty-id guard is
+/// the same fail-closed one `stop` and `delete` carry.
+///
+/// It does NOT fork the conversation: verified 2026-09-09 on a throwaway, the
+/// resumed session came back under the same short id and the same `sessionId`,
+/// with one row in the fleet and a NEW worker pid.
+///
+/// No `current_dir`: the session carries its own directory, and the reported
+/// `cwd` of a session that was just stopped is its PARENT rather than its
+/// worktree (§2), so honouring it would be worse than not.
+///
+/// Bounded by `RESUME_TIMEOUT` — see the constant.
+pub fn resume(session_id: &str) -> Result<(), AgentsError> {
+    if session_id.is_empty() {
+        return Err(AgentsError::NotAttachable);
+    }
+    run_checked(&["--bg", "--resume", session_id], Some(RESUME_TIMEOUT))
 }
 
 /// `claude rm <id>` — IRREVERSIBLE. PROBE-FINDINGS §2, verbatim from
@@ -1067,11 +1113,26 @@ mod tests {
 
     #[test]
     fn stop_delete_and_logs_refuse_an_empty_id_without_spawning() {
-        // Fail-closed guard: never `claude stop ''`, never `claude rm ''`.
+        // Fail-closed guard: never `claude stop ''`, never `claude rm ''`,
+        // never `claude --bg --resume ''` (which would dispatch a NEW session).
         assert!(matches!(stop(""), Err(AgentsError::NotAttachable)));
         assert!(matches!(delete(""), Err(AgentsError::NotAttachable)));
         assert!(matches!(logs("", 10), Err(AgentsError::NotAttachable)));
+        assert!(matches!(resume(""), Err(AgentsError::NotAttachable)));
         assert!(test_spawn::calls().is_empty(), "an empty id must not reach the boundary");
+    }
+
+    /// The headless resume's argv, pinned. `--bg --resume <uuid>`: the flag
+    /// order the CLI documents, and the UUID rather than the short id, which
+    /// is the one thing about this verb that can be wrong without erroring.
+    #[test]
+    fn the_headless_resume_names_the_uuid_and_nothing_else() {
+        test_spawn::reset();
+        assert!(resume("4fc47ebd-663a-4ff2-8681-1c22281dbe0d").is_ok());
+        assert_eq!(
+            test_spawn::joined(),
+            vec!["--bg --resume 4fc47ebd-663a-4ff2-8681-1c22281dbe0d"]
+        );
     }
 
     /// PROBE-FINDINGS §2: a refused `claude rm` exits 1, says why on STDOUT,

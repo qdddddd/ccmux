@@ -14,6 +14,8 @@ Element shape (keys union across all observed rows):
 ```json
 {
   "pid": 2877291,                 // UNSTABLE - changes across attach/detach. NEVER key on this.
+                                  // PRESENT-OR-NULL IS A DIFFERENT QUESTION, and
+                                  // it IS reliable - see below.
   "id": "1c45d64f",               // 8-hex short id. ABSENT for kind=="interactive".
   "cwd": "/home/dev/projects/...",
   "kind": "background",           // "background" | "interactive"
@@ -39,6 +41,33 @@ Element shape (keys union across all observed rows):
                                   // error and not an unknown.
 }
 ```
+
+**`pid` PRESENCE IS THE LIVENESS FLAG, AND IT IS THE ONLY ONE. Its VALUE is
+still forbidden.** These are two different readings of one key and the ban
+covers exactly one of them.
+
+* **Forbidden, unchanged:** the pid as an IDENTITY. Do not remember one, compare
+  two, match a row to a process by one, or carry one across a poll. It changes
+  across attach/detach, so anything keyed on the value is wrong the moment a
+  pane opens. `sessionId` is the only key there is.
+* **Sound, and now relied on:** `pid` present ⟺ a worker process is running for
+  that session. Measured on the live fleet 2026-09-09 — 16 rows, **7 with a
+  `pid` and 9 with `null`**, and that 7 matched the daemon's worker count
+  exactly. Re-measured the same day at 17 rows: 8 live, 9 `null`. A `null` row
+  is not stale, it is **dormant** — the session finished and its worker exited;
+  it is running no `claude` at all, old or new.
+
+Verified directly rather than inferred: a `done` session's own worker was ended
+(`SIGTERM`, pid taken from its own row) and the row went `pid: 1230016,
+status: "idle"` -> `pid: null, status` absent, with `state` still `done`. The
+same shape the 9 dormant rows are in.
+
+This is what `R`'s paneless population is scoped on (SPEC §8.11). A rule that
+looked only at `state` would have called all 14 idle-or-done rows restartable
+and, on one keypress, SPAWNED nine workers for sessions that had none — the
+opposite of what the verb is for. `model::Session::pid` is therefore an
+`Option` read only through `has_worker()`, and the crate reads the value
+nowhere.
 
 **`state` and `status` are two INDEPENDENT axes. Do not infer either from the
 other.** It is tempting to read `blocked` and `waiting` as two spellings of one
@@ -91,10 +120,13 @@ exclusion is why a `done` row carrying a stale status word is not hoisted.
 | `claude stop <id>` | Stops the session; conversation kept; resume later with `claude attach <id>`. | YES |
 | `claude kill <id>` | Alias of `stop`. | YES |
 | `claude rm <id>` | `claude rm --help`, verbatim: "Delete a background session and its worktree. Unlike `stop`, works on already-exited sessions." **IRREVERSIBLE** — it removes the git worktree, so uncommitted work in it is gone. Verified on 2.1.246. | YES |
+| `claude --bg --resume <sessionId>` | Documented on `--bg`: "With --resume &lt;session-id&gt;, continues that session in the background". Resumes a stopped session as a background worker with **no client and no pane**. Takes the **UUID**, not the short id. Verified on 2.1.266 — see below. | YES |
 
 `claude resume` and `claude list` are **NOT** subcommands — they fall through to the
 generic help (verified against a `bogus123` control). Only `attach`, `logs`, `stop`,
-`kill`, `rm` are real.
+`kill`, `rm` are real SUBCOMMANDS. `--resume` is a different thing: a documented
+**flag** on `--bg`, not a verb of its own, and `claude --bg --resume <uuid>` works
+where `claude resume <uuid>` does not.
 
 **`rm` REFUSES rather than destroying unpushed work, and it explains itself on
 STDOUT.** Verified on 2.1.246: against a worktree holding commits that are not
@@ -112,8 +144,10 @@ sentence that says the work is safe. Read stdout when stderr is blank. A `rm`
 whose worktree is clean (or which has none) deletes the session and removes the
 worktree from `git worktree list`, verified both ways.
 
-**`stop` + `attach` IS HOW AN AGENT CHANGES VERSION, and it is the only way there
-is.** Verified 2026-09-04 on 2.1.260. A background worker is a separate,
+**`stop` + a RESUME IS HOW AN AGENT CHANGES VERSION, and there is no other way.**
+There are two resumes: `attach`, below, which needs a terminal to attach in, and
+`--bg --resume`, further down, which needs nothing. Verified 2026-09-04 on
+2.1.260. A background worker is a separate,
 daemon-owned process (§3) and it keeps the `claude` it was launched with for its
 whole life; restarting the attach CLIENT changes nothing about it. `claude stop`
 followed by `claude attach` respawns it as a genuinely NEW process, which
@@ -124,6 +158,36 @@ before stop : pid=1941112 replPid=1941127 cliVersion=2.1.260
 after stop  : (absent from the roster)
 after attach: pid=1956984 replPid=1957001 cliVersion=2.1.260   <- new process
 ```
+
+**`claude --bg --resume <sessionId>` IS A RESUME THAT NEEDS NO PANE, and it is
+the other half of the version story.** `stop` + `attach` above needs a terminal
+to attach in, which is why ccmux could only ever refresh the agents it had open
+in a pane. `--bg` documents `--resume <session-id>` as "continues that session
+in the background", and it does exactly that: the daemon takes the session back
+as a background worker with no client at all.
+
+Verified 2026-09-09 on 2.1.266, on a throwaway:
+
+```
+worker before stop   pid=1057151  cliVersion=2.1.266
+after claude stop    (absent from the roster)
+claude --bg --resume 4fc47ebd-663a-4ff2-8681-1c22281dbe0d
+  -> "backgrounded · 4fc47ebd (idle — send a prompt to start)"
+worker after resume  pid=1071760  cliVersion=2.1.266     <- NEW process
+sessions with that uuid: 1                                <- no fork, no duplicate
+```
+
+Same short id, same `sessionId`, conversation intact, and a fresh worker that
+resolved `claude` at launch. Re-verified end to end the same day through ccmux's
+own `R`, three times over, against a session with no pane: `stop 5411d389` then
+`--bg --resume 5411d389-6fcd-4e1a-b9a0-5c8ed584a082` moved the worker
+`1218319 -> 1263673 -> 1268236 -> 1276203`, with one fleet row for that uuid
+throughout.
+
+**It takes the UUID, not the short id.** `stop`/`kill`/`rm`/`attach` all take
+the 8-hex `id`; this one takes `sessionId`. Both are on every row, and passing
+the wrong one names a session that does not exist rather than erroring in a way
+anyone would notice — so it is worth stating twice.
 
 **Agents go stale, and by a lot.** Measured on this host with 2.1.258 / 2.1.259 /
 2.1.260 installed and 2.1.260 current: of 7 live workers, 4 were on 2.1.251 and 1
