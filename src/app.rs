@@ -3767,16 +3767,33 @@ impl App {
         let _ = tmux::apply_layout(&self.tmux_session, sb, &layout);
     }
 
-    /// §1.3's per-tick width pin — and the one write that must yield to the
-    /// operator's zoom. `resize-pane` clears `window_zoomed_flag`, so pinning
-    /// through a zoom would hand the window back on the next tick; the pin
-    /// resumes, unchanged, the moment the zoom is released, because the flag
-    /// is read fresh from every `refresh_panes`.
+    /// §1.3's width pin — re-asserted only when the sidebar is not already at
+    /// the width it should be, and never through a zoom.
     ///
-    /// The width math is skipped too, deliberately: a zoomed window reports
-    /// the zoomed pane at the FULL window size and leaves the hidden panes on
-    /// their old geometry, so `pinned_width_from` would be reading coordinates
-    /// that describe no layout tmux will restore.
+    /// THE COMPARISON IS AGAINST OBSERVED STATE, NOT AGAINST AN EVENT. §1.3
+    /// forbids guarding the pin on "did the layout change", and it is right to:
+    /// a change flag cannot see the operator drag a border, so the width would
+    /// stop healing. `pane_width` is a fresh reading of the pane the pin is
+    /// about to write, taken from the enumeration `tick` step 2 has just made,
+    /// so a manual resize shows up as a mismatch on the very next tick and is
+    /// healed exactly as before. What is dropped is only the `resize-pane` on
+    /// the ticks that would have written the width it already had — every tick
+    /// of an idle sidebar.
+    ///
+    /// The verb call sites read a snapshot taken before `even_content`'s
+    /// `select-layout`, and that is sound in both directions: when a layout was
+    /// applied it already carries the sidebar at exactly `cols` (§1.4), so a
+    /// stale row that happens to match skips a pin that was a no-op anyway;
+    /// when it was not, the snapshot is the fresh post-split one and the
+    /// mismatch stands.
+    ///
+    /// A ZOOM outranks both. `resize-pane` clears `window_zoomed_flag`, so
+    /// pinning through a zoom would hand the window back on the next tick; the
+    /// pin resumes the moment the zoom is released. The width math is skipped
+    /// with it, deliberately: a zoomed window reports the zoomed pane at the
+    /// FULL window size and leaves the hidden panes on their old geometry, so
+    /// `pinned_width_from` would be reading coordinates that describe no layout
+    /// tmux will restore.
     fn pin_sidebar(&self) {
         if self.degraded {
             return;
@@ -3790,7 +3807,23 @@ impl App {
         let Some(cols) = self.pinned_width() else {
             return;
         };
+        if !Self::needs_repin(tmux::pane_width(&self.panes, sb), cols) {
+            return;
+        }
         tmux::pin_sidebar(&self.tmux_session, sb, cols);
+    }
+
+    /// The pin's whole decision, as a function of two numbers, so every case
+    /// is reachable without a tmux.
+    ///
+    /// `observed` is `None` when the last enumeration does not carry the
+    /// sidebar's row — a failed `list-panes` that left `panes_fresh` false, or
+    /// a pane created since. That is NOT evidence the width is right, so it
+    /// pins: the pre-existing behaviour, and the safe direction, because an
+    /// unnecessary `resize-pane` costs one spawn while a skipped one leaves the
+    /// sidebar at whatever width a manual split gave it.
+    fn needs_repin(observed: Option<u16>, want: u16) -> bool {
+        observed != Some(want)
     }
 
     /// Flush MY window's `@ccmux_tab_map`, addressed through my own pane.
@@ -4755,6 +4788,12 @@ mod tests {
             bg("eeeeeeee", "five", State::Working),
             bg("ffffffff", "six", State::Working),
         ]);
+        // THE LIVE SOCKET IS THE POINT. `app()` installs a panicking
+        // `kill_pane` so no hermetic test can ever kill a pane on the
+        // operator's server; this harness has already pinned `tmux::socket()`
+        // to the throwaway one, so `x` must reach the real call or the kill
+        // phase cannot be exercised at all.
+        a.kill_pane = tmux::kill_pane;
         a.refresh_panes();
         a
     }
@@ -4822,6 +4861,16 @@ mod tests {
             println!("after tick {i}    : {:?}", live_widths(&mut a));
         }
         assert_eq!(live_widths(&mut a), before, "the per-tick pin is a no-op on an even layout");
+        // And it is a no-op because it WRITES NOTHING, not because the write
+        // happens to land on the same number: on a settled layout the pin's
+        // own decision is "already right", so an idle sidebar spawns no
+        // `resize-pane` at all.
+        a.refresh_panes();
+        let sb = a.sidebar_pane.clone().expect("sidebar");
+        assert!(
+            !App::needs_repin(tmux::pane_width(&a.panes, &sb), 34),
+            "an idle tick on an even layout must not issue resize-pane"
+        );
 
         // ── `s`: four content panes, heights evened ─────────────────────────
         let mut a = live_app();
@@ -4894,6 +4943,16 @@ mod tests {
         assert_eq!(after_ticks, tree, "ticks do not move a tree either");
 
         live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
+    }
+
+    /// The pin writes only when the width is actually wrong, and an unknown
+    /// width counts as wrong — see `needs_repin`.
+    #[test]
+    fn the_pin_writes_only_when_the_width_is_wrong() {
+        assert!(!App::needs_repin(Some(34), 34), "already right: no resize-pane");
+        assert!(App::needs_repin(Some(20), 34), "a manual resize still heals");
+        assert!(App::needs_repin(Some(60), 34), "so does a split that halved it");
+        assert!(App::needs_repin(None, 34), "an unreadable snapshot pins, as it always did");
     }
 
     /// A ZOOM MUST OUTLIVE THE TICK. `<prefix> z` is the operator asserting a
