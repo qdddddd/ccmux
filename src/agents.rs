@@ -27,6 +27,7 @@
 
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use crate::model::{ParseError, Payload};
@@ -136,6 +137,23 @@ const POLL_STEP: Duration = Duration::from_millis(20);
 /// in-scope agent with no operator between them: unbounded, one hung `claude`
 /// would freeze the whole restart pass, and the sidebar with it.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wall-clock ceiling on one `claude respawn <id>`.
+///
+/// Bounded for the same reason `stop` is, and it is the same trade: `R` issues
+/// one of these per paneless agent with no operator between them, so an
+/// unbounded wait would let a single wedged `claude` freeze the restart pass
+/// and the sidebar with it. A kill here is as recoverable as a kill on `stop`
+/// — the daemon owns the restart it was asked for — but it is NOT free: this
+/// verb halts the worker and starts a new one, so a client killed mid-flight
+/// can leave the session halted. That is why the caller polls on the error
+/// path instead of guessing (`App::restart_headless_agents`).
+///
+/// Same 10 s as `STOP_TIMEOUT` and for the same reason: the measured call
+/// returns as soon as the daemon has swapped the worker (it prints
+/// `respawned <id>` and exits), so ten seconds fires only for a `claude` that
+/// is genuinely stuck.
+pub const RESPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `run`, with a deadline. On expiry the child is killed and reaped, and the
 /// call reports `Cmd { code: -1, stderr: "timed out after Ns" }`.
@@ -364,6 +382,141 @@ pub fn stop(id: &str) -> Result<(), AgentsError> {
         return Err(AgentsError::NotAttachable);
     }
     run_checked(&["stop", id], Some(STOP_TIMEOUT))
+}
+
+/// `claude respawn <id>` — THE RESTART THAT NEEDS NO PANE.
+///
+/// `stop` + `attach` is how a PANED agent changes version, and `attach` was
+/// the only resume ccmux had — which is why `R`'s agent scope could never be
+/// wider than the panes it was about to respawn. This is the CLI's own verb
+/// for the rest: "Restart a background session (or all of them) so it picks up
+/// the current Claude Code version" (`claude respawn --help`, 2.1.266). One
+/// call halts the worker and starts a new one, with no client and no terminal
+/// anywhere in it (PROBE-FINDINGS §2).
+///
+/// IT TAKES THE SHORT ID — the same 8-hex `id` `stop` and `attach` take, which
+/// is the reason it replaced the `claude --bg --resume <sessionId>` pair this
+/// feature was first built on. That pair had two defects this verb does not:
+///
+///   * `--bg --resume` has a documented FORK branch — "starts a copy and says
+///     so when the session is already running" (`claude --help`) — and it
+///     reports the copy on stdout with exit 0. ccmux issued it immediately
+///     after its own `stop`, inside the window where the daemon still called
+///     the session running, and measured ~5% of resumes came back as copies:
+///     an extra live agent and a duplicated conversation, counted as a
+///     success. `respawn` has no such branch (measured: same short id, same
+///     `sessionId`, one row before and after, a new worker pid).
+///   * Two calls meant a stop could land with its partner never sent — a
+///     halted agent nothing would bring back. One call cannot.
+///
+/// IT DOES NOT CHECK STATE, so the caller's gates are load-bearing rather than
+/// belt-and-braces. Measured 2026-09-09 on throwaways: `respawn` on a
+/// `stopped` session UN-STOPS it (pid `null` -> a live pid), and `respawn` on
+/// a `working` session interrupts the work mid-flight (`working`/`busy` ->
+/// `blocked`/`idle`). `restart::agent_verdict` and `Session::has_worker` are
+/// what keep this verb off both, and `--all` — which would hit every one of
+/// them at once — is never built.
+///
+/// No `current_dir`: the session carries its own directory.
+///
+/// Bounded by `RESPAWN_TIMEOUT` — see the constant.
+pub fn respawn(id: &str) -> Result<(), AgentsError> {
+    // Same fail-closed guard as `stop`: an empty id is what an unchecked
+    // `Option<String>` collapses to, and this verb restarts a worker.
+    if id.is_empty() {
+        return Err(AgentsError::NotAttachable);
+    }
+    run_checked(&["respawn", id], Some(RESPAWN_TIMEOUT))
+}
+
+/// WHO IS ATTACHED TO A SESSION, ANYWHERE ON THIS MACHINE.
+///
+/// The one question `R`'s paneless population turns on and that no tmux read
+/// can answer. `claude stop` and `claude respawn` both KILL the session's
+/// attach client — measured: the pane prints `Session <id> has exited.` and
+/// parks — and `claude agents --json` lists every session on the box, while
+/// every tmux record ccmux holds is scoped to its own tmux session (R2/R3).
+/// Subtracting only what ccmux itself has open therefore left three shapes
+/// classified "paneless" that are somebody's live terminal:
+///
+///   * a second ccmux workspace (`--session NAME`, `-L socket`) holding the
+///     session in a pane of ITS window;
+///   * a `claude attach` the operator ran by hand, even in ccmux's own window,
+///     which is in no `@ccmux_tab_map` and so is no pane ccmux knows;
+///   * any attach on another tmux server, or on no tmux at all.
+///
+/// So the evidence is taken from the thing that actually dies: the client
+/// process. `/proc/<pid>/cmdline` is read for every process on the machine and
+/// matched against the exact argv `claude attach <id>` — the shape
+/// `attach_pane_cmd` builds and the shape a human types. It is READ-ONLY and
+/// it can only ever REFUSE to act; nothing here authorises touching a pane, a
+/// session, or a process, so R2 and R3 are untouched. It is also not §5.4's
+/// deleted ancestry walk coming back: no ppid chain, no `list-panes -a`, no
+/// resolving a session to a pane — one flat argv match, used to subtract.
+///
+/// `None` means the scan itself could not run (no `/proc`), and the caller
+/// must then skip the paneless pass entirely rather than read "found nothing"
+/// out of "could not look" — the fail-open reading that made this bug.
+///
+/// WHAT IT CANNOT SEE, stated so the next reader does not assume otherwise: an
+/// attach on ANOTHER machine against a shared daemon, an attach started in the
+/// instant after the scan, and a client launched through a wrapper whose
+/// argv[0] is neither `claude` nor `claude_bin()`'s own name. The first two
+/// are the same snapshot race every other read in this pass carries; the third
+/// is why the match is on argv[0]'s file name rather than on a full path.
+pub fn attached_ids() -> Option<BTreeSet<String>> {
+    let bin = claude_bin();
+    let want = file_name(&bin);
+    let mut out = BTreeSet::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        // Only the numeric entries are processes; `self`, `sys`, `net` and the
+        // rest are not, and a non-UTF-8 name cannot be a pid.
+        let Some(pid) = name.to_str() else { continue };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process that exits between the listing and the read is not an
+        // error, it is just gone — and a gone client holds nothing.
+        let Ok(raw) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if let Some(id) = attach_id(&raw, want) {
+            out.insert(id);
+        }
+    }
+    Some(out)
+}
+
+/// The file-name component of a program path, for `attached_ids`' argv[0]
+/// match. Pure so the rule is testable without `/proc`.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The id a `/proc/<pid>/cmdline` is attached to, if it is a `claude attach`
+/// client at all. NUL-separated argv, exactly as the kernel writes it.
+///
+/// Positive evidence only, and in the argv POSITIONS the verb has: argv[0]'s
+/// file name is `claude` (or whatever `CCMUX_CLAUDE_BIN` names), argv[1] is
+/// `attach`, argv[2] is the id. Matching `attach` anywhere in any argv would
+/// make `grep attach …` or an editor holding this file read as a live client
+/// and silently shrink the population `R` restarts.
+fn attach_id(cmdline: &[u8], want: &str) -> Option<String> {
+    let mut argv = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty());
+    let argv0 = std::str::from_utf8(argv.next()?).ok()?;
+    let base = file_name(argv0);
+    if base != "claude" && base != want {
+        return None;
+    }
+    if argv.next()? != b"attach" {
+        return None;
+    }
+    let id = std::str::from_utf8(argv.next()?).ok()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 /// `claude rm <id>` — IRREVERSIBLE. PROBE-FINDINGS §2, verbatim from
@@ -1106,6 +1259,29 @@ mod tests {
         );
     }
 
+    /// Live check on the attach scan, against the real machine. `#[ignore]`d
+    /// so CI never depends on a `/proc` or on who happens to be attached.
+    ///
+    /// READ-ONLY BY CONSTRUCTION: it reads `/proc/<pid>/cmdline` and nothing
+    /// else, spawns nothing, and touches no session. What it pins is the one
+    /// thing a unit test on `attach_id` cannot — that the scan RUNS here, and
+    /// that every id it reports has the shape `claude attach` takes, so a
+    /// wrong match cannot quietly shrink the population `R` restarts.
+    ///
+    ///   cargo test -- --ignored live_attach_scan --nocapture
+    #[test]
+    #[ignore]
+    fn live_attach_scan() {
+        let ids = attached_ids().expect("this host has a readable /proc");
+        eprintln!("live attach clients: {ids:?}");
+        for id in &ids {
+            assert!(
+                !id.is_empty() && id.len() <= 64 && !id.contains('/'),
+                "not an id a `claude attach` would take: {id:?}"
+            );
+        }
+    }
+
     /// THE DRIFT GUARD, live half (see `App::note_drift` for the other).
     ///
     /// `state: "stopped"` and then `state: "blocked"` both shipped unmodelled,
@@ -1158,11 +1334,77 @@ mod tests {
 
     #[test]
     fn stop_delete_and_logs_refuse_an_empty_id_without_spawning() {
-        // Fail-closed guard: never `claude stop ''`, never `claude rm ''`.
+        // Fail-closed guard: never `claude stop ''`, never `claude rm ''`,
+        // never `claude respawn ''`.
         assert!(matches!(stop(""), Err(AgentsError::NotAttachable)));
         assert!(matches!(delete(""), Err(AgentsError::NotAttachable)));
         assert!(matches!(logs("", 10), Err(AgentsError::NotAttachable)));
+        assert!(matches!(respawn(""), Err(AgentsError::NotAttachable)));
         assert!(test_spawn::calls().is_empty(), "an empty id must not reach the boundary");
+    }
+
+    /// THE PANELESS RESTART'S ARGV, PINNED, and the pinning is the point.
+    ///
+    /// `claude respawn <shortId>` and nothing else. Two argvs it must never be:
+    /// `--all`, which restarts every background session on the machine —
+    /// dormant, stopped and working alike — and is the exact opposite of a pass
+    /// built on per-session gates; and `--bg --resume <uuid>`, whose documented
+    /// fork branch exits 0 while starting a COPY of the conversation, which
+    /// ccmux would have counted as a success (PROBE-FINDINGS §2).
+    #[test]
+    fn the_paneless_restart_names_one_short_id_and_nothing_else() {
+        test_spawn::reset();
+        assert!(respawn("4fc47ebd").is_ok());
+        assert_eq!(test_spawn::joined(), vec!["respawn 4fc47ebd"]);
+        let argv = test_spawn::calls();
+        assert!(
+            !argv.iter().any(|c| c.iter().any(|a| a == "--all" || a == "--resume")),
+            "`R` must never build `respawn --all` or `--bg --resume`: {argv:?}"
+        );
+    }
+
+    /// THE ATTACH-CLIENT MATCH, in the argv positions the verb actually has.
+    ///
+    /// This decides whether a live session is somebody's terminal, and both
+    /// halves of getting it wrong are damage: too loose and `R` silently stops
+    /// restarting agents that nobody has open, too tight and it kills the
+    /// operator's attach in another window.
+    #[test]
+    fn an_attach_client_is_recognised_by_argv_and_nothing_looser() {
+        let cmd = |parts: &[&str]| parts.join("\0").into_bytes();
+
+        assert_eq!(attach_id(&cmd(&["claude", "attach", "1c45d64f"]), "claude").as_deref(), Some("1c45d64f"));
+        // A full path is what `CCMUX_CLAUDE_BIN` produces, and what the shell
+        // records when the operator types one.
+        assert_eq!(
+            attach_id(&cmd(&["/home/dev/.local/bin/claude", "attach", "1c45d64f"]), "claude").as_deref(),
+            Some("1c45d64f")
+        );
+        // An override with its own name still matches — on the file name, so
+        // the same binary reached by two paths is one client.
+        assert_eq!(
+            attach_id(&cmd(&["/opt/x/claude-dev", "attach", "1c45d64f"]), "claude-dev").as_deref(),
+            Some("1c45d64f")
+        );
+        // The trailing NUL the kernel writes must not become a fourth argv.
+        assert_eq!(
+            attach_id(b"claude\0attach\x001c45d64f\0", "claude").as_deref(),
+            Some("1c45d64f")
+        );
+
+        for (why, argv) in [
+            ("another verb", cmd(&["claude", "stop", "1c45d64f"])),
+            ("no id", cmd(&["claude", "attach"])),
+            ("an empty id", cmd(&["claude", "attach", ""])),
+            ("another program", cmd(&["grep", "attach", "1c45d64f"])),
+            // The shape that would make an editor holding this source file, or
+            // a `grep`, read as a live client and silently shrink the
+            // population `R` restarts.
+            ("`attach` anywhere but argv[1]", cmd(&["claude", "logs", "attach", "1c45d64f"])),
+            ("nothing at all", Vec::new()),
+        ] {
+            assert!(attach_id(&argv, "claude").is_none(), "matched {why}: {argv:?}");
+        }
     }
 
     /// PROBE-FINDINGS §2: a refused `claude rm` exits 1, says why on STDOUT,

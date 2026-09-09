@@ -25,15 +25,27 @@
 //! image is RUNNING is what licenses it to touch anyone else's pane. If the
 //! `exec` fails, nothing anywhere has been killed and this sidebar says so.
 //!
-//! This module owns the three questions that answer badly if guessed: WHICH
-//! panes may be respawned (`plan`, pure), WHICH file to exec (`exe_path`), and
-//! whether that file actually RUNS (`probe`).
+//! A FOURTH population has no client at all: a live background worker nobody
+//! has open anywhere. `claude respawn <id>` swaps its worker with no terminal
+//! in it, so such a session need no longer keep its old `claude` for ever. It
+//! is scoped by LIVENESS — `Session::has_worker` — because a session with no
+//! worker is dormant rather than stale, and "restarting" it would start a
+//! process nobody asked for; and by ABSENCE OF A CLIENT from two readings,
+//! ccmux's own panes (`Plan::held`) and every `claude attach` on the machine
+//! (`agents::attached_ids`), because the fleet is machine-wide while every
+//! tmux record ccmux holds is scoped to its own session. See
+//! `headless_targets`.
+//!
+//! This module owns the four questions that answer badly if guessed: WHICH
+//! panes may be respawned (`plan`, pure), WHICH clientless agents may be
+//! restarted (`headless_targets`, pure), WHICH file to exec (`exe_path`),
+//! and whether that file actually RUNS (`probe`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::model::{Group, Session};
+use crate::model::{Group, Kind, Session, State};
 use crate::tmux::{self, PaneId, PaneInfo, TabInfo};
 
 /// The env var that tells a fresh sidebar it is the second half of an `R`, and
@@ -108,6 +120,33 @@ pub struct Plan {
     /// Mapped, live panes whose attach has already exited and handed the pane
     /// to a shell (`#{@ccmux_detached}`). Counted, never respawned.
     pub detached: usize,
+    /// EVERY SESSION A LIVE CCMUX PANE NAMES, respawned or not — the line
+    /// between `R`'s two agent populations.
+    ///
+    /// `agent_ids()` is the panes about to re-attach; this is the wider set
+    /// that includes the ones deliberately left alone (parked after `Ctrl+Z`,
+    /// or carrying no `short_id`). `headless_targets` subtracts it from the
+    /// fleet, and the subtraction is what makes the two populations DISJOINT:
+    /// one session, one mechanism, never a second destructive call for one
+    /// restart. A pane ccmux is leaving alone is still a pane, and its session
+    /// stays the pane pass's business — being restarted behind the operator's
+    /// back is not what "skipped" means.
+    ///
+    /// ONLY THIS TMUX SESSION'S PANES, which is why it is not the whole guard.
+    /// It is built from `list-windows`/`list-panes -s` scoped to `cli.session`
+    /// (R2, R3), so it cannot see a second ccmux workspace's pane, a
+    /// hand-run `claude attach` in any window, or another tmux server, while
+    /// the fleet `headless_targets` subtracts it from is machine-wide.
+    /// `agents::attached_ids` covers that gap from the client process itself;
+    /// this set covers what that one cannot — a pane ccmux owns whose attach
+    /// has already EXITED, which has no client process left to find and must
+    /// still not be adopted by the paneless pass.
+    ///
+    /// KEYED BY BOTH IDS, short and UUID, because a map entry written by a
+    /// build with no `short_id` field still carries a `session_id` — without
+    /// the second key that pane's session would read as paneless and be
+    /// restarted out from under whatever attach is in it.
+    pub held: BTreeSet<String>,
 }
 
 impl Plan {
@@ -117,26 +156,34 @@ impl Plan {
         self.unattachable + self.detached
     }
 
-    /// THE AGENT SCOPE: the short ids whose AGENT `R` may restart, in the order
-    /// the panes will be respawned.
+    /// THE PANED AGENT SCOPE: the short ids whose AGENT this plan's own panes
+    /// will resume, in the order those panes will be respawned.
     ///
-    /// It is derived from `targets`, and that is the whole rule: an agent is in
-    /// scope **exactly when this same plan is about to respawn a pane with
-    /// `claude attach <id>`**. Nothing else is, and the reason is composition
-    /// rather than tidiness. Restarting an agent is `claude stop` followed by
-    /// something that resumes it, and the only thing ccmux has that resumes one
-    /// is that pane's attach. Stop a session no pane is about to attach and
-    /// ccmux has not restarted it — it has STOPPED it, permanently, on a
-    /// keypress whose name is "restart". So the set that may be stopped is the
-    /// set that will be resumed, by construction.
+    /// It is derived from `targets`, and that is the whole rule: a session is
+    /// in THIS population **exactly when this same plan is about to respawn a
+    /// pane with `claude attach <id>`**. The reason is composition rather than
+    /// tidiness. Restarting an agent is `claude stop` followed by something
+    /// that resumes it; here the resume is that pane's attach, so the set that
+    /// may be stopped is the set that will be resumed, by construction.
     ///
-    /// That answers the two populations `plan` counts but does not target:
+    /// It is no longer the whole of `R`'s agent scope. A session with a LIVE
+    /// WORKER and no client anywhere is restarted by `headless_targets` +
+    /// `agents::respawn`, which needs no pane; the two populations are made
+    /// disjoint by `held`. What is still true, and is the invariant this
+    /// function exists for, is that nothing is STOPPED without something lined
+    /// up to resume it — the paneless population is not stopped at all, it is
+    /// handed to a verb that does both halves itself.
+    ///
+    /// That answers the two populations `plan` counts but does not target, and
+    /// neither of them moves to the headless pass — both are HELD by a live
+    /// pane, and a pane ccmux is deliberately leaving alone is still a pane:
     ///
     ///   * a pane parked after `Ctrl+Z` (`@ccmux_detached`) is NOT re-attached
     ///     — the operator's shell is in it and respawning would destroy their
-    ///     work — so nothing would resume its session, and it is out of scope.
-    ///     The session keeps running the old binary, which is the same trade
-    ///     `R` already makes for a busy one.
+    ///     work — so nothing resumes its session and it is out of scope. The
+    ///     session keeps running the old binary, which is the same trade `R`
+    ///     already makes for a busy one, and it is the trade the operator
+    ///     chose when they parked the pane.
     ///   * a mapped pane with no `short_id` has neither an attach to rebuild
     ///     nor an id to stop.
     ///
@@ -159,12 +206,17 @@ impl Plan {
     }
 }
 
-/// THE STATE RULE: may `R` stop this session's agent?
+/// THE STATE RULE: what `R` does about this session's agent, and why.
 ///
-/// Yes for a row under **Idle** or **Completed**; no for one under **Working**
-/// or **Blocked**. That is the operator's rule stated in the operator's own
-/// vocabulary, and stating it in `Group` rather than in `State` is deliberate
-/// on three counts.
+/// Three answers, because there are three different things to say. `Restart`
+/// is a running worker on a stale binary. `Busy` is a running worker `R`
+/// deliberately leaves on its stale binary. `NotRunning` is neither — there is
+/// no worker, so there is nothing to bring onto the new binary and nothing to
+/// report as an exception either.
+///
+/// **RESTART: a row under Idle, or a `done` row.** Both mean a worker that is
+/// up and has nothing in flight. Stated in `Group` rather than in `State`,
+/// deliberately, on three counts.
 ///
 /// FIRST, it is what the screen says. The sidebar files every session under one
 /// of four headings, and this reads the same verdict from the same function
@@ -190,9 +242,37 @@ impl Plan {
 /// that invents a new busy-ish word: an unmodelled state with `status: "busy"`
 /// groups as Working and is skipped.
 ///
-/// WHERE THE BELT STOPS, exactly, and it is not "nowhere": a TERMINAL state
-/// outranks the waiting status, so `done`/`stopped` + `status: "waiting"`
-/// groups as Completed and IS stopped. That is the terminal-exclusion rule of
+/// **NOT RUNNING: `state: "stopped"`, and it is checked BEFORE the group.**
+/// This is the one place the rule has to see past `Group`, because
+/// `Session::group` maps `Done` AND `Stopped` to the same `Completed` heading
+/// — correctly, they are both terminal — while `R` must treat them opposite
+/// ways. A `done` session's worker is up and idle; a `stopped` session's worker
+/// is GONE, `claude stop` having taken it. So the group cannot answer this one
+/// on its own, and reading it alone is what made a single `Ctrl+X` reversible
+/// by a keypress named "restart": the operator stopped a session on purpose,
+/// pressed `R` for an unrelated upgrade, and got it back running.
+///
+/// It is a refusal on both counts, which is why it needs no other argument. A
+/// stopped session is not on the old binary — it is on no binary — so there is
+/// nothing here for `R` to refresh; and stopping it again would be a no-op
+/// while resuming it would be an un-stop the operator never asked for. Exactly
+/// the same reasoning refuses a `pid: null` row in the headless population
+/// (`headless_targets`): both are the one rule "`R` restarts RUNNING workers",
+/// read off the two different fields that can say a worker is absent.
+///
+/// The ordering is load-bearing in one direction only: `Stopped` is tested
+/// first so it cannot be swallowed by `Completed`, and everything below it is
+/// still `group()`'s answer, belt and braces intact. In particular a
+/// `stopped` row carrying `status: "waiting"` is still refused — by this arm
+/// now rather than by the terminal-exclusion rule, and to the same end.
+///
+/// **BUSY: Working or Blocked.** A worker that IS running, deliberately left on
+/// its old version until it finishes. The intended trade, and what keeps `R`
+/// safe to press at any moment.
+///
+/// WHERE THE BELT STOPS, exactly, and it is not "nowhere": a `done` row
+/// outranks the waiting status, so `done` + `status: "waiting"` groups as
+/// Completed and IS restarted. That is the terminal-exclusion rule of
 /// `Session::group` (PROBE-FINDINGS §1) and it is deliberate — a finished
 /// session is waiting on nobody, and a stale status word on a `done` row is a
 /// live shape rather than a hypothetical one: 5 of the 14 `done` rows in the
@@ -204,19 +284,147 @@ impl Plan {
 /// row under Completed on screen too and every other verb — `x`, `Ctrl+X`,
 /// `Tab` — would follow it there. The cost is bounded either way: `claude stop`
 /// on a session that has already finished exits 0, changes nothing and leaves
-/// `state` as it was (PROBE-FINDINGS §2, verified), and the pane re-attaches it.
-/// `only_a_row_under_idle_or_completed_may_be_stopped` pins both halves.
+/// `state` as it was (PROBE-FINDINGS §2, verified), and it is resumed straight
+/// after. `only_a_running_idle_or_done_row_may_be_stopped` pins every cell.
 ///
 /// The residual case is an unmodelled state with an idle-looking status: it
 /// groups as Idle and is restarted. That is deliberate — it is where every
 /// other verb in ccmux files it, `Ctrl+X` included, and `note_drift` is already
 /// shouting about the word. Inventing a stricter private rule here would make
 /// `R` disagree with the heading the operator is reading.
-pub fn agent_restartable(s: &Session) -> bool {
-    match s.group() {
-        Group::Idle | Group::Completed => true,
-        Group::Working | Group::Blocked => false,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Bring it back onto the current binary — a running worker with nothing
+    /// in flight. Which call that is depends on the population: `claude stop`
+    /// plus the pane's own attach, or `claude respawn`.
+    Restart,
+    /// Running and busy (Working or Blocked). Left on its old binary and
+    /// COUNTED: the footer says `N busy`.
+    Busy,
+    /// No worker: `state: "stopped"`. Not restarted, and not counted either —
+    /// there is no exception to report about a process that is not there. See
+    /// `Agents::busy` for why folding this into that word would be a lie.
+    NotRunning,
+}
+
+/// See `Verdict`.
+pub fn agent_verdict(s: &Session) -> Verdict {
+    // BEFORE the group: `Stopped` and `Done` share the Completed heading and
+    // must not share this answer.
+    if s.state == Some(State::Stopped) {
+        return Verdict::NotRunning;
     }
+    match s.group() {
+        Group::Idle | Group::Completed => Verdict::Restart,
+        Group::Working | Group::Blocked => Verdict::Busy,
+    }
+}
+
+/// THE HEADLESS POPULATION: live agents `R` can restart with no client at all.
+///
+/// `Plan::agent_ids` can only ever name sessions ccmux has open, because the
+/// only resume it had was the pane's own `claude attach`. That left a session
+/// ccmux never opened — or opened and closed — on the `claude` it was
+/// dispatched with forever, which is the gap this closes: `claude respawn <id>`
+/// swaps the worker with no client and no terminal (PROBE-FINDINGS §2).
+///
+/// FOUR CONDITIONS, and the first two are the ones that matter:
+///
+/// 1. **A LIVE WORKER** (`Session::has_worker`, i.e. `pid` present). This is
+///    the guard the whole feature stands on. On the operator's fleet, 9 of 16
+///    sessions carry `pid: null` — they are DORMANT, not stale: not running an
+///    old binary, not running at all. "Restarting" one would SPAWN a worker for
+///    a session that had none, so a single `R` would resurrect nine finished
+///    conversations into live processes nobody asked for — the exact opposite
+///    of the verb's job. Presence of `pid`, never its value: see
+///    `model::Session::pid` for why that distinction is not a dodge.
+/// 2. **NOBODY IS LOOKING AT IT**, from two independent readings, because the
+///    fleet is MACHINE-WIDE and every tmux record ccmux holds is scoped to its
+///    own tmux session:
+///
+///      * `held` — `Plan::held`, every session a live ccmux pane in THIS
+///        workspace names, respawned or not. A session a pane holds belongs to
+///        the pane population and to that one only, including the panes `R`
+///        deliberately leaves alone: the two sets are disjoint by construction,
+///        so no session collects two acts for one restart and a pane the footer
+///        calls `skipped` really was left alone.
+///      * `attached` — `agents::attached_ids`, every session a live
+///        `claude attach` client names ANYWHERE ON THE MACHINE. `held` cannot
+///        see a second ccmux workspace's pane, an attach the operator ran by
+///        hand, or another tmux server, and `claude respawn` kills the attach
+///        client of every one of them — leaving that pane parked on a dead
+///        session this pass then reported as `restarted`. The client process is
+///        the thing that dies, so the client process is the evidence.
+///
+///    Two sets rather than one because they answer different questions:
+///    `held` says "this is the pane pass's business" (a PARKED pane has no
+///    client left to find, and must still not be adopted here), `attached` says
+///    "this is somebody's terminal". Neither implies the other.
+/// 3. **THE COMMAND'S OWN SHAPE** — a background kind, because `respawn` names
+///    nothing else and an interactive session is somebody's terminal; and a
+///    non-empty short id, because `claude respawn` takes that and building
+///    `claude respawn ''` at all is the bug the fail-closed guard in
+///    `agents::respawn` exists to catch after the fact.
+///
+/// WHAT IS DELIBERATELY NOT HERE IS THE STATE RULE. `agent_verdict` is applied
+/// by the caller, at the re-poll immediately before each act and from the
+/// same function the paned population uses — a snapshot's state may report,
+/// never authorise. Baking it in here would decide the population from a
+/// listing already one round trip stale by the time the first respawn lands,
+/// and it would also make a working paneless agent INVISIBLE: it would drop out
+/// of the population instead of being counted `busy`, and the footer would go
+/// quiet about live agents `R` deliberately left on the old binary.
+///
+/// Liveness is filtered here AND re-checked there, and that asymmetry is the
+/// point: a dormant row must never enter the population at all, because every
+/// exception this pass reports is a claim that some agent is still running
+/// something old, and about a dormant session that claim is simply false.
+///
+/// Deduped by `session_id`, and ORDERED BY IT, so two runs of `R` against one
+/// fleet issue the same commands in the same order — the fleet's own row order
+/// is the CLI's and is not promised to be stable.
+///
+/// Pure, so every one of those refusals is testable without a `claude` and
+/// without a `/proc`.
+pub fn headless_targets(
+    sessions: &[Session],
+    held: &BTreeSet<String>,
+    attached: &BTreeSet<String>,
+) -> Vec<Headless> {
+    // BOTH IDS AGAINST BOTH SETS. A map entry written by a build with no
+    // `short_id` field carries only a `session_id`, and a hand-run
+    // `claude attach` carries only whichever id the operator typed, so a rule
+    // that checked one key would let the other shape through.
+    let claimed = |id: &str| held.contains(id) || attached.contains(id);
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut out: Vec<Headless> = sessions
+        .iter()
+        .filter(|s| s.has_worker())
+        .filter(|s| s.kind == Kind::Background)
+        .filter(|s| !claimed(s.session_id.as_str()))
+        .filter_map(|s| {
+            let short = s.id.as_deref().filter(|i| !i.is_empty())?;
+            if claimed(short) || !seen.insert(s.session_id.as_str()) {
+                return None;
+            }
+            Some(Headless {
+                short_id: short.to_string(),
+                session_id: s.session_id.clone(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    out
+}
+
+/// One session in the headless population, carrying BOTH ids: `claude respawn`
+/// takes the 8-hex short id, and the `session_id` is what dedupes the
+/// population, orders it, and matches it against `Plan::held`. Keeping them
+/// together is what stops a call site pairing the wrong one with the wrong use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Headless {
+    pub short_id: String,
+    pub session_id: String,
 }
 
 /// THE OWNERSHIP RULE, and the only place it is decided.
@@ -283,7 +491,21 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
             let Some(pane) = PaneId::parse(raw) else {
                 continue;
             };
-            if !live.contains(&pane) || seen.contains(&pane) {
+            if !live.contains(&pane) {
+                continue;
+            }
+            // HELD, whichever arm the pane lands in below — and BEFORE the
+            // `seen` check, so a pane this loop is about to skip for any
+            // reason at all still shields its session from the headless pass.
+            // A dead pane holds nothing, which is why this sits under the
+            // liveness check and above everything else.
+            if !entry.short_id.is_empty() {
+                out.held.insert(entry.short_id.clone());
+            }
+            if !entry.session_id.is_empty() {
+                out.held.insert(entry.session_id.clone());
+            }
+            if seen.contains(&pane) {
                 continue;
             }
             // ONE COUNT PER PANE, in every arm. `seen` is what makes that
@@ -324,32 +546,58 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
 /// behind that does not fix itself.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Agents {
-    /// Stopped, AND a pane came back up on `claude attach <id>` to resume it —
-    /// so the worker is running again, as a new process on the `claude` that is
+    /// The worker is running again, as a new process on the `claude` that is
     /// installed NOW (PROBE-FINDINGS §2).
     ///
-    /// Counted after PHASE 2, never at the stop. A stop is only half of a
-    /// restart; the resume is the other half, and it is the half that can fail
-    /// independently. See `stranded`.
+    /// Two mechanisms reach this one count, and the word means the same thing
+    /// for both: a paned session was stopped and its pane came back up on
+    /// `claude attach <id>`, or a paneless session's `claude respawn <id>`
+    /// returned Ok.
+    ///
+    /// Never counted at a paned session's stop. A stop is only half of a
+    /// restart; the pane's attach is the other half, and it can fail
+    /// independently, so that verdict cannot be reached until PHASE 2 has run.
+    /// See `stranded`.
     pub restarted: usize,
     /// Deliberately left on the old binary because the row was under Working or
     /// Blocked. THE INTENDED TRADE, not a failure: a busy agent keeps its
     /// version until it finishes, and `R` stays safe to press at any moment.
+    ///
+    /// A RUNNING worker, always. A session that is `stopped`, and a paneless
+    /// one with no `pid`, are counted here — and anywhere — NOT AT ALL: they
+    /// are not on the old binary, they are on no binary, so there is no
+    /// exception to report about them. Folding either into this word would
+    /// tell the operator an agent is working when it is halted. See
+    /// `Verdict::NotRunning`.
     pub busy: usize,
     /// Everything that stopped ccmux doing the job: a `claude stop` that
-    /// errored, a state that could not be read, a session no longer in the
-    /// fleet, or an agent the pass ran out of budget for. All of them mean the
-    /// same thing to the operator — that agent is still on the old binary and
-    /// ccmux could not change it — so they are one number, and it is reported
-    /// rather than swallowed.
+    /// errored, a state that could not be read, a paned session no longer in
+    /// the fleet, or an agent the pass ran out of budget for. All of them mean
+    /// the same thing to the operator — that agent is still on the old binary
+    /// and ccmux could not change it — so they are one number, and it is
+    /// reported rather than swallowed.
     ///
-    /// EVERY ONE OF THESE LEFT THE AGENT RUNNING. Nothing was stopped, so
-    /// nothing needs resuming; the trade is identical to `busy`, one cause
-    /// along.
+    /// EVERY ONE OF THESE LEFT THE AGENT RUNNING, and the word is only used
+    /// where that has been established. Nothing was stopped, so nothing needs
+    /// resuming; the trade is identical to `busy`, one cause along. That is why
+    /// a paneless `claude respawn` that ERRORED is not counted here on the
+    /// error alone: `run_bounded` SIGKILLs the client at `RESPAWN_TIMEOUT`
+    /// while the daemon carries the restart out regardless, so the error says
+    /// nothing about the worker. `App::restart_headless_agents` polls and
+    /// files the outcome by what it finds — still there and unchanged is
+    /// `failed`, halted is `stranded`, a new worker is `restarted`. It is also
+    /// why a paneless target that has left the fleet, or whose worker exited,
+    /// between the enumeration and its turn is not counted here: there is no
+    /// agent left running for the operator to be told about.
     pub failed: usize,
-    /// STOPPED, AND NOT RESUMED: the `claude stop` succeeded and then no pane
-    /// came back up holding that session, because its respawn failed or the
-    /// pane was gone by the time PHASE 2 reached it.
+    /// HALTED, AND NOTHING WILL BRING IT BACK.
+    ///
+    /// Two ways in, one meaning. A paned session was stopped and its pane never
+    /// came back up — the respawn failed, or the pane was gone by the time
+    /// PHASE 2 reached it. A paneless session's `claude respawn` errored and
+    /// the poll that followed found the worker gone: the daemon carried out the
+    /// halt and either did not start the new worker or could not report it, and
+    /// there is no pane that might still have covered it.
     ///
     /// Its own word because it is its own outcome, and the only one `R` can
     /// produce that an operator must act on: the agent is halted, ccmux has
@@ -360,10 +608,23 @@ pub struct Agents {
     /// would read as "still on the old binary", which is the one thing it is
     /// not.
     ///
-    /// It needs a pane respawn to fail to happen at all, which is why it is
-    /// rare rather than impossible: `tmux kill-pane` on a Claude pane in the
-    /// seconds between PHASE 1 and PHASE 2 reproduces it exactly.
+    /// From a pane it needs a respawn to fail to happen at all, which is why
+    /// it is rare rather than impossible: `tmux kill-pane` on a Claude pane in
+    /// the seconds between PHASE 1 and PHASE 2 reproduces it exactly.
     pub stranded: usize,
+    /// THE PANELESS PASS DID NOT RUN, because ccmux could not establish who is
+    /// attached to what (`agents::attached_ids` answered `None`: no readable
+    /// `/proc`).
+    ///
+    /// Not a count, and deliberately not folded into one. Nothing was
+    /// attempted, so no agent is owed a number; what the operator needs to know
+    /// is that the population was not looked at rather than found empty. `R`'s
+    /// pane pass ran normally and its counts are exactly as truthful as ever.
+    ///
+    /// The alternative was to run the pass on `held` alone, and that is the
+    /// fail-open reading this flag exists to refuse: absent evidence would have
+    /// authorised stopping every attach client on the machine.
+    pub blind: bool,
 }
 
 impl Agents {
@@ -398,12 +659,13 @@ pub struct Report {
 /// SUCCESSES IN THE HEAD, EXCEPTIONS IN THE PARENTHESIS, and every exception
 /// gets its own word: `failed` is a pane that did not come back, `not
 /// restarted` an agent still on the old binary, `left stopped` an agent that
-/// was stopped and that no pane came back to resume, `busy` an agent
-/// deliberately left alone, `skipped` a pane deliberately left alone. They
-/// could have shared the word "failed" and must not: "a pane is gone", "an
-/// agent kept its version" and "an agent is halted with nothing to resume it"
-/// are three different problems with three different answers, and only the
-/// last one needs the operator to do something.
+/// was stopped and that nothing came back to resume, `busy` an agent
+/// deliberately left alone, `skipped` a pane deliberately left alone, and
+/// `paneless pass skipped` a whole population ccmux could not see well enough
+/// to touch. They could have shared the word "failed" and must not: "a pane is
+/// gone", "an agent kept its version" and "an agent is halted with nothing to
+/// resume it" are three different problems with three different answers, and
+/// only the last one needs the operator to do something.
 ///
 /// The agent clause is omitted entirely when the pass had nothing to say —
 /// no session ccmux opened was in scope — so a session with no Claude panes
@@ -443,6 +705,12 @@ pub fn note(r: &Report) -> String {
     }
     if r.skipped > 0 {
         ex.push(format!("{} skipped", r.skipped));
+    }
+    // Not a count: nothing was attempted, so there is no number to give. It is
+    // in the exception list because it is an exception — the operator asked for
+    // every agent and got only the paned ones.
+    if r.agents.blind {
+        ex.push("paneless pass skipped".to_string());
     }
     if !ex.is_empty() {
         s.push_str(&format!(" ({})", ex.join(", ")));
@@ -901,9 +1169,13 @@ mod tests {
 
     // ── the agent scope and the state rule ──────────────────────────────────
 
+    /// A row with NO WORKER. Dormant is the safe default and the one that
+    /// leaves the headless population empty, so a test that wants a live agent
+    /// has to say so — see `live`.
     fn sess(short: &str, state: Option<State>, status: Status) -> Session {
         Session {
             id: Some(short.to_string()),
+            pid: None,
             session_id: format!("{short}-uuid"),
             cwd: "/home/dev/projects".into(),
             kind: crate::model::Kind::Background,
@@ -957,7 +1229,8 @@ mod tests {
     }
 
     /// THE STATE RULE, across the whole state x status matrix — every state
-    /// this build models, and the unmodelled one, against every status.
+    /// this build models, and the unmodelled one, against every status. Three
+    /// answers, so the matrix names the answer rather than a bool.
     ///
     /// Working and Blocked are refused from either axis at every state that is
     /// STILL RUNNING. The row that matters most is the `waiting`-without-
@@ -965,50 +1238,371 @@ mod tests {
     /// "blocked"` and leaves `status: "waiting"` behind must still be refused,
     /// because that shape has already shipped once.
     ///
-    /// And the two rows the rule does NOT reach are here too, spelled out
-    /// rather than left to be discovered: a TERMINAL state outranks the waiting
-    /// status, so `done`/`stopped` + `waiting` is Completed and IS stopped.
-    /// That is `Session::group`'s terminal-exclusion rule (PROBE-FINDINGS §1),
-    /// it is what keeps the 5-of-14 live `done` rows that carry a status of
-    /// their own out of the `busy` count, and pinning it here is what stops the
-    /// prose above quietly overstating the belt again.
+    /// `stopped` is refused at EVERY status, including the two where the group
+    /// alone would have said yes. It is the one verdict the heading cannot
+    /// supply — `Done` and `Stopped` share the Completed heading and want
+    /// opposite answers — and it is the whole of the change that stopped `R`
+    /// un-stopping a session the operator stopped on purpose.
+    ///
+    /// The row the rule deliberately does NOT reach is here too, spelled out
+    /// rather than left to be discovered: `done` outranks the waiting status,
+    /// so `done` + `waiting` is Completed and IS restarted. That is
+    /// `Session::group`'s terminal-exclusion rule (PROBE-FINDINGS §1), it is
+    /// what keeps the 5-of-14 live `done` rows that carry a status of their own
+    /// out of the `busy` count, and pinning it here is what stops the prose
+    /// above quietly overstating the belt again.
     #[test]
-    fn only_a_row_under_idle_or_completed_may_be_stopped() {
-        let cases: &[(Option<State>, Status, bool)] = &[
-            (Some(State::Done), Status::Idle, true),
-            (Some(State::Done), Status::Busy, true),
-            (Some(State::Stopped), Status::Idle, true),
+    fn only_a_running_idle_or_done_row_may_be_stopped() {
+        let cases: &[(Option<State>, Status, Verdict)] = &[
+            (Some(State::Done), Status::Idle, Verdict::Restart),
+            (Some(State::Done), Status::Busy, Verdict::Restart),
             // TERMINAL OUTRANKS WAITING. Deliberate, and the limit of the belt.
-            (Some(State::Done), Status::Waiting, true),
-            (Some(State::Stopped), Status::Waiting, true),
-            (None, Status::Idle, true),
-            (Some(State::Unknown("napping".into())), Status::Idle, true),
-            (Some(State::Working), Status::Busy, false),
-            (Some(State::Working), Status::Idle, false),
-            (Some(State::Blocked), Status::Idle, false),
-            (Some(State::Blocked), Status::Waiting, false),
-            (None, Status::Busy, false),
-            (Some(State::Unknown("compacting".into())), Status::Busy, false),
+            (Some(State::Done), Status::Waiting, Verdict::Restart),
+            (None, Status::Idle, Verdict::Restart),
+            (Some(State::Unknown("napping".into())), Status::Idle, Verdict::Restart),
+            // STOPPED STAYS STOPPED, whatever status rides along with it — and
+            // the last two are the cells `Group` alone gets wrong.
+            (Some(State::Stopped), Status::Idle, Verdict::NotRunning),
+            (Some(State::Stopped), Status::Waiting, Verdict::NotRunning),
+            (Some(State::Stopped), Status::Busy, Verdict::NotRunning),
+            (Some(State::Working), Status::Busy, Verdict::Busy),
+            (Some(State::Working), Status::Idle, Verdict::Busy),
+            (Some(State::Blocked), Status::Idle, Verdict::Busy),
+            (Some(State::Blocked), Status::Waiting, Verdict::Busy),
+            (None, Status::Busy, Verdict::Busy),
+            (Some(State::Unknown("compacting".into())), Status::Busy, Verdict::Busy),
             // The belt, without the braces: a waiting status alone.
-            (Some(State::Working), Status::Waiting, false),
-            (Some(State::Unknown("halted".into())), Status::Waiting, false),
-            (None, Status::Waiting, false),
+            (Some(State::Working), Status::Waiting, Verdict::Busy),
+            (Some(State::Unknown("halted".into())), Status::Waiting, Verdict::Busy),
+            (None, Status::Waiting, Verdict::Busy),
         ];
         for (state, status, want) in cases {
             let s = sess("aaaaaaaa", state.clone(), status.clone());
             assert_eq!(
-                agent_restartable(&s),
+                agent_verdict(&s),
                 *want,
                 "state {state:?} / status {status:?} grouped as {:?}",
                 s.group()
             );
-            // And it never disagrees with the heading the operator is reading.
+            // `stopped` aside, the rule never disagrees with the heading the
+            // operator is reading. `stopped` is the documented exception: the
+            // row still sits under **Completed** on screen, and the footer says
+            // nothing about it, so there is no count to explain from it.
+            if *state != Some(State::Stopped) {
+                assert_eq!(
+                    agent_verdict(&s) == Verdict::Restart,
+                    matches!(s.group(), Group::Idle | Group::Completed),
+                    "the rule drifted from the group it claims to read"
+                );
+            } else {
+                assert_eq!(
+                    s.group(),
+                    Group::Completed,
+                    "a stopped row still belongs under Completed on screen"
+                );
+            }
+        }
+    }
+
+    // ── the headless population (`R`'s live paneless agents) ───────────────
+
+    /// The same row WITH a worker. The value is never read, only its presence,
+    /// so the number is deliberately not a plausible pid.
+    fn live(s: Session) -> Session {
+        Session { pid: Some(4242), ..s }
+    }
+
+    fn held(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The other subtraction: every session a live `claude attach` names,
+    /// wherever on the machine it is running. Same shape as `held` and a
+    /// separate argument, because they answer different questions.
+    fn attached(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// `headless_targets` with nothing subtracted, for the tests whose subject
+    /// is some OTHER refusal.
+    fn targets_of(fleet: &[Session]) -> Vec<Headless> {
+        headless_targets(fleet, &held(&[]), &attached(&[]))
+    }
+
+    fn shorts(t: &[Headless]) -> Vec<&str> {
+        t.iter().map(|h| h.short_id.as_str()).collect()
+    }
+
+    /// THE DORMANT-RESURRECTION GUARD, and the single most important test in
+    /// this file.
+    ///
+    /// Of the 16 sessions in the operator's fleet, 9 carry `pid: null`. They
+    /// are FINISHED — not running an old `claude`, not running anything — and
+    /// `claude respawn` on one does not restart it, it STARTS it (measured,
+    /// PROBE-FINDINGS §2). A rule that scoped on state alone would have turned one `R`
+    /// into nine background workers the operator never asked for, and it would
+    /// have looked exactly like the feature working.
+    ///
+    /// Every state a live row WOULD be restarted at is checked, so the guard
+    /// cannot be half-applied.
+    #[test]
+    fn a_dormant_session_is_never_a_headless_target() {
+        for state in [
+            Some(State::Done),
+            None,
+            Some(State::Unknown("napping".into())),
+        ] {
+            let s = sess("aaaaaaaa", state.clone(), Status::Idle);
             assert_eq!(
-                agent_restartable(&s),
-                matches!(s.group(), Group::Idle | Group::Completed),
-                "the rule drifted from the group it claims to read"
+                agent_verdict(&s),
+                Verdict::Restart,
+                "the state is not what is under test here ({state:?})"
+            );
+            assert!(!s.has_worker(), "the fixture's default row is dormant");
+            assert!(
+                targets_of(&[s]).is_empty(),
+                "a session with no worker was about to be started ({state:?})"
             );
         }
+    }
+
+    /// The population the feature exists for: a live worker, no client
+    /// anywhere, a restartable state. Both ids come back — `claude respawn`
+    /// takes the short one, and the uuid is what dedupes and orders the
+    /// population and matches it against `Plan::held`.
+    #[test]
+    fn a_live_paneless_session_is_a_headless_target() {
+        let t = targets_of(&[live(sess("aaaaaaaa", Some(State::Done), Status::Idle))]);
+        assert_eq!(
+            t,
+            vec![Headless {
+                short_id: "aaaaaaaa".into(),
+                session_id: "aaaaaaaa-uuid".into(),
+            }],
+            "the short id is what `claude respawn` takes"
+        );
+    }
+
+    /// THE DISJOINTNESS RULE. A session a live ccmux pane names belongs to the
+    /// pane population and to that one only — otherwise one restart would
+    /// spend two destructive calls and the footer would count it twice.
+    ///
+    /// Both keys are checked, because a map entry written by a build with no
+    /// `short_id` field carries only the uuid: without the second key that
+    /// pane's session would read as paneless and be restarted out from under
+    /// whatever attach is sitting in it.
+    #[test]
+    fn a_session_a_ccmux_pane_holds_is_never_a_headless_target() {
+        let fleet = [live(sess("aaaaaaaa", Some(State::Done), Status::Idle))];
+        assert!(
+            headless_targets(&fleet, &held(&["aaaaaaaa"]), &attached(&[])).is_empty(),
+            "held by short id"
+        );
+        assert!(
+            headless_targets(&fleet, &held(&["aaaaaaaa-uuid"]), &attached(&[])).is_empty(),
+            "held by uuid — the key a `short_id`-less map entry has"
+        );
+        assert_eq!(
+            shorts(&headless_targets(&fleet, &held(&["bbbbbbbb", "sid-b"]), &attached(&[]))),
+            vec!["aaaaaaaa"],
+            "some OTHER pane's session must not shield this one"
+        );
+    }
+
+    /// WHERE THE STATE RULE IS APPLIED, and where it deliberately is not.
+    ///
+    /// A stopped, working or blocked session with a live worker IS in the
+    /// population — the population is liveness, ownership and command shape —
+    /// and `agent_verdict` is what refuses it, at the re-poll immediately
+    /// before the act. Two reasons the split has to fall here. A state read at
+    /// enumeration is already stale by the time the first respawn lands, and only
+    /// the reading that authorises an act may decide it. And a working
+    /// paneless agent that dropped out of the population would be invisible
+    /// rather than `busy`: the footer would go quiet about a live agent `R`
+    /// left on the old binary.
+    ///
+    /// Blocked is checked from EITHER axis here too — the shape that has
+    /// shipped a bug twice, now in a population with no pane to soften it.
+    #[test]
+    fn a_stopped_or_busy_paneless_session_is_a_candidate_that_the_verdict_refuses() {
+        for (s, want) in [
+            (
+                live(sess("aaaaaaaa", Some(State::Stopped), Status::Idle)),
+                Verdict::NotRunning,
+            ),
+            (
+                live(sess("aaaaaaaa", Some(State::Working), Status::Busy)),
+                Verdict::Busy,
+            ),
+            (
+                live(sess("aaaaaaaa", Some(State::Blocked), Status::Idle)),
+                Verdict::Busy,
+            ),
+            (
+                live(sess("aaaaaaaa", Some(State::Working), Status::Waiting)),
+                Verdict::Busy,
+            ),
+            (
+                live(sess("aaaaaaaa", Some(State::Unknown("halted".into())), Status::Waiting)),
+                Verdict::Busy,
+            ),
+        ] {
+            let label = format!("{:?}/{:?}", s.state, s.status);
+            assert_eq!(
+                shorts(&targets_of(std::slice::from_ref(&s))),
+                vec!["aaaaaaaa"],
+                "the population is liveness and shape, not state ({label})"
+            );
+            assert_eq!(agent_verdict(&s), want, "and the verdict is what refuses it ({label})");
+        }
+    }
+
+    /// Two shape checks, and neither is pedantry. An interactive session has
+    /// no short id, so there is nothing to pass `claude respawn`; and that verb
+    /// names a background session, which an interactive one is not — it is
+    /// somebody's terminal.
+    #[test]
+    fn an_interactive_session_is_never_a_headless_target() {
+        let mut s = live(sess("aaaaaaaa", None, Status::Idle));
+        s.id = None;
+        s.kind = Kind::Interactive;
+        assert!(targets_of(&[s.clone()]).is_empty());
+
+        // And a background row that somehow lost its short id, which would
+        // otherwise build `claude stop ''`.
+        let mut blank = live(sess("aaaaaaaa", Some(State::Done), Status::Idle));
+        blank.id = Some(String::new());
+        assert!(targets_of(&[blank]).is_empty());
+    }
+
+    /// Deterministic order and one entry per session, so two runs of `R`
+    /// against one fleet issue the same commands in the same order — the row
+    /// order the CLI hands back is not promised to be stable.
+    #[test]
+    fn the_headless_targets_are_ordered_and_deduped_by_session() {
+        let a = live(sess("aaaaaaaa", Some(State::Done), Status::Idle));
+        let b = live(sess("bbbbbbbb", None, Status::Idle));
+        let fleet = [b.clone(), a.clone(), a.clone()];
+        assert_eq!(shorts(&targets_of(&fleet)), vec!["aaaaaaaa", "bbbbbbbb"]);
+    }
+
+    /// THE REGRESSION TEST for the fail-open reading of ccmux's own tmux
+    /// scope. `Plan::held` is built from `list-windows`/`list-panes -s` inside
+    /// `cli.session` (R2, R3); the fleet it is subtracted from is every agent
+    /// on the machine. So a session held by a live pane of a SECOND ccmux
+    /// workspace, or by a `claude attach` the operator ran by hand in any
+    /// window, is absent from `held` and used to read as paneless — and
+    /// `claude respawn` kills that client, parking the other window on a dead
+    /// session while this pass counted it `restarted`.
+    ///
+    /// The client process is the thing that dies, so the client process is the
+    /// evidence: `agents::attached_ids` names it wherever it runs.
+    #[test]
+    fn a_session_an_attach_client_holds_anywhere_is_never_a_headless_target() {
+        let fleet = [live(sess("aaaaaaaa", Some(State::Done), Status::Idle))];
+        assert_eq!(shorts(&targets_of(&fleet)), vec!["aaaaaaaa"], "the fixture is in scope");
+        assert!(
+            headless_targets(&fleet, &held(&[]), &attached(&["aaaaaaaa"])).is_empty(),
+            "another window's live `claude attach` was about to be killed"
+        );
+        // A human may paste either id at `claude attach`, so both keys count.
+        assert!(
+            headless_targets(&fleet, &held(&[]), &attached(&["aaaaaaaa-uuid"])).is_empty(),
+            "attached by uuid"
+        );
+        assert_eq!(
+            shorts(&headless_targets(&fleet, &held(&[]), &attached(&["bbbbbbbb"]))),
+            vec!["aaaaaaaa"],
+            "somebody else's attach must not shield this one"
+        );
+    }
+
+    /// The two subtractions are INDEPENDENT, which is the reason there are two.
+    /// A pane ccmux owns whose attach has already exited (parked by `Ctrl+Z`)
+    /// has no client process left to find, so only `held` can shield it; an
+    /// attach outside this tmux session is in no map, so only `attached` can.
+    /// Collapsing them into one set would drop whichever shape the survivor
+    /// could not express.
+    #[test]
+    fn held_and_attached_each_cover_what_the_other_cannot() {
+        let fleet = [
+            live(sess("aaaaaaaa", Some(State::Done), Status::Idle)),
+            live(sess("bbbbbbbb", Some(State::Done), Status::Idle)),
+        ];
+        assert_eq!(
+            shorts(&headless_targets(&fleet, &held(&["aaaaaaaa"]), &attached(&["bbbbbbbb"]))),
+            Vec::<&str>::new(),
+            "one shielded by ccmux's own record, the other by its live client"
+        );
+    }
+
+    /// `Plan::held` is what makes the two populations disjoint, so it has to
+    /// cover the arms `plan` does NOT target as well as the one it does: a
+    /// pane parked after `Ctrl+Z` and a pane whose entry has no short id are
+    /// both still panes, and their sessions stay the pane pass's business.
+    #[test]
+    fn the_plan_holds_every_session_a_live_pane_names() {
+        let mut parked = pane("%3", "@1");
+        parked.detached = true;
+        let panes = vec![pane("%1", "@1"), pane("%2", "@1"), parked, pane("%4", "@1")];
+        let mut tabs = vec![tab(
+            "@1",
+            Some("%1"),
+            &[("%2", "aaaaaaaa"), ("%3", "bbbbbbbb")],
+        )];
+        // `%4`: an entry from a build that had no `short_id` field. Only the
+        // uuid can shield it.
+        tabs[0].map.insert(
+            &PaneId::parse("%4").expect("pane id"),
+            PaneEntry {
+                session_id: "sid-cccccccc".into(),
+                short_id: String::new(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+        // `%9` is in the map but is NOT live, and a dead pane holds nothing.
+        tabs[0].map.insert(
+            &PaneId::parse("%9").expect("pane id"),
+            PaneEntry {
+                session_id: "sid-dddddddd".into(),
+                short_id: "dddddddd".into(),
+                name: "n".into(),
+                opened_at: 0,
+            },
+        );
+
+        let p = plan(&tabs, &panes, None);
+
+        assert_eq!((p.claude, p.detached, p.unattachable), (1, 1, 1));
+        assert!(p.held.contains("aaaaaaaa"), "the respawned pane's session");
+        assert!(p.held.contains("bbbbbbbb"), "the PARKED pane's session");
+        assert!(p.held.contains("sid-cccccccc"), "the short-id-less pane's session");
+        assert!(
+            !p.held.contains("dddddddd") && !p.held.contains("sid-dddddddd"),
+            "a dead pane holds nothing: {:?}",
+            p.held
+        );
+
+        // Which is the property that matters: only the dead pane's session is
+        // left for the headless pass.
+        let fleet: Vec<Session> = ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"]
+            .iter()
+            .map(|s| live(sess(s, Some(State::Done), Status::Idle)))
+            .collect();
+        // `map` writes `sid-<short>` as the uuid, and `sess` writes
+        // `<short>-uuid`; line them up so the uuid key is really being tested.
+        let fleet: Vec<Session> = fleet
+            .into_iter()
+            .map(|s| Session {
+                session_id: format!("sid-{}", s.id.clone().unwrap_or_default()),
+                ..s
+            })
+            .collect();
+        assert_eq!(
+            shorts(&headless_targets(&fleet, &p.held, &attached(&[]))),
+            vec!["dddddddd"]
+        );
     }
 
     #[test]
@@ -1094,12 +1688,42 @@ mod tests {
                 panes: 3,
                 failed: 1,
                 skipped: 4,
-                agents: Agents { restarted: 1, busy: 2, failed: 3, stranded: 5 },
+                agents: Agents {
+                    restarted: 1,
+                    busy: 2,
+                    failed: 3,
+                    stranded: 5,
+                    blind: false,
+                },
             }),
             concat!(
                 "restarted 2 sidebars, 3 panes, 1 agent ",
                 "(1 failed, 3 not restarted, 5 left stopped, 2 busy, 4 skipped)"
             )
+        );
+        // THE POPULATION THAT WAS NOT LOOKED AT. It is not a count — nothing
+        // was attempted — and it must not read as one: the pane pass's own
+        // numbers stay exactly what they were, and the operator is told that
+        // the paneless half did not run rather than being left to infer it
+        // from a silence that looks like "there were none".
+        assert_eq!(
+            note(&Report {
+                sidebars: 1,
+                panes: 2,
+                agents: Agents { restarted: 2, blind: true, ..Agents::default() },
+                ..Report::default()
+            }),
+            "restarted 1 sidebar, 2 panes, 2 agents (paneless pass skipped)"
+        );
+        // And on its own, with no agent pass to speak of at all.
+        assert_eq!(
+            note(&Report {
+                sidebars: 1,
+                panes: 0,
+                agents: Agents { blind: true, ..Agents::default() },
+                ..Report::default()
+            }),
+            "restarted 1 sidebar, 0 panes (paneless pass skipped)"
         );
     }
 

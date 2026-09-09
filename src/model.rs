@@ -118,9 +118,7 @@ impl Group {
 // ── Session ─────────────────────────────────────────────────────────────────
 
 /// One row from `claude agents --json`. Field names mirror the CLI's JSON
-/// exactly. Identity is `session_id` and nothing else: the CLI's `pid` is
-/// UNSTABLE across attach/detach, and with the /proc ancestry walk gone
-/// nothing reads it, so it is no longer carried.
+/// exactly. Identity is `session_id` and nothing else.
 /// `Hash` is derived so `App` can fingerprint a whole poll in one pass and
 /// tell an unchanged fleet from a changed one; every field here is payload the
 /// CLI reported, so hashing all of them is exactly the question "did the
@@ -132,6 +130,33 @@ pub struct Session {
     pub id: Option<String>,
     /// UUID. Stable. THE primary key everywhere in ccmux.
     pub session_id: String,
+    /// The worker's pid, **read for its PRESENCE and never for its value**.
+    ///
+    /// PROBE-FINDINGS §1 has said since the first probe: "UNSTABLE — changes
+    /// across attach/detach. NEVER key on this." That warning is about
+    /// IDENTITY, and it still stands without qualification — nothing may
+    /// remember a pid, compare two pids, match a row to a process by pid, or
+    /// carry one across a poll. `session_id` is the only key there is.
+    ///
+    /// `is_some()` asks a DIFFERENT question, and it is the one question this
+    /// field exists to answer: **is a worker running for this session right
+    /// now?** Measured on the live fleet 2026-09-09 — of 16 listed sessions 7
+    /// carried a `pid` and 9 carried `null`, and that 7 matched the daemon's
+    /// worker count exactly. So `pid` present ⟺ a live worker, and the value
+    /// is never looked at.
+    ///
+    /// `R` needs exactly that and nothing weaker (SPEC §8.11, *the paneless
+    /// agents*). A `pid: null` row is DORMANT — not running an old `claude`,
+    /// not running at all — and "restarting" it would SPAWN a worker the
+    /// operator never asked for. `restart::headless_targets` therefore refuses
+    /// every row without a pid, and that refusal is the whole guard against a
+    /// keypress that resurrects nine finished sessions.
+    ///
+    /// It is in the `Hash`, like every other field: a session that gained or
+    /// lost its worker is a listing that changed, which is exactly what the
+    /// fingerprint asks. A pid that changes without anything else changing is
+    /// a worker that was replaced — also a change, and also worth a redraw.
+    pub pid: Option<i64>,
     pub cwd: String,
     pub kind: Kind,
     /// epoch milliseconds
@@ -204,6 +229,19 @@ impl Session {
         self.id.is_some()
     }
 
+    /// IS A WORKER RUNNING FOR THIS SESSION? The one legitimate reading of
+    /// `pid`, and the only one — see that field for why presence is a fact
+    /// while the value is not.
+    ///
+    /// It is a function rather than an open-coded `pid.is_some()` at the call
+    /// site so that the value stays unreachable by construction: every reader
+    /// in the crate goes through here, and `pid` itself is touched only by the
+    /// parser. A future reader who wants the number has to add a second
+    /// accessor and explain themselves.
+    pub fn has_worker(&self) -> bool {
+        self.pid.is_some()
+    }
+
     /// Lowercased haystack for `/` filtering: name + " " + cwd + " " + short id.
     pub fn filter_haystack(&self) -> String {
         let mut out = String::with_capacity(self.name.len() + self.cwd.len() + 12);
@@ -250,6 +288,11 @@ impl std::error::Error for ParseError {}
 #[derive(Debug, Deserialize)]
 struct RawSession {
     id: Option<String>,
+    /// Absent OR explicitly `null` on a dormant row, and both must read the
+    /// same. `Option<i64>` over `serde_json`'s number handles either, and a
+    /// non-numeric `pid` fails the row's deserialize the way every other
+    /// wrongly-typed key does.
+    pid: Option<i64>,
     #[serde(rename = "sessionId")]
     session_id: Option<String>,
     cwd: Option<String>,
@@ -269,6 +312,9 @@ impl RawSession {
     ///   startedAt  -> 0        (renders as a very old age, never panics)
     ///   kind       -> inferred from `id` presence: an `id` means background
     ///   status     -> Status::Unknown("") -> the `?` glyph, groups as Idle
+    ///   pid        -> None, which reads as DORMANT and is the safe default:
+    ///                 a caller that cannot see a worker must not act as
+    ///                 though there is one (see `Session::pid`)
     fn into_session(self) -> Option<Session> {
         let session_id = self.session_id.filter(|s| !s.is_empty())?;
         let name = self.name?;
@@ -301,6 +347,7 @@ impl RawSession {
 
         Some(Session {
             id,
+            pid: self.pid,
             session_id,
             cwd,
             kind,
@@ -710,6 +757,9 @@ mod tests {
     fn sess(id: Option<&str>, status: Status, state: Option<State>) -> Session {
         Session {
             id: id.map(str::to_string),
+            // Dormant unless a test says otherwise: nothing in this module
+            // reads the worker, and the safe default is "cannot see one".
+            pid: None,
             session_id: format!("uuid-{}", id.unwrap_or("interactive")),
             cwd: "/tmp".into(),
             kind: if id.is_some() { Kind::Background } else { Kind::Interactive },
@@ -738,6 +788,29 @@ mod tests {
         assert_eq!(interactive.state, None);
         assert!(!interactive.is_attachable());
         assert_eq!(interactive.key(), "aaaaaaaa-3333-4038-8de7-d5f112c92363");
+    }
+
+    /// THE LIVENESS PREDICATE, and the three shapes the CLI answers it in.
+    ///
+    /// `R`'s paneless population turns entirely on this one bit (SPEC §8.11):
+    /// a row with a worker may be restarted, a row without one is DORMANT and
+    /// restarting it would spawn a process the operator never asked for. Both
+    /// ways of saying "no worker" — the key absent, and the key present as
+    /// `null` — must read the same, because the live fleet emits `null` and
+    /// nothing promises it always will.
+    #[test]
+    fn a_row_without_a_pid_reads_as_having_no_worker() {
+        let json = r#"[
+          {"sessionId":"a","name":"live","cwd":"/tmp","id":"aaaaaaaa","pid":1071760},
+          {"sessionId":"b","name":"dormant-null","cwd":"/tmp","id":"bbbbbbbb","pid":null},
+          {"sessionId":"c","name":"dormant-absent","cwd":"/tmp","id":"cccccccc"}
+        ]"#;
+        let p = parse_sessions(json).expect("parses");
+        assert!(p.is_complete(), "a null pid is not a malformed row");
+        assert_eq!(p.sessions.len(), 3);
+        assert!(p.sessions[0].has_worker(), "a pid is a running worker");
+        assert!(!p.sessions[1].has_worker(), "`pid: null` is dormant");
+        assert!(!p.sessions[2].has_worker(), "an absent pid is dormant too");
     }
 
     #[test]

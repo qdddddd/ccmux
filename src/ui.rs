@@ -1455,6 +1455,9 @@ mod tests {
                 Kind::Background => Some(format!("{n:08x}")),
                 Kind::Interactive => None,
             },
+            // Nothing the sidebar DRAWS reads the worker — `R`'s scope does,
+            // and that is tested where the scope lives.
+            pid: None,
             session_id: format!("uuid-{n:04}"),
             cwd: "/home/dev/projects/shared/Foundation/price-sanitize".into(),
             kind,
@@ -1529,6 +1532,7 @@ mod tests {
             was_watched: true,
             quiesced: false,
             panes_fresh: true,
+            tabs_fresh: true,
             should_quit: false,
             // Rendering never dispatches; a panic here is a rendering test
             // reaching into `agents`, which must be impossible.
@@ -1542,6 +1546,8 @@ mod tests {
             // so rather than shelling out to the operator's live `claude`.
             agents_poll: || panic!("ui test reached agents::poll"),
             agents_stop: |_| panic!("ui test reached agents::stop"),
+            agents_respawn: |_| panic!("ui test reached agents::respawn"),
+            agents_attached: || panic!("ui test reached agents::attached_ids"),
             agent_budget: Duration::from_secs(60),
         }
     }

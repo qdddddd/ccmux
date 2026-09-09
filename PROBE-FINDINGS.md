@@ -14,6 +14,8 @@ Element shape (keys union across all observed rows):
 ```json
 {
   "pid": 2877291,                 // UNSTABLE - changes across attach/detach. NEVER key on this.
+                                  // PRESENT-OR-NULL IS A DIFFERENT QUESTION, and
+                                  // it IS reliable - see below.
   "id": "1c45d64f",               // 8-hex short id. ABSENT for kind=="interactive".
   "cwd": "/home/dev/projects/...",
   "kind": "background",           // "background" | "interactive"
@@ -39,6 +41,45 @@ Element shape (keys union across all observed rows):
                                   // error and not an unknown.
 }
 ```
+
+**`pid` PRESENCE IS THE LIVENESS FLAG, AND IT IS THE ONLY ONE. Its VALUE is
+still forbidden.** These are two different readings of one key and the ban
+covers exactly one of them.
+
+* **Forbidden, unchanged:** the pid as an IDENTITY. Do not remember one, compare
+  two, match a row to a process by one, or carry one across a poll. It changes
+  across attach/detach, so anything keyed on the value is wrong the moment a
+  pane opens. `sessionId` is the only key there is.
+* **Sound, and now relied on:** `pid` present ⟺ a worker process is running for
+  that session. Measured on the live fleet 2026-09-09 — 16 rows, **7 with a
+  `pid` and 9 with `null`**, and that 7 matched the daemon's worker count
+  exactly. Re-measured the same day at 17 rows: 8 live, 9 `null`. A `null` row
+  is not stale, it is **dormant** — the session finished and its worker exited;
+  it is running no `claude` at all, old or new.
+
+Verified directly rather than inferred: a `done` session's own worker was ended
+(`SIGTERM`, pid taken from its own row) and the row went `pid: 1230016,
+status: "idle"` -> `pid: null, status` absent, with `state` still `done`. The
+same shape the 9 dormant rows are in.
+
+This is what `R`'s paneless population is scoped on (SPEC §8.11). A rule that
+looked only at `state` would have called all 14 idle-or-done rows restartable
+and, on one keypress, SPAWNED nine workers for sessions that had none — the
+opposite of what the verb is for. `model::Session::pid` is therefore an
+`Option` read only through `has_worker()`, and the crate reads the value
+nowhere. That includes the one place it would have been tempting: when a
+`claude respawn` returns an error, `R` polls and asks `has_worker()` whether the
+halt landed — never whether the pid CHANGED, which would have been the
+forbidden reading arriving through the back door for the sake of one footer
+word.
+
+**The presence flag is about the WORKER, not about a client.** A live
+`claude attach` neither creates a `pid` nor changes one, and `claude agents
+--json` carries no field at all that says a session has a client attached
+(the row is exactly `id, cwd, kind, startedAt, sessionId, name, state, status,
+pid` — checked 2026-09-09, 18 rows). So "is anyone looking at this session"
+cannot be answered from the payload, and `R` answers it from the client process
+instead — see §2, *who is attached*.
 
 **`state` and `status` are two INDEPENDENT axes. Do not infer either from the
 other.** It is tempting to read `blocked` and `waiting` as two spellings of one
@@ -91,10 +132,13 @@ exclusion is why a `done` row carrying a stale status word is not hoisted.
 | `claude stop <id>` | Stops the session; conversation kept; resume later with `claude attach <id>`. | YES |
 | `claude kill <id>` | Alias of `stop`. | YES |
 | `claude rm <id>` | `claude rm --help`, verbatim: "Delete a background session and its worktree. Unlike `stop`, works on already-exited sessions." **IRREVERSIBLE** — it removes the git worktree, so uncommitted work in it is gone. Verified on 2.1.246. | YES |
+| `claude --bg --resume <sessionId>` | Documented on `--bg`: "With --resume &lt;session-id&gt;, continues that session in the background". Resumes a stopped session as a background worker with **no client and no pane**. Takes the **UUID**, not the short id. Verified on 2.1.266 — see below. | YES |
 
 `claude resume` and `claude list` are **NOT** subcommands — they fall through to the
 generic help (verified against a `bogus123` control). Only `attach`, `logs`, `stop`,
-`kill`, `rm` are real.
+`kill`, `rm` are real SUBCOMMANDS. `--resume` is a different thing: a documented
+**flag** on `--bg`, not a verb of its own, and `claude --bg --resume <uuid>` works
+where `claude resume <uuid>` does not.
 
 **`rm` REFUSES rather than destroying unpushed work, and it explains itself on
 STDOUT.** Verified on 2.1.246: against a worktree holding commits that are not
@@ -112,8 +156,10 @@ sentence that says the work is safe. Read stdout when stderr is blank. A `rm`
 whose worktree is clean (or which has none) deletes the session and removes the
 worktree from `git worktree list`, verified both ways.
 
-**`stop` + `attach` IS HOW AN AGENT CHANGES VERSION, and it is the only way there
-is.** Verified 2026-09-04 on 2.1.260. A background worker is a separate,
+**`stop` + a RESUME IS HOW AN AGENT CHANGES VERSION, and there is no other way.**
+There are two resumes: `attach`, below, which needs a terminal to attach in, and
+`--bg --resume`, further down, which needs nothing. Verified 2026-09-04 on
+2.1.260. A background worker is a separate,
 daemon-owned process (§3) and it keeps the `claude` it was launched with for its
 whole life; restarting the attach CLIENT changes nothing about it. `claude stop`
 followed by `claude attach` respawns it as a genuinely NEW process, which
@@ -124,6 +170,94 @@ before stop : pid=1941112 replPid=1941127 cliVersion=2.1.260
 after stop  : (absent from the roster)
 after attach: pid=1956984 replPid=1957001 cliVersion=2.1.260   <- new process
 ```
+
+**`claude respawn <id>` IS THE RESTART THAT NEEDS NO PANE, and it is the other
+half of the version story.** `stop` + `attach` above needs a terminal to attach
+in, which is why ccmux could only ever refresh the agents it had open in a pane.
+`respawn` is a real subcommand, in the `claude --help` Commands list on 2.1.266:
+"Restart a background session, or all of them with `--all`, so it runs the
+current Claude Code version."
+
+Verified 2026-09-09 on 2.1.266, on throwaways:
+
+```
+before respawn   name='PLFIX-A: reply with…'  startedAt=…072902  pid=1486602  state=done
+claude respawn e77b0ddc   -> stdout "respawned e77b0ddc", rc=0, stderr empty
+after respawn    name='e77b0ddc'              startedAt=…083178  pid=1491316  state=done
+fleet size 18 before and 18 after                            <- no fork, no duplicate
+claude logs e77b0ddc  -> the original prompt and its answer  <- conversation intact
+```
+
+Same short id, same `sessionId`, one row throughout, a fresh worker that
+resolved `claude` at launch.
+
+**IT REPLACED `claude stop` + `claude --bg --resume <sessionId>`, and the reason
+is a fork branch, measured.** `--bg --resume` is documented as "continues that
+session in the background under the same ID, **or starts a copy and says so when
+the session is already running**", and the copy branch exits **0** with the
+notice on stdout — so a caller that reads only the exit status counts a
+duplicated conversation as a success. ccmux fired the resume immediately after
+its own `claude stop`, i.e. inside exactly the window where the daemon may still
+call the session running, and roughly one resume in twenty came back as a copy:
+an extra live agent on the machine, an extra row in the fleet, silently. Three
+different notice texts were observed for the one branch, so text-matching it
+would have been a guess:
+
+```
+note: session <id> is already running in the background, so this started a copy as <new>.
+note: started a copy of that conversation as <new>. To continue a session under its own id, …
+note: background session <id> keeps its own saved options, so the flags you passed started a copy as <new>.
+```
+
+`respawn` has no such branch, and it takes the same 8-hex short id that
+`stop`/`kill`/`rm`/`attach` take, so the uuid/short-id pairing hazard goes with
+it. Two calls also meant a stop could land with its partner never sent; one call
+cannot.
+
+**`respawn` CHECKS NOTHING, so the caller's gates are load-bearing.** Measured
+the same day:
+
+* on a **stopped** session it UN-STOPS it — `pid: null` -> a live pid. `R` must
+  refuse `state: "stopped"` itself, or a keypress named "restart" undoes a
+  deliberate `Ctrl+X`.
+* on a **working** session it interrupts the work mid-flight —
+  `state=working status=busy` -> `state=blocked status=idle`.
+* it KILLS the session's attach client, exactly as `claude stop` does: a pane
+  running `claude attach <id>` printed `Session <id> has exited.` and dropped to
+  its post-attach prompt.
+* `respawn --all` is therefore never built: it would hit every dormant, stopped
+  and working session at once.
+
+**A RESUMED WORKER LOSES ITS DISPLAY NAME AND ITS `startedAt`.** Not specific to
+`respawn` — `stop` + `attach` and `--bg --resume` do the same — and not a lost
+record. While the resumed worker runs, `name` reads as the bare 8-hex short id
+and `startedAt` is the moment of the resume; the persisted name comes BACK as
+soon as the session stops again:
+
+```
+dispatched       name='PLFIX-A: reply with exactly the word ALPHA…'   startedAt=…072902
+after respawn    name='e77b0ddc'                                      startedAt=…083178
+after claude stop name='PLFIX-A: reply with exactly the word ALPHA…'  startedAt=…072665
+```
+
+There is no way to set it back. The CLI has no rename verb, and `-n/--name`
+passed alongside `--resume` does not set one — it triggers the fork branch above
+("…keeps its own saved options, so the flags you passed started a copy as…"), so
+buying the name back would cost a duplicated conversation. ccmux states the cost
+in the README instead (§8.11, *The agents*).
+
+**WHO IS ATTACHED: `/proc/<pid>/cmdline`, because the payload cannot say.**
+`claude agents --json` is machine-wide and carries no attached/client field
+(§1), while every tmux record ccmux holds is scoped to its own session — so
+"does anyone have this session open" has no answer inside either source. The
+attach CLIENT is a plain process with argv `["claude", "attach", "<id>"]`
+(observed live: six of them, one per ccmux pane the operator had open), and it
+is the thing `stop`/`respawn` kill. A flat scan of `/proc` for that argv shape
+therefore answers the question across ccmux workspaces, tmux servers and bare
+terminals alike. It is read-only, it can only make `R` refuse to act, and it is
+NOT §5.4's deleted ancestry walk: no ppid chain, no `list-panes -a`, no
+resolving a session to a pane. It cannot see an attach on another machine
+against a shared daemon.
 
 **Agents go stale, and by a lot.** Measured on this host with 2.1.258 / 2.1.259 /
 2.1.260 installed and 2.1.260 current: of 7 live workers, 4 were on 2.1.251 and 1

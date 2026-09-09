@@ -123,7 +123,7 @@ environment-variable equivalent of `--socket`.
 | `/` | Filter by name, cwd, or short id | no |
 | `a` | Toggle visibility of the Completed group | no |
 | `r` | Force refresh | no |
-| `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, every pane ccmux opened, and the **agents** behind those panes that are not busy. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
+| `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, every pane ccmux opened, and every **running agent** that is not busy, whether or not it has a pane. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
 | `?` | Help overlay | no |
 | `q` | Quit the sidebar. Sessions and panes are untouched | no |
 | `Esc` | Close an open delete window if there is one; else clear the filter if one is active; otherwise does nothing | no |
@@ -329,9 +329,13 @@ What it restarts, and how:
 | this sidebar | `exec(2)` — the process image is replaced | the pane, by construction: tmux is never told |
 | the other tabs' sidebars | `respawn-pane -k` | the pane id, its geometry, the layout |
 | the panes ccmux opened, still attached | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
-| the **agents** behind those panes, when idle, done or stopped | `claude stop <id>`, and the pane's own `claude attach` is the resume | the conversation and the transcript |
-| an agent that is **working** or **blocked** | nothing — skipped and counted | the work in flight |
+| the **agents** behind those panes, when idle or done | `claude stop <id>`, and the pane's own `claude attach` is the resume | the conversation and the transcript |
+| **running agents nobody has open**, when idle or done | `claude respawn <id>` | the conversation and the transcript |
+| an agent that is **working** or **blocked** | nothing — skipped and counted as `busy` | the work in flight |
+| an agent you **stopped** yourself | nothing at all, and nothing is reported | it stays stopped |
+| a session with **no worker running** | nothing at all | it stays finished — it is not started |
 | a pane you detached from | nothing — skipped and counted | whatever you have been doing in it |
+| an agent open in **another ccmux**, or in a `claude attach` you ran yourself | nothing — it is somebody's terminal | that terminal |
 
 **Nothing else is touched.** A pane is restarted only if ccmux can prove it
 created it — it is a tab's recorded sidebar, or it is in that tab's pane map. A
@@ -342,16 +346,36 @@ keeps running, with the same pid.
 **The agents.** Restarting an attach client changes nothing about the version
 doing the work: the agent is a separate, daemon-owned process, and it runs
 whatever `claude` was current when it was dispatched until it dies. `R` refreshes
-it the only way there is — `claude stop <id>`, after which the pane's respawned
-`claude attach <id>` resumes it as a genuinely new process on the binary that is
-installed now. The conversation is kept; the transcript comes back.
+it, and which mechanism applies is the only difference between the two kinds of
+agent it reaches:
 
-It only ever touches sessions **ccmux has open in a pane** — the same ownership
-rule the panes follow. A session you never opened here is none of ccmux's
-business, and it could not be resumed anyway: the pane's attach is the resume,
-so ccmux stops only what it is about to re-attach.
+* an agent **open in a ccmux pane** is stopped with `claude stop <id>`, and that
+  pane's respawned `claude attach <id>` is the resume;
+* an agent **nobody has open** is restarted with `claude respawn <id>`, the
+  CLI's own verb for "pick up the current Claude Code version", which needs no
+  terminal at all.
 
-And it never touches an agent that is **working** or **blocked** — the two top
+Either way it comes back as a genuinely new process on the binary that is
+installed now, under the same id, with the conversation kept and the transcript
+intact.
+
+**One thing does not come back: the name.** A resumed worker comes up without
+the session's display name and with its start time reset, so while it runs the
+row shows the bare 8-hex id instead of the task text and the age reads as
+seconds. The record itself is fine — the name reappears the moment the session
+stops — and `/` still finds it by id or directory in the meantime. This is the
+CLI's behaviour on any resume, `stop` + `attach` included, so it is not new; what
+is new is that the no-pane route reaches agents you never opened here. There is
+no way for ccmux to put it back: the CLI has no rename, and passing `--name` to
+a resume starts a *copy* of the conversation instead, which is worse.
+
+The rule that decides is **whether a worker is running**. `R` restarts running
+agents; it never starts one. A session that has finished and whose worker has
+exited is not on an old version — it is not on any version — so `R` leaves it
+exactly where it is and says nothing about it. That is most of a busy fleet:
+nine of seventeen sessions here, on an average afternoon.
+
+It also never touches an agent that is **working** or **blocked** — the two top
 groups in the list. A working agent is mid-task, a blocked one is holding a
 question for you, and `claude stop` would take either. Those keep their old
 version until they finish, which is the trade that lets `R` stay safe to press
@@ -359,25 +383,63 @@ at any moment. The footer names them: `2 busy`. State is re-read from
 `claude agents --json` immediately before each stop, so a session that picks up
 work while `R` is running is left alone from the next one onwards.
 
-A pane you **detached from** is skipped for the same reason, even though ccmux
-did open it. Once `Ctrl-Z` has parked it — and especially once `s` has left a
-shell in it — the map entry says who created the pane and nothing about what is
-in it, and respawning a shell you have been working in for an hour with
-`claude attach` would destroy it. The footer counts those, one per pane:
+**A session you stopped yourself stays stopped.** `Ctrl-x`'s first press stops
+an agent on purpose; `R` used to undo that, because a stopped session sits under
+**Completed** next to the finished ones and the rule read the heading. It no
+longer does. A stopped session is not restarted, is not resumed, and is not
+counted in the footer — there is nothing to report about an agent that is not
+running. Press `Enter` on the row when you want it back.
+
+A pane you **detached from** is skipped, even though ccmux did open it. Once
+`Ctrl-Z` has parked it — and especially once `s` has left a shell in it — the map
+entry says who created the pane and nothing about what is in it, and respawning
+a shell you have been working in for an hour with `claude attach` would destroy
+it. The footer counts those, one per pane:
 `restarted 2 sidebars, 1 pane (1 skipped)`. Resume the pane with enter and it
 becomes a restart target again.
+
+Its **agent** is left alone too, and deliberately: a pane ccmux is leaving alone
+is still a pane, so its session stays with the pane and is never picked up by
+the no-pane route instead. You parked it; being stopped and restarted behind
+your back is not what `skipped` means.
+
+**An agent open somewhere else is not a no-pane agent.** `claude agents` lists
+every session on the machine, while everything ccmux knows about panes is scoped
+to its own tmux session — so a second ccmux workspace's pane, or a
+`claude attach` you ran by hand in any window, is invisible to the map. Both
+`claude stop` and `claude respawn` kill an attach client, which would leave that
+window sitting on `Session <id> has exited.` So before the no-pane route runs at
+all, `R` looks for a live `claude attach <id>` process anywhere on this machine
+and takes every session it finds out of scope. If that look cannot be made, the
+whole no-pane route is skipped and the footer says `paneless pass skipped` —
+not being able to see is not the same as seeing nobody. What it cannot cover is
+an attach on a *different* machine against a shared daemon.
 
 The footer then says what happened, from the new image: `restarted 3 sidebars,
 4 panes, 2 agents (1 busy, 1 skipped)`. Successes are in the head, exceptions in
 the parenthesis, and each gets its own word — `failed` is a pane that did not
 come back, `not restarted` an agent still on the old binary, `left stopped` an
-agent that was stopped and whose pane never came back to resume it, `busy` an
-agent deliberately left alone, `skipped` a pane deliberately left alone. A line
-too wide for the sidebar wraps rather than truncating.
+agent that was halted and that nothing came back to resume, `busy` a running
+agent deliberately left alone, `skipped` a pane deliberately left alone,
+`paneless pass skipped` a whole population `R` could not see well enough to
+touch. A line too wide for the sidebar wraps rather than truncating.
+
+If the tmux reads themselves fail — the session was renamed out from under
+ccmux, say — there is no report at all, only `cannot read this session's panes —
+restarted this sidebar only`. `R` will not plan from a blank inventory: with no
+panes to be seen, every agent on the machine would look like nobody's.
+
+Nothing is reported about an agent that was **not running** — one you had
+stopped, or one whose worker had already exited. `busy` is a claim that an agent
+is at work and keeping its old version, and a halted session is not that, so it
+gets no word rather than a misleading one.
 
 `left stopped` is the only one of those that asks anything of you, and it is
 rare: it needs a pane to be killed or to fail its respawn in the moment between
-the stop and the re-attach. The agent is halted and ccmux has nothing left that
+the stop and the re-attach, or a `claude respawn` to halt an agent and then
+fail to bring it back — which `R` establishes by re-reading the fleet rather
+than by guessing from the error.
+The agent is halted and ccmux has nothing left that
 would resume it, so press `Enter` on the row to open it again. An agent is
 counted as restarted only once a pane has actually come back holding it — a
 stop is half a restart, and the footer does not claim the other half before it
@@ -390,9 +452,13 @@ One agent that will not stop does not cost the others theirs: the stop is
 attempted for each in turn, a failure is counted, and the pass carries on. Every
 stop lands **before** any pane is respawned, because the respawned
 `claude attach` is what resumes the session — the other order would leave you
-looking at a pane whose agent had just been halted underneath it.
+looking at a pane whose agent had just been halted underneath it. The agents in
+panes are stopped first, since their resume is that pane pass and every moment
+before it is a moment they sit halted; the ones nobody has open follow, each a
+single `claude respawn` that halts and restarts inside the daemon, so there is
+no moment in which one of them is stopped with nothing on its way.
 
-The pass is not instant — about a second per agent, and up to 75 s against a
+The pass is not instant — about a second per agent, and up to 80 s against a
 `claude` that has wedged — so the restarted sidebar **draws a frame first** and
 says `restarting the session…` while it works. Keys struck at it during that
 window are discarded rather than replayed when it finishes: they were aimed at
@@ -485,12 +551,27 @@ that is known to have lost rows concludes nothing at all.
   the respawning — so a failed upgrade costs a message rather than your
   sidebars. That is why it has no confirmation: an arm belongs on a verb with no
   undo, and `Ctrl-x`'s second press is the only one of those.
-- `R` also runs `claude stop` — the same **recoverable** verb `Ctrl-x`'s first
-  press runs, and never `claude rm`. It reaches only sessions ccmux has open in
-  a pane, and only those that are neither working nor blocked; the conversation
-  is kept and the pane's own `claude attach` resumes it a moment later. A busy
-  agent keeps its old version until it finishes, which is the whole reason `R`
-  is safe to press at any moment.
+- `R` also runs `claude stop` and `claude respawn` — **recoverable** verbs, and
+  never `claude rm`. Everything it stops it puts straight back, a moment later,
+  by the pane's own `claude attach`; `claude respawn` halts and restarts in a
+  single call and never leaves a gap at all. The conversation is kept either
+  way; the display name is not, and comes back when the session next stops (see
+  *The agents*). A busy agent keeps its old version until it finishes, which is
+  the whole reason `R` is safe to press at any moment.
+- **`R` only ever restarts agents that are already running.** A session with no
+  worker — finished, or one you stopped — is left completely alone: not stopped,
+  not resumed, not started. That is the line that keeps a single keypress from
+  turning a fleet of finished conversations into a fleet of live processes. A
+  session you stopped with `Ctrl-x` stays stopped; `Enter` on its row is what
+  brings it back, and nothing else does.
+- **`R` reaches beyond ccmux's own panes, so it first checks that nobody else is
+  looking.** `claude agents` lists every session on the machine while ccmux's
+  pane records cover only its own tmux session, and stopping a session kills
+  whatever `claude attach` is attached to it. So the no-pane route excludes
+  every session that has a live `claude attach` process anywhere on this
+  machine — another ccmux workspace, another tmux server, a plain terminal — and
+  when that check cannot be made it does not run at all. Absent evidence never
+  authorises the act.
 - `Ctrl-x` is the only verb that can **delete** a session, and the only stop
   that reaches a **working or blocked** one — `R`'s stop refuses those, and puts
   everything it does stop straight back. The first press **stops** —

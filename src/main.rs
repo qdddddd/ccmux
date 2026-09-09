@@ -1105,6 +1105,12 @@ mod tests {
             "pub fn interactive_pane_cmd",
             // struct fields
             "pub interactive_panes",
+            // The pid as an IDENTITY, which is what the bare `i32` was: a value
+            // the /proc ancestry walk compared and remembered. That reading is
+            // still banned (PROBE-FINDINGS §1) and no spec may declare it back.
+            // `Session::pid` is an `Option`, read ONLY through `has_worker()`
+            // for its presence, and is a different field with a different type
+            // — which is exactly why this needle stays spelled `i32`.
             "pub pid: i32",
             "pub session_name: String",
             // the `NewInteractive` prompt variant, as a variant and not as prose
@@ -1137,6 +1143,28 @@ mod tests {
             // shade: a promised third place for "where is this open" is a
             // third place that has to be kept in step with the other two.
             "· pane",
+            // `R`'s state rule. The one-bit `agent_restartable` could not
+            // express the three outcomes the pass now reports — restart, busy,
+            // and "not running, so nothing to say" — and folding `stopped` back
+            // into a bool is exactly how a keypress named "restart" started
+            // undoing the operator's `Ctrl+X` in the first place. The rule is
+            // `agent_verdict` and a spec that still names the old one is
+            // promising a function the crate does not have.
+            "restart::agent_restartable",
+            // `R`'s paneless restart, as the pair it started life as. The
+            // resume half had a documented FORK branch — it exits 0 while
+            // starting a copy of the conversation when the daemon still calls
+            // the session running, which is exactly the state ccmux left it in
+            // by resuming straight after its own stop — and a spec that names
+            // it back is promising a verb whose success cannot be trusted.
+            // `claude respawn <id>` replaced both halves (PROBE-FINDINGS §2).
+            //
+            // The ARGV is guarded where argvs are, not here: §8.11 has to be
+            // able to say in prose why `--bg --resume` was dropped, while
+            // `agents::the_paneless_restart_names_one_short_id_and_nothing_else`
+            // and `app::the_agent_pass_builds_only_stop_and_respawn_argvs` are
+            // what make sure no caller can build it again.
+            "agents::resume",
         ] {
             assert!(
                 !SPEC.contains(needle),
