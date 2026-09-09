@@ -235,11 +235,19 @@ Either way the cursor follows the session you just dispatched. It does not
 happen at submit time — `claude --bg` returns before the daemon lists the
 session — so ccmux remembers the short id it printed and moves the selection
 onto the row the moment the row appears, however the list has re-sorted by
-then. Nothing is opened: `Enter` is still yours to press. If you move the
-cursor yourself first, the jump is dropped rather than yanking the selection
-back; if `/` is hiding the new session, the footer says
-`dispatched <name> — filtered out` and your filter is left alone; and if the
-session never turns up within a few polls, the cursor simply stays put.
+then. Nothing is opened: `Enter` is still yours to press.
+
+The cursor is yours the moment you reach for it. Any key that is about the
+cursor drops the pending jump before it can fire — the moves (`j` `k` `g` `G`
+`Tab` `Ctrl-d` `Ctrl-u`, including one that is already at the end of the list
+and moves nothing), and every key that acts on the row under it (`Enter` `o`
+`s` `t` `x` `Ctrl-x` `L` `d` `u`). So a jump can never arrive between the two
+presses of `Ctrl-x` and change what the second one deletes. `r`, `/`, `a` and
+`n` itself do not cancel it. If `/` is hiding the new session the footer says
+`dispatched <name> — filtered out` and your filter is left alone — and if the
+filter line is still open, that line waits until the footer is yours again to
+read. If the session never turns up within a few polls, the cursor simply
+stays put.
 
 ## Reading the list
 

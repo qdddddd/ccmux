@@ -2512,20 +2512,48 @@ daemon-owned, and closing its pane never touched it.
     ordinary `selected_key` / `reanchor_selection` path with its `session_id`.
     There is no second selection mechanism, and the selection still only ever
     lands on a `Row::Session`.
-  - It expires after `JUMP_POLLS` (8) polls that did not list the id, counted
-    in POLLS and not in wall-clock: the idle ladder, the failure backoff and
-    the §4.2 gate all stretch the cadence, so a tick that spawned no
-    `claude agents` learns nothing and is charged nothing. Expiry is silent —
-    the dispatch already flashed, truthfully, and only the cursor move is owed.
-  - It is cancelled the moment the operator moves the cursor themselves, by
-    `cancel_pending_jump` in `set_selected` (`j` `k` `g` `G` `Ctrl-d` `Ctrl-u`
-    `Tab`), `act_dismiss` and `act_undo_dismiss`. A jump that yanks the
-    selection out from under a keypress is worse than no jump.
+  - It expires after `JUMP_POLLS` (8) polls that did not settle it, counted in
+    POLLS and not in wall-clock: the idle ladder, the failure backoff and the
+    §4.2 gate all stretch the cadence, so a tick that spawned no
+    `claude agents` learns nothing and is charged nothing. Nor does a poll that
+    RAN but FAILED — `poll_step` reports the spawn, and `apply_poll`'s `Err`
+    path leaves `sessions` untouched, so `tick_pending_jump` reads `poll_error`
+    and charges only an ANSWER. Expiry is silent — the dispatch already
+    flashed, truthfully, and only the cursor move is owed.
+  - It is cancelled the moment the operator takes the cursor, by
+    `cancel_pending_jump` in `key_normal`, on the KEYPRESS; `claims_the_cursor`
+    is the table. Two populations: every cursor move (`j` `k` `↓` `↑` `g` `G`
+    `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`), **including one that hits the end of the
+    list and moves nothing**, and every verb that acts on the row under the
+    cursor (`Enter` `o` `s` `t` `x` `Ctrl-x` `L` `d` `u`). Not `n` (it arms the
+    next one), not `r` (the refresh that lands this one), not `/` or `a` (view
+    toggles, answered below). Cancelling on the resulting MOVE was wrong twice
+    over: `select_prev` on the top row and `select_next` on the bottom one find
+    no target and never reach `set_selected`, and `Ctrl+X`'s two presses
+    straddle the poll its own first press forces — a jump landing between them
+    retargeted the cursor, and `arm_second_press` then refused the delete with
+    `moved off <name> — nothing deleted`, blaming the operator for a move ccmux
+    had made. A jump that yanks the selection out from under a keypress is
+    worse than no jump.
   - When `/` or `a` hides the new session there is no row to move to, and the
     operator's filter is not ccmux's to clear: flash
     `dispatched <name> — filtered out` (Warn) instead, the precedent `u` set.
     A just-dispatched session is Working, Blocked or Idle, so `a` does not hide
     it; the flash is for `/`, and for the rare task that is already Done.
+    The flash waits for a footer that can carry it: while `footer_is_covered()`
+    — `/` open, an overlay up, a prompt on screen — the intent is HELD rather
+    than spent, because `draw_footer` gives the line to the filter input without
+    ever consulting `footer_message`, and `check_message_timeout` would then
+    drop the unread message after `MSG_TTL`. The wait costs no budget: the
+    budget's question ("does this session exist") is already answered by then,
+    and charging the wait made the hold worthless — ~20s of thinking with `/`
+    open at the default interval spends it, and the operator gets neither the
+    move nor the reason. It is safe to be unbounded because a covered footer is
+    a covered keymap: `key_filter`, `key_help`, `key_logs` and `key_prompt`
+    touch no selection, so nothing can move the cursor while it is held. The
+    first return to Normal settles it on the next tick; an operator who edits
+    the filter into one the new row matches gets the jump itself instead; and a
+    session that LEAVES the list while held puts the intent back on the budget.
   - `None` from the dispatch arms nothing, so a CLI whose banner changes shape
     loses the cursor jump and nothing else.
 

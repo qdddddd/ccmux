@@ -176,14 +176,24 @@ pub struct PendingDelete {
 /// a failure streak adds `BACKOFF`, and the §4.2 gate stops it dead while
 /// nobody is looking at this tab — so any wall-clock deadline would expire the
 /// intent during a gap in which the sidebar learned NOTHING. A poll budget only
-/// burns down on evidence: eight consecutive complete answers from
-/// `claude agents` that do not mention the id are eight refutations, whatever
-/// they took in wall time.
+/// burns down on evidence: eight consecutive ANSWERS from `claude agents` that
+/// did not settle the intent are eight refutations, whatever they took in wall
+/// time.
 ///
-/// Eight is generous against the one thing it has to cover. `dispatch_and_close`
-/// forces a poll immediately, and the daemon lists a `--bg` session on that poll
-/// or the next; the remaining slack absorbs a couple of failed polls without
-/// spending the operator's jump on them.
+/// An ANSWER, not a spawn. `poll_step` reports that `claude agents` RAN, which
+/// is a different claim: its `Err` path leaves `self.sessions` exactly as it
+/// found them, so a failed poll learned nothing about the id and must refute
+/// nothing. Charging it let a transiently failing CLI — `FAIL_BACKOFF` is 10s —
+/// spend the whole budget in ~80s without the sidebar having once seen a session
+/// list, and then not jump when the list finally arrived. `tick_pending_jump`
+/// reads `poll_error` for the difference.
+///
+/// The budget answers ONE question — does this session exist at all — and it is
+/// spent only on that. `tick_pending_jump`'s other wait, for a footer that can
+/// carry the filtered-out line, charges nothing: by then the session is listed
+/// and the question is answered. Eight is generous against what is left.
+/// `dispatch_and_close` forces a poll immediately, and the daemon lists a `--bg`
+/// session on that poll or the next.
 const JUMP_POLLS: u32 = 8;
 
 /// `n`'s cursor intent: move the selection onto the session just dispatched,
@@ -197,12 +207,28 @@ const JUMP_POLLS: u32 = 8;
 /// fallback and park it on an unrelated row. Exactly the trap
 /// `act_undo_dismiss` documents.
 ///
-/// THE INTENT IS CANCELLED THE MOMENT THE OPERATOR MOVES THE CURSOR, by
-/// `cancel_pending_jump` at the three places that move it deliberately:
-/// `set_selected` (`j` `k` `g` `G` `Ctrl-d` `Ctrl-u` `Tab` all funnel through
-/// it), `act_dismiss` (`d` re-points at a neighbour) and `act_undo_dismiss`
-/// (`u` follows the restored row). A jump that yanks the selection out from
-/// under a keypress is worse than no jump at all.
+/// THE INTENT IS CANCELLED THE MOMENT THE OPERATOR TAKES THE CURSOR, by
+/// `cancel_pending_jump` in `key_normal` — on the KEYPRESS, not on the move it
+/// produces. `set_selected` was the obvious funnel and it was wrong at both ends
+/// of the list: `select_prev` on the top row and `select_next` on the bottom one
+/// find no target row and never reach `set_selected` at all, so `k` and `j` —
+/// the two commonest keys there are — cancelled nothing exactly where a jump is
+/// most startling, and `Tab` on an empty list cancelled nothing either
+/// (`cycle_group` returns early with no headers). A key that moves the cursor
+/// nowhere is still the operator taking the cursor.
+///
+/// `claims_the_cursor` names the keys instead, and it is deliberately WIDER than
+/// the moves: every verb that acts on the ROW UNDER the cursor is on it too.
+/// `Ctrl+X` is the reason. Its first press stops the selection, opens a
+/// two-second delete window and forces a poll — the poll most likely to be the
+/// one that lists the new session — so a jump landing inside that window
+/// retargeted the cursor between the operator's two presses, and
+/// `arm_second_press` refused the delete with `moved off <name> — nothing
+/// deleted`: a message whose whole purpose is to tell the operator moving apart
+/// from the list moving, blaming them for a move ccmux had made itself.
+///
+/// A jump that yanks the selection out from under a keypress is worse than no
+/// jump at all.
 ///
 /// An EAGER cancel, deliberately, and not a `selected_key` snapshot compared at
 /// fire time. A snapshot cannot tell the operator apart from
@@ -212,9 +238,9 @@ const JUMP_POLLS: u32 = 8;
 /// snapshot would be `None`, the first arriving poll would park the cursor on
 /// the first row through the nearest-index fallback, and the comparison would
 /// read that as "the operator moved" and cancel the jump on the one screen
-/// where it is most obviously wanted. The three sites above are the complete
-/// set of deliberate moves (nothing else assigns `selected` or `selected_key`),
-/// so naming them is both narrower and correct.
+/// where it is most obviously wanted. Naming the KEYS is both narrower and
+/// correct: a keypress is the one event in this program that only the operator
+/// can produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingJump {
     /// The 8-hex short id `claude --bg` printed. Matched against `Session::id`,
@@ -1481,53 +1507,105 @@ impl App {
     /// Runs AFTER `rebuild_rows`, because both questions it asks are about the
     /// rebuilt list: is the session listed at all (`sessions`), and does it have
     /// a ROW (`is_visible` — `/`, `a` and `d` all decide that).
+    ///
+    /// Four ways out, and only two of them spend the intent: the cursor moves,
+    /// or the operator is told why it cannot. "Not listed yet" costs a poll off
+    /// the budget — see `JUMP_POLLS` for why that budget is counted in answers
+    /// rather than in seconds or ticks. "Listed, but the footer cannot carry the
+    /// reason" costs nothing and simply waits.
     pub fn tick_pending_jump(&mut self, polled: bool) {
         let Some(jump) = self.pending_jump.clone() else {
             return;
         };
-        let found = self
+        // A poll that RAN is not a poll that ANSWERED. `apply_poll` clears
+        // `poll_error` on every `Ok` and sets it on every `Err`, and its `Err`
+        // path leaves `self.sessions` untouched — so this is exactly "the poll
+        // this tick spawned came back with a list". A failing CLI refutes
+        // nothing and is charged nothing.
+        let answered = polled && self.poll_error.is_none();
+
+        // THE KEY MISMATCH resolved: `--bg` named it by short id, the cursor is
+        // keyed by uuid. Everything past here is the ordinary `selected_key` /
+        // `reanchor_selection` path — there is no second selection mechanism.
+        let listed = self
             .sessions
             .iter()
-            .find(|s| s.id.as_deref() == Some(jump.short_id.as_str()));
-        let Some(sess) = found else {
-            // Not listed yet. Only a poll that actually ran is evidence of
-            // absence, so only a poll spends budget: a tick whose gate was shut
-            // learned nothing and must not be allowed to time the intent out.
-            if polled {
-                let left = jump.polls_left.saturating_sub(1);
-                // Dropped SILENTLY at zero. The dispatch already flashed, and
-                // it was telling the truth — the agent is running either way,
-                // and only the cursor move is owed. A warning arriving eight
-                // polls later would land on a screen the operator has long
-                // since moved on from, attached to no keypress of theirs.
-                self.pending_jump = if left == 0 {
-                    None
-                } else {
-                    Some(PendingJump { polls_left: left, ..jump })
-                };
+            .find(|s| s.id.as_deref() == Some(jump.short_id.as_str()))
+            .map(|s| (s.session_id.clone(), session_label(s)));
+
+        if let Some((session_id, label)) = listed {
+            if self.is_visible(&session_id) {
+                self.pending_jump = None;
+                self.selected_key = Some(session_id);
+                self.reanchor_selection();
+                return;
             }
-            return;
-        };
-        // THE KEY MISMATCH resolved: `--bg` named it by short id, the cursor is
-        // keyed by uuid. Everything from here is the ordinary `selected_key` /
-        // `reanchor_selection` path — there is no second selection mechanism.
-        let session_id = sess.session_id.clone();
-        let label = session_label(sess);
-        self.pending_jump = None;
-        if self.is_visible(&session_id) {
-            self.selected_key = Some(session_id);
-            self.reanchor_selection();
-        } else {
             // `/` or `a` is hiding it. Clearing the operator's filter to chase
             // a row they did not ask to see would be a far bigger surprise than
             // a cursor that stayed put, so say so instead — the precedent `u`
             // set with `restored X — filtered out`.
+            //
+            // But only when the footer can actually carry the sentence. The
+            // filter line OWNS the footer while `/` is open (`draw_footer`
+            // returns before `footer_message` is ever consulted, and
+            // `overflow_message` declines to carve the detail block), and
+            // `Mode::Help`, `Mode::Logs` and a prompt cover the whole sidebar
+            // rect — so flashing here would set a message nobody can read, and
+            // `check_message_timeout` would drop it `MSG_TTL` later. The intent
+            // would be spent on nothing: no cursor move AND no explanation, in
+            // the one mode where the operator is most likely to be editing the
+            // very filter the message is about.
+            //
+            // So HOLD it, exactly as THE DRIFT GUARD holds a warning it could
+            // not deliver (`announce_drift`), and settle on a later tick.
+            if self.footer_is_covered() {
+                // AND CHARGE NOTHING FOR THE WAIT. The budget answers a
+                // different question — "does this session exist at all" — and
+                // that question is already answered here; only one sentence is
+                // outstanding. Charging the wait made the hold worthless in the
+                // case it exists for: at the 2500ms default the whole budget is
+                // ~20s of thinking with `/` open, measured, after which the
+                // operator got neither the cursor move nor the explanation,
+                // which is exactly the bug.
+                //
+                // Unbounded, and safe to be, because a covered footer is also a
+                // covered KEYMAP: `key_filter`, `key_help`, `key_logs` and
+                // `key_prompt` touch no selection at all (`j`/`k` in the
+                // overlays scroll the overlay), so while this is held the
+                // operator has no key that can move the cursor and no jump can
+                // arrive behind one. The first return to Normal frees the
+                // footer, and the next tick settles it — or their own first
+                // cursor key cancels it, which is the outcome the design wants.
+                // And if the session LEAVES the list while held, `listed` goes
+                // back to `None` and the budget resumes below, so nothing is
+                // ever held on a row that no longer exists.
+                return;
+            }
+            self.pending_jump = None;
             self.flash(format!("dispatched {label} — filtered out"), MsgLevel::Warn);
+            return;
+        }
+
+        // Not listed yet. Only an ANSWER is evidence; a tick whose gate was
+        // shut, or whose poll failed, learned nothing and must not time the
+        // intent out.
+        if answered {
+            let left = jump.polls_left.saturating_sub(1);
+            // Dropped SILENTLY at zero. The dispatch already flashed, and it was
+            // telling the truth — the agent is running either way, and only the
+            // cursor move is owed. A warning arriving eight polls later would
+            // land on a screen the operator has long since moved on from,
+            // attached to no keypress of theirs.
+            self.pending_jump = if left == 0 {
+                None
+            } else {
+                Some(PendingJump { polls_left: left, ..jump })
+            };
         }
     }
 
-    /// Drop `n`'s cursor intent because the operator just moved the cursor.
-    /// Called from every deliberate move; see `PendingJump`.
+    /// Drop `n`'s cursor intent because the operator just took the cursor.
+    /// Called from `key_normal`, on the keypress; see `PendingJump`.
     fn cancel_pending_jump(&mut self) {
         self.pending_jump = None;
     }
@@ -2240,7 +2318,6 @@ impl App {
         // absence rather than two.
         self.hidden_absent.remove(&id);
         self.selected_key = neighbour;
-        self.cancel_pending_jump();
         self.hidden_dirty = true;
         self.rebuild_rows();
         if owns_pane {
@@ -2280,7 +2357,6 @@ impl App {
         let visible = self.is_visible(&id);
         if visible {
             self.selected_key = Some(id.clone());
-            self.cancel_pending_jump();
             self.reanchor_selection();
         }
 
@@ -2882,10 +2958,12 @@ impl App {
         })
     }
 
+    /// NOT where `n`'s pending jump is cancelled, though it looks like the
+    /// funnel for it. Every cursor verb goes through here only when it FOUND a
+    /// row to move to: `k` on the top row and `j` on the bottom one never
+    /// arrive, and those are precisely the presses a jump would surprise. The
+    /// cancel is on the keypress instead — `key_normal`, `claims_the_cursor`.
     fn set_selected(&mut self, i: usize) {
-        // The funnel every cursor verb goes through, which makes it the one
-        // place `n`'s pending jump has to be cancelled from (see `PendingJump`).
-        self.cancel_pending_jump();
         self.selected = i;
         self.selected_key = self.key_at(i);
         self.clamp_scroll();
@@ -3560,6 +3638,14 @@ impl App {
 
     fn key_normal(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // §8.6: `n`'s pending cursor jump dies here, BEFORE the verb runs, the
+        // moment the operator touches a key that is about the cursor. Before
+        // the verb, because `Ctrl+X` reads the live selection: cancelling
+        // afterwards would leave the very race this closes. See
+        // `claims_the_cursor` and `PendingJump`.
+        if claims_the_cursor(key) {
+            self.cancel_pending_jump();
+        }
         // NOTE: uppercase chars arrive with SHIFT set, so char bindings must NOT
         // require empty modifiers. Only Ctrl-bindings inspect modifiers.
         match key.code {
@@ -3927,6 +4013,54 @@ impl App {
 }
 
 // ── free helpers ────────────────────────────────────────────────────────────
+
+/// Does this Normal-mode key take the cursor away from `n`'s pending jump
+/// (§8.6)? Two populations, and the second is the one that is easy to forget:
+///
+///   * THE MOVES — `j` `k` `↓` `↑` `g` `G` `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`.
+///     Answered on the KEY and not on the resulting move, because a move that
+///     found no row still happened as far as the operator is concerned: `k` on
+///     the top row and `j` on the bottom one never reach `set_selected`, and
+///     `Tab` returns early when `rows` carries no headers at all.
+///   * THE VERBS THAT ACT ON THE SELECTED ROW — `Enter` `o` `s` `t` `x`
+///     `Ctrl-x` `L` `d` `u`. Pressing one is a decision about the row that is
+///     under the cursor NOW, and a jump firing between that decision and the
+///     next keypress makes ccmux act on a row the operator never chose.
+///     `Ctrl+X` is the sharp end: its two presses straddle a forced poll.
+///
+/// NOT here, deliberately:
+///   * `n` — it arms the next intent itself; a second `n` replaces the first,
+///     and abandoning the prompt with `Esc` must not have cost the operator a
+///     jump they were still waiting on.
+///   * `r` — a manual refresh is the operator ASKING for the poll that lists
+///     the new session. Cancelling on it would make the obvious way to hurry
+///     the jump along the one way to lose it.
+///   * `/` and `a` — view toggles, not cursor verbs. §8.6 answers those with
+///     the filtered-out flash instead.
+///   * `?` `q` `R` `Esc` and every unbound key — they touch no selection.
+fn claims_the_cursor(key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Mirrors `key_normal`'s arm order, including its `_ if ctrl` catch-all:
+    // any Ctrl chord not bound there is inert and claims nothing.
+    match key.code {
+        KeyCode::Char('d') | KeyCode::Char('u') if ctrl => true,
+        KeyCode::Char('x') | KeyCode::Char('X') if ctrl => true,
+        _ if ctrl => false,
+
+        KeyCode::Char('j') | KeyCode::Down => true,
+        KeyCode::Char('k') | KeyCode::Up => true,
+        KeyCode::Char('g') | KeyCode::Char('G') => true,
+        KeyCode::Tab | KeyCode::BackTab => true,
+
+        KeyCode::Enter => true,
+        KeyCode::Char('o') | KeyCode::Char('s') | KeyCode::Char('t') => true,
+        KeyCode::Char('x') => true,
+        KeyCode::Char('L') => true,
+        KeyCode::Char('d') | KeyCode::Char('u') => true,
+
+        _ => false,
+    }
+}
 
 /// Char-index insert. Byte offsets are derived from `char_indices`, so a CJK or
 /// emoji cwd cannot split a code point (§6.6's char-based rule, applied to input).
@@ -7403,6 +7537,277 @@ mod tests {
             bg("e44654bf", "fresh task", State::Working),
         ]);
         assert_eq!(a.selected_key.as_deref(), Some("e44654bf-uuid"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// THE HOLE THE `set_selected` CANCEL LEFT. A cursor key that finds no row
+    /// to move to never reaches `set_selected`, and the two commonest presses
+    /// there are — `k` on the top row and `j` on the bottom — are exactly that.
+    /// The operator took the cursor either way, so the jump must not fire.
+    #[test]
+    fn a_cursor_key_that_moves_nothing_still_cancels_the_jump() {
+        type Move = (&'static str, fn(&mut App));
+
+        // The cursor is on the FIRST row: `k` and `Ctrl-u` have nowhere to go.
+        let at_top: [Move; 2] = [
+            ("k", |a| {
+                a.on_key(press('k'));
+            }),
+            ("C-u", |a| {
+                a.on_key(ctrl('u'));
+            }),
+        ];
+        for (label, mv) in at_top {
+            let (mut a, tmp) = armed("jump-top-boundary");
+            let before = a.selected_key.clone();
+            mv(&mut a);
+            assert_eq!(a.selected_key, before, "{label} really did move nothing");
+            assert_eq!(a.pending_jump, None, "{label} must cancel the intent anyway");
+            poll_and_settle(&mut a, three_plus_new(State::Blocked));
+            assert_eq!(a.selected_key, before, "{label}: the cursor was the operator's");
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        // The cursor is on the LAST row: `j` and `Ctrl-d` have nowhere to go.
+        // `select_last` is called DIRECTLY rather than through `G`, so the
+        // intent is still armed when the boundary key arrives — which is also
+        // the proof that the cancel hangs off the KEYPRESS now and not off
+        // `set_selected`, which `select_last` goes straight through.
+        let at_bottom: [Move; 2] = [
+            ("j", |a| {
+                a.on_key(press('j'));
+            }),
+            ("C-d", |a| {
+                a.on_key(ctrl('d'));
+            }),
+        ];
+        for (label, mv) in at_bottom {
+            let (mut a, tmp) = armed("jump-bottom-boundary");
+            a.select_last();
+            assert!(a.pending_jump.is_some(), "{label}: `set_selected` is not the cancel");
+            let before = a.selected_key.clone();
+            assert_eq!(before.as_deref(), Some("cccccccc-uuid"), "{label}: on the last row");
+            mv(&mut a);
+            assert_eq!(a.selected_key, before, "{label} really did move nothing");
+            assert_eq!(a.pending_jump, None, "{label} must cancel the intent anyway");
+            poll_and_settle(&mut a, three_plus_new(State::Blocked));
+            assert_eq!(a.selected_key, before, "{label}: the cursor was the operator's");
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        // `Tab` with no rows at all: `cycle_group` returns before it can select
+        // anything, because `rows` carries no headers to walk between.
+        let tmp = fs_fixture("jump-tab-empty");
+        let mut a = app();
+        a.rebuild_rows();
+        a.dispatch = recording_dispatch_with_id;
+        prompt_with(&mut a, &tmp.to_string_lossy(), "do it");
+        enter(&mut a);
+        assert!(a.pending_jump.is_some(), "armed on an empty list");
+        assert!(a.rows.is_empty(), "and there is nothing to Tab between");
+        a.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(a.pending_jump, None, "Tab must cancel the intent anyway");
+        // The arriving list is shaped so the two outcomes are distinguishable:
+        // `Blocked` sorts first, so `reanchor_selection`'s nearest-index
+        // fallback parks the cursor on `one` and a jump that fired would be the
+        // only thing that could put it on `fresh task`.
+        poll_and_settle(&mut a, vec![
+            bg("aaaaaaaa", "one", State::Blocked),
+            bg("e44654bf", "fresh task", State::Working),
+        ]);
+        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"), "the fallback parked it");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The cancel table, stated once. It is WIDER than the moves on purpose: a
+    /// verb that acts on the row under the cursor has committed to that row.
+    #[test]
+    fn the_keys_that_claim_the_cursor_are_the_moves_and_the_row_verbs() {
+        for c in ['j', 'k', 'g', 'G', 'o', 's', 't', 'x', 'L', 'd', 'u'] {
+            assert!(claims_the_cursor(press(c)), "{c} claims the cursor");
+        }
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Tab, KeyCode::BackTab, KeyCode::Enter] {
+            let k = KeyEvent::new(code, KeyModifiers::NONE);
+            assert!(claims_the_cursor(k), "{code:?} claims the cursor");
+        }
+        for c in ['d', 'u', 'x', 'X'] {
+            assert!(claims_the_cursor(ctrl(c)), "C-{c} claims the cursor");
+        }
+        // Uppercase bindings arrive with SHIFT set, exactly as `key_normal`
+        // documents; the table must not require empty modifiers either.
+        for c in ['G', 'L'] {
+            let k = KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+            assert!(claims_the_cursor(k), "shifted {c} claims the cursor");
+        }
+
+        // `n` arms the next intent itself, `r` is the refresh that LANDS the
+        // one already armed, `/` and `a` are view toggles that §8.6 answers
+        // with the filtered-out flash, and the rest touch no selection at all.
+        for c in ['n', 'r', '/', 'a', '?', 'q', 'R'] {
+            assert!(!claims_the_cursor(press(c)), "{c} does not claim the cursor");
+        }
+        let shifted_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert!(!claims_the_cursor(shifted_r), "shifted R does not claim the cursor");
+        for c in ['j', 'k', 'g', 'n', 'z'] {
+            assert!(!claims_the_cursor(ctrl(c)), "C-{c} is unbound and inert");
+        }
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!claims_the_cursor(esc), "Esc does not claim the cursor");
+    }
+
+    /// `Ctrl+X`'s two presses straddle a forced poll — and the poll the FIRST
+    /// press forces is the one most likely to list the new session. A jump
+    /// firing in between retargeted the cursor, `arm_second_press` refused with
+    /// `moved off <name> — nothing deleted`, and the operator, who had moved
+    /// nothing, lost their delete and was told they had done it.
+    #[test]
+    fn a_pending_jump_cannot_retarget_the_ctrl_x_delete() {
+        let (mut a, tmp) = armed("jump-ctrl-x");
+        agents::test_spawn::reset();
+
+        // First press: stop the row under the cursor and open the window.
+        a.on_key(ctrl('x'));
+        assert_eq!(agents::test_spawn::joined(), vec!["stop aaaaaaaa"]);
+        assert!(a.stop_arm.is_some(), "the delete window is open");
+        assert_eq!(a.pending_jump, None, "and the press took the cursor with it");
+
+        // The poll that press forced now lists the new session — the exact
+        // moment the jump used to fire, inside the operator's own window.
+        poll_and_settle(&mut a, three_plus_new(State::Blocked));
+        assert_eq!(
+            a.selected_session().map(|s| s.name.clone()).as_deref(),
+            Some("one"),
+            "the cursor is still on the row the first press stopped"
+        );
+
+        // Second press, well inside the window: it deletes what was stopped.
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(settle(&mut a), "the settled delete must ask for a redraw");
+        assert_eq!(agents::test_spawn::joined(), vec!["stop aaaaaaaa", "rm aaaaaaaa"]);
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "deleted one + worktree");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A poll that FAILED is not evidence. `poll_step` reports that
+    /// `claude agents` RAN, and its `Err` path leaves `sessions` exactly as it
+    /// found them — so charging the budget for it let a transiently failing CLI
+    /// spend the whole jump before the sidebar had once seen a session list.
+    #[test]
+    fn a_poll_that_failed_spends_none_of_the_jumps_budget() {
+        let (mut a, tmp) = armed("jump-failing-cli");
+        for i in 0..(JUMP_POLLS * 2) {
+            age(&mut a, Duration::from_secs(60));
+            let polled = a.poll_step(|| {
+                Err(AgentsError::Cmd {
+                    code: 1,
+                    stderr: "daemon is not running".into(),
+                })
+            });
+            assert!(polled, "poll {i} ran");
+            a.rebuild_rows();
+            a.tick_pending_jump(polled);
+            assert!(a.poll_error.is_some(), "poll {i} failed");
+        }
+        assert_eq!(
+            a.pending_jump.as_ref().map(|j| j.polls_left),
+            Some(JUMP_POLLS),
+            "sixteen polls that never answered refuted nothing"
+        );
+
+        // And the jump still lands the moment the CLI answers.
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert_eq!(a.selected_key.as_deref(), Some("e44654bf-uuid"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The `— filtered out` flash is the design's alternative to dropping the
+    /// jump silently, and it is the only thing the operator is owed. It must
+    /// not be spent into a footer that cannot show it: `draw_footer` hands the
+    /// line to the filter input while `/` is open and never consults
+    /// `footer_message` at all, and `Mode::Help`, `Mode::Logs` and a prompt
+    /// cover the sidebar rect outright. Hold the intent instead, exactly as THE
+    /// DRIFT GUARD holds a warning it could not deliver.
+    ///
+    /// The wait is FREE, and it has to be: the budget's question — does this
+    /// session exist — is already answered by the time we get here, and charging
+    /// the wait made the hold worthless in the case it exists for. At the
+    /// 2500ms default the whole budget is ~20s of thinking with `/` open, after
+    /// which the operator got neither the move nor the reason.
+    #[test]
+    fn a_filtered_out_jump_waits_for_a_footer_that_can_carry_the_reason() {
+        for (label, mode) in [("filter", Mode::Filter), ("help", Mode::Help), ("logs", Mode::Logs)] {
+            let (mut a, tmp) = armed("jump-covered-footer");
+            a.filter = "one".into();
+            a.rebuild_rows();
+            a.mode = mode;
+            let before = a.selected_key.clone();
+
+            // Far more polls than the budget would ever have allowed.
+            for _ in 0..(JUMP_POLLS * 3) {
+                poll_and_settle(&mut a, three_plus_new(State::Working));
+            }
+
+            let (text, _) = a.message.clone().unwrap_or_default_msg();
+            assert_eq!(
+                text, "dispatched background session",
+                "{label}: nothing was said where nothing can be read"
+            );
+            assert_eq!(a.selected_key, before, "{label}: there is still no row to move to");
+            assert_eq!(
+                a.pending_jump.as_ref().map(|j| j.polls_left),
+                Some(JUMP_POLLS),
+                "{label}: the wait for a free footer costs no budget"
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
+        // Held is not unbounded in the way that matters: a session that LEAVES
+        // the list while the footer is covered puts the intent back on the
+        // budget, so nothing is held forever on a row that no longer exists.
+        let (mut a, tmp) = armed("jump-covered-then-gone");
+        a.filter = "one".into();
+        a.rebuild_rows();
+        a.mode = Mode::Filter;
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert_eq!(a.pending_jump.as_ref().map(|j| j.polls_left), Some(JUMP_POLLS));
+        for _ in 0..JUMP_POLLS {
+            poll_and_settle(&mut a, three());
+        }
+        assert_eq!(a.pending_jump, None, "the budget resumed the moment it stopped being listed");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // Commit the filter with `Enter` and the footer is the list's again:
+        // the very next tick says it, without needing another poll.
+        let (mut a, tmp) = armed("jump-covered-then-committed");
+        a.filter = "one".into();
+        a.rebuild_rows();
+        a.mode = Mode::Filter;
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        enter(&mut a);
+        assert_eq!(a.mode, Mode::Normal, "Enter commits the filter");
+        settle_without_polling(&mut a);
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!((text.as_str(), level), ("dispatched fresh task — filtered out", MsgLevel::Warn));
+        assert_eq!(a.filter, "one", "the filter is still not ccmux's to clear");
+        assert_eq!(a.pending_jump, None, "said once, then spent");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        // The other way out: a filter edited into one the new row DOES match
+        // lets the held intent simply land, with nothing to explain.
+        let (mut a, tmp) = armed("jump-covered-then-matched");
+        a.filter = "one".into();
+        a.rebuild_rows();
+        a.mode = Mode::Filter;
+        poll_and_settle(&mut a, three_plus_new(State::Working));
+        assert!(a.pending_jump.is_some(), "held while `/` owned the footer");
+        a.filter = "fresh".into();
+        a.rebuild_rows();
+        settle_without_polling(&mut a);
+        assert_eq!(a.selected_key.as_deref(), Some("e44654bf-uuid"));
+        let (text, _) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, "dispatched background session", "the jump landed; nothing to explain");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
