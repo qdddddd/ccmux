@@ -956,7 +956,21 @@ pub fn logs(id: &str, lines: usize) -> Result<String, AgentsError>;
 /// `claude --bg <task>` executed with `current_dir(cwd)`, returning
 /// immediately. Pure argv — `task` and `cwd` never touch a shell.
 /// Empty `task` is rejected before the call by app.rs.
-pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError>;
+///
+/// Returns the new session's 8-hex SHORT ID, parsed off the CLI's first line
+/// by `parse_backgrounded_id`, or `None` when that line is not the shape this
+/// build knows. `None` is not an error: the session was dispatched either way,
+/// and the id only ever moves the cursor (§8.6).
+pub fn dispatch_background(cwd: &str, task: &str) -> Result<Option<String>, AgentsError>;
+
+/// The 8-hex short id off `claude --bg`'s first line. The real output on
+/// 2.1.246 is colourised — `backgrounded \u{b7} \x1b[36me44654bf\x1b[39m` —
+/// so the text is taken through `strip_ansi` first, and the token is looked for
+/// on the `backgrounded` line ONLY. The lines under it repeat the same id in
+/// `claude attach|logs|stop <id>` hints, so an unanchored 8-hex scan lands on
+/// the right value today and would just as happily pull one out of a future
+/// banner. Anything not of this shape is `None`.
+pub fn parse_backgrounded_id(raw: &str) -> Option<String>;
 
 // ── Pane command templates (shell strings; see §7) ──────────────────────────
 
@@ -1241,6 +1255,9 @@ impl App {
     ///      the parser; the decision lives in `poll_step`, which takes the
     ///      fetch as a closure so a skipped poll spawns nothing.
     ///   5. rebuild rows, re-anchor selection by selected_key
+    ///      5b. tick_pending_jump: settle `n`'s cursor intent against the
+    ///      rebuilt rows (§8.6). AFTER the rebuild, because it asks both
+    ///      whether the session is listed and whether it has a row.
     ///   6. flush the map if map_dirty
     ///   7. pin_sidebar (unconditional, §1.3)
     ///   8. last_poll = Instant::now()
@@ -2047,7 +2064,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `x` | close the pane showing a session — the agent keeps running (§8.5) | no |
 | `Ctrl-x` | **stop the session**, immediately; again within 2 s **deletes** it and its worktree (§8.2) | **YES** (§8.2) |
 | `S` | deliberately unbound — pressing it does nothing, silently (stop is `Ctrl-x`, §8.2) | no |
-| `n` | dispatch a new background session with a typed task | no |
+| `n` | dispatch a new background session with a typed task; the cursor follows it onto its row once it is listed, but it is not opened | no |
 | `L` | show `claude logs` for this session (ANSI-stripped) | no |
 | `/` | enter filter mode | no |
 | `a` | toggle visibility of the Completed group | no |
@@ -2478,10 +2495,67 @@ daemon-owned, and closing its pane never touched it.
     mkdir half did happen and the directory stays. **This mkdir is the ONLY
     filesystem write in ccmux.**
 - Dispatch: `agents::dispatch_background(cwd, task)` — pure argv (Q4), the
-  expanded cwd and the task text never touch a shell.
+  expanded cwd and the task text never touch a shell. It returns the new
+  session's 8-hex short id when the CLI's first line can be read, else `None`.
 - On success: leave the prompt, flash `dispatched background session` (Info),
-  force a refresh. The new session appears in the next poll under **Working**.
-  ccmux does **not** auto-open it — the operator decides with `Enter`.
+  arm the cursor jump below, force a refresh. ccmux does **not** auto-open the
+  session — the operator decides with `Enter`.
+- **The cursor jump.** The CURSOR follows the new session onto its row as soon
+  as the row exists; the PANE still does not. It cannot be a plain selection at
+  submit time: `claude --bg` returns as soon as the daemon accepts the task, and
+  the forced poll usually runs before the session is listed — and pointing
+  `selected_key` at an absent key would hand the cursor to
+  `reanchor_selection`'s nearest-index fallback and park it on an unrelated row.
+  So `App::pending_jump` carries the intent across polls:
+  - The key it carries is the SHORT id, because that is all `--bg` gives back.
+    `tick_pending_jump` finds the session by `Session::id` and then drives the
+    ordinary `selected_key` / `reanchor_selection` path with its `session_id`.
+    There is no second selection mechanism, and the selection still only ever
+    lands on a `Row::Session`.
+  - It expires after `JUMP_POLLS` (8) polls that did not settle it, counted in
+    POLLS and not in wall-clock: the idle ladder, the failure backoff and the
+    §4.2 gate all stretch the cadence, so a tick that spawned no
+    `claude agents` learns nothing and is charged nothing. Nor does a poll that
+    RAN but FAILED — `poll_step` reports the spawn, and `apply_poll`'s `Err`
+    path leaves `sessions` untouched, so `tick_pending_jump` reads `poll_error`
+    and charges only an ANSWER. Expiry is silent — the dispatch already
+    flashed, truthfully, and only the cursor move is owed.
+  - It is cancelled the moment the operator takes the cursor, by
+    `cancel_pending_jump` in `key_normal`, on the KEYPRESS; `claims_the_cursor`
+    is the table. Two populations: every cursor move (`j` `k` `↓` `↑` `g` `G`
+    `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`), **including one that hits the end of the
+    list and moves nothing**, and every verb that acts on the row under the
+    cursor (`Enter` `o` `s` `t` `x` `Ctrl-x` `L` `d` `u`). Not `n` (it arms the
+    next one), not `r` (the refresh that lands this one), not `/` or `a` (view
+    toggles, answered below). Cancelling on the resulting MOVE was wrong twice
+    over: `select_prev` on the top row and `select_next` on the bottom one find
+    no target and never reach `set_selected`, and `Ctrl+X`'s two presses
+    straddle the poll its own first press forces — a jump landing between them
+    retargeted the cursor, and `arm_second_press` then refused the delete with
+    `moved off <name> — nothing deleted`, blaming the operator for a move ccmux
+    had made. A jump that yanks the selection out from under a keypress is
+    worse than no jump.
+  - When `/` or `a` hides the new session there is no row to move to, and the
+    operator's filter is not ccmux's to clear: flash
+    `dispatched <name> — filtered out` (Warn) instead, the precedent `u` set.
+    A just-dispatched session is Working, Blocked or Idle, so `a` does not hide
+    it; the flash is for `/`, and for the rare task that is already Done.
+    The flash waits for a footer that can carry it: while `footer_is_covered()`
+    — `/` open, an overlay up, a prompt on screen — the intent is HELD rather
+    than spent, because `draw_footer` gives the line to the filter input without
+    ever consulting `footer_message`, and `check_message_timeout` would then
+    drop the unread message after `MSG_TTL`. The wait costs no budget: the
+    budget's question ("does this session exist") is already answered by then,
+    and charging the wait made the hold worthless — ~20s of thinking with `/`
+    open at the default interval spends it, and the operator gets neither the
+    move nor the reason. It is safe to be unbounded because a covered footer is
+    a covered keymap: `key_filter`, `key_help`, `key_logs` and `key_prompt`
+    touch no selection, so nothing can move the cursor while it is held. The
+    first return to Normal settles it on the next tick; an operator who edits
+    the filter into one the new row matches gets the jump itself instead; and a
+    session that LEAVES the list while held puts the intent back on the budget.
+  - `None` from the dispatch arms nothing, so a CLI whose banner changes shape
+    loses the cursor jump and nothing else.
 
 ### 8.7 `c` — new interactive session in a chosen cwd
 

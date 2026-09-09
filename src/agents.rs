@@ -424,8 +424,16 @@ fn last_lines(text: &str, lines: usize) -> String {
 /// SPEC NOTE: uses `output()` rather than `spawn()`. Appendix A verified that
 /// `claude --bg` dispatches and returns immediately, so the block is
 /// negligible; in exchange the child is reaped and a non-zero exit surfaces as
-/// `Cmd` with real stderr, which `spawn()` without a `wait` discards.
-pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
+/// `Cmd` with real stderr, which `spawn()` without a `wait` discards. Reaping
+/// is also what makes the SHORT ID readable at all: it is on stdout, and
+/// `spawn()` throws stdout away.
+///
+/// Returns the dispatched session's 8-hex short id when the CLI's first line
+/// can be read (`parse_backgrounded_id`), else `None`. `None` is NOT an error:
+/// the session was dispatched either way, and the id is only ever used to move
+/// the cursor onto the new row (§8.6). A CLI whose banner changes must lose the
+/// cursor jump, never the dispatch.
+pub fn dispatch_background(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
     let bin = claude_bin();
     let out = Command::new(&bin)
         .arg("--bg")
@@ -442,7 +450,38 @@ pub fn dispatch_background(cwd: &str, task: &str) -> Result<(), AgentsError> {
             },
         })?;
     check_status(&out)?;
-    Ok(())
+    Ok(parse_backgrounded_id(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// The 8-hex short id off `claude --bg`'s first line.
+///
+/// The real output on 2.1.246 is colourised, so the raw bytes are:
+///
+/// ```text
+/// backgrounded \u{b7} \x1b[36me44654bf\x1b[39m
+/// ```
+///
+/// and after `strip_ansi`: `backgrounded · e44654bf`. Exactly one 8-hex token
+/// survives on that line.
+///
+/// ANCHORED ON THE `backgrounded` LINE ON PURPOSE. The lines below it repeat
+/// the same id inside `claude attach|logs|stop <id>` hints, so an unanchored
+/// "first 8-hex token anywhere" scan happens to land on the right value today —
+/// and would just as happily pull an id out of a future tip, banner or warning
+/// that has nothing to do with what was just dispatched. Anything that is not
+/// this shape is `None`, which the caller reads as "no jump", not "failure".
+pub fn parse_backgrounded_id(raw: &str) -> Option<String> {
+    strip_ansi(raw).lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("backgrounded")?;
+        rest.split_whitespace()
+            .find(|t| is_short_id(t))
+            .map(str::to_string)
+    })
+}
+
+/// The shape of a `claude` short id: exactly 8 ASCII hex digits.
+fn is_short_id(tok: &str) -> bool {
+    tok.len() == 8 && tok.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 // ── Pane command templates (shell strings; see §7) ──────────────────────────
@@ -936,6 +975,58 @@ mod tests {
     fn strip_ansi_is_identity_on_clean_text() {
         let s = "plain text\nwith\ttabs\nand ünïcode";
         assert_eq!(strip_ansi(s), s);
+    }
+
+    // ── `--bg` short id ─────────────────────────────────────────────────────
+
+    /// VERBATIM first line of a real `claude --bg` on 2.1.246, colour and all.
+    /// This is the byte sequence the parser actually has to survive; a test
+    /// written against the pretty form would not have caught the SGR wrapper.
+    const BG_RAW_FIRST_LINE: &str = "backgrounded \u{b7} \x1b[36me44654bf\x1b[39m";
+
+    #[test]
+    fn the_short_id_parses_out_of_the_real_ansi_first_line() {
+        assert_eq!(strip_ansi(BG_RAW_FIRST_LINE), "backgrounded \u{b7} e44654bf");
+        assert_eq!(parse_backgrounded_id(BG_RAW_FIRST_LINE).as_deref(), Some("e44654bf"));
+    }
+
+    #[test]
+    fn the_short_id_parses_out_of_the_stripped_form_too() {
+        assert_eq!(
+            parse_backgrounded_id("backgrounded \u{b7} e44654bf").as_deref(),
+            Some("e44654bf")
+        );
+    }
+
+    /// The real output continues with `claude attach|logs|stop <id>` hints.
+    /// The parser must read the `backgrounded` line, and the hints must not be
+    /// able to supply an id of their own.
+    #[test]
+    fn the_short_id_comes_from_the_backgrounded_line_not_the_hints() {
+        let full = format!(
+            "{BG_RAW_FIRST_LINE}\n\n  claude attach deadbeef\n  claude logs deadbeef\n  claude stop deadbeef\n"
+        );
+        assert_eq!(parse_backgrounded_id(&full).as_deref(), Some("e44654bf"));
+        // Hints WITHOUT the `backgrounded` line are not an id.
+        assert_eq!(parse_backgrounded_id("  claude attach deadbeef\n"), None);
+    }
+
+    /// A future format change must degrade to "no id", which the caller reads
+    /// as "no jump" — never as a failed dispatch.
+    #[test]
+    fn an_unparseable_bg_banner_yields_no_id() {
+        for raw in [
+            "",
+            "\n\n",
+            "backgrounded",                    // no token at all
+            "backgrounded \u{b7} e44654b",     // 7 hex: not a short id
+            "backgrounded \u{b7} e44654bff",   // 9 hex: not a short id
+            "backgrounded \u{b7} zzzzzzzz",    // right length, not hex
+            "started session e44654bf",        // right token, wrong line
+            "\x1b[?1049h\x1b[H\x1b[2J",        // pure escapes
+        ] {
+            assert_eq!(parse_backgrounded_id(raw), None, "raw={raw:?}");
+        }
     }
 
     // ── supporting behaviour ────────────────────────────────────────────────
