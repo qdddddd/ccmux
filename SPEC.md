@@ -944,9 +944,27 @@ pub fn poll() -> Result<Vec<Session>, AgentsError>;
 // ── Verbs ───────────────────────────────────────────────────────────────────
 
 /// `claude stop <id>` — DESTRUCTIVE. Callers MUST have passed §8.2's
-/// confirmation gate. `id` is the 8-hex short id; a session without one cannot
-/// be stopped, so `Session::is_attachable()` must be checked first.
+/// confirmation gate, EXCEPT `R`, which has its own (§8.11: a live worker, a
+/// resume lined up, and a state that is neither working nor blocked nor already
+/// stopped). `id` is the 8-hex short id; a session without one cannot be
+/// stopped, so `Session::is_attachable()` must be checked first.
 pub fn stop(id: &str) -> Result<(), AgentsError>;
+
+/// `claude respawn <id>` — DESTRUCTIVE and RECOVERABLE: halts the worker and
+/// starts a new one on the current binary, in one call, with no terminal
+/// anywhere in it. `R`'s paneless population only (§8.11); it CHECKS NOTHING
+/// itself — it un-stops a stopped session, interrupts a working one, and kills
+/// the session's attach client — so the caller's gates are the whole safety
+/// argument. `--all` is never built.
+pub fn respawn(id: &str) -> Result<(), AgentsError>;
+
+/// Every session a live `claude attach <id>` process names, ANYWHERE ON THIS
+/// MACHINE, from a read-only `/proc/<pid>/cmdline` scan matched on argv[0]'s
+/// file name + `attach` + the id. `None` = the scan could not run, which is not
+/// the same as finding nobody and must never be read as it (§8.11).
+/// NOT §5.4's ancestry walk: no ppid chain, no `list-panes -a`, no pane
+/// resolution, and nothing it returns authorises an act — it only refuses.
+pub fn attached_ids() -> Option<BTreeSet<String>>;
 
 /// `claude logs <id>`. Output is a RAW ANSI/PTY DUMP including alt-screen setup
 /// and cursor moves (PROBE-FINDINGS §2) — always pass it through `strip_ansi`
@@ -2619,6 +2637,15 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
            input; without this the pane is blank for all of it
        app.finish_restart():
            refresh_panes()                     fresh panes + every tab's records
+
+           PHASE 0 — NO EVIDENCE, NO PLAN.
+           if not panes_fresh or not tabs_fresh:
+               flash "cannot read this session's panes — restarted this
+                      sidebar only" (Warn); STOP HERE
+               # this image's inventory starts EMPTY, so a failed tmux read
+               # leaves a blank picture, not a stale one — and every rule
+               # below reads absence as a decision
+
            tabs := list-windows, with MY window's map replaced by self.map
            plan := restart::plan(tabs, panes, own_pane)
 
@@ -2638,22 +2665,26 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
                                    Ok  -> owed a resume by PHASE 2
                                    Err -> failed += 1, CONTINUE
 
-           1b — THE HEADLESS AGENTS, only if 1a did not end the pass. Live
-           workers with NO ccmux pane; their resume is here, not in PHASE 2.
+           1b — THE PANELESS AGENTS, only if 1a did not end the pass. Live
+           workers with NO CLIENT ANYWHERE; one call does both halves.
+           agents::attached_ids()               # every `claude attach <id>` on the box
+               None -> blind = true, SKIP 1b     # could not look != looked and found none
            agents::poll()                       # ENUMERATE; Err -> skip 1b, count nothing
-           for t in restart::headless_targets(fleet, plan.held):
+           for t in restart::headless_targets(fleet, plan.held, attached):
                past the deadline -> count the rest as failed, stop
-               agents::poll()                   # RE-READ, immediately before this stop
+               agents::poll()                   # RE-READ, immediately before this act
                    Err  -> count the rest as failed, stop
                    uuid absent, or pid gone -> nothing at all, continue
                restart::agent_verdict(session):
                    Busy       -> busy += 1
                    NotRunning -> nothing at all
-                   Restart    -> agents::stop(t.short_id)   # STOP_TIMEOUT
-                                   Err -> failed += 1, CONTINUE
-                                   Ok  -> agents::resume(t.session_id)  # RESUME_TIMEOUT (10 s)
-                                            Ok  -> restarted += 1
-                                            Err -> stranded += 1
+                   Restart    -> agents::respawn(t.short_id)  # RESPAWN_TIMEOUT (10 s)
+                                   Ok  -> restarted += 1
+                                   Err -> agents::poll()      # WHAT ACTUALLY HAPPENED?
+                                            row gone      -> nothing at all
+                                            has a worker  -> failed += 1
+                                            no worker     -> stranded += 1
+                                            Err           -> stranded += 1, rest failed, stop
 
            PHASE 2 — the panes, unconditional on phase 1:
            for t in plan.targets:
@@ -2662,7 +2693,7 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
                    Err -> failed += 1
 
            PHASE 3 — close 1a's books, which only phase 2 can. 1b settled its
-           own, one call after each of its stops.
+           own: `claude respawn` does both halves in one call.
            for id in stopped:                   # the PANED ids only
                resumed  -> restarted += 1
                not      -> stranded += 1        # halted, nothing will resume it
@@ -2682,9 +2713,9 @@ are respawned the same way; the AGENT survives, because every session ccmux
 lists is a daemon-owned background one (PROBE-FINDINGS §3) and an attach client
 is disposable. The AGENTS BEHIND THOSE PANES are restarted by `claude stop <id>`,
 whose resume is that pane's own respawned `claude attach <id>`. And the LIVE
-AGENTS WITH NO PANE are restarted by the same `claude stop <id>` followed by
-`claude --bg --resume <sessionId>`, a resume that needs no terminal at all — see
-*The agents* below.
+AGENTS NOBODY HAS OPEN are restarted by `claude respawn <id>`, the CLI's own
+verb for "run the current Claude Code version", which needs no terminal at all
+— see *The agents* below.
 
 **THE AGENTS.** An agent surviving its attach client is exactly why restarting
 the client changes nothing about the version doing the work: a background worker
@@ -2696,9 +2727,9 @@ with until it dies. Measured on the author's host with 2.1.258 / 2.1.259 /
 resolves `claude` at launch.
 
 *Scope, in one sentence* — **`R` restarts agents that have a LIVE WORKER, that
-ccmux can resume, and that are neither working nor blocked nor already
-stopped.** Two populations answer "can resume" two different ways, and they are
-disjoint by construction.
+ccmux can bring back, and that are neither working nor blocked nor already
+stopped.** Two populations answer "can bring back" two different ways, and they
+are disjoint by construction.
 
 *Scope 1a, the paned agents* — `Plan::agent_ids`: exactly the panes this same
 plan is about to respawn with `claude attach <id>`, deduped by session. The
@@ -2708,12 +2739,59 @@ out: that pane is not respawned, so nothing would re-attach its session and the
 be — the pane is respawned either way, and its attach resumes the session
 whether a worker was up or not.
 
-*Scope 1b, the headless agents* — `restart::headless_targets`: a LIVE WORKER,
-no ccmux pane, and the shape the two commands need (a background kind, a
-non-empty short id). The resume is `claude --bg --resume <sessionId>`
-(PROBE-FINDINGS §2), which needs no terminal, so for the first time a session
-ccmux never opened can be brought onto the current binary instead of keeping
-the `claude` it was dispatched with for ever.
+*Scope 1b, the paneless agents* — `restart::headless_targets`: a LIVE WORKER,
+NO CLIENT ANYWHERE, and the shape the command needs (a background kind, a
+non-empty short id). The verb is `claude respawn <id>` (PROBE-FINDINGS §2),
+which needs no terminal, so for the first time a session ccmux never opened can
+be brought onto the current binary instead of keeping the `claude` it was
+dispatched with for ever.
+
+**ONE VERB, NOT A STOP/RESUME PAIR.** This population was first built on
+`claude stop <id>` + `claude --bg --resume <sessionId>`, and that pair had two
+defects `respawn` does not. `--bg --resume` has a documented FORK branch —
+"starts a copy and says so when the session is already running" — which exits 0
+and prints the notice on stdout; ccmux issued it immediately after its own stop,
+inside exactly the window where the daemon still called the session running, and
+roughly one resume in twenty came back as a COPY: an extra live agent and a
+duplicated conversation, counted as a success. And two calls meant a stop could
+land with its partner never sent. `respawn` halts and restarts inside the daemon
+in one call, takes the same short id `stop` and `attach` take, and has no copy
+branch (measured: same short id, same `sessionId`, one row before and after, a
+new worker pid). `respawn --all` is never built — it would hit every dormant,
+stopped and working session at once, which is the opposite of a pass built on
+per-session gates.
+
+**IT CHECKS NOTHING ITSELF**, so §8.11's gates are load-bearing rather than
+belt-and-braces. Measured 2026-09-09 on throwaways: `claude respawn` on a
+`stopped` session UN-STOPS it, and on a `working` session interrupts the work
+mid-flight (`working`/`busy` becomes `blocked`/`idle`). `has_worker` and
+`agent_verdict` are what keep it off both.
+
+**WHAT EVERY RESTART COSTS, AND IT IS THE CLI'S, NOT CCMUX'S.** A resumed worker
+comes up WITHOUT the session's display name and with `startedAt` reset to now,
+so while it runs the sidebar draws the bare 8-hex short id in place of the task
+text and the age reads as seconds. Measured on a throwaway, 2.1.266:
+
+```text
+dispatched     name='PLFIX-A: reply with exactly the word ALPHA…'  startedAt=…072902  pid=1486602
+claude respawn name='e77b0ddc'                                     startedAt=…083178  pid=1491316
+claude stop    name='PLFIX-A: reply with exactly the word ALPHA…'  startedAt=…072665  pid=null
+```
+
+The PERSISTED name is intact — the third line is the same session after a stop —
+so this is the live worker's display name, not a lost record, and it comes back
+whenever the session next stops. It is also not new and not specific to this
+population: `stop` + `attach`, the paned mechanism that has shipped since `R`
+learned about agents, does exactly the same thing. What IS new is the reach,
+which is the whole point of the paneless pass, so it is stated here and in the
+README rather than discovered.
+
+ccmux cannot put the name back. There is no rename verb in the CLI, and `--name`
+alongside `--resume` does not set one — it FORKS: "background session <id> keeps
+its own saved options, so the flags you passed started a copy as <other id>"
+(measured). Passing flags to get the name back would cost a duplicated
+conversation, which is strictly worse than a row that reads as its short id
+until it next stops.
 
 **LIVENESS IS THE WHOLE GUARD HERE.** `pid` present ⟺ a worker is running
 (PROBE-FINDINGS §1); 9 of the operator's 16 rows carry `pid: null` and are
@@ -2723,13 +2801,57 @@ alone would have spawned nine background workers nobody asked for. Presence
 only: the value stays forbidden as an identity, and `model::Session::pid` is
 read solely through `has_worker()`.
 
-*Disjointness* — `Plan::held` carries every session a LIVE ccmux pane names,
-respawned or not, keyed by BOTH the short id and the uuid, and
-`headless_targets` subtracts it. So no session collects two `claude stop`s for
-one restart, and a pane the footer calls `skipped` really was left alone: being
-stopped and resumed behind the operator's back is not what "skipped" means. The
-second key matters for a map entry written by a build with no `short_id` field —
-without it, that pane's session would read as paneless.
+*Disjointness* — TWO SUBTRACTIONS, because the fleet is MACHINE-WIDE while
+every tmux record ccmux holds is scoped to its own session (R2, R3).
+
+* `Plan::held` — every session a LIVE ccmux pane in THIS workspace names,
+  respawned or not, keyed by BOTH the short id and the uuid. So no session
+  collects two acts for one restart, and a pane the footer calls `skipped`
+  really was left alone: being restarted behind the operator's back is not what
+  "skipped" means. The second key matters for a map entry written by a build
+  with no `short_id` field — without it, that pane's session would read as
+  paneless.
+* `agents::attached_ids` — every session a live `claude attach <id>` names
+  ANYWHERE ON THE MACHINE, read from `/proc/<pid>/cmdline`. `held` cannot see a
+  second ccmux workspace (`--session NAME`, `-L socket` are both documented), a
+  `claude attach` the operator ran by hand — even in ccmux's own window, where
+  it is in no `@ccmux_tab_map` — or an attach on another tmux server. Both
+  `claude stop` and `claude respawn` KILL that client: the pane prints
+  `Session <id> has exited.` and latches `@ccmux_detached`, and without this
+  subtraction the footer counted it `restarted`.
+
+Neither implies the other, which is why there are two. A pane ccmux owns whose
+attach has already EXITED (parked by `Ctrl+Z`) has no client process left to
+find, so only `held` shields it; an attach outside this tmux session is in no
+map, so only `attached_ids` does.
+
+This is a READ-ONLY, flat argv match — argv[0]'s file name is `claude`, argv[1]
+is `attach`, argv[2] is the id — and it can only ever REFUSE to act. It is not
+§5.4's deleted /proc ancestry walk returning: no ppid chain, no `list-panes -a`,
+no resolving a session to a pane, and nothing it produces authorises touching a
+pane, a session or a process. R2 and R3 are untouched. What it cannot see is
+stated rather than assumed: an attach against a shared daemon on ANOTHER
+machine, one started in the instant after the scan, and a client launched
+through a wrapper whose argv[0] is neither `claude` nor `CCMUX_CLAUDE_BIN`'s own
+file name.
+
+*Blind* — a scan that could not RUN (`attached_ids` returns `None`: no readable
+`/proc`) is not a scan that found nobody. Sub-pass 1b is skipped entirely and
+the footer says `paneless pass skipped`. The alternative is the fail-open
+reading, and the act it would have authorised is stopping every attach client
+on the machine.
+
+*No evidence, no plan* — the same rule one level up. `refresh_panes` keeps the
+previous inventory when a tmux read fails, which is right for every drawing
+reader and wrong here: the process that runs this pass is a FRESH image whose
+previous inventory is EMPTY, so a failed `list-panes` or `list-windows` leaves a
+blank picture rather than a stale one. `plan` then yields no targets AND no
+`held`, and 1b read the whole machine's fleet as nobody's — it halted and
+restarted the very sessions this window had open in panes and respawned none of
+them, while reporting success. Renaming the tmux session out from under a
+running ccmux produces it. `panes_fresh` and `tabs_fresh` gate the whole of
+`restart_others`: this sidebar has already restarted by `exec`, and the operator
+is told the reads failed instead of being handed counts computed from a blank.
 
 *State* — `restart::agent_verdict`, the same function for both populations,
 applied at the RE-POLL rather than at enumeration, because a snapshot's state
@@ -2794,27 +2916,41 @@ session that goes idle -> working inside that window. It is stopped, and the
 work in flight is lost — the same exposure `Ctrl+X` has always had, one poll
 wide instead of one poll interval wide.
 
-*Failure* — one failed `claude stop`, or one failed `claude --bg --resume`,
-costs that agent and nothing else: it is counted and the pass continues. A
-failed POLL ends the pass instead, because without it ccmux cannot tell working
-from idle and every later stop would be a guess; a failed ENUMERATION poll skips
-sub-pass 1b and counts nothing, because unlike 1a ccmux cannot name a single
-agent it missed and a made-up number in the footer is worse than silence.
+*Failure* — one failed `claude stop`, or one failed `claude respawn`, costs
+that agent and nothing else: it is counted and the pass continues. A failed POLL
+ends the pass instead, because without it ccmux cannot tell working from idle
+and every later act would be a guess; a failed ENUMERATION poll skips sub-pass
+1b and counts nothing, because unlike 1a ccmux cannot name a single agent it
+missed and a made-up number in the footer is worse than silence.
 `AGENT_BUDGET` (60 s) caps the whole pass, both sub-passes inside it — the
 per-call bounds multiply, and the pane pass must not be lost to a wedged daemon.
-It is a START GATE: the deadline is checked before each poll+stop(+resume) group
-and no call can be cut short once begun, so the true worst case is
-`AGENT_BUDGET + POLL_TIMEOUT + STOP_TIMEOUT + RESUME_TIMEOUT` = **85 s**, once
+It is a START GATE: the deadline is checked before each poll+act group and no
+call can be cut short once begun, so the true worst case is
+`AGENT_BUDGET + POLL_TIMEOUT + RESPAWN_TIMEOUT + POLL_TIMEOUT` = **80 s**, once
 per pass. In every one of those cases PHASE 2 still runs.
+
+**A FAILED `respawn` IS NOT A FACT ABOUT THE WORKER.** `run_bounded` SIGKILLs
+the client at `RESPAWN_TIMEOUT` while the daemon carries the restart out
+regardless, so the error alone cannot be filed. One poll settles it, on
+`has_worker` and nothing finer: a worker still there is `not restarted` (the
+agent is running and ccmux could not change it — exactly what that word
+promises), no worker is `left stopped` (the halt landed and nothing will resume
+it — the outcome that needs a human), and a row that has left the fleet is
+counted nowhere. The residual imprecision is on the safe side: a respawn that
+LANDED and lost only its report also shows a worker, so it reads as `not
+restarted` and the operator may press `R` again, which restarts an idle agent
+that was already fine. Filing a halted agent under a word that says it is
+running is the failure that strands work silently, and it is the one this
+rules out.
 
 *Counting the restarts* — a `claude stop` that returned Ok is HALF a restart.
 The resume is the other half and it can fail on its own: for a paned agent it is
 the pane's respawned `claude attach` (kill that pane between the phases and the
-agent is halted with nothing left to resume it), for a headless one it is
-`claude --bg --resume`, which the daemon can simply refuse. So neither is
-counted at the stop: a paned session's verdict waits for PHASE 3, a headless
-one's arrives one call later in 1b. Resumed either way it is `restarted`; not
-resumed either way it is `stranded` — reported as `N left stopped`, its own word
+agent is halted with nothing left to resume it). So it is not counted at the
+stop; a paned session's verdict waits for PHASE 3. A paneless one has no such
+split — `claude respawn` is both halves — and settles in 1b. Running again
+either way it is `restarted`; halted with nothing to bring it back either way it
+is `stranded` — reported as `N left stopped`, its own word
 because it is the only outcome of `R` that asks the operator to do something
 (press `Enter` on the row). Rolled into `restarted` it would claim an upgrade
 for a worker that is not running; rolled into `not restarted` it would read as
@@ -2845,11 +2981,11 @@ and is then halted underneath itself). Not merely "each stop before its own
 pane": two panes may hold one session, so the whole-phase boundary is the only
 version of the rule with no ordering left to get wrong.
 
-Within PHASE 1 the paned stops go FIRST and the headless pairs follow, and both
-halves of that are deliberate. The paned stops go first because their resume is
-PHASE 2, which cannot begin until PHASE 1 ends — every second spent elsewhere
-before them is a second longer that every paned session sits halted with no
-attach yet. The headless work sits inside PHASE 1 rather than after PHASE 2
+Within PHASE 1 the paned stops go FIRST and the paneless respawns follow, and
+both halves of that are deliberate. The paned stops go first because their
+resume is PHASE 2, which cannot begin until PHASE 1 ends — every second spent
+elsewhere before them is a second longer that every paned session sits halted
+with no attach yet. The paneless work sits inside PHASE 1 rather than after PHASE 2
 because those sessions touch no pane and so have no ordering relationship with
 the respawns in either direction; putting them in the earlier phase costs
 nothing and keeps "every stop before any respawn" a property of the phase
@@ -2945,9 +3081,12 @@ ordering above a refusal costs one flash.
 second press deletes a session and its git worktree, which has no undo. `R`
 kills attach clients, sidebars whose entire state is in tmux window options, and
 workers that are provably not working — and it puts every one of them straight
-back into the same pane. The verb it runs on an agent is `claude stop`, the
-RECOVERABLE one: the conversation is kept and the pane's attach resumes it
-(PROBE-FINDINGS §2). `claude rm` is `Ctrl+X`'s second press and is reachable
+back. The verbs it runs on an agent are the RECOVERABLE ones: `claude stop`,
+whose conversation is kept and whose pane's attach resumes it, and
+`claude respawn`, which halts and restarts a worker in one call and keeps the
+conversation likewise (PROBE-FINDINGS §2). What both of them DO cost is stated
+under *The agents*: the CLI drops a resumed session's display name and start
+time, so a restarted row reads as its own short id until it next stops. `claude rm` is `Ctrl+X`'s second press and is reachable
 from nowhere else. The worst an accidental `R` costs is the panes' scrollback
 and a few seconds. An arm on a recoverable verb is a tax on the common case,
 and the confirm modal it would revive was deleted outright (§8.2). `R` also
@@ -2980,12 +3119,16 @@ requires the pane to be live.
 it: `restarted 3 sidebars, 4 panes, 2 agents (1 busy, 1 skipped)`. Successes in
 the head, exceptions in one parenthesis, and every exception has its own word —
 `N failed` (a pane that did not come back), `N not restarted` (an agent still on
-the old binary), `N left stopped` (an agent that was stopped and whose pane
-never came back to resume it), `N busy` (an agent deliberately left alone),
-`N skipped` (a pane deliberately left alone). Those could have shared "failed"
+the old binary), `N left stopped` (an agent that was halted and that nothing
+came back to resume), `N busy` (an agent deliberately left alone),
+`N skipped` (a pane deliberately left alone), and `paneless pass skipped` (a
+whole population ccmux could not see well enough to touch — not a count,
+because nothing was attempted). Those could have shared "failed"
 and must not: a lost pane, a stale agent and a halted agent with nothing to
 resume it are three different problems, and only the last one needs the operator
-to act. The agent clause is
+to act. When the tmux reads themselves failed there is no report at all, only
+`cannot read this session's panes — restarted this sidebar only`: counts
+computed from a blank inventory would be worse than none. The agent clause is
 omitted entirely when nothing was in scope, so a session with no Claude panes
 reads exactly as it did before agents were part of `R`. A line wider than the
 sidebar wraps into §6.8's overflow carve rather than truncating. The count

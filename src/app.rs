@@ -34,28 +34,28 @@ use crate::tmux::{
 /// RESPAWNED, because the pane pass is what `R` was always for and it must not
 /// be lost to a wedged daemon.
 ///
-/// ONE BUDGET FOR BOTH SUB-PASSES — the paned agents and the headless ones.
+/// ONE BUDGET FOR BOTH SUB-PASSES — the paned agents and the paneless ones.
 /// Splitting it would let a long paned pass starve the half that has no pane
-/// behind it, which is the half whose stop leaves a session halted until its
-/// own resume lands.
+/// behind it, which is the half whose restart nothing else would ever make.
 ///
 /// IT IS A START GATE, NOT A STOPWATCH, and the arithmetic is stated because
-/// it was once stated wrong. The deadline is checked before each poll+stop
+/// it was once stated wrong. The deadline is checked before each poll+act
 /// group, and no call can be cut short once it has begun — `run_bounded` owns
 /// their timeouts and takes no remaining-budget argument. So an agent whose
 /// turn comes a millisecond before the deadline still gets its full
-/// `POLL_TIMEOUT` (5 s), `STOP_TIMEOUT` (10 s) and — for a headless one, whose
-/// resume is part of the same indivisible group — `RESUME_TIMEOUT` (10 s). The
-/// true worst case is therefore
+/// `POLL_TIMEOUT` (5 s) and then `STOP_TIMEOUT` (10 s) for a paned one, or
+/// `RESPAWN_TIMEOUT` (10 s) plus the verifying `POLL_TIMEOUT` (5 s) for a
+/// paneless one. The true worst case is therefore
 ///
-///   AGENT_BUDGET + POLL_TIMEOUT + STOP_TIMEOUT + RESUME_TIMEOUT = 85 s
+///   AGENT_BUDGET + POLL_TIMEOUT + RESPAWN_TIMEOUT + POLL_TIMEOUT = 80 s
 ///
 /// not 60. Tightening that to 60 would mean cancelling a `claude stop` in
 /// flight, which is not a thing a caller can do and not a thing worth wanting:
 /// the stop is the destructive half, and abandoning it mid-call would leave
 /// exactly the ambiguity `Agents::stranded` exists to name. Abandoning a
-/// headless RESUME mid-call is worse still — that is the ambiguity actually
-/// happening. The 25 s of overshoot is bounded, once per pass, and — since the
+/// paneless RESPAWN mid-call is worse still — that is the ambiguity actually
+/// happening, and the verifying poll is what settles it. The 20 s of overshoot
+/// is bounded, once per pass, and — since the
 /// frame now comes first (`main::run_sidebar`) — spent on a drawn sidebar
 /// whose buffered keys are discarded rather than on a blank one.
 const AGENT_BUDGET: Duration = Duration::from_secs(60);
@@ -482,6 +482,18 @@ pub struct App {
     /// So the gate reads this flag first and answers `Unknown` — which polls.
     pub panes_fresh: bool,
 
+    /// Did the LAST `list_tabs` succeed?
+    ///
+    /// The other half of `panes_fresh`, and it is separate because the two
+    /// reads fail separately: `refresh_panes` keeps the previous `self.tabs`
+    /// when `list-windows` errors, which is right for every drawing reader and
+    /// wrong for the one decision that turns on ABSENCE. `Plan::held` is built
+    /// from the tab maps, so an unread `list-windows` empties it — and an
+    /// empty `held` is indistinguishable, to `headless_targets`, from a fleet
+    /// no pane holds. `R` therefore refuses to plan at all without both reads:
+    /// see `restart_others`.
+    pub tabs_fresh: bool,
+
     pub should_quit: bool,
 
     /// `R`'s decision, made and consumed within one keypress: a binary that has
@@ -538,16 +550,25 @@ pub struct App {
     /// through it spawns nothing while still proving the argv.
     pub agents_stop: fn(&str) -> Result<(), AgentsError>,
 
-    /// Seam for `agents::resume`, `R`'s OTHER half of a headless restart.
+    /// Seam for `agents::respawn`, `R`'s restart for an agent with no client.
     ///
     /// It exists for the same two reasons `agents_stop` does, and one more
-    /// that is specific to it: this is the only resume ccmux has that is not a
-    /// pane, so a test of the stop/resume PAIRING — that every headless stop
-    /// is followed immediately by its own resume, and that a resume which
-    /// fails leaves its session counted as `left stopped` rather than
-    /// restarted — can only be written against one recorder that sees both
-    /// verbs on one timeline.
-    pub agents_resume: fn(&str) -> Result<(), AgentsError>,
+    /// that is specific to it: this is the only restart ccmux has that is not
+    /// a pane, so a test of what a FAILED one is counted as — `not restarted`
+    /// when the worker is still there, `left stopped` when the daemon halted
+    /// it anyway — can only be written against one recorder that sees the verb
+    /// and the polls around it on one timeline.
+    pub agents_respawn: fn(&str) -> Result<(), AgentsError>,
+
+    /// Seam for `agents::attached_ids`, the machine-wide "who has a client"
+    /// read that scopes the paneless population.
+    ///
+    /// A seam because the production one walks the REAL `/proc` — every
+    /// process on the operator's machine, their own live agents among them —
+    /// and because the property that matters is a refusal: a test must be able
+    /// to say "this session has an attach ccmux cannot see" and "the scan
+    /// could not run at all" without arranging either on the host.
+    pub agents_attached: fn() -> Option<BTreeSet<String>>,
 
     /// `AGENT_BUDGET`, as a field so a test can set it to zero and prove the
     /// pane pass survives an exhausted budget without sleeping for a minute.
@@ -641,6 +662,7 @@ impl App {
             // Nothing has been enumerated yet, and in degraded mode nothing
             // ever will be: both must read as "cannot answer", which polls.
             panes_fresh: false,
+            tabs_fresh: false,
 
             should_quit: false,
 
@@ -651,7 +673,8 @@ impl App {
             dispatch: agents::dispatch_background,
             agents_poll: agents::poll,
             agents_stop: agents::stop,
-            agents_resume: agents::resume,
+            agents_respawn: agents::respawn,
+            agents_attached: agents::attached_ids,
             agent_budget: AGENT_BUDGET,
         }
     }
@@ -2311,7 +2334,10 @@ impl App {
     ///
     /// The evidence is re-read first, in this fresh process, so the plan is
     /// built from what tmux says NOW rather than from a snapshot taken before
-    /// the operator's last keypress.
+    /// the operator's last keypress — and if either read FAILS there is no
+    /// plan to build. This image's inventory starts empty, so a failed read
+    /// leaves a blank picture rather than a stale one, and every rule below
+    /// reads absence as a decision. `restart_others` refuses on that.
     pub fn finish_restart(&mut self) {
         if self.degraded {
             return;
@@ -2360,6 +2386,30 @@ impl App {
     /// counting waits until phase 2 has run and is done in `stopped`/`resumed`
     /// terms rather than at the `claude stop` call site.
     fn restart_others(&mut self) {
+        // PHASE 0 — CAN THIS IMAGE SEE ANYTHING AT ALL?
+        //
+        // The reads happened in `finish_restart`, in a FRESH process whose
+        // `panes` and `tabs` start empty, so a `list-panes` or `list-windows`
+        // that errored leaves not a stale picture but a blank one. Everything
+        // below reads absence as a decision: no pane in the plan means nothing
+        // to respawn, and — the part that bites — no session in `Plan::held`
+        // means every live agent on the machine looks like nobody's. Renaming
+        // the tmux session out from under a running ccmux is enough to produce
+        // that (the session-scoped reads then fail), and the fail-open reading
+        // stopped and restarted the very sessions this window had open.
+        //
+        // So: no evidence, no plan. `R` has already restarted THIS sidebar by
+        // `exec` — that much is done and cannot be undone — and the operator is
+        // told plainly that the rest could not be attempted, rather than being
+        // handed counts computed from a blank inventory.
+        if !self.panes_fresh || !self.tabs_fresh {
+            self.flash(
+                "cannot read this session's panes — restarted this sidebar only",
+                MsgLevel::Warn,
+            );
+            return;
+        }
+
         // Built from THIS image's argv[0], which is the path `act_restart`
         // resolved and probed. `sidebar_cmd` is the launcher's string, built
         // from a `current_exe()` that a `cargo install` may since have turned
@@ -2370,12 +2420,12 @@ impl App {
         let plan = restart::plan(&tabs, &self.panes, self.own_pane.as_ref());
 
         // PHASE 1 — the agents, BOTH populations. Nothing has been respawned
-        // yet, and that is the point: every stop this pass makes lands here,
-        // the headless ones included, so "every stop before any respawn" is a
-        // property of the phase boundary rather than of a case analysis. The
-        // headless pairs also complete their own resumes in here — they touch
-        // no pane, so they have nothing in PHASE 2 to wait for, and `stopped`
-        // carries only the paned ids that are still owed one.
+        // yet, and that is the point: every stop this pass makes lands here, so
+        // "every stop before any respawn" is a property of the phase boundary
+        // rather than of a case analysis. The paneless restarts complete in
+        // here too — they touch no pane, so they have nothing in PHASE 2 to
+        // wait for, and `stopped` carries only the paned ids that are still
+        // owed a resume.
         let (mut agents, stopped) = self.restart_agents(&plan);
 
         // PHASE 2 — the panes, exactly as before, plus a record of WHICH
@@ -2451,12 +2501,12 @@ impl App {
     /// session of new sidebars and new attach clients talking to workers on a
     /// version from days ago — measured on this host: of 7 live workers, 4 were
     /// on 2.1.251 and 1 on 2.1.247 while the CLI had moved to 2.1.260. This
-    /// pass closes that, in two sub-passes that differ only in what resumes
-    /// the session after the stop.
+    /// pass closes that, in two sub-passes that differ in the call each one
+    /// makes and in nothing else.
     ///
     /// THE SCOPE RULE, one sentence for both: **`R` restarts agents that have
-    /// a LIVE WORKER, that ccmux can resume, and that are neither working nor
-    /// blocked nor already stopped.**
+    /// a LIVE WORKER, that ccmux can bring back, and that are neither working
+    /// nor blocked nor already stopped.**
     ///
     ///   * SUB-PASS A, THE PANED AGENTS (`Plan::agent_ids`) — the sessions a
     ///     pane in this window is about to re-attach. The resume is that
@@ -2465,24 +2515,32 @@ impl App {
     ///     to settle. Liveness is not tested here and does not need to be: the
     ///     pane is respawned either way, and its `claude attach` resumes the
     ///     session whether a worker was up or not.
-    ///   * SUB-PASS B, THE HEADLESS AGENTS (`restart::headless_targets`) — a
-    ///     live worker with NO ccmux pane. Its resume is
-    ///     `claude --bg --resume <sessionId>`, which needs no pane, so the pair
-    ///     completes here and settles its own counts. Liveness IS the scope
-    ///     here: a `pid: null` session is dormant, and "restarting" it would
-    ///     spawn a worker nobody asked for.
+    ///   * SUB-PASS B, THE PANELESS AGENTS (`restart::headless_targets`) — a
+    ///     live worker with NO CLIENT ANYWHERE. `claude respawn <id>` does both
+    ///     halves inside the daemon and needs no pane, so this sub-pass
+    ///     completes and settles its own counts. Liveness IS the scope here: a
+    ///     `pid: null` session is dormant, and "restarting" it would spawn a
+    ///     worker nobody asked for.
     ///
-    /// The two populations are DISJOINT by construction (`Plan::held`), so no
-    /// session is stopped twice and nothing is counted twice.
+    /// The two populations are DISJOINT by construction — `Plan::held` for the
+    /// panes ccmux owns in THIS tmux session, `agents::attached_ids` for every
+    /// `claude attach` client on the machine — so no session is restarted twice
+    /// and nothing is counted twice. The second subtraction is not a
+    /// refinement: the fleet is machine-wide while every tmux record ccmux
+    /// holds is scoped to its own session, so without it a session open in
+    /// another ccmux workspace read as paneless and had its attach killed.
     ///
     /// WHICH STATES: `restart::agent_verdict`, the same function for both —
     /// Idle and `done` yes; Working and Blocked `busy`; `stopped` refused and
     /// not counted, because a stopped session is not running an old binary,
     /// it is not running. Applying that to only one population would let `R`
     /// revive a stopped session when it happened to have a pane and not
-    /// otherwise.
+    /// otherwise. In sub-pass B the gate is load-bearing rather than
+    /// belt-and-braces: `claude respawn` checks nothing itself, and was
+    /// measured un-stopping a `stopped` session and interrupting a `working`
+    /// one mid-task (PROBE-FINDINGS §2).
     ///
-    /// THE STATE IS RE-READ IMMEDIATELY BEFORE EVERY STOP, in both sub-passes,
+    /// THE STATE IS RE-READ IMMEDIATELY BEFORE EVERY ACT, in both sub-passes,
     /// and that is not belt-and-braces. `App::sessions` is up to one poll
     /// interval old at the best of times, and in the process that runs this
     /// pass it is EMPTY — `finish_restart` runs before the first `tick`.
@@ -2499,12 +2557,13 @@ impl App {
     /// WHAT IT RETURNS. The counts it can settle on its own — everything
     /// sub-pass B did, plus sub-pass A's `busy` and `failed`, both of which
     /// leave the agent RUNNING on its old binary — plus the paned ids it
-    /// actually stopped, which it cannot settle. A stopped session is owed a
+    /// actually stopped, which it cannot settle. And `Agents::blind`, which is
+    /// not a count at all: sub-pass B did not run. A stopped session is owed a
     /// resume, and for those the resume is phase 2's `claude attach`; until
     /// that has been attempted, "restarted" is not yet a fact about any of
     /// them. `restart_others` closes the books.
     ///
-    /// FAIL CLOSED, AND DO NOT CASCADE. A stop or a resume that errors is
+    /// FAIL CLOSED, AND DO NOT CASCADE. A stop or a respawn that errors is
     /// counted and the pass moves on to the next session: one unreachable
     /// agent must not cost the other eleven their upgrade. A POLL that fails
     /// ends the pass instead, and the difference is deliberate — a stop
@@ -2518,8 +2577,8 @@ impl App {
         // Stopped, and therefore OWED A RESUME BY PHASE 2. Returned rather
         // than counted: whether each of these is a `restarted` or a `stranded`
         // is a question only PHASE 2 can answer, and this function runs before
-        // it. Sub-pass B's sessions are NOT in here — their resume happens
-        // inside this call, so they settle here.
+        // it. Sub-pass B's sessions are NOT in here — `claude respawn` does
+        // both halves in one call, so they settle here.
         let mut stopped: Vec<&'p str> = Vec::new();
         // `checked_add` because a `Duration` this far out could overflow the
         // monotonic clock; `None` then means "no deadline", which the per-call
@@ -2584,37 +2643,73 @@ impl App {
         true
     }
 
-    /// SUB-PASS B — the LIVE PANELESS agents, stopped and resumed here.
+    /// SUB-PASS B — the LIVE agents NOBODY HAS OPEN, restarted here.
     ///
-    /// WHERE IT SITS, AND WHY. Inside PHASE 1, after sub-pass A, and each stop
-    /// immediately followed by its own resume. Three things decide that:
+    /// WHERE IT SITS, AND WHY. Inside PHASE 1, after sub-pass A:
     ///
-    ///   * It is still PHASE 1, so every stop this pass makes — paned and
-    ///     headless alike — lands before any pane is respawned, and
-    ///     `every_stop_lands_before_every_respawn` stays a property of the
-    ///     whole pass rather than of one half of it. These sessions touch no
-    ///     pane, so nothing here has an ordering relationship with PHASE 2 in
-    ///     either direction; being inside the earlier phase costs nothing and
-    ///     keeps the invariant with no case analysis.
+    ///   * It is still PHASE 1, so every stop this pass makes lands before any
+    ///     pane is respawned, and `every_stop_lands_before_every_respawn` stays
+    ///     a property of the whole pass rather than of one half of it. These
+    ///     sessions touch no pane, so nothing here has an ordering relationship
+    ///     with PHASE 2 in either direction; being inside the earlier phase
+    ///     costs nothing and keeps the invariant with no case analysis.
     ///   * The PANED stops go first because their resume is PHASE 2, which
-    ///     cannot begin until PHASE 1 ends. Every second spent here before
-    ///     them would be a second longer that every paned session sits halted
-    ///     with no attach yet.
-    ///   * Each headless stop is followed AT ONCE by its own resume, rather
-    ///     than stopping them all and resuming them all. There is no pane
-    ///     fallback for these: if this process died between the halves,
-    ///     nothing anywhere would bring that session back. Pairing them makes
-    ///     the halted window one `claude` round trip instead of the rest of
-    ///     the pass, and it lets each pair settle its own count immediately.
+    ///     cannot begin until PHASE 1 ends. Every second spent here before them
+    ///     would be a second longer that every paned session sits halted with
+    ///     no attach yet.
+    ///
+    /// ONE VERB, NOT A PAIR. `claude respawn <id>` halts the worker and starts
+    /// the new one inside the daemon, so this sub-pass cannot leave a stop
+    /// without its partner and cannot be interrupted between them. It replaced
+    /// `claude stop` + `claude --bg --resume <sessionId>`, whose documented
+    /// fork branch ("starts a copy and says so when the session is already
+    /// running") fired inside exactly the window ccmux created by resuming
+    /// immediately after its own stop — measured at roughly one resume in
+    /// twenty, each one an extra live agent and a duplicated conversation
+    /// reported as a success. See `agents::respawn`.
+    ///
+    /// WHO IS IN SCOPE, and the second half of it is why this function reads
+    /// `/proc` at all. The fleet is MACHINE-WIDE; `Plan::held` is scoped to
+    /// ccmux's own tmux session (R2, R3). Subtracting only `held` therefore
+    /// classified as "paneless" every session held by a second ccmux
+    /// workspace, by a hand-run `claude attach`, or by any attach on another
+    /// tmux server — and `claude respawn` KILLS that client, leaving the
+    /// operator's other window parked on a dead session while this footer
+    /// counted it `restarted`. `agents::attached_ids` answers the question from
+    /// the process that actually dies.
+    ///
+    /// A SCAN THAT COULD NOT RUN IS NOT AN EMPTY SCAN. `None` skips the whole
+    /// sub-pass and sets `Agents::blind`, because the alternative is the
+    /// fail-open reading — absent evidence authorising the act — and here that
+    /// act is stopping every attach client on the machine.
     ///
     /// THE ENUMERATION POLL. Sub-pass A knows its ids from the plan; this one
-    /// cannot — a session with no pane is by definition not in any tmux
-    /// record, so the fleet itself is the only place the population exists.
-    /// One poll answers that, and then the per-stop re-poll runs as usual, so
-    /// the rule "the state is re-read immediately before every stop" holds
-    /// here exactly as it does there. If that first poll fails, nothing is
-    /// counted: unlike sub-pass A, ccmux cannot name a single agent it missed,
-    /// and inventing a number for the footer would be worse than silence.
+    /// cannot — a session with no pane is by definition not in any tmux record,
+    /// so the fleet itself is the only place the population exists. One poll
+    /// answers that, and then the per-target re-poll runs as usual, so the rule
+    /// "the state is re-read immediately before every act" holds here exactly
+    /// as it does there. If that first poll fails, nothing is counted: unlike
+    /// sub-pass A, ccmux cannot name a single agent it missed, and inventing a
+    /// number for the footer would be worse than silence.
+    ///
+    /// WHAT A FAILED RESPAWN IS COUNTED AS, and it is not decided from the
+    /// error. `run_bounded` SIGKILLs the client at `RESPAWN_TIMEOUT` while the
+    /// daemon carries out the restart regardless, so an `Err` says nothing
+    /// about the worker — and the two outcomes it hides are the two words that
+    /// must never be swapped. One poll separates them, on `has_worker` and
+    /// nothing finer: NO WORKER is `left stopped`, the halt landed and nothing
+    /// will resume it, which is the one outcome of `R` an operator has to act
+    /// on; A WORKER is `not restarted`, whose documented meaning — that agent
+    /// is still running and ccmux could not change it — is true of it.
+    ///
+    /// The residual imprecision is deliberate and lies on the safe side: a
+    /// respawn that fully LANDED and lost only its report also shows a worker,
+    /// so it reads as `not restarted` and the operator may press `R` again,
+    /// which restarts an idle agent that was already fine. The reverse — a
+    /// halted agent filed under a word that says it is running — is the bug
+    /// this replaced, and it strands work silently. Nothing here reads `pid`'s
+    /// VALUE: `has_worker` is the only accessor, exactly as `Session::pid`
+    /// requires.
     fn restart_headless_agents(
         &self,
         plan: &restart::Plan,
@@ -2624,17 +2719,23 @@ impl App {
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return;
         }
+        // BEFORE THE FLEET IS EVEN READ: without this, there is no population
+        // this function is entitled to compute.
+        let Some(attached) = (self.agents_attached)() else {
+            out.blind = true;
+            return;
+        };
         let Ok(fleet) = (self.agents_poll)() else {
             return;
         };
-        let targets = restart::headless_targets(&fleet.sessions, &plan.held);
+        let targets = restart::headless_targets(&fleet.sessions, &plan.held, &attached);
         for (i, t) in targets.iter().enumerate() {
             let left = targets.len() - i;
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 out.failed += left;
                 return;
             }
-            // THE RE-POLL, immediately before this one stop — and it re-asks
+            // THE RE-POLL, immediately before this one act — and it re-asks
             // every question the enumeration asked, because all of them can
             // have changed in the meantime.
             let fresh = match (self.agents_poll)() {
@@ -2652,9 +2753,11 @@ impl App {
                 continue;
             };
             // A worker that exited inside the window is DORMANT now, and
-            // dormant is exactly what this sub-pass must never resurrect. The
-            // enumeration's `has_worker` is a snapshot like every other; this
-            // is the one that authorises the act.
+            // dormant is exactly what this sub-pass must never resurrect —
+            // `claude respawn` on a session with no worker STARTS one
+            // (measured, PROBE-FINDINGS §2). The enumeration's `has_worker` is
+            // a snapshot like every other; this is the one that authorises the
+            // act.
             if !sess.has_worker() {
                 continue;
             }
@@ -2662,23 +2765,40 @@ impl App {
                 restart::Verdict::Restart => {}
                 // It picked up work between the enumeration and now: running,
                 // left on its old binary, and that is what `busy` means.
+                // `respawn` would interrupt it mid-task (measured: `working`
+                // becomes `blocked`), which is the whole reason for this gate.
                 restart::Verdict::Busy => {
                     out.busy += 1;
                     continue;
                 }
-                // Stopped inside the window — no worker, nothing owed.
+                // Stopped inside the window — no worker, nothing owed, and
+                // `respawn` would un-stop it.
                 restart::Verdict::NotRunning => continue,
             }
-            if (self.agents_stop)(&t.short_id).is_err() {
-                out.failed += 1;
+            if (self.agents_respawn)(&t.short_id).is_ok() {
+                out.restarted += 1;
                 continue;
             }
-            // THE RESUME, immediately after its own stop, and the pair settles
-            // here: this sub-pass owns both halves, so `stranded` is decided
-            // now rather than in PHASE 3.
-            match (self.agents_resume)(&t.session_id) {
-                Ok(()) => out.restarted += 1,
-                Err(_) => out.stranded += 1,
+            // THE VERIFYING POLL. See the doc above: the error says nothing
+            // about the worker, and the three outcomes it hides need three
+            // different words.
+            match (self.agents_poll)() {
+                Ok(after) => match after.sessions.iter().find(|s| s.session_id == t.session_id) {
+                    // Gone from the fleet: same rule as above, nothing to say.
+                    None => {}
+                    Some(s) if s.has_worker() => out.failed += 1,
+                    Some(_) => out.stranded += 1,
+                },
+                // Two failures in a row, and the second is a poll: ccmux can no
+                // longer tell working from halted, so it stops guessing. This
+                // one gets the word that asks the operator to LOOK, because the
+                // outcome it might be hiding is a halted agent; the rest are
+                // `failed`, exactly as any other poll failure ends the pass.
+                Err(_) => {
+                    out.stranded += 1;
+                    out.failed += left - 1;
+                    return;
+                }
             }
         }
     }
@@ -2951,9 +3071,18 @@ impl App {
         };
         self.panes = live;
         self.panes_fresh = true;
-        if let Ok((tabs, width)) = tmux::list_tabs(&self.tmux_session) {
-            self.tabs = tabs;
-            self.width_opt = width;
+        match tmux::list_tabs(&self.tmux_session) {
+            Ok((tabs, width)) => {
+                self.tabs = tabs;
+                self.width_opt = width;
+                self.tabs_fresh = true;
+            }
+            // Same trade as the pane inventory: the previous tabs stay, because
+            // every drawing reader wants the last good answer. `tabs_fresh` is
+            // how the one reader that must not treat a stale — or, in this
+            // fresh post-`exec` image, EMPTY — map as evidence of absence is
+            // told the difference.
+            Err(_) => self.tabs_fresh = false,
         }
         self.resolve_identity();
         self.adopt_own_state();
@@ -4193,6 +4322,7 @@ mod tests {
             // and it counts as freshly enumerated. A test that wants a FAILED
             // enumeration clears this, the way `refresh_panes` does.
             panes_fresh: true,
+            tabs_fresh: true,
             should_quit: false,
             pending_restart: None,
             // Same rule as `dispatch`: no hermetic test may respawn a pane on
@@ -4217,9 +4347,14 @@ mod tests {
             // installs its own recording stub.
             agents_poll: || panic!("unit test reached agents::poll"),
             agents_stop: |_| panic!("unit test reached agents::stop"),
-            // Same rule again, and this one would SPAWN: `claude --bg --resume`
+            // Same rule again, and this one would SPAWN: `claude respawn`
             // starts a worker for a real session on the operator's daemon.
-            agents_resume: |_| panic!("unit test reached agents::resume"),
+            agents_respawn: |_| panic!("unit test reached agents::respawn"),
+            // "SCANNED, AND NOBODY IS ATTACHED" is the ambient truth of a unit
+            // test — no `/proc`, no clients — so every test written before the
+            // attach guard sees the population it always saw. A test whose
+            // subject IS the guard says so by replacing this.
+            agents_attached: || Some(BTreeSet::new()),
             agent_budget: AGENT_BUDGET,
         }
     }
@@ -8370,13 +8505,20 @@ mod tests {
         /// an agent that was restarted and one left halted.
         static RESPAWN_FAIL: std::cell::RefCell<BTreeSet<String>> =
             const { std::cell::RefCell::new(BTreeSet::new()) };
-        /// Session uuids whose headless RESUME must fail. Empty by default.
-        /// A resume can fail on its own — the daemon refused, the CLI wedged —
-        /// and, with no pane to fall back on, that failure is the whole
-        /// difference between a headless agent that was restarted and one left
-        /// halted with nothing anywhere that would bring it back.
-        static RESUME_FAIL: std::cell::RefCell<BTreeSet<String>> =
+        /// Short ids whose paneless `claude respawn` must fail. Empty by
+        /// default. A respawn can fail on its own — the daemon refused, the
+        /// CLI wedged, `run_bounded` killed the client — and with no pane to
+        /// fall back on, what that failure MEANT is the whole difference
+        /// between an agent still on its old binary and one halted with
+        /// nothing anywhere that would bring it back.
+        static RESPAWN_AGENT_FAIL: std::cell::RefCell<BTreeSet<String>> =
             const { std::cell::RefCell::new(BTreeSet::new()) };
+        /// What `agents_attached` answers: `Some(ids)` for a scan that ran,
+        /// `None` for one that could not. Default `Some(empty)` — no clients —
+        /// so a test that does not mention the guard sees the fleet it always
+        /// saw.
+        static ATTACHED: std::cell::RefCell<Option<BTreeSet<String>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// The respawn seam, recording instead of shelling out. Thread-local, so
@@ -8432,28 +8574,49 @@ mod tests {
         agents::stop(id)
     }
 
-    /// The headless resume seam, on the SAME timeline as the stops and the
-    /// respawns — which is the only way "every headless stop is followed
-    /// immediately by its own resume" can be asserted at all — and calling
-    /// through to `agents::resume`, whose process boundary is closed in test
-    /// builds, so `agents::test_spawn` still proves the exact argv.
-    fn recording_resume(session_id: &str) -> Result<(), AgentsError> {
-        ORDER.with(|o| o.borrow_mut().push(format!("resume {session_id}")));
-        if RESUME_FAIL.with(|f| f.borrow().contains(session_id)) {
+    /// The paneless-restart seam, on the SAME timeline as the stops and the
+    /// pane respawns — which is the only way the phase ordering can be
+    /// asserted at all — and calling through to `agents::respawn`, whose
+    /// process boundary is closed in test builds, so `agents::test_spawn`
+    /// still proves the exact argv.
+    ///
+    /// Logged as `respawn-agent <id>`, not `respawn <id>`: the pane seam
+    /// already owns `respawn %N` on this timeline, and an ordering assertion
+    /// that could not tell a pane from an agent would pass for the wrong
+    /// reason.
+    fn recording_agent_respawn(id: &str) -> Result<(), AgentsError> {
+        ORDER.with(|o| o.borrow_mut().push(format!("respawn-agent {id}")));
+        if RESPAWN_AGENT_FAIL.with(|f| f.borrow().contains(id)) {
             return Err(AgentsError::Cmd {
                 code: 1,
-                stderr: "daemon refused the resume".into(),
+                stderr: "daemon refused the respawn".into(),
             });
         }
-        agents::resume(session_id)
+        agents::respawn(id)
     }
 
-    /// Make the headless resume of `session_id` fail, as the daemon does when
-    /// it will not take the session back.
-    fn resume_fails(session_id: &str) {
-        RESUME_FAIL.with(|f| {
-            f.borrow_mut().insert(session_id.to_string());
+    /// Make the paneless restart of `id` fail, as it does when the daemon
+    /// refuses — or when `run_bounded` kills a client that had already asked.
+    fn agent_respawn_fails(id: &str) {
+        RESPAWN_AGENT_FAIL.with(|f| {
+            f.borrow_mut().insert(id.to_string());
         });
+    }
+
+    /// The attach-scan seam. `None` is a scan that could NOT run, which is a
+    /// different thing from one that found nobody.
+    fn fixture_attached() -> Option<BTreeSet<String>> {
+        ATTACHED.with(|a| a.borrow().clone())
+    }
+
+    /// Say who holds a live `claude attach`, anywhere on the machine.
+    fn attached(ids: &[&str]) {
+        ATTACHED.with(|a| *a.borrow_mut() = Some(ids.iter().map(|s| (*s).to_string()).collect()));
+    }
+
+    /// Say the scan itself could not run — no readable `/proc`.
+    fn attach_scan_fails() {
+        ATTACHED.with(|a| *a.borrow_mut() = None);
     }
 
     fn order() -> Vec<String> {
@@ -8521,7 +8684,8 @@ mod tests {
         a.respawn = recording_respawn;
         a.agents_poll = fixture_poll;
         a.agents_stop = recording_stop;
-        a.agents_resume = recording_resume;
+        a.agents_respawn = recording_agent_respawn;
+        a.agents_attached = fixture_attached;
         // Both mapped panes hold a session that is finished and idle, so the
         // fixture's default is "everything in scope is restartable" and a test
         // that cares about a busy agent says so by scripting its own fleet.
@@ -8538,7 +8702,9 @@ mod tests {
         RESPAWNS.with(|r| r.borrow_mut().clear());
         ORDER.with(|o| o.borrow_mut().clear());
         RESPAWN_FAIL.with(|f| f.borrow_mut().clear());
-        RESUME_FAIL.with(|f| f.borrow_mut().clear());
+        RESPAWN_AGENT_FAIL.with(|f| f.borrow_mut().clear());
+        // The fixture's ambient truth: the scan RAN and nobody is attached.
+        attached(&[]);
         agents::test_spawn::reset();
     }
 
@@ -8988,25 +9154,24 @@ mod tests {
         assert_eq!(
             agents::test_spawn::joined(),
             vec!["stop aaaaaaaa", "stop bbbbbbbb"],
-            "a session with no worker must never be stopped, let alone started"
+            "a session with no worker must never be restarted, which would START it"
         );
         assert!(
-            !order().iter().any(|e| e.starts_with("resume ")),
-            "nothing may be resumed that was not running: {:?}",
+            !order().iter().any(|e| e.starts_with("respawn-agent ")),
+            "nothing may be respawned that was not running: {:?}",
             order()
         );
     }
 
-    /// THE FEATURE. A session with a LIVE WORKER and no ccmux pane used to be
-    /// out of reach — the only resume `R` had was a pane's `claude attach`, so
-    /// a session ccmux never opened kept the `claude` it was dispatched with
-    /// for ever. `claude --bg --resume <sessionId>` is a resume that needs no
-    /// pane, so the stop finally has a partner and the session comes back on
-    /// the binary that is installed now.
+    /// THE FEATURE. A session with a LIVE WORKER and no client used to be out
+    /// of reach — the only resume `R` had was a pane's `claude attach`, so a
+    /// session ccmux never opened kept the `claude` it was dispatched with for
+    /// ever. `claude respawn <id>` needs no pane, so it comes back on the
+    /// binary that is installed now.
     ///
-    /// The uuid is what the resume names, and the short id is what the stop
-    /// names. Passing the wrong one gets a session that does not exist rather
-    /// than an error anybody would notice, which is why both are pinned.
+    /// ONE VERB, and no `claude stop` of its own: the pair it replaced could
+    /// leave a stop without its partner, and its resume had a documented fork
+    /// branch that exited 0 while starting a copy of the conversation.
     #[test]
     fn a_live_session_ccmux_never_opened_is_restarted_headlessly() {
         let mut a = app();
@@ -9023,13 +9188,8 @@ mod tests {
 
         assert_eq!(
             agents::test_spawn::joined(),
-            vec![
-                "stop aaaaaaaa",
-                "stop bbbbbbbb",
-                "stop zzzzzzzz",
-                "--bg --resume zzzzzzzz-uuid",
-            ],
-            "the live paneless agent is stopped and resumed; the dormant one is not touched"
+            vec!["stop aaaaaaaa", "stop bbbbbbbb", "respawn zzzzzzzz"],
+            "the live paneless agent is respawned; the dormant one is not touched"
         );
         // Its pane pass is untouched: the headless session has no pane, and no
         // pane was invented for it.
@@ -9042,97 +9202,91 @@ mod tests {
         );
     }
 
-    /// THE PAIRING. A headless stop is followed IMMEDIATELY by its own resume,
-    /// not by the next session's stop — there is no pane fallback for these,
-    /// so anything between the halves is time in which nothing anywhere would
-    /// bring the session back.
+    /// NO CASCADE, on the population that has no pane behind it. A respawn
+    /// that failed costs THAT session and nothing else; the next one is still
+    /// attempted, and so are all the panes.
+    ///
+    /// It is also the regression test for reading a failure as a fact about
+    /// the worker. `run_bounded` SIGKILLs the client at `RESPAWN_TIMEOUT`
+    /// while the daemon carries out the restart regardless, so the error alone
+    /// says nothing. The poll that follows is what decides, and here it finds
+    /// `yyyyyyyy` HALTED — the outcome the operator has to act on, and the one
+    /// the old code filed under `not restarted`, whose documented meaning is
+    /// "this agent is still running its old binary".
     #[test]
-    fn every_headless_stop_is_followed_at_once_by_its_own_resume() {
+    fn a_failed_paneless_respawn_is_counted_by_what_the_poll_finds() {
         let mut a = app();
         restartable(&mut a);
-        fleet(vec![Ok(vec![
-            live(bg("yyyyyyyy", "live 1", State::Done)),
-            live(bg("zzzzzzzz", "live 2", State::Done)),
-        ])]);
-
-        a.restart_others();
-
-        // The two paned sessions have left the fleet in this scripted poll, so
-        // the log is the headless pass alone and the pairing is legible.
-        let log: Vec<String> = order()
-            .into_iter()
-            .filter(|e| e.starts_with("stop ") || e.starts_with("resume "))
-            .collect();
-        assert_eq!(
-            log,
-            vec![
-                "stop yyyyyyyy",
-                "resume yyyyyyyy-uuid",
-                "stop zzzzzzzz",
-                "resume zzzzzzzz-uuid",
-            ],
-            "the stops were batched away from their resumes"
-        );
-    }
-
-    /// NO CASCADE, on the half that has no pane behind it. A resume that fails
-    /// leaves THAT session halted — `left stopped`, the one word that asks the
-    /// operator to act — and costs the next session nothing.
-    #[test]
-    fn a_failed_headless_resume_does_not_cascade_and_is_left_stopped() {
-        let mut a = app();
-        restartable(&mut a);
-        fleet(vec![Ok(vec![
-            live(bg("yyyyyyyy", "resume refused", State::Done)),
-            live(bg("zzzzzzzz", "fine", State::Done)),
-        ])]);
-        resume_fails("yyyyyyyy-uuid");
+        let both = || {
+            Ok(vec![
+                live(bg("yyyyyyyy", "live 1", State::Done)),
+                live(bg("zzzzzzzz", "live 2", State::Done)),
+            ])
+        };
+        fleet(vec![
+            // 1-2: sub-pass A's re-polls. Neither paned session is in this
+            // fleet, so both are `not restarted` and the log below is the
+            // paneless pass alone.
+            both(),
+            both(),
+            // 3: the enumeration. 4: the re-poll before `yyyyyyyy`.
+            both(),
+            both(),
+            // 5: THE VERIFYING POLL after its respawn failed — the daemon
+            // carried out the halt and the worker is gone.
+            Ok(vec![
+                Session { pid: None, ..bg("yyyyyyyy", "halted by the respawn", State::Done) },
+                live(bg("zzzzzzzz", "live 2", State::Done)),
+            ]),
+            // 6: the re-poll before `zzzzzzzz`, which is still fine.
+            both(),
+        ]);
+        agent_respawn_fails("yyyyyyyy");
 
         a.restart_others();
 
         assert_eq!(
             order()
                 .into_iter()
-                .filter(|e| e.starts_with("stop ") || e.starts_with("resume "))
+                .filter(|e| e.starts_with("respawn-agent "))
                 .collect::<Vec<_>>(),
-            vec![
-                "stop yyyyyyyy",
-                "resume yyyyyyyy-uuid",
-                "stop zzzzzzzz",
-                "resume zzzzzzzz-uuid",
-            ],
-            "one refused resume ended the pass instead of costing one session"
+            vec!["respawn-agent yyyyyyyy", "respawn-agent zzzzzzzz"],
+            "one failure ended the pass instead of costing one session"
         );
         let panes: Vec<String> = recorded().into_iter().map(|(p, _)| p).collect();
         assert_eq!(panes, vec!["%2", "%4", "%5"], "the panes still restart: {panes:?}");
         assert_eq!(
             a.message.clone().unwrap_or_default_msg().0,
             "restarted 2 sidebars, 2 panes, 1 agent (2 not restarted, 1 left stopped)",
-            "halted-with-nothing-to-resume-it is not `restarted` and not `not restarted`"
+            "a halted agent must not be reported as one still running its old binary"
         );
     }
 
-    /// A headless stop that fails leaves the agent RUNNING on its old binary —
-    /// `not restarted`, exactly like a paned one — and above all it must not
-    /// be followed by a resume: nothing was stopped, so resuming would be an
-    /// unrequested act on a session that is already up.
+    /// THE OTHER SIDE OF THE SAME POLL: the worker is still there, so nothing
+    /// was halted and the agent is still running whatever it was running.
+    /// `not restarted` says exactly that, and the pass must not reach for
+    /// `left stopped` on the strength of an error code.
     #[test]
-    fn a_failed_headless_stop_is_not_followed_by_a_resume() {
+    fn a_failed_paneless_respawn_that_halted_nothing_is_not_restarted() {
         let mut a = app();
         restartable(&mut a);
-        fleet(vec![Ok(vec![live(bg("zzzzzzzz", "live", State::Done))])]);
-        agents::test_spawn::fail_next("daemon is not running");
+        let full = || {
+            Ok(vec![
+                bg("aaaaaaaa", "a", State::Done),
+                bg("bbbbbbbb", "b", State::Done),
+                live(bg("zzzzzzzz", "z", State::Done)),
+            ])
+        };
+        // Polls 1-2 are sub-pass A, 3 the enumeration, 4 the re-poll, and 5 —
+        // the last, so it repeats — the VERIFYING poll: the worker is untouched.
+        fleet(vec![full(), full(), full(), full(), full()]);
+        agent_respawn_fails("zzzzzzzz");
 
         a.restart_others();
 
         assert_eq!(
-            agents::test_spawn::joined(),
-            vec!["stop zzzzzzzz"],
-            "a stop that failed must not be followed by a resume"
-        );
-        assert_eq!(
             a.message.clone().unwrap_or_default_msg().0,
-            "restarted 2 sidebars, 2 panes, 0 agents (3 not restarted)"
+            "restarted 2 sidebars, 2 panes, 2 agents (1 not restarted)"
         );
     }
 
@@ -9181,9 +9335,9 @@ mod tests {
         }
     }
 
-    /// A worker that exits between the enumeration and its own stop is DORMANT
-    /// by the time the stop would land, and the re-poll is what catches it.
-    /// Stopping it would be a no-op and resuming it would start it — the
+    /// A worker that exits between the enumeration and its own turn is DORMANT
+    /// by the time the respawn would land, and the re-poll is what catches it.
+    /// `claude respawn` on a session with no worker STARTS one — the
     /// dormant-resurrection bug arriving through the race instead of through
     /// the rule.
     #[test]
@@ -9224,6 +9378,11 @@ mod tests {
             vec!["stop aaaaaaaa", "stop bbbbbbbb"],
             "the enumeration's snapshot authorised the act instead of the re-poll"
         );
+        assert!(
+            !order().iter().any(|e| e.starts_with("respawn-agent ")),
+            "a dormant session was respawned: {:?}",
+            order()
+        );
         assert_eq!(
             a.message.clone().unwrap_or_default_msg().0,
             "restarted 2 sidebars, 2 panes, 2 agents"
@@ -9232,7 +9391,7 @@ mod tests {
 
     /// The disjointness rule, end to end. `bbbbbbbb` is live AND held by `%5`,
     /// so it belongs to the pane population — one stop, resumed by its pane,
-    /// and no `--bg --resume` on top. Two stops for one restart would be a
+    /// and no `claude respawn` on top. Two acts for one restart would be a
     /// second destructive call and a double count.
     #[test]
     fn a_live_session_ccmux_has_open_is_restarted_by_its_pane_and_not_twice() {
@@ -9248,7 +9407,7 @@ mod tests {
         assert_eq!(
             agents::test_spawn::joined(),
             vec!["stop aaaaaaaa", "stop bbbbbbbb"],
-            "a session a pane holds must not also be resumed headlessly"
+            "a session a pane holds must not also be respawned headlessly"
         );
         assert_eq!(
             a.message.clone().unwrap_or_default_msg().0,
@@ -9285,6 +9444,113 @@ mod tests {
         );
     }
 
+    /// THE REGRESSION TEST for a population scoped to ccmux's own tmux session
+    /// and subtracted from the whole machine's fleet.
+    ///
+    /// `Plan::held` is built from `list-windows`/`list-panes -s` inside
+    /// `cli.session` (R2, R3). A session held by a live pane of a SECOND ccmux
+    /// workspace — `--session NAME` and `-L socket` are both documented — or by
+    /// a `claude attach` the operator ran by hand in any window is in no map
+    /// this instance can read, so it used to read as paneless. `claude respawn`
+    /// KILLS that client: the other window printed `Session <id> has exited.`
+    /// and latched `@ccmux_detached`, while this footer counted the session
+    /// `restarted`.
+    ///
+    /// The client process is what dies, so the client process is the evidence.
+    #[test]
+    fn a_session_attached_outside_this_ccmux_is_never_restarted_headlessly() {
+        let mut a = app();
+        restartable(&mut a);
+        fleet(vec![Ok(vec![
+            bg("aaaaaaaa", "a", State::Done),
+            bg("bbbbbbbb", "b", State::Done),
+            live(bg("zzzzzzzz", "open in another ccmux window", State::Done)),
+        ])]);
+        // No ccmux pane of THIS session names it, and there never could be one.
+        attached(&["zzzzzzzz"]);
+
+        a.restart_others();
+
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop aaaaaaaa", "stop bbbbbbbb"],
+            "another window's live attach was about to be killed"
+        );
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "restarted 2 sidebars, 2 panes, 2 agents",
+            "and it is not counted: this pass never had any business with it"
+        );
+    }
+
+    /// THE REGRESSION TEST for reading "the scan found nobody" out of "the scan
+    /// could not run".
+    ///
+    /// The attach evidence is the only thing standing between this pass and
+    /// every attach client on the machine, so an unavailable scan must stop
+    /// the paneless pass dead rather than authorise it. The pane pass is
+    /// untouched — that is what `R` was always for — and the footer says which
+    /// half did not happen, instead of a silence that reads as "there were
+    /// none".
+    #[test]
+    fn an_attach_scan_that_cannot_run_stops_the_paneless_pass() {
+        let mut a = app();
+        restartable(&mut a);
+        fleet(vec![Ok(vec![
+            bg("aaaaaaaa", "a", State::Done),
+            bg("bbbbbbbb", "b", State::Done),
+            live(bg("zzzzzzzz", "live and paneless", State::Done)),
+        ])]);
+        attach_scan_fails();
+
+        a.restart_others();
+
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop aaaaaaaa", "stop bbbbbbbb"],
+            "absent evidence authorised the act"
+        );
+        let panes: Vec<String> = recorded().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(panes, vec!["%2", "%4", "%5"], "the pane pass is untouched: {panes:?}");
+        assert_eq!(
+            a.message.clone().unwrap_or_default_msg().0,
+            "restarted 2 sidebars, 2 panes, 2 agents (paneless pass skipped)"
+        );
+    }
+
+    /// THE REGRESSION TEST for the fleet's fork branch, at the call site.
+    ///
+    /// `claude --bg --resume <sessionId>` exits 0 while starting a COPY of the
+    /// conversation when the daemon still calls the session running — which is
+    /// precisely the state ccmux left it in by resuming immediately after its
+    /// own stop. Every occurrence was invisible: an extra live agent, an extra
+    /// row in the fleet, counted as a success. `claude respawn` has no such
+    /// branch, and no argv this pass builds may reintroduce one.
+    #[test]
+    fn the_agent_pass_builds_only_stop_and_respawn_argvs() {
+        let mut a = app();
+        restartable(&mut a);
+        fleet(vec![Ok(vec![
+            live(bg("aaaaaaaa", "a", State::Done)),
+            live(bg("bbbbbbbb", "b", State::Done)),
+            live(bg("zzzzzzzz", "live and paneless", State::Done)),
+        ])]);
+
+        a.restart_others();
+
+        let argv = agents::test_spawn::calls();
+        assert_eq!(
+            agents::test_spawn::joined(),
+            vec!["stop aaaaaaaa", "stop bbbbbbbb", "respawn zzzzzzzz"]
+        );
+        for c in &argv {
+            assert!(
+                !c.iter().any(|f| f == "--resume" || f == "--bg" || f == "--all"),
+                "a forking or fleet-wide argv came back: {c:?}"
+            );
+        }
+    }
+
     /// A pane parked after `Ctrl+Z` is the operator's shell now, so `R` does
     /// not respawn it — and therefore nothing would re-attach its session.
     /// Stopping it would leave that agent halted with no resume, which is a
@@ -9309,6 +9575,64 @@ mod tests {
             a.message.clone().unwrap_or_default_msg().0,
             "restarted 2 sidebars, 1 pane, 1 agent (1 skipped)"
         );
+    }
+
+    /// THE REGRESSION TEST for absent evidence authorising an act.
+    ///
+    /// `refresh_panes` keeps the previous inventory when a tmux read fails —
+    /// right for every drawing reader — but the process that runs this pass is
+    /// a FRESH image whose previous inventory is EMPTY. So a failed
+    /// `list-panes` or `list-windows` left `plan` with no targets AND no
+    /// `held`, and the paneless pass then read the whole machine's fleet as
+    /// nobody's: it halted and restarted the very sessions this window had
+    /// open in panes, respawned none of them, and reported success. Renaming
+    /// the tmux session out from under a running ccmux is enough to produce it.
+    ///
+    /// `plan` used missing evidence to REFUSE to act and the paneless pass
+    /// used it to AUTHORISE acting; the asymmetry is the bug. Now neither
+    /// runs, and the operator is told the reads failed.
+    #[test]
+    fn a_tmux_read_that_failed_stops_the_whole_pass_rather_than_widening_it() {
+        for (why, panes_fresh, tabs_fresh) in [
+            ("list-panes failed", false, true),
+            ("list-windows failed", true, false),
+            ("both failed", false, false),
+        ] {
+            let mut a = app();
+            restartable(&mut a);
+            fleet(vec![Ok(vec![
+                live(bg("aaaaaaaa", "open in %2 — this window", State::Done)),
+                live(bg("bbbbbbbb", "open in %5 — the other tab", State::Done)),
+            ])]);
+            // What the fresh post-`exec` image is left holding when the read
+            // fails: nothing, and a flag that says so.
+            a.panes_fresh = panes_fresh;
+            a.tabs_fresh = tabs_fresh;
+            if !panes_fresh {
+                a.panes.clear();
+            }
+            if !tabs_fresh {
+                a.tabs.clear();
+            }
+
+            a.restart_others();
+
+            assert!(
+                agents::test_spawn::calls().is_empty(),
+                "an agent was touched on no evidence at all ({why}): {:?}",
+                agents::test_spawn::joined()
+            );
+            assert!(
+                recorded().is_empty(),
+                "a pane was respawned from a blank inventory ({why}): {:?}",
+                recorded()
+            );
+            assert_eq!(
+                a.message.clone().unwrap_or_default_msg().0,
+                "cannot read this session's panes — restarted this sidebar only",
+                "({why})"
+            );
+        }
     }
 
     /// THE ORDERING PROPERTY, on one timeline. `claude attach` is what resumes
@@ -9342,11 +9666,11 @@ mod tests {
     /// could have been lost, since those sessions touch no pane and so have no
     /// ordering constraint of their own to keep them honest.
     ///
-    /// The whole of PHASE 1 stays before the whole of PHASE 2: every stop,
-    /// paned and headless, then every respawn. The paned stops go FIRST within
-    /// phase 1, because their resume is phase 2 and every second spent
-    /// elsewhere is a second longer they sit halted; the headless pairs follow,
-    /// each resume hard against its own stop.
+    /// The whole of PHASE 1 stays before the whole of PHASE 2: every halt,
+    /// paned and paneless, then every pane respawn. The paned stops go FIRST
+    /// within phase 1, because their resume is phase 2 and every second spent
+    /// elsewhere is a second longer they sit halted; the paneless restarts
+    /// follow, each one whole in a single call.
     #[test]
     fn every_stop_lands_before_every_respawn_with_a_headless_agent_too() {
         let mut a = app();
@@ -9365,19 +9689,22 @@ mod tests {
             vec![
                 "stop aaaaaaaa",
                 "stop bbbbbbbb",
-                "stop zzzzzzzz",
-                "resume zzzzzzzz-uuid",
+                "respawn-agent zzzzzzzz",
                 "respawn %2",
                 "respawn %4",
                 "respawn %5",
             ],
             "the phase boundary moved: {log:?}"
         );
-        let last_stop = log.iter().rposition(|e| e.starts_with("stop "));
-        let first_respawn = log.iter().position(|e| e.starts_with("respawn "));
+        // A paneless respawn is a stop-and-start inside the daemon, so it
+        // belongs on the same side of the boundary as every other halt.
+        let last_agent = log.iter().rposition(|e| {
+            e.starts_with("stop ") || e.starts_with("respawn-agent ")
+        });
+        let first_respawn = log.iter().position(|e| e.starts_with("respawn %"));
         assert!(
-            last_stop < first_respawn,
-            "a headless stop landed after a pane had already re-attached: {log:?}"
+            last_agent < first_respawn,
+            "an agent was halted after a pane had already re-attached: {log:?}"
         );
     }
 

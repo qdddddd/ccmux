@@ -1531,6 +1531,7 @@ mod tests {
             was_watched: true,
             quiesced: false,
             panes_fresh: true,
+            tabs_fresh: true,
             should_quit: false,
             // Rendering never dispatches; a panic here is a rendering test
             // reaching into `agents`, which must be impossible.
@@ -1544,7 +1545,8 @@ mod tests {
             // so rather than shelling out to the operator's live `claude`.
             agents_poll: || panic!("ui test reached agents::poll"),
             agents_stop: |_| panic!("ui test reached agents::stop"),
-            agents_resume: |_| panic!("ui test reached agents::resume"),
+            agents_respawn: |_| panic!("ui test reached agents::respawn"),
+            agents_attached: || panic!("ui test reached agents::attached_ids"),
             agent_budget: Duration::from_secs(60),
         }
     }

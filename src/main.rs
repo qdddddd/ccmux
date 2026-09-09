@@ -1151,6 +1151,20 @@ mod tests {
             // `agent_verdict` and a spec that still names the old one is
             // promising a function the crate does not have.
             "restart::agent_restartable",
+            // `R`'s paneless restart, as the pair it started life as. The
+            // resume half had a documented FORK branch — it exits 0 while
+            // starting a copy of the conversation when the daemon still calls
+            // the session running, which is exactly the state ccmux left it in
+            // by resuming straight after its own stop — and a spec that names
+            // it back is promising a verb whose success cannot be trusted.
+            // `claude respawn <id>` replaced both halves (PROBE-FINDINGS §2).
+            //
+            // The ARGV is guarded where argvs are, not here: §8.11 has to be
+            // able to say in prose why `--bg --resume` was dropped, while
+            // `agents::the_paneless_restart_names_one_short_id_and_nothing_else`
+            // and `app::the_agent_pass_builds_only_stop_and_respawn_argvs` are
+            // what make sure no caller can build it again.
+            "agents::resume",
         ] {
             assert!(
                 !SPEC.contains(needle),
