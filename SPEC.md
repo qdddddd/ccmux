@@ -204,12 +204,22 @@ The sidebar width is not maintained by a tmux layout; it is re-asserted.
 
 - After **every** `split-window` issued by ccmux: `resize-pane -t <sidebar> -x <W>`.
 - After **every** `kill-pane` issued by ccmux: same.
-- On **every poll tick** (§4.2): same, unless the sidebar's window is zoomed.
+- On **every poll tick** (§4.2) on which the sidebar is not already at the
+  width it should be, and never while its window is zoomed.
 
 The tick re-pin is the important one: it makes the width self-healing against
 the user manually splitting or resizing panes with tmux keys, and it is a
-proven no-op when the sidebar is the only pane. Do not guard it behind a "did
-the layout change" check.
+proven no-op when the sidebar is the only pane.
+
+**Compare observed state, never a change event.** Do not guard the pin behind
+"did the layout change": no flag ccmux sets can see the operator drag a border,
+so the width would stop healing. The guard is a reading of `#{pane_width}` for
+the pane the pin is about to write, taken from the enumeration the same tick
+has just made — a manual resize is a mismatch on the very next tick and heals
+exactly as it did when the call was unconditional. What is dropped is only the
+`resize-pane` that would have written the width the sidebar already had, which
+on an idle sidebar is every tick. A sidebar whose row is missing from the
+snapshot pins: an unreadable width is not evidence of a correct one.
 
 **The one exception is a zoomed window** (`#{window_zoomed_flag}`). `<prefix> z`
 is the operator asserting a geometry of their own, and on tmux 3.4
@@ -3784,6 +3794,7 @@ behaviour, the pin is superseded by this appendix.
 | §9.6, §1.2 step 6 | `inside_tmux()` decides "already inside" and `switch-client` vs `attach-session`. | `inside_target_server()` decides both: `$TMUX`'s socket path compared against the target server's own `#{socket_path}`. Under `--socket` the two disagree, which made the launcher either fail on `switch-client` or report success without creating anything. |
 | §1.2 step 5 | `@ccmux_width` is written once at creation and never read. | It is the source of truth. `heal_sidebar` writes it; the running sidebar re-reads it each tick, so a relaunch with a new `--width` takes effect instead of being reverted. |
 | §1.3, §1.4 | Geometry is re-asserted on every tick regardless of what the operator did with tmux keys. | `resize-pane` and `select-layout` both clear `#{window_zoomed_flag}` on 3.4, so the pin un-zoomed a window the operator had zoomed, within one tick. Both writes now yield while the flag is set, and resume when it clears. |
+| §1.3 | The tick pin spawns `resize-pane` unconditionally. | It spawns one only when `#{pane_width}` disagrees with the target, read from the enumeration the tick already makes. This is a state comparison, not the change-event guard §1.3 forbids, so a manual resize still heals on the next tick; an idle sidebar now writes nothing. |
 | §1.3, §9.8 | The per-tick re-pin is unconditional; "tmux clamps `resize-pane`". | tmux does not clamp — it takes the columns from the other panes, and a 30-column window left a Claude pane at 1 column. The pin is bounded by the window (`MIN_CONTENT_COLS = 20`) and skipped while the sidebar is alone in its window. |
 | §4.2 | Every tick spawns `claude agents`. | The spawn is gated on `watchers()`: a sidebar whose window no client is rendering polls nothing, and a payload unchanged for four polls widens the gap up to `IDLE_MAX = 30s`. Both collapse instantly on a keypress, on a change, on `r`, and on the transition back into view, which also forces a poll on that tick. "Rendering" is `#{window_active_clients}`, so a client attached through a grouped session still counts, and the gate answers `Unknown` — which polls — unless THIS tick's enumeration succeeded. Only step 4 of `tick` is gated; the tmux reads and the §1.3 pin stay on `interval`. A skip sets no `poll_error`, no `fail_streak` and runs no `reconcile_hidden`. |
 | §4.2 | `fail_streak >= 3` widens the interval the event loop ticks on. | It widens `agents_interval()` only. `tick_interval()` is `interval`, flat: the tick is also the gate's edge detector, and only a successful poll clears `fail_streak`, so a backoff on the tick latched on a quiesced sidebar and slowed its wake-up, its §1.3 pin and its pane reconcile to the backoff. |

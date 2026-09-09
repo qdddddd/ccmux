@@ -1014,6 +1014,13 @@ pub fn window_of(panes: &[PaneInfo], pane: &PaneId) -> Option<u32> {
     panes.iter().find(|p| &p.id == pane).map(|p| p.window_index)
 }
 
+/// `#{pane_width}` of `pane` in the last enumeration, or `None` when the
+/// snapshot does not carry it. Read by the pin so it can tell an already-right
+/// width from one that needs asserting.
+pub fn pane_width(panes: &[PaneInfo], pane: &PaneId) -> Option<u16> {
+    panes.iter().find(|p| &p.id == pane).map(|p| p.width)
+}
+
 /// Does the window holding `pane` have a zoomed pane in it?
 ///
 /// THE GATE ON EVERY GEOMETRY WRITE ccmux makes on a timer. A zoom is the
