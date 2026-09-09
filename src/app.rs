@@ -3747,6 +3747,13 @@ impl App {
         let (Some(sb), Some(cols)) = (&self.sidebar_pane, self.pinned_width()) else {
             return;
         };
+        // §1.4 yields to the zoom for the same reason §1.3 does, and reads a
+        // snapshot both call sites have just refreshed: a split un-zooms the
+        // window before this runs, so `o`/`s` still even; a kill does not, so
+        // closing one pane no longer un-zooms another. See `tmux::window_zoomed`.
+        if tmux::window_zoomed(&self.panes, sb) {
+            return;
+        }
         let Some(win) = tmux::window_of(&self.panes, sb) else {
             return;
         };
@@ -3760,11 +3767,27 @@ impl App {
         let _ = tmux::apply_layout(&self.tmux_session, sb, &layout);
     }
 
+    /// §1.3's per-tick width pin — and the one write that must yield to the
+    /// operator's zoom. `resize-pane` clears `window_zoomed_flag`, so pinning
+    /// through a zoom would hand the window back on the next tick; the pin
+    /// resumes, unchanged, the moment the zoom is released, because the flag
+    /// is read fresh from every `refresh_panes`.
+    ///
+    /// The width math is skipped too, deliberately: a zoomed window reports
+    /// the zoomed pane at the FULL window size and leaves the hidden panes on
+    /// their old geometry, so `pinned_width_from` would be reading coordinates
+    /// that describe no layout tmux will restore.
     fn pin_sidebar(&self) {
         if self.degraded {
             return;
         }
-        let (Some(sb), Some(cols)) = (&self.sidebar_pane, self.pinned_width()) else {
+        let Some(sb) = self.sidebar_pane.as_ref() else {
+            return;
+        };
+        if tmux::window_zoomed(&self.panes, sb) {
+            return;
+        }
+        let Some(cols) = self.pinned_width() else {
             return;
         };
         tmux::pin_sidebar(&self.tmux_session, sb, cols);
@@ -4873,6 +4896,75 @@ mod tests {
         live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
     }
 
+    /// A ZOOM MUST OUTLIVE THE TICK. `<prefix> z` is the operator asserting a
+    /// geometry of their own, and `resize-pane` clears `window_zoomed_flag` on
+    /// tmux 3.4 — so before the gate, §1.3's per-tick pin gave the window back
+    /// within one `interval` and the zoom looked like it "wore off after a few
+    /// seconds". This drives the same two calls a real tick makes and asserts
+    /// the flag is still set afterwards, then that releasing the zoom restores
+    /// the pinned width on the very next tick.
+    ///
+    /// Run with:
+    ///   cargo test -- --ignored --nocapture live_zoom
+    ///
+    /// Same socket caveat as `live_even_layout_spreads_panes_on_split_and_kill`:
+    /// run it by name.
+    #[test]
+    #[ignore = "mutates a tmux server; run by name (see the doc comment)"]
+    fn live_zoom_survives_the_per_tick_pin() {
+        tmux::set_socket(Some(LIVE_SOCKET));
+        assert_eq!(tmux::socket().as_deref(), Some(LIVE_SOCKET), "throwaway socket only");
+
+        let mut a = live_app();
+        let rows = live_session_rows(&a);
+        a.selected = rows[0];
+        a.act_open(SplitDir::Vertical);
+        a.selected = rows[1];
+        a.act_open(SplitDir::Vertical);
+        a.refresh_panes();
+        let pinned = live_widths(&mut a);
+        println!("\n== zoom hold — 120x40 window, sidebar 34 ==");
+        println!("before zoom     : {pinned:?}");
+
+        // Zoom a CONTENT pane, the way the operator does: the pane that is not
+        // the sidebar, addressed by id so this cannot land on the wrong one.
+        let sb = a.sidebar_pane.clone().expect("sidebar");
+        let victim = a
+            .panes
+            .iter()
+            .find(|p| p.id != sb)
+            .map(|p| p.id.clone())
+            .expect("a content pane");
+        live_raw(&["resize-pane", "-Z", "-t", victim.as_str()]);
+        a.refresh_panes();
+        assert!(tmux::window_zoomed(&a.panes, &sb), "the window is zoomed to start with");
+
+        for i in 1..=5 {
+            a.refresh_panes();
+            a.pin_sidebar();
+            a.refresh_panes();
+            println!("after tick {i}    : zoomed={}", tmux::window_zoomed(&a.panes, &sb));
+            assert!(
+                tmux::window_zoomed(&a.panes, &sb),
+                "tick {i} un-zoomed the window — the pin ran through a zoom"
+            );
+        }
+
+        // And the pin is only DEFERRED, never abandoned: the next tick after
+        // the operator un-zooms puts the sidebar back on its width.
+        live_raw(&["resize-pane", "-Z", "-t", victim.as_str()]);
+        a.refresh_panes();
+        assert!(!tmux::window_zoomed(&a.panes, &sb), "un-zoomed");
+        live_raw(&["resize-pane", "-t", sb.as_str(), "-x", "20"]);
+        a.refresh_panes();
+        a.pin_sidebar();
+        let healed = live_widths(&mut a);
+        println!("after unzoom    : {healed:?}");
+        assert_eq!(healed[0], 34, "the pin heals a manual resize as soon as the zoom is gone");
+
+        live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
+    }
+
     /// A background row with NO WORKER (`pid: null`) — DORMANT.
     ///
     /// Dormant is the default on purpose, and it is not laziness about a
@@ -4981,6 +5073,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            window_zoomed: false,
             detached: false,
             shell: false,
         }

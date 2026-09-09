@@ -1568,6 +1568,7 @@ mod tests {
             window_active: true,
             session_clients: 1,
             window_viewers: Some(1),
+            window_zoomed: false,
             detached: false,
             shell: false,
         }
