@@ -1144,7 +1144,7 @@ const KEYS: &[(&str, &str)] = &[
     ("u", "undo the last hide"),
     ("/", "filter"),
     ("a", "toggle Completed group"),
-    ("r", "force refresh"),
+    ("r", "refresh + re-even panes"),
     ("R", "restart ccmux + agents"),
     ("?", "this help"),
     ("q", "quit sidebar"),
