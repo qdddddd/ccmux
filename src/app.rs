@@ -1722,7 +1722,7 @@ impl App {
                 // §1.4: `o` built a row, `s` a column — even that axis, then
                 // pin. The pin is a no-op afterwards because `even_content`
                 // laid the sidebar out at the width it is about to ask for.
-                self.even_content(Some(dir.shape()));
+                self.even_content(Some(dir.shape()), Force::No);
                 self.pin_sidebar();
                 match self.pane_index_of(&pane) {
                     Some(i) => self.flash(format!("opened {name} in pane {i}"), MsgLevel::Info),
@@ -1818,6 +1818,78 @@ impl App {
         self.refresh_panes();
         self.pin_sidebar();
         self.flash(format!("opened {name} in tab {index}"), MsgLevel::Info);
+    }
+
+    /// `r`'s geometry half — re-assert ccmux's own layout NOW (SPEC §1.3, §1.4).
+    ///
+    /// The manual counterpart to §1.3 and §1.4, and the reason it exists:
+    /// neither runs unconditionally any more. The pin writes only on a width
+    /// that disagrees with the target, the even pass runs only on the two
+    /// verbs that made the layout uneven, and both stand down while the window
+    /// is zoomed — so a window the operator has rearranged with tmux's own
+    /// keys can sit in a shape ccmux will not touch, and nothing short of
+    /// opening or closing a pane put it back.
+    ///
+    /// FORCED THROUGH BOTH GATES, INCLUDING THE ZOOM. The gates exist to stop
+    /// writes nobody asked for; this keypress is the ask. Re-asserting a
+    /// layout necessarily ends a zoom — `select-layout` and `resize-pane` both
+    /// clear the flag — so the flash says so rather than leaving it to be
+    /// discovered.
+    ///
+    /// EVENS BEFORE IT PINS, the same order `o` and `x` use: the layout string
+    /// carries the sidebar cell at exactly the width the pin then asserts, so
+    /// the pin lands on a window already the right shape instead of fighting
+    /// it. A window whose panes form a tree is left alone by the even pass
+    /// (§1.4) and still gets its width back.
+    ///
+    /// Re-enumerates first. Every other caller of these two runs inside a tick
+    /// or straight after a split, where the snapshot is fresh; this one runs
+    /// whenever the operator presses the key, up to a whole `interval` after
+    /// the last reading, and a stale width is exactly what it is here to fix.
+    ///
+    /// FLASHES ONLY WHEN THE WINDOW ACTUALLY MOVED, compared as geometry
+    /// before against geometry after. `r` is pressed to refresh the list far
+    /// more often than to fix a layout, and a verb that announced a re-assert
+    /// on every press would be announcing a no-op nearly every time — and
+    /// would bury the flashes that mean something. An unchanged window says
+    /// nothing, exactly as `r` always did.
+    pub fn act_repin(&mut self) {
+        if self.degraded {
+            return;
+        }
+        self.refresh_panes();
+        let Some(sb) = self.sidebar_pane.clone() else {
+            return;
+        };
+        let was_zoomed = tmux::window_zoomed(&self.panes, &sb);
+        let before = self.geometry();
+        self.even_content(None, Force::Yes);
+        self.pin_sidebar_with(Force::Yes);
+        self.refresh_panes();
+        if before == self.geometry() {
+            return;
+        }
+        match tmux::pane_width(&self.panes, &sb) {
+            Some(w) if was_zoomed => {
+                self.flash(format!("layout re-asserted, {w} cols — zoom released"), MsgLevel::Info)
+            }
+            Some(w) => self.flash(format!("layout re-asserted, {w} cols"), MsgLevel::Info),
+            None => self.flash("layout re-asserted", MsgLevel::Info),
+        }
+    }
+
+    /// Every pane's id and cell, in a stable order — the comparison `act_repin`
+    /// reports on. Ids included, so a pane appearing or leaving between the two
+    /// readings counts as movement rather than passing unnoticed because the
+    /// remaining cells happen to line up.
+    fn geometry(&self) -> Vec<(String, u16, u16, u16, u16)> {
+        let mut g: Vec<_> = self
+            .panes
+            .iter()
+            .map(|p| (p.id.as_str().to_string(), p.left, p.top, p.width, p.height))
+            .collect();
+        g.sort();
+        g
     }
 
     /// `Enter` — open or jump. SPEC §8.3.
@@ -1969,7 +2041,7 @@ impl App {
         self.refresh_panes();
         self.save_map_now();
         if killed_here {
-            self.even_content(None);
+            self.even_content(None, Force::No);
         }
         self.pin_sidebar();
     }
@@ -3740,7 +3812,7 @@ impl App {
     /// The width handed to `even_layout` is `pinned_width()` — the very number
     /// `pin_sidebar` re-asserts — so the layout this writes is a fixed point of
     /// the per-tick pin by construction, not by luck.
-    fn even_content(&self, want: Option<tmux::ContentShape>) {
+    fn even_content(&self, want: Option<tmux::ContentShape>, force: Force) {
         if self.degraded {
             return;
         }
@@ -3751,7 +3823,10 @@ impl App {
         // snapshot both call sites have just refreshed: a split un-zooms the
         // window before this runs, so `o`/`s` still even; a kill does not, so
         // closing one pane no longer un-zooms another. See `tmux::window_zoomed`.
-        if tmux::window_zoomed(&self.panes, sb) {
+        //
+        // `Force::Yes` is `=` and only `=`: the gate exists to stop writes the
+        // operator did not ask for, and a keypress is not one of those.
+        if force == Force::No && tmux::window_zoomed(&self.panes, sb) {
             return;
         }
         let Some(win) = tmux::window_of(&self.panes, sb) else {
@@ -3795,19 +3870,24 @@ impl App {
     /// `pinned_width_from` would be reading coordinates that describe no layout
     /// tmux will restore.
     fn pin_sidebar(&self) {
+        self.pin_sidebar_with(Force::No);
+    }
+
+    /// `pin_sidebar`, with the two gates the tick needs and `=` does not.
+    fn pin_sidebar_with(&self, force: Force) {
         if self.degraded {
             return;
         }
         let Some(sb) = self.sidebar_pane.as_ref() else {
             return;
         };
-        if tmux::window_zoomed(&self.panes, sb) {
+        if force == Force::No && tmux::window_zoomed(&self.panes, sb) {
             return;
         }
         let Some(cols) = self.pinned_width() else {
             return;
         };
-        if !Self::needs_repin(tmux::pane_width(&self.panes, sb), cols) {
+        if force == Force::No && !Self::needs_repin(tmux::pane_width(&self.panes, sb), cols) {
             return;
         }
         tmux::pin_sidebar(&self.tmux_session, sb, cols);
@@ -4103,7 +4183,17 @@ impl App {
                 self.act_undo_dismiss();
                 Action::Redraw
             }
+            // `r` is BOTH halves of "put this back the way it should be": the
+            // poll that refreshes the list, and the geometry §1.3 and §1.4 no
+            // longer re-assert on a timer. Geometry first, so the frame this
+            // keypress draws is already the right shape.
+            //
+            // The fold is HERE and not inside `act_force_refresh`, which three
+            // post-verb refreshes also call. Forcing a layout from those would
+            // put the timer-driven writes back — through a zoom — by the side
+            // door, which is the whole thing the gates exist to stop.
             KeyCode::Char('r') => {
+                self.act_repin();
                 self.act_force_refresh();
                 Action::Redraw
             }
@@ -4373,6 +4463,19 @@ impl App {
 }
 
 // ── free helpers ────────────────────────────────────────────────────────────
+
+/// Whether a geometry write is the TICK's or the OPERATOR's.
+///
+/// The two gates on §1.3 and §1.4 — "the width is already right" and "the
+/// window is zoomed" — exist to stop ccmux writing geometry nobody asked for.
+/// Neither is a reason to refuse `=`, which is the operator asking in as many
+/// words, so the flag is threaded rather than the gates being softened: the
+/// tick keeps every guarantee it had.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Force {
+    No,
+    Yes,
+}
 
 /// Does this Normal-mode key take the cursor away from `n`'s pending jump
 /// (§8.6)? Two populations, and the second is the one that is easy to forget:
@@ -4953,6 +5056,73 @@ mod tests {
         assert!(App::needs_repin(Some(20), 34), "a manual resize still heals");
         assert!(App::needs_repin(Some(60), 34), "so does a split that halved it");
         assert!(App::needs_repin(None, 34), "an unreadable snapshot pins, as it always did");
+    }
+
+    /// `r` IS THE WAY BACK. The tick pin stands down on a matching width and
+    /// on a zoom, and the even pass never runs on a timer at all — so this
+    /// asserts the other half of that bargain: a window the operator has
+    /// wrecked with tmux's own keys, and one they have zoomed, both come back
+    /// on one `r`.
+    ///
+    /// Run with:
+    ///   cargo test -- --ignored --nocapture live_r_reasserts
+    ///
+    /// Same socket caveat as the other live tests: run it by name.
+    #[test]
+    #[ignore = "mutates a tmux server; run by name (see the doc comment)"]
+    fn live_r_reasserts_a_layout_the_tick_will_not_touch() {
+        tmux::set_socket(Some(LIVE_SOCKET));
+        assert_eq!(tmux::socket().as_deref(), Some(LIVE_SOCKET), "throwaway socket only");
+
+        let mut a = live_app();
+        let rows = live_session_rows(&a);
+        for row in rows.iter().take(3) {
+            a.selected = *row;
+            a.act_open(SplitDir::Vertical);
+        }
+        let even = live_widths(&mut a);
+        println!("\n== `r` re-asserts — 120x40 window, sidebar 34 ==");
+        println!("start           : {even:?}");
+        assert_eq!(even[0], 34);
+        assert_spread_is_at_most_one("start", &even[1..]);
+
+        // ── the operator drags a border, the way tmux's own keys do ─────────
+        let sb = a.sidebar_pane.clone().expect("sidebar");
+        let victim = a.panes.iter().find(|p| p.id != sb).map(|p| p.id.clone()).expect("content pane");
+        live_raw(&["resize-pane", "-t", victim.as_str(), "-x", "12"]);
+        let dragged = live_widths(&mut a);
+        println!("after a drag    : {dragged:?}");
+        assert_ne!(dragged, even, "the drag actually moved something");
+
+        // A tick alone leaves it: the sidebar is still on its width, and §1.4
+        // does not run on a timer. That is the gap `r` fills.
+        a.refresh_panes();
+        a.pin_sidebar();
+        assert_eq!(live_widths(&mut a), dragged, "a tick does not undo a drag");
+
+        a.act_repin();
+        let healed = live_widths(&mut a);
+        println!("after r         : {healed:?}");
+        assert_eq!(healed[0], 34, "sidebar back on its pinned width");
+        assert_spread_is_at_most_one("after `r`", &healed[1..]);
+
+        // ── and it forces through a zoom, which the tick must never do ──────
+        live_raw(&["resize-pane", "-Z", "-t", victim.as_str()]);
+        a.refresh_panes();
+        assert!(tmux::window_zoomed(&a.panes, &sb), "zoomed");
+        a.refresh_panes();
+        a.pin_sidebar();
+        a.refresh_panes();
+        assert!(tmux::window_zoomed(&a.panes, &sb), "a tick still holds the zoom");
+        a.act_repin();
+        a.refresh_panes();
+        assert!(!tmux::window_zoomed(&a.panes, &sb), "but `r` re-lays the window, which ends it");
+        let after_zoom = live_widths(&mut a);
+        println!("after r on zoom : {after_zoom:?}");
+        assert_eq!(after_zoom[0], 34);
+        assert_spread_is_at_most_one("after `r` on a zoom", &after_zoom[1..]);
+
+        live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
     }
 
     /// A ZOOM MUST OUTLIVE THE TICK. `<prefix> z` is the operator asserting a

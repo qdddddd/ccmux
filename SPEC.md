@@ -1481,7 +1481,9 @@ backoff on the tick would latch on a quiesced sidebar and slow the very edge
 detector that is supposed to un-quiesce it — along with the §1.3 pin and the
 pane reconcile — for a `claude` that was never being retried.
 
-`r` (force refresh) sets `force_poll = true` and
+`r` (force refresh) also re-asserts the layout — see §1.3 and §1.4; that half
+runs from the key binding, never from `act_force_refresh`, which the post-verb
+refreshes share. It sets `force_poll = true` and
 `last_poll = Instant::now() - tick_interval()` so the next loop iteration
 polls immediately; it does **not** call `tick()` inline.
 
@@ -2114,7 +2116,7 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 | `L` | show `claude logs` for this session (ANSI-stripped) | no |
 | `/` | enter filter mode | no |
 | `a` | toggle visibility of the Completed group | no |
-| `r` | force refresh | no |
+| `r` | force refresh **and** re-assert the layout (§1.3, §1.4) | no |
 | `R` | **restart ccmux in place** — this sidebar, every other tab's sidebar, every ccmux-opened Claude pane, and every agent with a **live worker** that is neither working, blocked nor already stopped, whether or not it has a pane, keeping every window, pane and layout (§8.11) | no |
 | `?` | help overlay | no |
 | `q` | quit the sidebar (sessions and panes untouched) | no |
@@ -3794,6 +3796,7 @@ behaviour, the pin is superseded by this appendix.
 | §9.6, §1.2 step 6 | `inside_tmux()` decides "already inside" and `switch-client` vs `attach-session`. | `inside_target_server()` decides both: `$TMUX`'s socket path compared against the target server's own `#{socket_path}`. Under `--socket` the two disagree, which made the launcher either fail on `switch-client` or report success without creating anything. |
 | §1.2 step 5 | `@ccmux_width` is written once at creation and never read. | It is the source of truth. `heal_sidebar` writes it; the running sidebar re-reads it each tick, so a relaunch with a new `--width` takes effect instead of being reverted. |
 | §1.3, §1.4 | Geometry is re-asserted on every tick regardless of what the operator did with tmux keys. | `resize-pane` and `select-layout` both clear `#{window_zoomed_flag}` on 3.4, so the pin un-zoomed a window the operator had zoomed, within one tick. Both writes now yield while the flag is set, and resume when it clears. |
+| §1.3, §1.4 | Nothing needs to re-assert geometry by hand, because the tick always does. | With the tick pin conditional and the even pass already off the timer, a window rearranged with tmux's own keys had no way back. `r` now re-asserts both, forced through the width check and the zoom, and flashes only when the window actually moved. |
 | §1.3 | The tick pin spawns `resize-pane` unconditionally. | It spawns one only when `#{pane_width}` disagrees with the target, read from the enumeration the tick already makes. This is a state comparison, not the change-event guard §1.3 forbids, so a manual resize still heals on the next tick; an idle sidebar now writes nothing. |
 | §1.3, §9.8 | The per-tick re-pin is unconditional; "tmux clamps `resize-pane`". | tmux does not clamp — it takes the columns from the other panes, and a 30-column window left a Claude pane at 1 column. The pin is bounded by the window (`MIN_CONTENT_COLS = 20`) and skipped while the sidebar is alone in its window. |
 | §4.2 | Every tick spawns `claude agents`. | The spawn is gated on `watchers()`: a sidebar whose window no client is rendering polls nothing, and a payload unchanged for four polls widens the gap up to `IDLE_MAX = 30s`. Both collapse instantly on a keypress, on a change, on `r`, and on the transition back into view, which also forces a poll on that tick. "Rendering" is `#{window_active_clients}`, so a client attached through a grouped session still counts, and the gate answers `Unknown` — which polls — unless THIS tick's enumeration succeeded. Only step 4 of `tick` is gated; the tmux reads and the §1.3 pin stay on `interval`. A skip sets no `poll_error`, no `fail_streak` and runs no `reconcile_hidden`. |

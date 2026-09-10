@@ -122,7 +122,7 @@ environment-variable equivalent of `--socket`.
 | `u` | Undo the most recent `d` | no |
 | `/` | Filter by name, cwd, or short id | no |
 | `a` | Toggle visibility of the Completed group | no |
-| `r` | Force refresh | no |
+| `r` | Force refresh, **and** re-assert the layout: spread the content panes evenly and put the sidebar back on its pinned width. Neither happens on a timer — the width is re-asserted only when it is actually wrong, the even pass runs only on `o`/`s`/`x`, and both stand down while a pane is zoomed — so `r` is the way back for a window you have rearranged with tmux's own keys. It ends a zoom, because re-laying a window does, and says so | no |
 | `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, every pane ccmux opened, and every **running agent** that is not busy, whether or not it has a pane. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
 | `?` | Help overlay | no |
 | `q` | Quit the sidebar. Sessions and panes are untouched | no |
