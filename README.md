@@ -15,14 +15,14 @@ and the layout orchestration that makes the two feel like one app.
 ┌──────────────────┬───────────────────────┬───────────────────────┐
 │ ccmux   18       │                       │                       │
 │ ── Blocked (1) ──│                       │                       │
-│  ▲ client statem… │                       │                       │
+│  ▲ client statem…│                       │                       │
 │ ── Working (2) ──│                       │                       │
 │ ▌● bt/reg-update │   live Claude TUI     │   live Claude TUI     │
 │  ◐ kernel bugs   │                       │                       │
 │ ── Idle (4) ─────│   ✶ Thundering… 3m    │   ✶ Bunning… 16m      │
-│  ○ alpha/opt    │   >                   │   >                   │
+│  ○ alpha/opt     │   >                   │   >                   │
 │ ── Completed ────│                       │                       │
-│  ✓ alpha/axioma │                       │                       │
+│  ✓ alpha/axioma  │                       │                       │
 ├──────────────────┤                       │                       │
 │ name  af/reg-…   │                       │                       │
 │ id    1c45d64f   │                       │                       │
