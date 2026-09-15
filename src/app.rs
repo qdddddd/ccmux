@@ -6,6 +6,9 @@
 //! Panic policy (SPEC §9): no `unwrap`, no `expect`, no `panic!` on any sidebar
 //! path. Every failure degrades to a footer message over the last good list.
 
+pub mod providers;
+use providers::{CodexPoll, Diagnostics};
+
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -518,6 +521,8 @@ pub struct App {
     pub message: Option<(String, MsgLevel)>,
     pub msg_deadline: Option<Instant>,
     pub poll_error: Option<String>,
+    pub codex: CodexPoll,
+    pub diagnostics: Diagnostics,
     pub fail_streak: u32,
     pub last_poll: Instant,
 
@@ -620,8 +625,7 @@ pub struct App {
     /// already resolved to `claude`.
     pub dispatch: fn(&str, &str) -> Result<Option<String>, AgentsError>,
 
-    /// Seam for `agents::poll`, for `R`'s agent pass ONLY — `tick` still hands
-    /// `poll_step` the real function directly.
+    /// Seam for `agents::poll`, shared by the tick and `R`'s agent pass.
     ///
     /// It is a seam for the same reason `respawn` is: the pass decides WHICH
     /// live agents to stop, and a hermetic test of that decision must be able
@@ -726,6 +730,8 @@ impl App {
             message: None,
             msg_deadline: None,
             poll_error: None,
+            codex: Default::default(),
+            diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
             drift_pending: BTreeSet::new(),
@@ -833,7 +839,7 @@ impl App {
         // touches `poll_error`, `fail_streak`, or `reconcile_hidden`'s
         // two-strike debounce, so the header stays healthy and no dismissal
         // ages toward being dropped on the strength of a poll never taken.
-        let polled = self.poll_step(agents::poll);
+        let polled = self.poll_providers();
 
         // 5
         self.rebuild_rows();
@@ -887,17 +893,22 @@ impl App {
                 // scan the same population or the ignored test can fail over a
                 // row the running sidebar never had a word to say about.
                 self.note_drift(&payload.sessions);
+                let codex_rows: Vec<_> = self.sessions.iter()
+                    .filter(|s| s.provider == Provider::Codex).cloned().collect();
                 self.sessions = payload
                     .sessions
                     .into_iter()
-                    .filter(|s| s.kind != model::Kind::Interactive)
+                    .filter(|s| s.provider == Provider::Claude && s.kind != model::Kind::Interactive)
+                    .chain(codex_rows)
                     .collect();
+                self.diagnostics.claude.success();
                 self.poll_error = None;
                 self.fail_streak = 0;
                 self.note_idle();
                 self.reconcile_hidden(Provider::Claude, complete);
             }
             Err(e) => {
+                self.note_claude_failure(&e);
                 self.fail_streak = self.fail_streak.saturating_add(1);
                 self.poll_error = Some(model::truncate_end(&agents_msg(&e), POLL_ERR_MAX));
                 // A failed poll says nothing about whether the fleet is still.
@@ -952,6 +963,10 @@ impl App {
     /// is handed the raw payload too.
     fn note_drift(&mut self, raw: &[Session]) {
         for sess in raw {
+            if sess.provider == Provider::Codex {
+                self.note_codex_drift(sess);
+                continue;
+            }
             if let model::Status::Unknown(v) = &sess.status
                 && !v.is_empty()
             {
@@ -974,7 +989,7 @@ impl App {
     /// would not be read. `Help`, `Logs` and `Prompt` all render over the WHOLE
     /// sidebar rect (§6.7), and `Filter` owns the footer line itself.
     fn footer_is_covered(&self) -> bool {
-        !matches!(self.mode, Mode::Normal)
+        !matches!(self.mode, Mode::Normal) || self.arm_hint().is_some()
     }
 
     /// Event-loop hook, called next to `check_message_timeout` — returns true
@@ -989,6 +1004,7 @@ impl App {
     /// actually frees up is a tick, not a poll, so the retry lives on the tick.
     pub fn tick_drift(&mut self) -> bool {
         let before = self.message.clone();
+        self.announce_runtime(Instant::now());
         self.announce_drift();
         self.message != before
     }
@@ -1053,8 +1069,9 @@ impl App {
     fn fingerprint(sessions: &[model::Session]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        sessions.len().hash(&mut h);
-        sessions.hash(&mut h);
+        let claude: Vec<_> = sessions.iter().filter(|s| s.provider == Provider::Claude).collect();
+        claude.len().hash(&mut h);
+        claude.hash(&mut h);
         h.finish()
     }
 
@@ -1211,6 +1228,10 @@ impl App {
         if watched && !self.was_watched {
             self.idle_streak = 0;
             self.force_poll = true;
+            if self.codex_enabled() {
+                self.codex.idle_streak = 0;
+                self.codex.force = true;
+            }
         }
         self.was_watched = watched;
         self.quiesced = !watched;
@@ -1303,6 +1324,7 @@ impl App {
         // spawn behind every `j` — it only stops the sidebar being slow to
         // update for someone who is demonstrably looking at it.
         self.idle_streak = 0;
+        self.codex.idle_streak = 0;
 
         // §8.9: Ctrl-c quits from ANY mode, immediately, without confirming.
         // Checked before mode dispatch on purpose.
@@ -1698,6 +1720,7 @@ impl App {
             self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
             return;
         }
+        if self.refuse_codex_pane() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -1781,6 +1804,7 @@ impl App {
             self.flash("not inside tmux — tabs unavailable", MsgLevel::Warn);
             return;
         }
+        if self.refuse_codex_pane() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -1932,6 +1956,7 @@ impl App {
             self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
             return;
         }
+        if self.refuse_codex_pane() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -1966,6 +1991,7 @@ impl App {
             self.flash("not inside tmux — close unavailable", MsgLevel::Warn);
             return;
         }
+        if self.refuse_codex_pane() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -2172,6 +2198,11 @@ impl App {
     /// and the press stamps it AGAIN on the way out, which is the half that
     /// makes the guard measure what it claims to. See the re-stamp below.
     pub fn act_ctrl_x(&mut self) -> Action {
+        if self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
+            self.disarm_ctrl_x();
+            self.flash("Codex stop/delete unavailable in v1 — use the Codex TUI", MsgLevel::Warn);
+            return Action::Redraw;
+        }
         let now = Instant::now();
         let gap = self
             .cx_last_press
@@ -2538,6 +2569,10 @@ impl App {
 
     /// `L` — the on-demand, ANSI-stripped logs overlay. SPEC §6.7.
     pub fn act_open_logs(&mut self) {
+        if self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
+            self.flash("Codex logs unavailable in v1 — use the Codex TUI", MsgLevel::Warn);
+            return;
+        }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -2570,6 +2605,7 @@ impl App {
     /// which is what makes a `Ctrl+X` stop show up on the next frame.
     pub fn act_force_refresh(&mut self) {
         self.force_poll = true;
+        if self.codex_enabled() { self.codex.force = true; }
         self.last_poll = Instant::now()
             .checked_sub(self.tick_interval())
             .unwrap_or_else(Instant::now);
@@ -2735,7 +2771,7 @@ impl App {
         // from a `current_exe()` that a `cargo install` may since have turned
         // into a deleted inode; respawning with it leaves a pane running
         // nothing at all.
-        let cmd = restart::exe_path().and_then(|exe| restart::sidebar_command(&exe));
+        let cmd = restart::exe_path().and_then(|exe| restart::sidebar_command(&exe, &self.codex.settings));
         let tabs = self.restart_tabs();
         let plan = restart::plan(&tabs, &self.panes, self.own_pane.as_ref());
 
@@ -2808,6 +2844,7 @@ impl App {
                 panes: plan.claude,
                 failed,
                 skipped: plan.skipped(),
+                codex: plan.codex,
                 agents,
             }),
             MsgLevel::Info,
@@ -4111,6 +4148,7 @@ impl App {
     fn open_prompt(&mut self, kind: PromptKind) {
         let cwd = self
             .selected_session()
+            .filter(|s| s.provider == Provider::Claude)
             .map(|s| s.cwd.clone())
             .or_else(|| {
                 std::env::current_dir()
@@ -4255,6 +4293,8 @@ impl App {
             // put the timer-driven writes back — through a zoom — by the side
             // door, which is the whole thing the gates exist to stop.
             KeyCode::Char('r') => {
+                self.diagnostics.claude.explicit_refresh = true;
+                if self.codex_enabled() { self.codex.reload = true; }
                 self.act_repin();
                 self.act_force_refresh();
                 Action::Redraw
@@ -4752,7 +4792,7 @@ mod tests {
     /// Builds an `App` WITHOUT touching tmux. `App::new` probes `$TMUX` and
     /// calls `PaneMap::new`; these tests must run on a machine with live agent
     /// sessions and must never shell out, so they construct the struct directly.
-    fn app() -> App {
+    pub(super) fn app() -> App {
         App {
             tmux_session: "ccmux-test".into(),
             sidebar_width: 34,
@@ -4806,6 +4846,8 @@ mod tests {
             message: None,
             msg_deadline: None,
             poll_error: None,
+            codex: Default::default(),
+            diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
             drift_pending: BTreeSet::new(),
@@ -8542,7 +8584,7 @@ mod tests {
     /// enumerated inventory, carrying the three fields `PANE_FMT` now reads
     /// off it. The viewer count is the one tmux would report for this pair —
     /// a client on my session, rendering my window.
-    fn watched_by(a: &mut App, clients: u32, window_active: bool) {
+    pub(super) fn watched_by(a: &mut App, clients: u32, window_active: bool) {
         let viewers = u32::from(clients > 0 && window_active);
         watched_by_row(a, clients, window_active, Some(viewers));
     }
@@ -10044,7 +10086,7 @@ mod tests {
         // `cargo install` may since have turned into a deleted inode.
         assert!(a.sidebar_cmd.is_none(), "nothing stale was available to reuse");
         let exe = restart::exe_path().expect("the test binary is on disk");
-        let want = restart::sidebar_command(&exe).expect("build");
+        let want = restart::sidebar_command(&exe, &a.codex.settings).expect("build");
         assert_eq!(got[1].1, want);
         assert!(got[2].1.contains("attach bbbbbbbb;"), "{:?}", got[2].1);
 
@@ -11586,6 +11628,26 @@ mod tests {
         assert!(a.message.clone().unwrap_or_default_msg().0.contains("provider conflict"));
         let wire = serde_json::to_string(&a.map).expect("wire");
         assert_eq!(serde_json::from_str::<PaneMap>(&wire).expect("roundtrip"), a.map);
+    }
+
+    #[test]
+    fn r_propagates_codex_settings_and_reports_skipped_panes() {
+        let mut a = app();
+        restartable(&mut a);
+        a.codex.settings = crate::settings::CodexSettings {
+            url: "ws://127.0.0.1:8965".into(),
+            token_file: "/absolute/token file".into(), bin: "/custom/codex bin".into(),
+        };
+        let entry = a.map.panes.get_mut("%2").expect("own Claude pane");
+        entry.provider = Provider::Codex;
+        a.restart_others();
+        let got = recorded();
+        assert!(!got.iter().any(|(pane, _)| pane == "%2"));
+        let sidebar = got.iter().find(|(pane, _)| pane == "%4").unwrap();
+        assert!(sidebar.1.contains("'CCMUX_CODEX_BIN=/custom/codex bin'"));
+        assert!(sidebar.1.contains("--codex-url ws://127.0.0.1:8965"));
+        assert!(sidebar.1.contains("--codex-token-file '/absolute/token file'"));
+        assert!(a.message.as_ref().unwrap().0.ends_with("Codex panes skipped: 1"));
     }
 
 }

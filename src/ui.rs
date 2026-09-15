@@ -292,7 +292,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             // does whenever there is no detail block), so clear it first.
             f.render_widget(Clear, rect);
             f.render_widget(
-                Paragraph::new(text)
+                Paragraph::new(footer_spans(app, &text, color, usize::MAX, &p))
                     .style(Style::default().fg(color))
                     .wrap(Wrap { trim: true }),
                 rect,
@@ -426,7 +426,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     // they land on says the list was paused, one tick before the forced poll
     // refreshes it.
     if w >= 14 {
-        let (glyph, style) = if app.poll_error.is_some() {
+        let (glyph, style) = if app.poll_error.is_some() || app.codex_error().is_some() {
             ("●", Style::default().fg(p.red))
         } else if app.degraded {
             ("○", Style::default().fg(p.yellow))
@@ -584,6 +584,9 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     if matches!(sess.state, Some(State::Done)) {
         return ("✓", p.green);
     }
+    if matches!(sess.state, Some(State::Unloaded)) {
+        return ("◇", p.gray);
+    }
     if matches!(sess.state, Some(State::Stopped)) {
         return ("■", p.gray);
     }
@@ -631,6 +634,10 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
 /// is the row's LEFT edge, so a badge that grew would push this row's glyph
 /// and name right while its neighbours stayed put, and the eye reads a broken
 /// left edge as broken far more readily than a short name.
+fn provider_marker(sess: &Session, budget: usize) -> String {
+    if sess.provider == Provider::Codex { truncate_end("> ", budget) } else { String::new() }
+}
+
 fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette) -> Line<'static> {
     if w == 0 {
         return Line::from(Vec::<Span>::new());
@@ -662,8 +669,10 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
             Span::styled(glyph.to_string(), base.fg(glyph_color)),
             Span::styled(" ".to_string(), base),
         ];
-        let name = truncate_end(&sess.name, w.saturating_sub(2));
-        let used = 2 + display_width(&name);
+        let marker = provider_marker(sess, w.saturating_sub(2));
+        let name = truncate_end(&sess.name, w.saturating_sub(2 + display_width(&marker)));
+        let used = 2 + display_width(&marker) + display_width(&name);
+        if !marker.is_empty() { spans.push(Span::styled(marker, base.fg(p.gray))); }
         spans.push(Span::styled(name, name_style));
         pad_to(&mut spans, used, w, base);
         return Line::from(spans);
@@ -688,7 +697,8 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     };
     let right = if age.is_some() { GAP + field } else { 0 };
     let name_budget = w.saturating_sub(GUTTER + right + m);
-    let name = truncate_end(&sess.name, name_budget);
+    let marker = provider_marker(sess, name_budget);
+    let name = truncate_end(&sess.name, name_budget.saturating_sub(display_width(&marker)));
 
     // The gutter's ONE ink, shared by both its columns. `badge.is_some()` is
     // already the "not in the tab you are looking at" test — it is what makes
@@ -728,7 +738,8 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     }
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
     spans.push(Span::styled(" ".to_string(), base));
-    let mut used = GUTTER + display_width(&name);
+    let mut used = GUTTER + display_width(&marker) + display_width(&name);
+    if !marker.is_empty() { spans.push(Span::styled(marker, base.fg(p.gray))); }
     spans.push(Span::styled(name, name_style));
 
     // Pad out to the rail's lead so the age lands flush on column W-1.
@@ -830,16 +841,25 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     };
 
     let short = sess.id.clone().unwrap_or_else(|| "—".to_string());
-    let kind = match sess.kind {
+    let kind = if sess.provider == Provider::Codex { "codex" } else { match sess.kind {
         Kind::Background => "background",
         Kind::Interactive => "interactive",
-    };
+    }};
     // Most `state: "done"` rows carry no `status` key (9 of 14 done rows on
     // 2026-08-31; the rest said `idle`), and an absent key parses to
     // `Status::Unknown("")`, so the state is resolved FIRST here for the same
     // reason `status_glyph` resolves it first — otherwise the list says
     // "Completed" while the detail block says "?".
-    let status = if matches!(sess.state, Some(State::Done)) {
+    let status = if sess.provider == Provider::Codex {
+        match sess.codex.as_ref().map(|m| &m.runtime) {
+            Some(crate::model::CodexStatus::NotLoaded) => "unloaded",
+            Some(crate::model::CodexStatus::Idle) => "idle",
+            Some(crate::model::CodexStatus::SystemError) => "systemError",
+            Some(crate::model::CodexStatus::Active { .. }) if sess.group() == Group::Blocked => "blocked",
+            Some(crate::model::CodexStatus::Active { .. }) if !matches!(sess.status, Status::Unknown(_)) => "working",
+            _ => "unknown",
+        }.to_string()
+    } else if matches!(sess.state, Some(State::Done)) {
         "done".to_string()
     } else if matches!(sess.state, Some(State::Stopped)) {
         "stopped".to_string()
@@ -900,7 +920,9 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let st = truncate_end(&status, 8);
     let sw = display_width(&st);
     let mut l2 = vec![label("id")];
-    if budget >= sw + 1 + MIN_BODY {
+    if sess.provider == Provider::Codex {
+        l2.push(Span::styled(truncate_end(&format!("{body} {status}"), budget), Style::default().fg(p.gray)));
+    } else if budget >= sw + 1 + MIN_BODY {
         let left = truncate_end(&body, budget - sw - 1);
         let used = VALUE_COL + display_width(&left);
         l2.push(Span::styled(left, Style::default().fg(p.gray)));
@@ -943,26 +965,26 @@ fn footer_message(app: &App, p: &Palette) -> Option<(String, Color)> {
     if let Some(hint) = app.arm_hint() {
         return Some((hint, p.red));
     }
-    match (&app.message, &app.poll_error) {
-        (Some((text, level)), _) => Some((
-            text.clone(),
-            match level {
-                MsgLevel::Info => p.green,
-                MsgLevel::Warn => p.yellow,
-                MsgLevel::Error => p.red,
-            },
-        )),
-        (None, Some(err)) => Some((format!("agents: {}", err.lines().next().unwrap_or("")), p.red)),
-        (None, None) => None,
+    if let Some((text, level)) = &app.message {
+        return Some((text.clone(), match level {
+            MsgLevel::Info => p.green, MsgLevel::Warn => p.yellow, MsgLevel::Error => p.red,
+        }));
     }
+    let mut errors = Vec::new();
+    if let Some(err) = &app.poll_error {
+        errors.push(format!("agents: {}", err.lines().next().unwrap_or("")));
+    }
+    if let Some(err) = app.codex_error() { errors.push(format!("codex degraded: {err}")); }
+    if errors.is_empty() { None } else { Some((errors.join("; "), p.red)) }
 }
 
 fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)> {
     if w == 0 || app.mode == Mode::Filter {
         return None;
     }
+    if app.message.is_none() && app.arm_hint().is_none() { return None; }
     let (text, color) = footer_message(app, p)?;
-    if display_width(&text) <= w {
+    if display_width(&text) + display_width(footer_prefix(app)) <= w {
         return None;
     }
     Some((text, color))
@@ -1006,6 +1028,19 @@ const HINTS: &[(&str, &str)] = &[
 /// Pinned to the rail at every width that can hold it.
 const HELP_HINT: &str = "? help";
 
+fn footer_prefix(app: &App) -> &'static str {
+    if app.codex_error().is_some() { "[codex!] " } else { "" }
+}
+
+fn footer_spans(app: &App, text: &str, color: Color, w: usize, p: &Palette) -> Line<'static> {
+    let prefix = truncate_end(footer_prefix(app), w);
+    let budget = w.saturating_sub(display_width(&prefix));
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(p.red)),
+        Span::styled(truncate_end(text, budget), Style::default().fg(color)),
+    ])
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let w = area.width as usize;
     if w == 0 {
@@ -1016,10 +1051,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     if app.mode == Mode::Filter {
         let text = format!("/{}▏", app.filter);
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_end(&text, w),
-                Style::default().fg(p.yellow),
-            ))),
+            Paragraph::new(footer_spans(app, &text, p.yellow, w, p)),
             area,
         );
         return;
@@ -1030,10 +1062,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     //    rendering never reads a clock.
     if let Some((text, color)) = footer_message(app, p) {
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_end(&text, w),
-                Style::default().fg(color),
-            ))),
+            Paragraph::new(footer_spans(app, &text, color, w, p)),
             area,
         );
         return;
@@ -1156,8 +1185,20 @@ const KEYS: &[(&str, &str)] = &[
 /// Number of lines the `?` overlay renders. `main.rs` copies it into
 /// `App::help_lines` each frame so `app.rs` can clamp `help_scroll` against the
 /// real content without importing `ui` (the DAG stays acyclic).
-pub fn help_line_count() -> usize {
-    KEYS.len()
+const CODEX_KEYS: &[(&str, &str)] = &[
+    (">", "Codex session"),
+    ("◇", "not loaded in this server"),
+    ("", "last-turn outcome unknown"),
+    ("Codex", "pane actions unavailable"),
+    ("n", "creates a Claude session"),
+    ("", "create Codex in Codex TUI"),
+    ("map", "records pane launch target"),
+    ("", "/resume /new /fork can change it"),
+    ("C-x/L", "use Codex TUI for stop/logs"),
+];
+
+pub fn help_line_count(codex: bool) -> usize {
+    KEYS.len() + if codex { CODEX_KEYS.len() } else { 0 }
 }
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
@@ -1177,6 +1218,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let key_w = 10usize;
     let all: Vec<Line> = KEYS
         .iter()
+        .chain(if app.codex_enabled() { CODEX_KEYS } else { &[] }.iter())
         .map(|(k, a)| {
             if two_col {
                 let key = truncate_end(k, key_w);
@@ -1442,6 +1484,7 @@ fn tab_badge_for(app: &App, provider: Provider, session_id: &str) -> Option<u32>
 
 #[cfg(test)]
 mod tests {
+    mod codex;
     use super::*;
     use crate::model::{Kind, Session, State, Status, build_rows};
     use crate::tmux::{PaneEntry, PaneId, PaneInfo, PaneMap};
@@ -1487,7 +1530,7 @@ mod tests {
             viewport: 10,
             help_scroll: 0,
             overlay_viewport: 20,
-            help_lines: help_line_count(),
+            help_lines: help_line_count(false),
             filter: String::new(),
             show_completed: true,
             hidden: crate::tmux::HiddenSet::new(),
@@ -1522,6 +1565,8 @@ mod tests {
             message: None,
             msg_deadline: None,
             poll_error: None,
+            codex: Default::default(),
+            diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: std::collections::BTreeSet::new(),
             drift_pending: std::collections::BTreeSet::new(),
@@ -1941,7 +1986,7 @@ mod tests {
     fn the_help_overlay_documents_ctrl_x_and_what_the_second_press_takes() {
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
-        app.help_lines = help_line_count();
+        app.help_lines = help_line_count(false);
         for w in [60u16, 34] {
             let rows = rows_at(&app, w, 40).join("\n");
             assert!(rows.contains("Ctrl-x"), "w={w}: {rows}");
@@ -2035,7 +2080,7 @@ mod tests {
     fn the_help_overlay_says_esc_closes_the_delete_window() {
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
-        app.help_lines = help_line_count();
+        app.help_lines = help_line_count(false);
         for w in [34u16, 60] {
             let rows = rows_at(&app, w, 40).join("\n");
             assert!(rows.contains("cancel window/filter"), "w={w}: {rows}");
@@ -2047,7 +2092,7 @@ mod tests {
     fn the_help_overlay_documents_dismiss_and_undo() {
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
-        app.help_lines = help_line_count();
+        app.help_lines = help_line_count(false);
         let rows = rows_at(&app, 60, 40).join("\n");
         assert!(rows.contains("hide row (pane stays)"), "{rows}");
         assert!(rows.contains("undo the last hide"), "{rows}");
@@ -2924,11 +2969,11 @@ mod tests {
         assert!(KEYS.iter().any(|(k, _)| k.contains('▌')), "the badge is explained");
         assert!(HINTS.iter().any(|(k, a)| *k == "t" && *a == "tab"));
         assert!(!KEYS.iter().any(|(k, _)| *k == "c"), "`c` stays deleted");
-        assert_eq!(help_line_count(), KEYS.len());
+        assert_eq!(help_line_count(false), KEYS.len());
 
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
-        app.help_lines = help_line_count();
+        app.help_lines = help_line_count(false);
         let dump = rows_at(&app, 40, 30).join("\n");
         assert!(dump.contains("open in a new tab"), "{dump}");
     }
@@ -2949,7 +2994,7 @@ mod tests {
 
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
-        app.help_lines = help_line_count();
+        app.help_lines = help_line_count(false);
         let dump = rows_at(&app, 40, 34).join("\n");
         assert!(dump.contains("restart ccmux + agents"), "{dump}");
 

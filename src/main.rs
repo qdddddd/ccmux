@@ -9,11 +9,11 @@
 
 mod agents;
 mod app;
-// Read-only Codex module; app integration follows in a separate step.
 #[allow(dead_code)]
 mod codex;
 mod model;
 mod restart;
+mod settings;
 mod tmux;
 mod ui;
 
@@ -67,6 +67,14 @@ pub struct Cli {
     /// throwaway tmux server that cannot reach the operator's live panes.
     #[arg(short = 'L', long, global = true, value_parser = validate_socket_name)]
     pub socket: Option<String>,
+
+    /// Optional loopback ws:// Codex app-server URL (CCMUX_CODEX_URL)
+    #[arg(long, global = true)]
+    pub codex_url: Option<String>,
+
+    /// Codex bearer-token file path (CCMUX_CODEX_TOKEN_FILE); never a token
+    #[arg(long, global = true)]
+    pub codex_token_file: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -139,9 +147,14 @@ fn main() -> anyhow::Result<()> {
         tmux::set_socket(Some(name));
     }
 
+    let cwd = std::env::current_dir().ok();
+    let codex = settings::CodexSettings::resolve(
+        cli.codex_url.clone(), cli.codex_token_file.clone(),
+        |key| std::env::var(key).ok(), cwd.as_deref(),
+    );
     match cli.cmd {
-        Some(Cmd::Sidebar { interval }) => run_sidebar(&cli, interval),
-        None => run_launcher(&cli),
+        Some(Cmd::Sidebar { interval }) => run_sidebar(&cli, interval, &codex),
+        None => run_launcher(&cli, &codex),
     }
 }
 
@@ -179,7 +192,7 @@ fn resolve_dark(cli: &Cli) -> bool {
 /// `CCMUX_TMUX_SOCKET=` env-assignment prefix the Tmux lane proposed. Same
 /// effect, one quoting rule instead of two: the whole command stays a plain
 /// `sh_join` of quoted argv words. Env seeding still works and is untouched.
-fn sidebar_command(cli: &Cli, width: u16) -> anyhow::Result<String> {
+fn sidebar_command(cli: &Cli, width: u16, codex: &settings::CodexSettings) -> anyhow::Result<String> {
     let exe = std::env::current_exe().context("cannot resolve the ccmux executable path")?;
     let exe = exe
         .to_str()
@@ -197,11 +210,12 @@ fn sidebar_command(cli: &Cli, width: u16) -> anyhow::Result<String> {
         parts.push("--socket");
         parts.push(sock);
     }
-    Ok(tmux::sh_join(&parts))
+    codex.command(std::path::Path::new(exe), parts.into_iter().skip(1).map(Into::into))
+        .ok_or_else(|| anyhow!("sidebar arguments are not valid UTF-8"))
 }
 
 /// SPEC §1.2. Never enters raw mode.
-fn run_launcher(cli: &Cli) -> anyhow::Result<()> {
+fn run_launcher(cli: &Cli, codex: &settings::CodexSettings) -> anyhow::Result<()> {
     // 1 — tmux binary missing.
     if !tmux::server_available() {
         eprintln!("ccmux: tmux not found on PATH");
@@ -218,7 +232,7 @@ fn run_launcher(cli: &Cli) -> anyhow::Result<()> {
     }
 
     let width = cli.width.clamp(WIDTH_MIN, WIDTH_MAX);
-    let sidebar_cmd = sidebar_command(cli, width)?;
+    let sidebar_cmd = sidebar_command(cli, width, codex)?;
 
     // 3 — a dead server also exits non-zero, which reads correctly as "absent".
     if tmux::has_session(&cli.session) {
@@ -438,7 +452,7 @@ fn install_panic_hook() {
 
 /// Raw mode + alternate screen + the event loop; teardown runs on every exit
 /// path including a panic-free error return.
-fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
+fn run_sidebar(cli: &Cli, interval_ms: u64, codex: &settings::CodexSettings) -> anyhow::Result<()> {
     let width = cli.width.clamp(WIDTH_MIN, WIDTH_MAX);
     let interval = Duration::from_millis(interval_ms.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS));
     let mut app = app::App::new(cli.session.clone(), width, interval, resolve_dark(cli));
@@ -446,7 +460,8 @@ fn run_sidebar(cli: &Cli, interval_ms: u64) -> anyhow::Result<()> {
     // one is built here, from the same `current_exe()` + `sh_join` builder the
     // launcher uses. `app` never imports `main`; the string is handed down, so
     // the module DAG stays acyclic.
-    app.sidebar_cmd = sidebar_command(cli, width).ok();
+    app.codex.settings = codex.clone();
+    app.sidebar_cmd = sidebar_command(cli, width, codex).ok();
 
     install_panic_hook();
     enable_raw_mode().context("cannot enter raw mode")?;
@@ -510,7 +525,7 @@ fn measure<B: Backend>(terminal: &Terminal<B>, app: &mut app::App) -> anyhow::Re
     let height = terminal.size()?.height;
     app.viewport = ui::list_viewport_rows(height);
     app.overlay_viewport = height.saturating_sub(2);
-    app.help_lines = ui::help_line_count();
+    app.help_lines = ui::help_line_count(app.codex_enabled());
     app.clamp_scroll();
     Ok(())
 }
@@ -551,6 +566,9 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
         if app.tick_drift() {
             needs_draw = true;
         }
+        if app.tick_diagnostics() {
+            needs_draw = true;
+        }
         // §8.2: expires `Ctrl+X`'s delete window, and runs a delete that has
         // settled. It lives here rather than in the keypress so a held key's
         // repeat stream gets its chance to cancel one, and so the footer stops
@@ -560,16 +578,8 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
         }
 
         if app.last_poll.elapsed() >= app.tick_interval() {
-            let started = std::time::Instant::now();
-            app.tick();
+            timed_tick(app, std::time::Instant::now, drain_pending_input)?;
             needs_draw = true;
-            // A tick that blocked long enough to be felt swallowed every key
-            // pressed during it, and the terminal will now replay them all at
-            // once against whatever is on screen. Those keystrokes were aimed
-            // at a frozen UI; execute none of them.
-            if started.elapsed() >= SLOW_TICK {
-                drain_pending_input()?;
-            }
         }
 
         measure(terminal, app)?;
@@ -603,6 +613,7 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                             // `exec` does not return on success, so everything
                             // after this line is the FAILURE path.
                             if let Some(p) = app.pending_restart.take() {
+                                let codex = app.codex.settings.clone();
                                 let err = restart_now(
                                     &p,
                                     &mut |step| match step {
@@ -617,7 +628,7 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                                         RestartStep::RestoreTerminal => restore_terminal(),
                                         RestartStep::FlushTmuxState => app.shutdown(),
                                     },
-                                    &mut exec_pending,
+                                    &mut |pending| exec_pending(pending, &codex),
                                 );
                                 resume_terminal(terminal)?;
                                 restart_failed(app, &err);
@@ -640,6 +651,19 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Preparation and both polls share the slow-tick input guard. A clock seam
+/// lets tests model a stalled resolver without sleeping or touching DNS.
+fn timed_tick(
+    app: &mut app::App,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut drain: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let started = now();
+    app.tick();
+    if now().saturating_duration_since(started) >= SLOW_TICK { drain()?; }
     Ok(())
 }
 
@@ -744,11 +768,16 @@ fn restart_now(
 /// the image that comes up knows it owes the rest of the session a restart, and
 /// — because only an `exec` keeps a pid — how a sidebar that merely inherited
 /// the variable knows it does not.
-fn exec_pending(p: &restart::Pending) -> io::Error {
-    std::process::Command::new(&p.exe)
-        .args(std::env::args_os().skip(1))
-        .env(restart::HANDOFF_ENV, restart::handoff_token())
-        .exec()
+fn exec_pending(p: &restart::Pending, codex: &settings::CodexSettings) -> io::Error {
+    exec_command(p, codex).exec()
+}
+
+fn exec_command(p: &restart::Pending, codex: &settings::CodexSettings) -> std::process::Command {
+    let mut command = std::process::Command::new(&p.exe);
+    command.args(codex.args(std::env::args_os().skip(1)))
+        .env("CCMUX_CODEX_BIN", &codex.bin)
+        .env(restart::HANDOFF_ENV, restart::handoff_token());
+    command
 }
 
 /// Undo `restore_terminal`. Reachable only when the `exec` failed, which is the
@@ -839,7 +868,7 @@ mod tests {
     fn sidebar_command_is_a_quoted_argv_line() {
         let cli = Cli::try_parse_from(["ccmux", "--session", "ccmux-test-a", "--width", "40"])
             .expect("parse");
-        let cmd = sidebar_command(&cli, 40).expect("build");
+        let cmd = sidebar_command(&cli, 40, &settings::CodexSettings::default()).expect("build");
         assert!(cmd.contains(" sidebar --session ccmux-test-a --width 40"));
         // Light is the default, so nothing is forwarded for it.
         assert!(!cmd.contains("--light"));
@@ -847,8 +876,9 @@ mod tests {
         assert!(!cmd.contains("--socket"));
 
         let cli = Cli::try_parse_from(["ccmux", "--dark", "-L", "ccmux"]).expect("parse");
-        let cmd = sidebar_command(&cli, 34).expect("build");
-        assert!(cmd.ends_with(" sidebar --session ccmux --width 34 --dark --socket ccmux"));
+        let cmd = sidebar_command(&cli, 34, &settings::CodexSettings::default()).expect("build");
+        assert!(cmd.contains(" sidebar --session ccmux --width 34 --dark --socket ccmux"));
+        assert!(cmd.ends_with("--codex-url '' --codex-token-file ''"));
     }
 
     #[test]
@@ -880,8 +910,8 @@ mod tests {
         assert!(Cli::try_parse_from(["ccmux", "--light", "--dark"]).is_err());
 
         // The non-default is the one that travels to the pane.
-        assert!(sidebar_command(&dark, 34).expect("cmd").contains("--dark"));
-        assert!(!sidebar_command(&light, 34).expect("cmd").contains("--dark"));
+        assert!(sidebar_command(&dark, 34, &settings::CodexSettings::default()).expect("cmd").contains("--dark"));
+        assert!(!sidebar_command(&light, 34, &settings::CodexSettings::default()).expect("cmd").contains("--dark"));
 
         // Guarded: an operator running the suite with CCMUX_THEME exported
         // would otherwise see this fail for a reason that is not a defect.
@@ -1309,6 +1339,94 @@ mod tests {
             !README.contains("`q`, moving the cursor\n  to another row"),
             "README still closes the delete window on a cursor move"
         );
+    }
+
+    #[test]
+    fn codex_flags_are_global_and_empty_url_is_an_explicit_off() {
+        for args in [
+            vec!["ccmux", "--codex-url", "ws://localhost:8965", "sidebar", "--codex-token-file", "/token"],
+            vec!["ccmux", "sidebar", "--codex-url", "ws://localhost:8965", "--codex-token-file", "/token"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.codex_url.as_deref(), Some("ws://localhost:8965"));
+            assert_eq!(cli.codex_token_file.as_deref(), Some("/token"));
+        }
+        let cli = Cli::try_parse_from(["ccmux", "--codex-url", ""]).unwrap();
+        assert_eq!(cli.codex_url.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn creation_heal_tab_and_restart_commands_keep_resolved_on_and_off() {
+        use std::ffi::OsStr;
+        for url in ["", "ws://127.0.0.1:8965"] {
+            let cli = Cli::try_parse_from(["ccmux", "--socket", "ccmux-smoke"]).unwrap();
+            let settings = settings::CodexSettings {
+                url: url.into(), token_file: "/absolute/token file".into(), bin: "/custom/codex bin".into(),
+            };
+            // Launcher create/heal and t all consume this one command builder.
+            let launch = sidebar_command(&cli, 34, &settings).unwrap();
+            assert!(launch.contains(&tmux::sh_quote(&format!("CCMUX_CODEX_BIN={}", settings.bin))));
+            assert!(launch.contains(&format!("--codex-url {}", tmux::sh_quote(url))));
+            assert!(launch.contains("--codex-token-file '/absolute/token file'"));
+            let pending = restart::Pending { exe: "/new/ccmux".into() };
+            let command = exec_command(&pending, &settings);
+            let args: Vec<_> = command.get_args().collect();
+            assert!(args.ends_with(&[OsStr::new("--codex-url"), OsStr::new(url),
+                OsStr::new("--codex-token-file"), OsStr::new("/absolute/token file")]));
+            assert!(command.get_envs().any(|(key, value)| key == "CCMUX_CODEX_BIN"
+                && value == Some(OsStr::new("/custom/codex bin"))));
+            let peer = restart::sidebar_command(&pending.exe, &settings).unwrap();
+            assert!(peer.contains(&tmux::sh_quote(&format!("CCMUX_CODEX_BIN={}", settings.bin))));
+            assert!(peer.ends_with(&format!("--codex-url {} --codex-token-file '/absolute/token file'", tmux::sh_quote(url))));
+            assert!(!launch.contains("CODEX_REMOTE_TOKEN") && !peer.contains("CODEX_REMOTE_TOKEN"));
+        }
+    }
+
+    #[test]
+    fn first_frame_precedes_lazy_prepare_and_slow_tick_drains_typeahead() {
+        use std::cell::{Cell, RefCell};
+        use std::time::Instant;
+        thread_local! {
+            static CLOCK: Cell<Instant> = Cell::new(Instant::now());
+            static EVENTS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+            static KEYS: RefCell<Vec<crossterm::event::KeyEvent>> = const { RefCell::new(Vec::new()) };
+        }
+        for launch in ["fresh", "heal", "t", "R"] {
+            EVENTS.with(|e| e.borrow_mut().clear());
+            KEYS.with(|k| k.borrow_mut().clear());
+            let mut app = app::App::new("ccmux-test".into(), 34, Duration::from_millis(2500), true);
+            app.degraded = true; // tick must not access tmux
+            app.codex.settings.url = "ws://localhost:8965".into();
+            app.codex.prepare = |_| {
+                EVENTS.with(|e| e.borrow_mut().push("prepare"));
+                CLOCK.with(|c| c.set(c.get() + Duration::from_millis(700)));
+                Err(codex::CodexDiagnostic {
+                    kind: codex::CodexFailureKind::Connection, message: "mock slow resolver".into(),
+                })
+            };
+            app.agents_poll = || {
+                EVENTS.with(|e| e.borrow_mut().push("claude poll"));
+                CLOCK.with(|c| c.set(c.get() + Duration::from_millis(400)));
+                // A buffered Ctrl-x is a key Press too; none may be dispatched.
+                KEYS.with(|k| k.borrow_mut().push(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('x'), crossterm::event::KeyModifiers::CONTROL,
+                )));
+                Ok(model::Payload::default())
+            };
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(34, 20)).unwrap();
+            first_frame(&mut term, &mut app).unwrap();
+            EVENTS.with(|e| {
+                assert!(e.borrow().is_empty(), "{launch}: preparation preceded first_frame");
+                e.borrow_mut().push("frame");
+            });
+            timed_tick(&mut app, || CLOCK.with(Cell::get), || {
+                EVENTS.with(|e| e.borrow_mut().push("drain"));
+                KEYS.with(|k| k.borrow_mut().clear());
+                Ok(())
+            }).unwrap();
+            KEYS.with(|k| assert!(k.borrow().is_empty(), "{launch}: buffered input survived"));
+            EVENTS.with(|e| assert_eq!(*e.borrow(), ["frame", "claude poll", "prepare", "drain"]));
+        }
     }
 
 }

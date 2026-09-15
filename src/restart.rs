@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::model::{Group, Kind, Provider, Session, State};
-use crate::tmux::{self, PaneId, PaneInfo, TabInfo};
+use crate::tmux::{PaneId, PaneInfo, TabInfo};
 
 /// The env var that tells a fresh sidebar it is the second half of an `R`, and
 /// so must finish the job by respawning everything this image could not.
@@ -120,6 +120,8 @@ pub struct Plan {
     /// Mapped, live panes whose attach has already exited and handed the pane
     /// to a shell (`#{@ccmux_detached}`). Counted, never respawned.
     pub detached: usize,
+    /// Live Codex panes, including parked clients. Never restart targets.
+    pub codex: usize,
     /// EVERY SESSION A LIVE CCMUX PANE NAMES, respawned or not — the line
     /// between `R`'s two agent populations.
     ///
@@ -465,7 +467,11 @@ pub struct Headless {
 /// one call site's discipline.
 pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
     let live: HashSet<&PaneId> = panes.iter().map(|p| &p.id).collect();
-    let mut out = Plan::default();
+    let codex: HashSet<PaneId> = tabs.iter().flat_map(|t| t.map.panes.iter())
+        .filter(|(_, entry)| entry.provider == Provider::Codex)
+        .filter_map(|(raw, _)| PaneId::parse(raw))
+        .filter(|id| live.contains(id)).collect();
+    let mut out = Plan { codex: codex.len(), ..Plan::default() };
     let mut seen: HashSet<PaneId> = HashSet::new();
     if let Some(me) = me {
         // Never a target of a respawn, whatever the records say.
@@ -479,6 +485,7 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
         // about the window that carries it.
         if let Some(sb) = tab.sidebar.as_ref()
             && live.contains(sb)
+            && !codex.contains(sb)
             && panes.iter().any(|p| &p.id == sb && p.window_id == tab.window)
             && seen.insert(sb.clone())
         {
@@ -495,7 +502,7 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
             let Some(pane) = PaneId::parse(raw) else {
                 continue;
             };
-            if !live.contains(&pane) {
+            if !live.contains(&pane) || codex.contains(&pane) {
                 continue;
             }
             // HELD, whichever arm the pane lands in below — and BEFORE the
@@ -651,6 +658,7 @@ pub struct Report {
     /// Panes ccmux owns, found alive, and deliberately left running
     /// (`Plan::skipped`).
     pub skipped: usize,
+    pub codex: usize,
     /// The agent pass.
     pub agents: Agents,
 }
@@ -718,6 +726,9 @@ pub fn note(r: &Report) -> String {
     }
     if !ex.is_empty() {
         s.push_str(&format!(" ({})", ex.join(", ")));
+    }
+    if r.codex > 0 {
+        s.push_str(&format!("; Codex panes skipped: {}", r.codex));
     }
     s
 }
@@ -903,13 +914,8 @@ fn probe_within(exe: &Path, timeout: Duration) -> Result<(), String> {
 /// deleted inode, so respawning another tab's sidebar with it would leave that
 /// pane running nothing at all. Same binary, same flags, same session, same
 /// socket, same width — resolved fresh.
-pub fn sidebar_command(exe: &Path) -> Option<String> {
-    let exe = exe.to_str()?;
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut parts: Vec<&str> = Vec::with_capacity(args.len() + 1);
-    parts.push(exe);
-    parts.extend(args.iter().map(String::as_str));
-    Some(tmux::sh_join(&parts))
+pub fn sidebar_command(exe: &Path, codex: &crate::settings::CodexSettings) -> Option<String> {
+    codex.command(exe, std::env::args_os().skip(1))
 }
 
 /// A restart that `App` has authorised and `main` has still to perform.
@@ -929,7 +935,7 @@ pub struct Pending {
 mod tests {
     use super::*;
     use crate::model::{State, Status};
-    use crate::tmux::{HiddenLog, PaneEntry, PaneMap, WindowId};
+    use crate::tmux::{self, HiddenLog, PaneEntry, PaneMap, WindowId};
 
     fn pane(id: &str, window: &str) -> PaneInfo {
         PaneInfo {
@@ -1622,6 +1628,7 @@ mod tests {
             panes,
             failed,
             skipped,
+            codex: 0,
             agents: Agents::default(),
         };
         assert_eq!(note(&r(3, 4, 0, 0)), "restarted 3 sidebars, 4 panes");
@@ -1698,6 +1705,7 @@ mod tests {
                 panes: 3,
                 failed: 1,
                 skipped: 4,
+                codex: 0,
                 agents: Agents {
                     restarted: 1,
                     busy: 2,
@@ -1905,8 +1913,9 @@ mod tests {
     /// in front, so every flag rides along and nothing is re-derived.
     #[test]
     fn the_sidebar_command_is_the_resolved_binary_plus_my_own_argv() {
-        let cmd = sidebar_command(Path::new("/opt/ccmux")).expect("build");
-        assert!(cmd.starts_with("/opt/ccmux"), "{cmd:?}");
+        let cmd = sidebar_command(Path::new("/opt/ccmux"), &crate::settings::CodexSettings::default()).expect("build");
+        assert!(cmd.starts_with("env CCMUX_CODEX_BIN=codex /opt/ccmux"), "{cmd:?}");
+        assert!(cmd.ends_with("--codex-url '' --codex-token-file ''"));
         let args: Vec<String> = std::env::args().skip(1).collect();
         for a in &args {
             assert!(cmd.contains(&tmux::sh_quote(a)), "{a:?} missing from {cmd:?}");
@@ -1954,6 +1963,32 @@ mod tests {
         let p = plan(&[t], &[pane("%1", "@1"), pane("%2", "@1"), pane("%3", "@1")], None);
         assert!(p.held.is_empty());
         assert!(p.agent_ids().is_empty());
+    }
+
+    #[test]
+    fn codex_skip_count_deduplicates_live_panes_before_attachment_checks() {
+        let mut a = tab("@1", Some("%1"), &[("%2", "aaaaaaaa"), ("%3", "bbbbbbbb")]);
+        for entry in a.map.panes.values_mut() { entry.provider = Provider::Codex; }
+        let mut b = tab("@2", Some("%4"), &[("%2", "aaaaaaaa"), ("%9", "cccccccc")]);
+        for entry in b.map.panes.values_mut() { entry.provider = Provider::Codex; }
+        let mut parked = pane("%3", "@1");
+        parked.detached = true;
+        let p = plan(&[a, b], &[pane("%1", "@1"), pane("%2", "@1"), parked, pane("%4", "@2")], None);
+        assert_eq!(p.codex, 2);
+        assert_eq!(p.claude + p.detached + p.unattachable, 0);
+        assert!(p.agent_ids().is_empty());
+        assert_eq!(ids(&p), ["%1", "%4"]);
+        assert_eq!(note(&Report { sidebars: 2, codex: p.codex, ..Report::default() }),
+            "restarted 2 sidebars, 0 panes; Codex panes skipped: 2");
+    }
+
+    #[test]
+    fn a_codex_launch_record_cannot_be_restarted_as_a_stale_sidebar_marker() {
+        let mut t = tab("@1", Some("%2"), &[("%2", "aaaaaaaa")]);
+        t.map.panes.get_mut("%2").unwrap().provider = Provider::Codex;
+        let p = plan(&[t], &[pane("%2", "@1")], None);
+        assert!(p.targets.is_empty());
+        assert_eq!(p.codex, 1);
     }
 
 }

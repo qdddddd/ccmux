@@ -296,6 +296,10 @@ impl Session {
         if let Some(id) = &self.id {
             out.push_str(id);
         }
+        if self.provider == Provider::Codex {
+            out.push_str(" codex ");
+            out.push_str(&self.session_id);
+        }
         out.to_lowercase()
     }
 }
