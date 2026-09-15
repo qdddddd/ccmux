@@ -1189,11 +1189,15 @@ const CODEX_KEYS: &[(&str, &str)] = &[
     (">", "Codex session"),
     ("◇", "not loaded in this server"),
     ("", "last-turn outcome unknown"),
-    ("Codex", "pane actions unavailable"),
+    ("Enter/o/s/t", "open Codex TUI"),
+    ("x", "close pane; work continues"),
+    ("R", "Codex panes are skipped"),
     ("n", "creates a Claude session"),
     ("", "create Codex in Codex TUI"),
-    ("map", "records pane launch target"),
-    ("", "/resume /new /fork can change it"),
+    ("map", "records launch target"),
+    ("", "/resume /new /fork"),
+    ("", "change TUI, not map"),
+    ("enter", "parked: retry launch id"),
     ("C-x/L", "use Codex TUI for stop/logs"),
 ];
 
@@ -1587,7 +1591,7 @@ mod tests {
             respawn: |_, _, _| panic!("ui test reached respawn_pane"),
             kill_pane: |_, _| panic!("ui test reached kill_pane"),
             probe: |_| panic!("ui test reached restart::probe"),
-            dispatch: |_, _| panic!("ui test reached dispatch_background"),
+            dispatch: |_, _, _| panic!("ui test reached dispatch_background"),
             // `ui` draws; it never restarts anything. Both `R` seams panic so
             // a rendering test that somehow reached the agent pass would say
             // so rather than shelling out to the operator's live `claude`.

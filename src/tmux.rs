@@ -548,6 +548,8 @@ fn refuse_default_socket_under_test() -> Result<(), TmuxError> {
 /// command. Always argv; never `sh -c`; never a formatted shell string.
 pub fn tmux(args: &[&str]) -> Result<String, TmuxError> {
     let argv = full_argv(args)?;
+    #[cfg(test)]
+    if let Some(result) = test_commands::intercept(&argv) { return result; }
     refuse_default_socket_under_test()?;
     let out = Command::new("tmux")
         .args(&argv)
@@ -567,6 +569,39 @@ pub fn tmux(args: &[&str]) -> Result<String, TmuxError> {
         s.pop();
     }
     Ok(s)
+}
+
+/// Test-local command boundary: fixtures exercise the real R2 gates and
+/// serialization without ever spawning tmux. Unscripted tests still refuse
+/// the default socket through the existing guard.
+#[cfg(test)]
+pub(crate) mod test_commands {
+    use super::TmuxError;
+    use std::cell::RefCell;
+    type Handler = Box<dyn FnMut(&[String]) -> Result<String, TmuxError>>;
+    thread_local! {
+        static HANDLER: RefCell<Option<Handler>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn intercept(args: &[String]) -> Option<Result<String, TmuxError>> {
+        HANDLER.with(|h| h.borrow_mut().as_mut().map(|f| f(args)))
+    }
+
+    pub fn with<T>(handler: impl FnMut(&[String]) -> Result<String, TmuxError> + 'static,
+        test: impl FnOnce() -> T) -> T
+    {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) { HANDLER.with(|h| *h.borrow_mut() = None); }
+        }
+        HANDLER.with(|h| {
+            let mut h = h.borrow_mut();
+            assert!(h.is_none(), "nested tmux fixture");
+            *h = Some(Box::new(handler));
+        });
+        let _reset = Reset;
+        test()
+    }
 }
 
 /// Convenience: true when `tmux(args)` returned Ok.

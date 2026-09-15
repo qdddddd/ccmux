@@ -129,6 +129,11 @@ fn codex_help_is_opt_in_and_matches_scroll_geometry() {
     let enabled = rows_at(&app, 80, 60).join("\n");
     assert!(enabled.contains("not loaded in this server"));
     assert!(enabled.contains("creates a Claude session"));
-    assert!(enabled.contains("records pane launch target"));
+    assert!(enabled.contains("records launch target"));
+    assert!(enabled.contains("open Codex TUI"));
+    assert!(enabled.contains("Codex panes are skipped"));
+    assert!(enabled.contains("change TUI, not map"));
+    assert!(enabled.contains("parked: retry launch id"));
+    assert!(!enabled.contains("pane actions unavailable"));
     assert_eq!(help_line_count(true), help_line_count(false) + CODEX_KEYS.len());
 }

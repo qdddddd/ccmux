@@ -543,14 +543,10 @@ fn codex_navigation_filter_completed_dismiss_undo_and_new_are_local() {
 }
 
 #[test]
-fn all_deferred_codex_verbs_refuse_before_any_claude_or_tmux_call() {
+fn unsupported_codex_verbs_refuse_before_any_claude_or_tmux_call() {
     let mut a = configured();
     poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
     a.rebuild_rows();
-    for code in [KeyCode::Enter, KeyCode::Char('o'), KeyCode::Char('s'), KeyCode::Char('t'), KeyCode::Char('x')] {
-        key(&mut a, code);
-        assert_eq!(a.message.as_ref().unwrap().0, "Codex pane actions unavailable in this build");
-    }
     key(&mut a, KeyCode::Char('L'));
     assert_eq!(a.message.as_ref().unwrap().0, "Codex logs unavailable in v1 — use the Codex TUI");
     a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));

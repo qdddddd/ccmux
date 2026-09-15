@@ -623,7 +623,7 @@ pub struct App {
     /// operator's real `claude` — `CCMUX_CLAUDE_BIN` cannot serve, because
     /// `claude_bin()` is a process-wide `OnceLock` that other tests may have
     /// already resolved to `claude`.
-    pub dispatch: fn(&str, &str) -> Result<Option<String>, AgentsError>,
+    pub dispatch: fn(Provider, &str, &str) -> Result<Option<String>, AgentsError>,
 
     /// Seam for `agents::poll`, shared by the tick and `R`'s agent pass.
     ///
@@ -642,7 +642,7 @@ pub struct App {
     /// `agents::stop` is already hermetic under `cfg(test)` — its process
     /// boundary routes to `test_spawn::intercept` — so a test stub that calls
     /// through it spawns nothing while still proving the argv.
-    pub agents_stop: fn(&str) -> Result<(), AgentsError>,
+    pub agents_stop: fn(&Session) -> Result<(), AgentsError>,
 
     /// Seam for `agents::respawn`, `R`'s restart for an agent with no client.
     ///
@@ -652,7 +652,7 @@ pub struct App {
     /// when the worker is still there, `left stopped` when the daemon halted
     /// it anyway — can only be written against one recorder that sees the verb
     /// and the polls around it on one timeline.
-    pub agents_respawn: fn(&str) -> Result<(), AgentsError>,
+    pub agents_respawn: fn(&Session) -> Result<(), AgentsError>,
 
     /// Seam for `agents::attached_ids`, the machine-wide "who has a client"
     /// read that scopes the paneless population.
@@ -1348,8 +1348,11 @@ impl App {
         // that leaves Normal — `/`, `n`, `?`, `L` — or quits closes it, because
         // the footer that carries the warning is no longer the thing on screen
         // and the operator's attention has moved with it. One place, so no
-        // handler can forget.
-        if self.mode != Mode::Normal || self.should_quit {
+        // handler can forget. A Codex selection also closes a Claude arm:
+        // stop/delete is not a verb of that provider (§12.8).
+        if self.mode != Mode::Normal || self.should_quit
+            || self.selected_session().is_some_and(|s| s.provider == Provider::Codex)
+        {
             self.disarm_ctrl_x();
         }
         action
@@ -1720,11 +1723,11 @@ impl App {
             self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
             return;
         }
-        if self.refuse_codex_pane() { return; }
-        let Some(sel) = self.selected_session() else {
+        if self.refuse_codex_open() { return; }
+        let Some(sel) = self.selected_session().cloned() else {
             return;
         };
-        if !sel.is_attachable() {
+        if sel.provider == Provider::Claude && !sel.is_attachable() {
             // §9.7: `claude attach` takes the 8-hex short id, so without one a
             // split would have nothing to run. Rare but reachable on a listed
             // row: `parse_sessions` honours an explicit `kind: "background"`
@@ -1745,7 +1748,14 @@ impl App {
             self.flash("no pane to split — sidebar unmapped", MsgLevel::Error);
             return;
         };
-        let cmd = agents::attach_pane_cmd(&short_id);
+        let codex = if provider == Provider::Codex { self.codex.settings.config().ok() } else { None };
+        let cmd = match agents::attach_pane_cmd(&sel, codex.as_ref()) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                self.flash(agents_msg(&e), MsgLevel::Warn);
+                return;
+            }
+        };
         match tmux::split(&self.tmux_session, &anchor, dir, &cmd) {
             Ok(pane) => {
                 let recorded = self.map.insert(
@@ -1804,11 +1814,11 @@ impl App {
             self.flash("not inside tmux — tabs unavailable", MsgLevel::Warn);
             return;
         }
-        if self.refuse_codex_pane() { return; }
-        let Some(sel) = self.selected_session() else {
+        if self.refuse_codex_open() { return; }
+        let Some(sel) = self.selected_session().cloned() else {
             return;
         };
-        if !sel.is_attachable() {
+        if sel.provider == Provider::Claude && !sel.is_attachable() {
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
@@ -1827,7 +1837,14 @@ impl App {
             return;
         };
 
-        let attach = agents::attach_pane_cmd(&short_id);
+        let codex = if provider == Provider::Codex { self.codex.settings.config().ok() } else { None };
+        let attach = match agents::attach_pane_cmd(&sel, codex.as_ref()) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                self.flash(agents_msg(&e), MsgLevel::Warn);
+                return;
+            }
+        };
         let (_, index, claude) = match tmux::new_tab(&self.tmux_session, &attach) {
             Ok(t) => t,
             Err(e) => {
@@ -1956,11 +1973,11 @@ impl App {
             self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
             return;
         }
-        if self.refuse_codex_pane() { return; }
+        if self.refuse_codex_open() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };
-        if !sel.is_attachable() {
+        if sel.provider == Provider::Claude && !sel.is_attachable() {
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
@@ -1991,7 +2008,6 @@ impl App {
             self.flash("not inside tmux — close unavailable", MsgLevel::Warn);
             return;
         }
-        if self.refuse_codex_pane() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -2030,13 +2046,16 @@ impl App {
                 // The sentence below is true either way: the agent is a
                 // background one, daemon-owned, and closing its pane never
                 // touched it (§8.5).
+                let outcome = if provider == Provider::Codex {
+                    "Codex work stays on server"
+                } else { "agent still running" };
                 match idx {
                     Some(i) => self.flash(
-                        format!("closed pane {i}{where_} — agent still running"),
+                        format!("closed pane {i}{where_} — {outcome}"),
                         MsgLevel::Info,
                     ),
                     None => self.flash(
-                        format!("closed pane{where_} — agent still running"),
+                        format!("closed pane{where_} — {outcome}"),
                         MsgLevel::Info,
                     ),
                 }
@@ -2287,7 +2306,7 @@ impl App {
             return;
         }
 
-        match agents::stop(&short_id) {
+        match agents::stop(sel) {
             Ok(()) => {
                 self.act_force_refresh();
                 // Stamped AFTER the shell-out: the window the footer promises
@@ -2389,18 +2408,16 @@ impl App {
         let label = model::truncate_end(&arm.name, LABEL_MAX);
         // Fail closed: re-validate the CAPTURED id against the current poll. A
         // poll can land between the press and the settle.
-        let still_there = self
-            .sessions
-            .iter()
-            .any(|s| s.provider == Provider::Claude && s.id.as_deref() == Some(arm.short_id.as_str()));
-        if !still_there {
+        let target = self.sessions.iter().find(|s| s.provider == Provider::Claude
+            && s.session_id == arm.session_id && s.id.as_deref() == Some(arm.short_id.as_str()));
+        let Some(target) = target else {
             self.flash(
                 format!("session {} is gone — not deleted", arm.short_id),
                 MsgLevel::Warn,
             );
             return;
-        }
-        match agents::delete(&arm.short_id) {
+        };
+        match agents::delete(target) {
             Ok(()) => {
                 // The session is gone, so every pane showing it has nothing
                 // left to resume: its wrapper has parked on a prompt whose
@@ -2576,12 +2593,12 @@ impl App {
         let Some(sel) = self.selected_session() else {
             return;
         };
-        let Some(id) = sel.id.clone() else {
+        let Some(_) = sel.id.as_ref() else {
             self.flash("no short id — no logs for this session", MsgLevel::Warn);
             return;
         };
         let title = sel.name.clone();
-        match agents::logs(&id, LOGS_LINES) {
+        match agents::logs(sel, LOGS_LINES) {
             Ok(text) => {
                 self.logs = Some(LogsView {
                     title,
@@ -2801,18 +2818,24 @@ impl App {
                         continue;
                     }
                 },
-                Role::Claude { short_id } => agents::attach_pane_cmd(short_id),
+                Role::Claude { entry } => match agents::attach_entry_cmd(entry, None) {
+                    Ok(cmd) => cmd,
+                    Err(_) => {
+                        failed += 1;
+                        continue;
+                    }
+                },
             };
             // R2 lives inside the helper: every one of these is an
             // `assert_in_session`-gated write on a validated `PaneId`.
             match (self.respawn)(&self.tmux_session, &t.pane, &shell_cmd) {
                 Err(_) => failed += 1,
                 Ok(()) => {
-                    if let Role::Claude { short_id } = &t.role {
+                    if let Role::Claude { entry } = &t.role {
                         // ANY pane is enough: one session can sit in two panes
                         // (double-attach is legal, PROBE-FINDINGS §3), and one
                         // `claude attach` that came up is one resume.
-                        resumed.insert(short_id.as_str());
+                        resumed.insert(entry.short_id.as_str());
                     }
                 }
             }
@@ -2985,7 +3008,7 @@ impl App {
                 continue;
             };
             match restart::agent_verdict(sess) {
-                restart::Verdict::Restart => match (self.agents_stop)(id) {
+                restart::Verdict::Restart => match (self.agents_stop)(sess) {
                     Ok(()) => stopped.push(id),
                     Err(_) => out.failed += 1,
                 },
@@ -3132,7 +3155,7 @@ impl App {
                 // `respawn` would un-stop it.
                 restart::Verdict::NotRunning => continue,
             }
-            if (self.agents_respawn)(&t.short_id).is_ok() {
+            if (self.agents_respawn)(sess).is_ok() {
                 out.restarted += 1;
                 continue;
             }
@@ -3318,7 +3341,7 @@ impl App {
     /// `created` carries the `~`-shortened path when this submit mkdir'd it,
     /// so the flash names what now exists on disk even if dispatch then fails.
     fn dispatch_and_close(&mut self, cwd: &str, task: &str, created: Option<String>) {
-        match (self.dispatch)(cwd, task) {
+        match (self.dispatch)(Provider::Claude, cwd, task) {
             Ok(short_id) => {
                 self.prompt = None;
                 self.mode = Mode::Normal;
@@ -4771,6 +4794,7 @@ fn agents_msg(e: &AgentsError) -> String {
         AgentsError::Parse(ParseError::Json { excerpt, .. }) => format!("bad json: {excerpt}"),
         AgentsError::Parse(ParseError::NotAnArray) => "bad json: not an array".to_string(),
         AgentsError::NotAttachable => "session has no id".to_string(),
+        AgentsError::UnsupportedProvider { .. } | AgentsError::NotConfigured(_) => e.to_string(),
     }
 }
 
@@ -4882,7 +4906,7 @@ mod tests {
             // real `claude` (a dispatch here would start a real background
             // session on the operator's daemon). Tests that exercise the submit
             // path install their own recording stub.
-            dispatch: |_, _| panic!("unit test reached dispatch_background"),
+            dispatch: |_, _, _| panic!("unit test reached dispatch_background"),
             // STRUCTURAL, exactly like `dispatch` and `respawn`: `R`'s agent
             // pass STOPS live sessions, and the unit suite runs on the same
             // machine as the operator's real fleet. Neither seam may reach a
@@ -7467,13 +7491,15 @@ mod tests {
     /// behaves again whenever the banner changes shape. `Ok(None)` is the
     /// degraded case, and every pre-existing §8.6 test runs through it, which
     /// is what proves the degradation is exactly today's behaviour.
-    fn recording_dispatch(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+    fn recording_dispatch(provider: Provider, cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+        assert_eq!(provider, Provider::Claude);
         DISPATCHED.with(|d| d.borrow_mut().push((cwd.to_string(), task.to_string())));
         Ok(None)
     }
 
     /// The seam as the real CLI behaves: it hands back the short id.
-    fn recording_dispatch_with_id(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+    fn recording_dispatch_with_id(provider: Provider, cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+        assert_eq!(provider, Provider::Claude);
         DISPATCHED.with(|d| d.borrow_mut().push((cwd.to_string(), task.to_string())));
         Ok(Some("e44654bf".to_string()))
     }
@@ -9913,9 +9939,11 @@ mod tests {
     /// `agents::stop`, whose process boundary is closed in test builds — so the
     /// same call proves the ORDER here and the exact argv (`stop <id>`) in
     /// `agents::test_spawn`, and `fail_next` still works on it.
-    fn recording_stop(id: &str) -> Result<(), AgentsError> {
+    fn recording_stop(session: &Session) -> Result<(), AgentsError> {
+        assert_eq!(session.provider, Provider::Claude);
+        let id = session.id.as_deref().unwrap();
         ORDER.with(|o| o.borrow_mut().push(format!("stop {id}")));
-        agents::stop(id)
+        agents::stop(session)
     }
 
     /// The paneless-restart seam, on the SAME timeline as the stops and the
@@ -9928,7 +9956,9 @@ mod tests {
     /// already owns `respawn %N` on this timeline, and an ordering assertion
     /// that could not tell a pane from an agent would pass for the wrong
     /// reason.
-    fn recording_agent_respawn(id: &str) -> Result<(), AgentsError> {
+    fn recording_agent_respawn(session: &Session) -> Result<(), AgentsError> {
+        assert_eq!(session.provider, Provider::Claude);
+        let id = session.id.as_deref().unwrap();
         ORDER.with(|o| o.borrow_mut().push(format!("respawn-agent {id}")));
         if RESPAWN_AGENT_FAIL.with(|f| f.borrow().contains(id)) {
             return Err(AgentsError::Cmd {
@@ -9936,7 +9966,7 @@ mod tests {
                 stderr: "daemon refused the respawn".into(),
             });
         }
-        agents::respawn(id)
+        agents::respawn(session)
     }
 
     /// Make the paneless restart of `id` fail, as it does when the daemon
@@ -11651,3 +11681,6 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod pane_tests;

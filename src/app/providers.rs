@@ -265,7 +265,8 @@ impl App {
             AgentsError::NotFound(_) => FailureCategory::CommandUnavailable,
             AgentsError::Cmd { .. } => FailureCategory::CommandFailed,
             AgentsError::Parse(_) => FailureCategory::InvalidPayload,
-            AgentsError::NotAttachable => FailureCategory::CommandFailed,
+            AgentsError::NotAttachable | AgentsError::UnsupportedProvider { .. }
+                | AgentsError::NotConfigured(_) => FailureCategory::CommandFailed,
         };
         self.diagnostics.claude.failure(category, model::truncate_end(&agents_msg(error), POLL_ERR_MAX));
     }
@@ -350,10 +351,22 @@ impl App {
         self.msg_deadline = now.checked_add(MSG_TTL);
     }
 
-    /// Temporary step-3 boundary: rows are visible before remote pane support.
-    pub(super) fn refuse_codex_pane(&mut self) -> bool {
-        if self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
-            self.flash("Codex pane actions unavailable in this build", MsgLevel::Warn);
+    /// Opening uses non-secret settings even when polling or credentials fail.
+    /// A known unsafe resolution remains refused until a successful reload.
+    pub(super) fn refuse_codex_open(&mut self) -> bool {
+        if !self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
+            return false;
+        }
+        let settings = &self.codex.settings;
+        let reason = if !settings.enabled() || settings.config().is_err()
+            || !settings.token_file.is_absolute() || settings.bin.is_empty()
+        {
+            Some("codex not configured — open unavailable")
+        } else if self.codex.open_rejected {
+            Some("codex localhost resolved outside loopback — open unavailable")
+        } else { None };
+        if let Some(reason) = reason {
+            self.flash(reason, MsgLevel::Warn);
             true
         } else { false }
     }

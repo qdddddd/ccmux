@@ -1,9 +1,10 @@
 # ccmux
 
-A tmux-backed, neovim-style frontend for Claude Code background sessions.
+A tmux-backed, neovim-style frontend for Claude Code background sessions and
+Codex sessions.
 
 `claude agents` gives you a fleet view. ccmux gives you a workspace: a session
-list pinned to the left of a tmux window, with the real Claude Code TUIs open in
+list pinned to the left of a tmux window, with the real agent TUIs open in
 splits to its right. tmux keeps everything alive across detaches and SSH drops.
 
 ```
@@ -60,7 +61,46 @@ The palette can also be set with `CCMUX_THEME=dark`. A flag wins over the
 variable. `CCMUX_CLAUDE_BIN` overrides the `claude` binary, and
 `CCMUX_TMUX_SOCKET` is the variable form of `--socket`.
 
+## Codex sessions
+
+Codex is opt-in. Point ccmux at an existing Codex app-server:
+
+```sh
+ccmux --codex-url ws://127.0.0.1:8965 \
+  --codex-token-file "$HOME/.config/agents/codex-serve.token"
+```
+
+The environment equivalents are `CCMUX_CODEX_URL` and
+`CCMUX_CODEX_TOKEN_FILE`; flags take precedence. `CCMUX_CODEX_BIN`
+selects the Codex executable. Settings follow new tabs and `R` restarts.
+The token is read inside each attach pane, never placed in tmux options or
+command arguments. No URL means no Codex connections.
+
+Only loopback `ws://` is supported: `localhost`, `127.0.0.0/8` or
+`[::1]`. For a remote server, open your own SSH tunnel, for example
+`ssh -N -L 8965:127.0.0.1:8965 host`, then use the local URL above.
+
+The list includes loaded threads and unloaded threads updated in the last
+seven days, limited to persistent, top-level threads. `> ` marks Codex rows;
+`◇` means unloaded and appears under Completed. It does not establish the
+last turn's outcome.
+
+`Enter/o/s/t` open the official Codex TUI; `x` closes a pane while work
+stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
+as usual; `r` also reloads credentials and DNS. `Ctrl-x` and `L` refuse
+on Codex rows. `n` always creates a Claude session, using the sidebar's local
+cwd when Codex is selected. `R` skips Codex panes.
+
+After `/quit` in the Codex TUI, the pane parks: Enter resumes, `s` opens a
+shell, `q` closes it. The pane map records the **launch target**.
+`/resume`, `/new` and `/fork` can change the TUI's thread without
+changing that record: sidebar Enter/`x` still refer to the original launch,
+and a parked retry returns to it. The Codex TUI owns all thread mutations.
+
 ## Keys
+
+The stop, delete and logs keys below apply to Claude rows; Codex differences
+are listed above.
 
 | Key | Action |
 |---|---|
@@ -93,8 +133,8 @@ Pasted text is never run as keys.
 
 ## The list
 
-Only background sessions are listed: those started with `claude --bg` or `n`.
-Interactive sessions cannot be attached into a split, so they are left out.
+Claude rows list only background sessions: those started with `claude --bg` or `n`.
+Interactive Claude sessions cannot be attached into a split, so they are left out.
 
 Groups run **Blocked**, **Working**, **Idle**, **Completed**.
 
@@ -106,6 +146,7 @@ Groups run **Blocked**, **Working**, **Idle**, **Completed**.
 | `○` gray | Idle |
 | `✓` green | Completed |
 | `■` gray | Stopped. Opening it resumes it |
+| `◇` gray | Codex thread unloaded from this server |
 | `?` purple | A state this build does not recognize. The footer names it |
 | `▌` aqua | Open in a pane in this tab |
 | `▌` grey | Open in a pane in another tab |
@@ -140,7 +181,7 @@ missing sidebar. Windows you create yourself are never touched.
 
 ## Detaching
 
-`Ctrl-z` in an attached pane detaches from the session. The agent keeps running.
+`Ctrl-z` in a Claude pane detaches from the session. The agent keeps running.
 The pane then waits instead of closing:
 
 ```
@@ -176,12 +217,13 @@ as they are.
 |---|---|
 | This sidebar | `exec` |
 | Other tabs' sidebars | `respawn-pane` |
-| Panes ccmux opened | `respawn-pane` with `claude attach` |
+| Claude panes ccmux opened | `respawn-pane` with `claude attach` |
 | Idle or done agents in those panes | `claude stop`, then the pane re-attaches |
 | Idle or done running agents with no pane | `claude respawn` |
 | Working or blocked agents | Skipped, and counted as `busy` |
 | Stopped or finished sessions | Skipped, never started |
 | Detached panes | Skipped, and counted as `skipped` |
+| Codex panes | Skipped; the app-server is untouched |
 | Agents attached anywhere else on the machine | Skipped |
 
 A restarted agent keeps its id, name and conversation. Its age resets, because
@@ -245,5 +287,5 @@ ccmux --socket ccmux-test --session scratch
 tmux -L ccmux-test kill-server
 ```
 
-`SPEC.md` is the implementation contract. `PROBE-FINDINGS.md` records the tmux
-and `claude` behaviour it is based on.
+`SPEC.md` is the implementation contract. `PROBE-FINDINGS.md` records the tmux,
+Claude and Codex behaviour it is based on.

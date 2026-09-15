@@ -1,14 +1,14 @@
 //! Owner: Agents lane. SPEC §3.3.
 //!
 //! Everything that shells out to `claude`, plus the shell-command templates for
-//! panes. Builds strings; never runs tmux.
+//! panes, including Codex remote attach. Builds strings; never runs tmux.
 //!
 //! Consumes `model::{Payload, ParseError}`, `tmux::sh_quote` (the pane command
 //! templates are the shell boundary of RULE Q2 and must quote through the same
 //! function the launcher uses), and `tmux::OPT_PANE_DETACHED` — the name of the
 //! pane option `attach_pane_cmd` latches is single-sourced with the `PANE_FMT`
-//! field that reads it back, so the two can never drift apart. Nothing else
-//! from `tmux`.
+//! field that reads it back, so the two can never drift apart. Codex also
+//! uses the configured socket and provider-bearing PaneEntry.
 //!
 //! SPEC NOTE (polling): SPEC §4.2 pins polling as *synchronous, on the
 //! event-loop thread* — "No threads, no channels, no async runtime" — and §10.3
@@ -30,8 +30,9 @@ use std::sync::OnceLock;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use crate::model::{ParseError, Payload};
-use crate::tmux::{LATCH_SHELL, OPT_PANE_DETACHED, sh_quote};
+use crate::codex::CodexConfig;
+use crate::model::{ParseError, Payload, Provider, Session};
+use crate::tmux::{PaneEntry, LATCH_SHELL, OPT_PANE_DETACHED, sh_quote};
 
 #[derive(Debug)]
 pub enum AgentsError {
@@ -43,6 +44,8 @@ pub enum AgentsError {
     Parse(ParseError),
     /// Caller asked for a verb that needs a short id on a session without one.
     NotAttachable,
+    UnsupportedProvider { provider: Provider, verb: &'static str },
+    NotConfigured(Provider),
 }
 
 /// SPEC NOTE: these strings are **footer-ready**. §9.1 wants
@@ -65,11 +68,30 @@ impl std::fmt::Display for AgentsError {
             AgentsError::Parse(ParseError::Json { excerpt, .. }) => write!(f, "bad json: {excerpt}"),
             AgentsError::Parse(ParseError::NotAnArray) => write!(f, "bad json: not a JSON array"),
             AgentsError::NotAttachable => write!(f, "session has no short id"),
+            AgentsError::UnsupportedProvider { provider, verb } =>
+                write!(f, "{provider:?} {verb} unavailable in v1"),
+            AgentsError::NotConfigured(Provider::Codex) =>
+                write!(f, "codex not configured — open unavailable"),
+            AgentsError::NotConfigured(Provider::Claude) =>
+                write!(f, "claude not configured — open unavailable"),
         }
     }
 }
 
 impl std::error::Error for AgentsError {}
+
+/// Provider is checked before any Claude addressing or process boundary.
+fn require_claude(provider: Provider, verb: &'static str) -> Result<(), AgentsError> {
+    if provider != Provider::Claude {
+        return Err(AgentsError::UnsupportedProvider { provider, verb });
+    }
+    Ok(())
+}
+
+fn claude_id<'a>(session: &'a Session, verb: &'static str) -> Result<&'a str, AgentsError> {
+    require_claude(session.provider, verb)?;
+    session.id.as_deref().filter(|id| !id.is_empty()).ok_or(AgentsError::NotAttachable)
+}
 
 /// First line of `s` that is not blank after trimming, trimmed.
 fn first_nonempty_line(s: &str) -> Option<&str> {
@@ -99,6 +121,7 @@ pub fn claude_bin() -> String {
 /// and pipes stdout/stderr, so nothing the child prints can corrupt the
 /// alternate screen. It also reaps the child, which `spawn()` without a `wait`
 /// would not — this process is long-lived and must not accumulate zombies.
+#[cfg(not(test))]
 fn run(args: &[&str]) -> Result<std::process::Output, AgentsError> {
     let bin = claude_bin();
     Command::new(&bin).args(args).output().map_err(|e| match e.kind() {
@@ -108,6 +131,21 @@ fn run(args: &[&str]) -> Result<std::process::Output, AgentsError> {
             stderr: e.to_string(),
         },
     })
+}
+
+#[cfg(test)]
+fn run(args: &[&str]) -> Result<std::process::Output, AgentsError> {
+    use std::os::unix::process::ExitStatusExt;
+    test_spawn::intercept(args)?;
+    Ok(std::process::Output {
+        status: std::process::ExitStatus::from_raw(0), stdout: Vec::new(), stderr: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+fn dispatch_claude(_cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+    test_spawn::intercept(&["--bg", task])?;
+    Ok(None)
 }
 
 /// Wall-clock ceiling on one `claude agents --json --all`.
@@ -374,13 +412,8 @@ pub mod test_spawn {
 /// calls it to refresh one, and the pane's own `claude attach` is the resume.
 ///
 /// Bounded by `STOP_TIMEOUT` — see the constant for why `delete` is not.
-pub fn stop(id: &str) -> Result<(), AgentsError> {
-    // Fail closed rather than invoking `claude stop ''`: an empty id is what an
-    // unchecked `Option<String>` collapses to, and this is the destructive verb
-    // (Appendix A.1 — the empty-target class of bug).
-    if id.is_empty() {
-        return Err(AgentsError::NotAttachable);
-    }
+pub fn stop(session: &Session) -> Result<(), AgentsError> {
+    let id = claude_id(session, "stop")?;
     run_checked(&["stop", id], Some(STOP_TIMEOUT))
 }
 
@@ -420,12 +453,8 @@ pub fn stop(id: &str) -> Result<(), AgentsError> {
 /// No `current_dir`: the session carries its own directory.
 ///
 /// Bounded by `RESPAWN_TIMEOUT` — see the constant.
-pub fn respawn(id: &str) -> Result<(), AgentsError> {
-    // Same fail-closed guard as `stop`: an empty id is what an unchecked
-    // `Option<String>` collapses to, and this verb restarts a worker.
-    if id.is_empty() {
-        return Err(AgentsError::NotAttachable);
-    }
+pub fn respawn(session: &Session) -> Result<(), AgentsError> {
+    let id = claude_id(session, "restart")?;
     run_checked(&["respawn", id], Some(RESPAWN_TIMEOUT))
 }
 
@@ -530,22 +559,17 @@ fn attach_id(cmdline: &[u8], want: &str) -> Option<String> {
 ///
 /// Same fail-closed empty-id guard as `stop`, for the same reason: `claude rm ''`
 /// must never be built.
-pub fn delete(id: &str) -> Result<(), AgentsError> {
-    if id.is_empty() {
-        return Err(AgentsError::NotAttachable);
-    }
-    // Deliberately UNBOUNDED — see `STOP_TIMEOUT`. A kill halfway through a
-    // worktree removal is not a timeout, it is damage.
+pub fn delete(session: &Session) -> Result<(), AgentsError> {
+    let id = claude_id(session, "delete")?;
+    // Deliberately unbounded: never interrupt worktree removal halfway.
     run_checked(&["rm", id], None)
 }
 
 /// `claude logs <id>`. Output is a RAW ANSI/PTY DUMP including alt-screen setup
 /// and cursor moves (PROBE-FINDINGS §2) — always pass it through `strip_ansi`
 /// before display. Returns the last `lines` lines after stripping.
-pub fn logs(id: &str, lines: usize) -> Result<String, AgentsError> {
-    if id.is_empty() {
-        return Err(AgentsError::NotAttachable);
-    }
+pub fn logs(session: &Session, lines: usize) -> Result<String, AgentsError> {
+    let id = claude_id(session, "logs")?;
     let out = run(&["logs", id])?;
     check_status(&out)?;
     let text = strip_ansi(&String::from_utf8_lossy(&out.stdout));
@@ -586,7 +610,13 @@ fn last_lines(text: &str, lines: usize) -> String {
 /// the session was dispatched either way, and the id is only ever used to move
 /// the cursor onto the new row (§8.6). A CLI whose banner changes must lose the
 /// cursor jump, never the dispatch.
-pub fn dispatch_background(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+pub fn dispatch_background(provider: Provider, cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
+    require_claude(provider, "dispatch")?;
+    dispatch_claude(cwd, task)
+}
+
+#[cfg(not(test))]
+fn dispatch_claude(cwd: &str, task: &str) -> Result<Option<String>, AgentsError> {
     let bin = claude_bin();
     let out = Command::new(&bin)
         .arg("--bg")
@@ -638,6 +668,38 @@ fn is_short_id(tok: &str) -> bool {
 }
 
 // ── Pane command templates (shell strings; see §7) ──────────────────────────
+
+/// Dispatch a pane command from the row's provider and native address.
+/// This is pure string construction; credentials are read only inside the pane.
+pub fn attach_pane_cmd(session: &Session, codex: Option<&CodexConfig>) -> Result<String, AgentsError> {
+    attach_cmd(session.provider, &session.session_id, session.id.as_deref().unwrap_or(""), codex)
+}
+
+/// Restart/restore uses the persisted launch record, never a display id guess.
+pub fn attach_entry_cmd(entry: &PaneEntry, codex: Option<&CodexConfig>) -> Result<String, AgentsError> {
+    attach_cmd(entry.provider, &entry.session_id, &entry.short_id, codex)
+}
+
+fn attach_cmd(
+    provider: Provider, native_id: &str, short_id: &str, codex: Option<&CodexConfig>,
+) -> Result<String, AgentsError> {
+    match provider {
+        Provider::Claude => {
+            if short_id.is_empty() { return Err(AgentsError::NotAttachable); }
+            Ok(claude_attach_cmd(short_id))
+        }
+        Provider::Codex => {
+            let config = codex.ok_or(AgentsError::NotConfigured(provider))?;
+            if crate::codex::validate_url(&config.url).is_err() || config.bin.is_empty()
+                || !config.token_file.is_absolute()
+            {
+                return Err(AgentsError::NotConfigured(provider));
+            }
+            if !crate::model::valid_codex_id(native_id) { return Err(AgentsError::NotAttachable); }
+            codex_attach_cmd(native_id, config, crate::tmux::socket().as_deref())
+        }
+    }
+}
 
 /// Shell command for a pane that attaches a background session.
 ///
@@ -767,7 +829,7 @@ fn is_short_id(tok: &str) -> bool {
 /// `o`/`s`/`t` or from `R` — and a background session's real directory is a
 /// `.claude/worktrees/…` checkout the daemon owns, which is not somewhere to
 /// drop an operator with a live agent in it.
-pub fn attach_pane_cmd(id: &str) -> String {
+fn claude_attach_cmd(id: &str) -> String {
     let bin = sh_quote(&claude_bin());
     let id = sh_quote(id);
     // Quoted a second time because these two are PRINTED, not run: the shell
@@ -794,6 +856,40 @@ pub fn attach_pane_cmd(id: &str) -> String {
         opt = OPT_PANE_DETACHED,
         shell = LATCH_SHELL,
     )
+}
+
+/// Pure pane template: the only token read happens in the pane's own shell.
+/// The displayed retry line is quoted as data, so it retains literal $(cat ...).
+fn codex_attach_cmd(id: &str, config: &CodexConfig, socket: Option<&str>) -> Result<String, AgentsError> {
+    let token_file = config.token_file.to_str().ok_or(AgentsError::NotConfigured(Provider::Codex))?;
+    let invocation = format!(
+        "CODEX_REMOTE_TOKEN=\"$(cat {file})\" {bin} --remote {url} \
+         --remote-auth-token-env CODEX_REMOTE_TOKEN resume {id}",
+        file = sh_quote(token_file),
+        bin = sh_quote(&config.bin), url = sh_quote(&config.url), id = sh_quote(id),
+    );
+    let shown = sh_quote(&invocation);
+    let tmux = match socket {
+        Some(socket) => format!("tmux -L {}", sh_quote(socket)),
+        None => "tmux".into(),
+    };
+    Ok(format!(
+        "while :; do \
+         case \"${{TMUX_PANE:-}}\" in %*) case \"${{TMUX_PANE#%}}\" in ''|*[!0-9]*) exit 2;; esac;; *) exit 2;; esac; \
+         {tmux} set-option -p -u -t \"$TMUX_PANE\" {opt} 2>/dev/null; \
+         {invocation}; rc=$?; \
+         {tmux} set-option -p -t \"$TMUX_PANE\" {opt} 1 2>/dev/null; \
+         printf '\\n[ccmux] Codex attach exited (rc=%s). resume: %s\\n' \"$rc\" {shown}; \
+         printf '[ccmux] enter=resume  s=shell  q=close pane: '; \
+         read ans || ans=q; \
+         case \"$ans\" in s|S) break;; q|Q) exit \"$rc\";; esac; \
+         done; \
+         {tmux} set-option -p -t \"$TMUX_PANE\" {opt} {shell} 2>/dev/null; \
+         printf '\\n'; \
+         [ -x \"${{SHELL:-}}\" ] || SHELL=/bin/sh; \
+         exec \"$SHELL\" -l",
+        opt = OPT_PANE_DETACHED, shell = LATCH_SHELL,
+    ))
 }
 
 // ── ANSI ────────────────────────────────────────────────────────────────────
@@ -864,6 +960,17 @@ pub fn strip_ansi(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    fn session(id: &str) -> Session {
+        crate::model::parse_sessions(&format!(
+            r#"[{{"id":{id},"sessionId":"fixture-uuid","name":"fixture","cwd":"/tmp"}}]"#,
+            id = serde_json::to_string(id).unwrap(),
+        )).unwrap().sessions.remove(0)
+    }
+
+    fn attach(id: &str) -> String {
+        attach_pane_cmd(&session(id), None).unwrap()
+    }
+
     // ── §10.1 agents.rs ─────────────────────────────────────────────────────
 
     // NOTE: `claude_bin()` is "claude" unless CCMUX_CLAUDE_BIN is set, and
@@ -873,7 +980,7 @@ mod tests {
     #[test]
     fn attach_pane_cmd_matches_spec_template() {
         assert_eq!(
-            attach_pane_cmd("1c45d64f"),
+            attach("1c45d64f"),
             "while :; do \
              [ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" @ccmux_detached 2>/dev/null; \
              claude attach 1c45d64f; rc=$?; \
@@ -898,7 +1005,7 @@ mod tests {
     /// written once: a second write anywhere would be a second opinion.
     #[test]
     fn attach_pane_cmd_marks_the_pane_as_a_shell_on_the_way_out_of_the_loop() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         let mark = format!("tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} {LATCH_SHELL} 2>/dev/null");
         let at = cmd.find(&mark).expect("shell mark");
         let done = cmd.find("; done; ").expect("loop end");
@@ -918,7 +1025,7 @@ mod tests {
     /// forever.
     #[test]
     fn attach_pane_cmd_ends_by_execing_an_interactive_login_shell() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         assert!(cmd.ends_with("exec \"$SHELL\" -l"), "{cmd}");
         assert!(!cmd.contains("read _"), "the old close-the-pane trailer is gone: {cmd}");
         // $SHELL, with a fallback that cannot be an empty program name.
@@ -936,7 +1043,7 @@ mod tests {
     /// path from the attach's exit to the `exec` must go through the `read`.
     #[test]
     fn attach_pane_cmd_never_reaches_the_shell_without_a_keystroke() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         let attach = cmd.find("claude attach").expect("attach");
         let read = cmd.find("read ans || ans=q").expect("read");
         let exec = cmd.find("exec \"$SHELL\"").expect("exec");
@@ -957,7 +1064,7 @@ mod tests {
     /// attach). Enter still re-runs the SAME attach; the loop is what does that.
     #[test]
     fn attach_pane_cmd_clears_the_latch_before_every_attach() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         let clear = cmd
             .find(&format!(
                 "[ -n \"$TMUX_PANE\" ] && tmux set-option -p -u -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 2>/dev/null"
@@ -986,7 +1093,7 @@ mod tests {
     /// exit status when the operator closes it.
     #[test]
     fn attach_pane_cmd_surfaces_the_exit_code() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         assert!(cmd.contains("attach 1c45d64f; rc=$?;"), "{cmd}");
         assert!(cmd.contains("(rc=%s)"), "{cmd}");
         assert!(cmd.contains("\"$rc\""), "{cmd}");
@@ -998,7 +1105,7 @@ mod tests {
     /// PANE-scoped, and target the pane it runs in.
     #[test]
     fn attach_pane_cmd_latches_the_pane_option_on_itself() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         assert!(
             cmd.contains(&format!(
                 "tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 1 2>/dev/null"
@@ -1023,7 +1130,7 @@ mod tests {
     /// `2>/dev/null` never covered that; the guard does.
     #[test]
     fn attach_pane_cmd_never_latches_a_pane_it_cannot_name() {
-        let cmd = attach_pane_cmd("1c45d64f");
+        let cmd = attach("1c45d64f");
         for op in [
             format!("tmux set-option -p -t \"$TMUX_PANE\" {OPT_PANE_DETACHED} 1"),
             format!("tmux set-option -p -u -t \"$TMUX_PANE\" {OPT_PANE_DETACHED}"),
@@ -1043,7 +1150,7 @@ mod tests {
     /// `%` in it is inert as well as unquoted-safe.
     #[test]
     fn attach_pane_cmd_quotes_a_hostile_id() {
-        let cmd = attach_pane_cmd("a'; rm -rf ~; echo '%s");
+        let cmd = attach("a'; rm -rf ~; echo '%s");
         assert!(
             cmd.contains("; claude attach 'a'\\''; rm -rf ~; echo '\\''%s'; rc=$?"),
             "{cmd}"
@@ -1068,7 +1175,7 @@ mod tests {
     /// why this shows up only in the human-facing half.
     #[test]
     fn attach_pane_cmd_prints_a_resume_line_that_can_be_pasted_back() {
-        let cmd = attach_pane_cmd("a b");
+        let cmd = attach("a b");
         // Run: one layer, so the shell sees `attach 'a b'`.
         assert!(cmd.contains("; claude attach 'a b'; rc=$?"), "{cmd}");
         // Printed: two, so the shell hands `printf` the literal text `'a b'`.
@@ -1077,7 +1184,7 @@ mod tests {
 
         // And an ordinary id is untouched by either layer, so the common line
         // reads exactly as it always did.
-        let plain = attach_pane_cmd("1c45d64f");
+        let plain = attach("1c45d64f");
         assert!(plain.contains("resume: %s attach %s\\n' \"$rc\" claude 1c45d64f;"), "{plain}");
     }
 
@@ -1336,10 +1443,10 @@ mod tests {
     fn stop_delete_and_logs_refuse_an_empty_id_without_spawning() {
         // Fail-closed guard: never `claude stop ''`, never `claude rm ''`,
         // never `claude respawn ''`.
-        assert!(matches!(stop(""), Err(AgentsError::NotAttachable)));
-        assert!(matches!(delete(""), Err(AgentsError::NotAttachable)));
-        assert!(matches!(logs("", 10), Err(AgentsError::NotAttachable)));
-        assert!(matches!(respawn(""), Err(AgentsError::NotAttachable)));
+        assert!(matches!(stop(&session("")), Err(AgentsError::NotAttachable)));
+        assert!(matches!(delete(&session("")), Err(AgentsError::NotAttachable)));
+        assert!(matches!(logs(&session(""), 10), Err(AgentsError::NotAttachable)));
+        assert!(matches!(respawn(&session("")), Err(AgentsError::NotAttachable)));
         assert!(test_spawn::calls().is_empty(), "an empty id must not reach the boundary");
     }
 
@@ -1354,7 +1461,7 @@ mod tests {
     #[test]
     fn the_paneless_restart_names_one_short_id_and_nothing_else() {
         test_spawn::reset();
-        assert!(respawn("4fc47ebd").is_ok());
+        assert!(respawn(&session("4fc47ebd")).is_ok());
         assert_eq!(test_spawn::joined(), vec!["respawn 4fc47ebd"]);
         let argv = test_spawn::calls();
         assert!(
@@ -1423,15 +1530,18 @@ mod tests {
     #[test]
     fn the_two_verbs_are_pure_argv_and_name_the_documented_subcommands() {
         test_spawn::reset();
-        assert!(stop("1c45d64f").is_ok());
-        assert!(delete("1c45d64f").is_ok());
+        assert!(stop(&session("1c45d64f")).is_ok());
+        assert!(delete(&session("1c45d64f")).is_ok());
         // RULE Q4: positional argv, no shell, no flags invented on the side.
         assert_eq!(test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
 
         // A non-zero exit surfaces through the same footer-ready Display both
         // verbs already share.
         test_spawn::fail_next("no such session: 1c45d64f");
-        let err = delete("1c45d64f").expect_err("queued failure");
+        let err = delete(&session("1c45d64f")).expect_err("queued failure");
         assert_eq!(err.to_string(), "no such session: 1c45d64f");
     }
 }
+
+#[cfg(test)]
+mod codex_tests;

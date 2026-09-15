@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::model::{Group, Kind, Provider, Session, State};
-use crate::tmux::{PaneId, PaneInfo, TabInfo};
+use crate::tmux::{PaneEntry, PaneId, PaneInfo, TabInfo};
 
 /// The env var that tells a fresh sidebar it is the second half of an `R`, and
 /// so must finish the job by respawning everything this image could not.
@@ -94,7 +94,7 @@ pub enum Role {
     Sidebar,
     /// A pane in some window's `@ccmux_tab_map`: restart it with
     /// `claude attach <short_id>` under the usual wrapper.
-    Claude { short_id: String },
+    Claude { entry: PaneEntry },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +200,8 @@ impl Plan {
         self.targets
             .iter()
             .filter_map(|t| match &t.role {
-                Role::Claude { short_id } => Some(short_id.as_str()),
+                Role::Claude { entry } if entry.provider == Provider::Claude => Some(entry.short_id.as_str()),
+                Role::Claude { .. } => None,
                 Role::Sidebar => None,
             })
             .filter(|id| seen.insert(id))
@@ -541,7 +542,7 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
             seen.insert(pane.clone());
             out.targets.push(Target {
                 pane,
-                role: Role::Claude { short_id: entry.short_id.clone() },
+                role: Role::Claude { entry: entry.clone() },
             });
             out.claude += 1;
         }
@@ -1033,7 +1034,7 @@ mod tests {
         assert_eq!((p.sidebars, p.claude), (2, 3));
         assert_eq!(
             p.targets[1].role,
-            Role::Claude { short_id: "aaaaaaaa".into() },
+            Role::Claude { entry: tabs[0].map.panes["%2"].clone() },
             "a mapped pane is restarted as its own attach client"
         );
     }
