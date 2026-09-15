@@ -511,3 +511,386 @@ default socket. Never steal focus: no `select-window`, `switch-client`, or
 
 `ccmux` must accept a socket override (`-L/--socket`, default none) precisely so it can
 be tested here. Test it as `ccmux --socket ccmux ...`, never against the default socket.
+
+## 9. Codex app-server probes — 2026-09-16
+
+These findings apply to **codex-cli 0.154.0 connecting to app-server 0.153.4**
+on this host, with tmux 3.4. All measurements below were made on **2026-09-16
+(Asia/Taipei, UTC+08:00)**; clock times in this section are local. The temporary
+stdio contention probe also used 0.153.4. These version and date qualifiers
+apply to every finding below.
+
+### Method and isolation
+
+Only the explicitly authorized `ccmux-probe` tmux socket was used, overriding
+the older socket example in §8 for this run. The harness removed `TMUX` and
+`TMUX_PANE` from the environment of every tmux invocation and initialized:
+
+```sh
+env -u TMUX -u TMUX_PANE tmux -L ccmux-probe -f /dev/null \
+  new-session -d -s probe -x 180 -y 48 '/usr/bin/sleep 7200'
+```
+
+Every new window used `tmux -L ccmux-probe new-window -d -t =probe:`, with a
+command, never an interactive shell. Returned `%N` pane IDs were recorded and
+checked against this server before capture, input, or destruction. Each TUI ran
+this command inside a noninteractive wrapper; the wrapper recorded its exit
+code and parked on `sleep`:
+
+```sh
+CODEX_REMOTE_TOKEN="$(cat /home/qdu/.config/agents/codex-serve.token)" \
+  codex --remote ws://127.0.0.1:8965 \
+  --remote-auth-token-env CODEX_REMOTE_TOKEN resume "$THREAD_ID"
+```
+
+The token was read into process memory only, never printed or placed in argv,
+probe results, or this repository. RPC probes used Python
+`~/.venv/bin/python` with `websockets.sync.client.connect`, a Bearer authorization
+header, and proxy bypass for the loopback endpoint. Temporary scripts and
+timestamped evidence are under
+`~/.local/tmp/ccmux-probe-20260916/` (`probe.py`, `scenarios.py`,
+`extra.py`, `watch_grace.py`, `events.jsonl`, and the ownership registry).
+The methods and relevant wire parameters are recorded here so the findings
+do not depend on retaining those temporary files.
+
+Each connection sent `initialize` with
+`clientInfo={"name":"ccmux_probe","version":"2026-09-16"}`,
+`capabilities={"experimentalApi":true}`, then the `initialized` notification.
+Messages were dispatched by field presence: `method` denotes a server
+notification/request; a response has `id` without `method`. Only requests
+belonging to owned probe threads could be held or answered.
+
+Probe threads used `thread/start` with
+`cwd="/home/qdu/.local/tmp/ccmux-probe-20260916/work"`,
+`model="gpt-5.6-luna"`, `config={"model_reasoning_effort":"low"}`,
+`ephemeral=false`, `sandbox="read-only"`, `approvalPolicy="never"`,
+and `approvalsReviewer="user"`. Restrictive developer instructions limited
+them to the exact probe task. Each returned `Thread.id` was registered before
+any further mutation, then named with `thread/name/set` and a
+`ccmux-probe-` prefix. The approval probe alone used `"untrusted"`.
+The TUI-created fork/new threads were identified from that owned pane's
+`/status` and registered separately. Every model turn used luna/low; the
+`/new` default reset described below was corrected before sending its turn.
+
+### Versions and protocol surface
+
+- **The installed CLI and running server differ.** Commands:
+  `codex --version` returned `codex-cli 0.154.0`;
+  `/proc/4714/exe --version` returned `codex-cli 0.153.4`.
+  PID 4714 was identified read-only by its `app-server` and
+  `--listen ws://0.0.0.0:8965` argv. RPC `initialize` reported a user agent
+  beginning `meterboard/0.153.4`, and the attached TUI's `/status` showed
+  `Remote: ws://127.0.0.1:8965/ (v0.153.4)`. The executable was an old,
+  deleted-on-disk binary still running. **Consequence:** generated bindings
+  from the installed CLI alone do not establish the server's capabilities.
+
+- **The planned read parameters exist in the running server's schema.**
+  Commands:
+  `codex app-server generate-json-schema --out ~/.local/tmp/ccmux-codex-schema-20260916`
+  and
+  `/proc/4714/exe app-server generate-json-schema --out ~/.local/tmp/ccmux-codex-server-schema-20260916`.
+  Both schemas contain `thread/list.useStateDbOnly`, `sourceKinds`,
+  `sortKey`, `sortDirection`, `thread/read.includeTurns`, and
+  `thread/loaded/list.cursor/limit`. The installed schema additionally has
+  `thread/list.originators`; the running server's does not.
+  **Consequence:** v1 can use the measured read subset without that newer filter.
+
+### Attach-safety gate and client lifecycle
+
+**GATE: PASS.**
+
+- **Two TUIs can attach to one thread and receive the same live turn.**
+  Method: launch the wrapper twice for `attach-idle`, producing panes
+  `%1` and `%2`; send
+  `Reply with exactly multi-attach-ok. Do not use tools.` in `%1`.
+  Both panes displayed that prompt and the final `multi-attach-ok`.
+  `/status` identified the original full thread ID.
+  **Consequence:** same-server multi-attach is supported in this version pair.
+
+- **Active work survives loss of its last subscribed client.**
+  Method: send `turn/start` with luna/low and the prompt
+  `Run /usr/bin/sleep 90 using the shell execution tool in the foreground.
+  Do not background it or shorten the duration. After it exits, reply exactly
+  done. Do not inspect files or run any other commands.`
+  Wait for `item/started` containing an in-progress
+  `/bin/zsh -c '/usr/bin/sleep 90'`, attach a TUI, verify its native client
+  process and active display, then close the creating RPC connection.
+  The following action removed the last TUI. Fresh observers used only
+  `thread/read(includeTurns:false)` and
+  `thread/turns/list(limit:2,itemsView:"full")`; they did not resume/subscribe.
+
+  | Owned thread label | Last-client action | Turn ID | Result on the same turn |
+  |---|---|---|---|
+  | `active-pane-valid` | `tmux -L ccmux-probe kill-pane -t %9`, 01:13:10 | `01a0a60e-b8f4-77f2-8c43-ae49400d6260` | completed 01:14:37; command exit 0; final `done` |
+  | `active-sigkill` | `os.kill(2300282, signal.SIGKILL)`, 01:07:54 | `01a0a609-ecfc-76c1-95c1-96bf6a58b588` | completed 01:09:21; command exit 0; final `done` |
+  | `active-graceful-valid` | type `/quit`, wait 0.7 s, Enter in `%10`, 01:13:57 | `01a0a60f-7105-72a1-b4d1-6baa0a087335` | completed 01:15:23; command exit 0; final `done` |
+
+  The SIGKILL PID was first verified as the sole native Codex descendant of
+  the owned pane's PID; no existing client was targeted. Each fresh observer
+  still saw `active{activeFlags:[]}` after client loss. The graceful wrapper
+  reported exit code 0 before the turn completed, and the TUI printed
+  `Disconnected from this task. Any running work continues.`
+  **Consequence:** remote attach and ccmux's pane-closing `x` pass the active-work
+  survival requirement for the measured server.
+
+- **Pending approval survives disconnect and is shown on reattach.**
+  Method: on `approval-last-client`, use per-thread
+  `approvalPolicy:"untrusted"`, `approvalsReviewer:"user"`, and read-only
+  sandbox; ask only for
+  `/usr/bin/touch /home/qdu/.local/tmp/ccmux-probe-20260916/work/approval-marker`.
+  Hold the `item/commandExecution/requestApproval` server request unanswered
+  (request ID `0`, turn
+  `01a0a608-4c13-7090-afaf-9837b1c4fa96`).
+  At 01:06:04, `thread/read` showed
+  `active{activeFlags:["waitingOnApproval"]}`; close the last client.
+  A fresh observer three seconds later saw the same pending turn and flag.
+  Resume in `%3`: the TUI showed the command approval menu.
+  Kill `%3` at 01:06:37; resume in `%4`: the menu appeared again.
+  Choose the one-time Yes, not the persistent rule option.
+  The same command item
+  `exec-194ac023-fc41-4879-89d1-e738cbbd0ded` completed with exit 0,
+  the turn completed at 01:07:42, and its final answer was `done`.
+  **Consequence:** an approval remains actionable after the last client leaves;
+  the read-only sidebar does not need to own or answer it.
+
+- **Graceful exit leaves an idle thread loaded.** Method: after moving `%2`
+  to another owned thread, send `/quit` to the remaining `attach-idle` TUI
+  in `%1`; repeat for `tui-new` in `%2`.
+  Both wrappers exited 0, native client PID sets became empty, and immediate
+  `thread/read` results remained `idle` with unchanged timestamps.
+  **Consequence:** client exit is not a stopped/completed-work status signal.
+
+- **An empty new thread can be loaded but not yet resumable.**
+  Method: the first `active-pane` attempt opened a TUI immediately after
+  `thread/start`, before its first turn. The TUI exited 1 with
+  `invalid paginated history lineage ... missing source rollout`
+  (`thread/resume` error `-32600`). After a first turn had started,
+  ordinary remote resume succeeded.
+  That initial pane kill is excluded from the active-TUI gate evidence.
+  Its turn did independently complete after the creating RPC client closed.
+  A separate first graceful-quit attempt left `/quit` in the composer;
+  only the delayed-input repeat with a verified exited client counts above.
+  **Consequence:** retain the deferral of Codex `n`; loaded membership alone
+  does not guarantee that a brand-new, empty thread has resumable history.
+
+### Idle unload, read side effects, and attach recency
+
+- **Unsubscribed idle threads unloaded after approximately 30 minutes.**
+  Method: complete one trivial turn in each of `grace-control` and
+  `grace-read`; explicitly `thread/unsubscribe` and close the creating
+  connection. Neither had a TUI. The control had no subsequent
+  `thread/read` or resume until the unload check. Both were observed through
+  `thread/loaded/list` and historical listings; `grace-read` additionally
+  received periodic `thread/read(includeTurns:false)`, every 15 seconds from
+  01:23:51 through the boundary.
+
+  | Thread | Unsubscribe time | Last loaded sample | First absent sample | Elapsed-time bound |
+  |---|---|---|---|---|
+  | `grace-control` | 01:02:07.818 | 01:32:07.196 | 01:32:22.211 | (1799.38, 1814.39] s |
+  | `grace-read` | 01:02:35.013 | 01:32:22.212 | 01:32:37.226 | (1787.20, 1802.21] s |
+
+  The latter read at 01:32:37 returned `status:{"type":"notLoaded"}`.
+  Both threads remained in DB-only historical listing with their original
+  timestamps. **Consequence:** recent unloaded rows are necessary to preserve
+  the “done, reopen for review” workflow. Metadata reads did not prevent
+  the measured idle unload; `notLoaded` does not mean stopped or deleted.
+
+- **The planned reads do not load an unloaded persistent thread.**
+  Method: after both controls disappeared from loaded membership, use a fresh
+  connection for each of `thread/list` (DB-only, isolated cwd),
+  `thread/loaded/list`, and `thread/read(includeTurns:false)`.
+  Check loaded membership before and after each, then issue the owned
+  control's `thread/unsubscribe` as an assertion.
+  At 01:32:49 all three left both controls absent from loaded membership;
+  reads/listing returned `notLoaded`, and unsubscribe returned
+  `{"status":"notLoaded"}`. No server request arrived.
+  **Consequence:** the read-only loaded-plus-history union does not itself
+  reload those threads.
+
+- **Ordinary remote resume reopens an unloaded thread without refreshing
+  its activity timestamp.** Method: launch the standard TUI wrapper for
+  `grace-control` in `%11` at 01:32:49; verify a live native client and the
+  original `ready` transcript. The next read returned `idle`, with
+  `createdAt=1789491722`, `updatedAt=1789491727`,
+  `recencyAt=1789491722` unchanged from the `notLoaded` read.
+  `tmux -L ccmux-probe kill-pane -t %11` then left the thread idle.
+  **Consequence:** the same attach command supports loaded and unloaded rows;
+  attach alone does not extend this thread's recent-history eligibility.
+
+- **Read-only polling does not subscribe to a loaded thread.**
+  Method: on a fresh connection, separately call
+  `thread/list(limit:3,sourceKinds:[cli,vscode,exec,appServer,unknown],useStateDbOnly:true)`,
+  `thread/loaded/list(limit:100)`, and
+  `thread/read(threadId:attach-idle,includeTurns:false)`.
+  After each, call `thread/unsubscribe` for that owned thread on the same
+  connection. Every response was `{"status":"notSubscribed"}`.
+  Loaded population remained 12 before/after; the owned thread's metadata
+  did not change. The observer received no server requests, only the unrelated
+  connection notification `remoteControl/status/changed`.
+  **Consequence:** these reads can form a short-lived, non-subscribing poll.
+  `thread/unsubscribe` was a probe assertion, not a proposed v1 poll method.
+
+- **Attaching an already-loaded persistent thread did not advance recency.**
+  Method: read `attach-idle`, open its two TUIs without sending a turn, then
+  read again. Before and after:
+  `createdAt=1789491790`, `updatedAt=1789491795`,
+  `recencyAt=1789491790`. A real new turn later advanced `updatedAt` to
+  `1789491982`. **Consequence:** do not assume viewing a thread renews its
+  recent-history window; the loaded union remains necessary.
+
+### Listing freshness, scope, pagination, and cost
+
+- **DB-only listing was fresh for completed probe turns.**
+  Method: create `empty-index` and list the isolated cwd in the order
+  `useStateDbOnly:true`, `false`, `true`, with the source allowlist below.
+  Before any turn, all three omitted it (nine other probe rows).
+  Run `Reply with exactly indexed. Do not use tools.`; immediately after
+  `turn/completed`, repeat. All three included it (ten rows), with the same
+  ID, name, and timestamps. The first post-completion DB-only query took
+  2.8 ms and already found it, before the scan query ran.
+  Full-population DB-only and scan queries at 01:13:11 also returned identical
+  sets of 32 IDs and no differences in
+  `updatedAt/createdAt/name/cwd/source/ephemeral`.
+  **Consequence:** the measured ordinary write path does not require a
+  scan-and-repair poll. Recovery after an external index fault is
+  **UNMEASURED**: no live storage was altered to manufacture one.
+
+- **Source is not a reliable “created through this endpoint” label.**
+  Method: inspect `Thread.source` on the owned `thread/start`, fork, and new
+  results and on listing metadata. All probe threads reported `"vscode"`,
+  including those created directly over WebSocket RPC.
+  The poll used
+  `sourceKinds:["cli","vscode","exec","appServer","unknown"]` and
+  `modelProviders:[]`. At the pagination check, four loaded IDs were absent
+  from this historical list: three had source `vscode`, one had a structured
+  `subAgent` source; two were ephemeral. All four were idle and recently
+  updated. **Consequence:** query loaded IDs separately, read missing metadata,
+  and apply the persistent/top-level filters to that union too. Do not narrow
+  the historical list to `appServer` source alone.
+
+- **Both list methods paginate with opaque string cursors.**
+  Method: compare a `limit:100` baseline with repeated `limit:3` calls,
+  passing each returned `nextCursor` unchanged until null. Historical calls
+  used `sortKey:"updated_at"`, `sortDirection:"desc"`, the source allowlist,
+  and `useStateDbOnly:true`. At 01:16:18, `thread/list` returned 34 unique
+  rows across 12 pages (eleven of three, one of one), in descending update
+  order. `thread/loaded/list` returned 16 unique IDs across six pages.
+  Neither traversal had duplicates or omissions versus its baseline.
+  **Consequence:** follow cursors for both methods; a single page is not a
+  complete provider observation. These live traversals do not prove an atomic
+  snapshot while other clients mutate rows.
+
+- **A complete cold-connection poll cost about 0.42 s here.**
+  Method: `scenarios.py budget`, 20 consecutive fresh WebSocket connections,
+  each timed from before connect through initialize, loaded-ID pagination,
+  historical pagination, missing-ID metadata reads, and close.
+  Historical requests used `limit:100`, the filters above, and a client-side
+  seven-day cutoff (`updatedAt < now - 7*86400`); traversal stops after
+  the first page crossing the cutoff, or after the final page.
+  Every sample saw 14 loaded IDs, 32 historical rows in one page, and required
+  four `thread/read(includeTurns:false)` calls for loaded IDs absent from
+  history. Measured median **412.8 ms**, nearest-rank p95 **422.5 ms**, maximum
+  **422.5 ms**; initialize/connect was about 10–22 ms.
+  The separate full-population DB query took **60.1 ms**, scan query
+  **112.9 ms**. **Consequence:** 1.5 s has headroom for this measured Codex poll,
+  but roughly 0.42 s still adds to input latency when run synchronously after
+  Claude. Seven days was a measurement parameter, not a newly fixed product
+  default. Enforce one deadline across connection, writes, all pages/reads,
+  and close in the implementation: the probe's per-request remaining-time
+  check does not validate hard-deadline behavior under stalled connect/close.
+  Large-history, saturated-server, and failure-path latency are **UNMEASURED**;
+  the live server was not overloaded, stopped, or fault-injected.
+
+### Cross-runtime contention and in-TUI identity
+
+- **A second runtime cannot acquire this thread's active writer.**
+  Method: while `attach-idle` still had its remote TUIs, start
+  `/proc/4714/exe app-server --listen stdio://` as one owned subprocess,
+  with a 15 s whole-operation cap and guaranteed process cleanup.
+  Initialize it and request
+  `thread/resume({"threadId":<attach-idle ID>,"excludeTurns":true})`.
+  It returned `-32600`:
+  `thread <ID> already has an active writer`.
+  Close stdin: the temporary server exited 0; total lifetime was 0.212 s.
+  Existing-server status and timestamps were unchanged.
+  **Consequence:** same-version writer contention fails explicitly rather than
+  silently creating a second writer. A desktop runtime or a differently
+  versioned writer is **UNMEASURED**; this test did not launch either.
+  Surface remote resume errors instead of declaring a `notLoaded` row
+  globally free of writers.
+
+- **All three in-TUI navigation commands can invalidate launch identity.**
+  Method: in `%2`, native client PID 2280314, run `/status`,
+  `/resume 01a0a60f-f2b6-7680-beee-f25c46a8345f`, `/status`,
+  `/fork`, `/status`, `/new`, `/status`.
+  The displayed IDs changed from `attach-idle` to `empty-index`, then
+  `tui-fork`, then `tui-new` (full IDs below), while the PID and pane stayed
+  unchanged. The remote endpoint remained the same.
+  Reading that owned process's `/proc/2280314/cmdline` afterwards still showed
+  `resume 01a0a605-c1c8-7960-a4c1-c32f0c4b3002`, the original launch target.
+  `/new` also reset cwd from the probe directory to `/home/qdu` and model
+  from luna/low to the server default, astra/max; no turn was sent using that
+  default. Its cleanup turn explicitly overrode cwd and model back to the
+  probe directory and luna/low.
+  **Consequence:** document the accepted v1 limitation that the pane map
+  records the launch target. It cannot track current identity through argv,
+  and `/new` must not be assumed to inherit the selected thread's settings.
+
+- **Unmaterialized thread timestamps need caution.**
+  Method: read the empty `tui-new` twice before its first turn.
+  `createdAt/updatedAt/recencyAt` were all `1789492894` at 01:21:34 and
+  all `1789492927` at 01:22:07. After its first persisted turn,
+  `createdAt` became `1789492788` (the actual `/new` time).
+  The empty fork was likewise absent from DB-only history until its first
+  new turn, though it was loaded and had a visible inherited transcript.
+  **Consequence:** do not interpret fallback metadata for empty loaded threads
+  as durable activity timestamps. This does not change the measured stable
+  timestamps of persisted threads.
+
+### Cleanup and probe thread inventory
+
+At 01:33:58 all 12 owned threads were checked for their probe names and absence
+of active turns. `tmux -L ccmux-probe kill-server` removed the throwaway server;
+a subsequent `list-sessions` returned 1 with “no server running”, and its
+remaining tracked native client was gone. Each registered thread then received
+`thread/archive({"threadId":<owned ID>})`, the owned fork before its parent.
+All 12 calls succeeded. Paginated DB-only listings with `archived:true` and
+`archived:false` found all 12 in the former and none in the latter.
+No thread was deleted.
+
+The original server was still PID 4714 and reported `codex-cli 0.153.4` after
+cleanup. No default tmux command, existing-client kill, service-management
+command, or global configuration change was performed. The bounded stdio process had
+already exited 0.
+
+All names have the `ccmux-probe-` prefix. The following are **Thread.id**
+values, not transport/session IDs.
+
+| Label after the prefix | Thread.id | Final state |
+|---|---|---|
+| `grace-control` | `01a0a604-b81e-7970-862e-1b57affdcf1c` | archived |
+| `grace-read` | `01a0a605-2256-7892-b440-34956927be79` | archived |
+| `attach-idle` | `01a0a605-c1c8-7960-a4c1-c32f0c4b3002` | archived |
+| `approval-last-client` | `01a0a608-49ee-7c03-8adc-dd20d358b8d5` | archived |
+| `active-pane` | `01a0a609-04bf-75f2-8507-6714b009d9fa` | archived |
+| `active-sigkill` | `01a0a609-eada-7b83-9709-14281a2c69f6` | archived |
+| `active-graceful` | `01a0a60a-ba5c-7c91-852b-3dfe989b6363` | archived |
+| `active-pane-valid` | `01a0a60e-b6cc-7dc1-ae92-64fce28cdfd7` | archived |
+| `active-graceful-valid` | `01a0a60f-6edf-7d61-9869-cb25e480adb4` | archived |
+| `empty-index` | `01a0a60f-f2b6-7680-beee-f25c46a8345f` | archived |
+| `tui-fork` | `01a0a613-17cd-7d81-bdd5-e028a714dcde` | archived |
+| `tui-new` | `01a0a614-fbfa-7ec3-b3bf-ee9c88ef2dd9` | archived |
+
+### Decision for the next stage
+
+**PASS — the attach-safety gate is satisfied for CLI 0.154.0 / server 0.153.4.**
+The same active turns completed after pane kill, SIGKILL, and graceful quit;
+pending approval reappeared on reattach; an idle thread unloaded naturally and
+resumed through the ordinary remote command.
+
+The approved read-only listing + attach + `x` scope remains viable. The SPEC
+amendment must carry the measured version skew, empty-thread resume failure,
+unchanged attach timestamps, approximately 30-minute unload, and launch-target
+pane-map limitation. The 1.5 s poll budget has measured headroom here, not a
+general latency guarantee. The explicitly UNMEASURED cases above remain
+evidence limits. This stage changes only this findings document.
