@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agents::{self, AgentsError};
-use crate::model::{self, Group, ParseError, Row, Session};
+use crate::model::{self, Group, ParseError, Provider, Row, Session};
 use crate::restart::{self, Role};
 use crate::tmux::{
     self, HiddenLog, HiddenOp, HiddenSet, PaneEntry, PaneId, PaneInfo, PaneMap, SplitDir, TabInfo,
@@ -333,6 +333,7 @@ pub enum Action {
 /// without anyone having to write to a window they do not own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPane {
+    pub provider: Provider,
     /// The pane `Enter` jumps to and `x` closes: one in THIS sidebar's own tab
     /// when the session has one there, else the lowest-numbered live one.
     pub pane: PaneId,
@@ -894,7 +895,7 @@ impl App {
                 self.poll_error = None;
                 self.fail_streak = 0;
                 self.note_idle();
-                self.reconcile_hidden(complete);
+                self.reconcile_hidden(Provider::Claude, complete);
             }
             Err(e) => {
                 self.fail_streak = self.fail_streak.saturating_add(1);
@@ -1077,17 +1078,21 @@ impl App {
     ///
     /// An `Err` poll never reaches here: nothing is concluded from a poll we
     /// did not get.
-    fn reconcile_hidden(&mut self, complete: bool) {
-        if !complete {
+    fn reconcile_hidden(&mut self, provider: Provider, complete: bool) {
+        // Merge provider metadata before consulting any old absence strikes.
+        self.refold_hidden();
+        if provider != Provider::Claude || !complete {
             return;
         }
         let live: std::collections::HashSet<&str> =
-            self.sessions.iter().map(|s| s.session_id.as_str()).collect();
+            self.sessions.iter().filter(|s| s.provider == Provider::Claude)
+                .map(|s| s.session_id.as_str()).collect();
         let absent: std::collections::BTreeSet<String> = self
             .hidden
             .ids()
             .iter()
-            .filter(|id| !live.contains(id.as_str()))
+            .filter(|id| self.hidden.provider_of(id) == Some(Provider::Claude)
+                && !live.contains(id.as_str()))
             .cloned()
             .collect();
         // Survivors: alive right now, or absent for the first time. Passing the
@@ -1097,7 +1102,7 @@ impl App {
             .hidden
             .ids()
             .iter()
-            .filter(|id| live.contains(id.as_str()) || !self.hidden_absent.contains(*id))
+            .filter(|id| !absent.contains(*id) || !self.hidden_absent.contains(*id))
             .cloned()
             .collect();
         let retired: Vec<String> = self
@@ -1379,10 +1384,10 @@ impl App {
     /// `open` came from some tab's map, i.e. from a pane ccmux opened inside
     /// `tmux_session`, so a `Some` result is always safe to pass to an R2-gated
     /// mutation — the session gate already spans every window (`list-panes -s`).
-    pub fn pane_of(&self, session_id: &str) -> Option<PaneId> {
+    pub fn pane_of(&self, provider: Provider, session_id: &str) -> Option<PaneId> {
         self.open
             .get(session_id)
-            .filter(|o| o.attached)
+            .filter(|o| o.provider == provider && o.attached)
             .map(|o| o.pane.clone())
     }
 
@@ -1393,8 +1398,16 @@ impl App {
     /// it is the one verb that must still reach a detached one. ccmux opened it;
     /// without this, the pane ccmux created would be unclosable from the sidebar
     /// that created it, and the operator would have to go find it and `exit`.
-    pub fn pane_of_any(&self, session_id: &str) -> Option<PaneId> {
-        self.open.get(session_id).map(|o| o.pane.clone())
+    pub fn pane_of_any(&self, provider: Provider, session_id: &str) -> Option<PaneId> {
+        self.open.get(session_id).filter(|o| o.provider == provider).map(|o| o.pane.clone())
+    }
+
+    /// A provider disagreement is not an invitation to create another pane.
+    /// Use the same own-map authority as rebuild_open and delete's pane list.
+    fn pane_provider_conflict(&self, provider: Provider, session_id: &str) -> bool {
+        self.map.provider_conflict(provider, session_id)
+            || self.tabs.iter().filter(|t| Some(&t.window) != self.own_window.as_ref())
+                .any(|t| t.map.provider_conflict(provider, session_id))
     }
 
     /// True when `pane` is any tab's sidebar. `x` refuses those: with a sidebar
@@ -1434,8 +1447,8 @@ impl App {
     /// field-only helper so its no-panic matrix can render an `App` built by
     /// struct literal; the two are specified identical.
     #[allow(dead_code)]
-    pub fn is_open(&self, session_id: &str) -> bool {
-        self.pane_of(session_id).is_some()
+    pub fn is_open(&self, provider: Provider, session_id: &str) -> bool {
+        self.pane_of(provider, session_id).is_some()
     }
 
     // ── selection ────────────────────────────────────────────────────────────
@@ -1573,7 +1586,7 @@ impl App {
         let listed = self
             .sessions
             .iter()
-            .find(|s| s.id.as_deref() == Some(jump.short_id.as_str()))
+            .find(|s| s.provider == Provider::Claude && s.id.as_deref() == Some(jump.short_id.as_str()))
             .map(|s| (s.session_id.clone(), session_label(s)));
 
         if let Some((session_id, label)) = listed {
@@ -1691,9 +1704,14 @@ impl App {
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
+        let provider = sel.provider;
         let session_id = sel.session_id.clone();
         let short_id = sel.id.clone().unwrap_or_default();
         let name = sel.name.clone();
+        if self.pane_provider_conflict(provider, &session_id) {
+            self.flash("provider conflict in pane map", MsgLevel::Warn);
+            return;
+        }
 
         let Some(anchor) = self.split_anchor() else {
             self.flash("no pane to split — sidebar unmapped", MsgLevel::Error);
@@ -1702,9 +1720,10 @@ impl App {
         let cmd = agents::attach_pane_cmd(&short_id);
         match tmux::split(&self.tmux_session, &anchor, dir, &cmd) {
             Ok(pane) => {
-                self.map.insert(
+                let recorded = self.map.insert(
                     &pane,
                     PaneEntry {
+                        provider,
                         session_id,
                         short_id,
                         // Bounded: `@ccmux_map` has a hard ~16 KB ceiling and
@@ -1714,6 +1733,10 @@ impl App {
                         opened_at: self.now_ms,
                     },
                 );
+                if !recorded {
+                    self.flash("provider conflict in pane map", MsgLevel::Warn);
+                    return;
+                }
                 self.map_dirty = true;
                 // Refresh before flashing: the new pane's `#{pane_index}` only
                 // exists in a freshly enumerated list.
@@ -1760,9 +1783,14 @@ impl App {
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
+        let provider = sel.provider;
         let session_id = sel.session_id.clone();
         let short_id = sel.id.clone().unwrap_or_default();
         let name = sel.name.clone();
+        if self.pane_provider_conflict(provider, &session_id) {
+            self.flash("provider conflict in pane map", MsgLevel::Warn);
+            return;
+        }
         let Some(sidebar_cmd) = self.sidebar_cmd.clone() else {
             // Only reachable when `App` was built without `main.rs` handing the
             // command down; every real sidebar has one.
@@ -1783,6 +1811,7 @@ impl App {
         seed.insert(
             &claude,
             PaneEntry {
+                provider,
                 session_id,
                 short_id,
                 name: model::truncate_end(&name, MAP_NAME_MAX),
@@ -1905,6 +1934,7 @@ impl App {
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
         }
+        let provider = sel.provider;
         let session_id = sel.session_id.clone();
         // FRESH EVIDENCE FIRST. `open` is rebuilt by `tick`, and a keypress is
         // not a tick: between the two, `Ctrl+Z` in a pane can retire its
@@ -1917,7 +1947,7 @@ impl App {
         // branch, so this costs one `list-panes` on a verb the operator asked
         // for, never on a tick.
         self.refresh_panes();
-        match self.pane_of(&session_id) {
+        match self.pane_of(provider, &session_id) {
             // Already open: jump rather than re-split. A UX preference, not a
             // correctness requirement — double-attach is legal (PROBE §3).
             Some(pane) => self.jump_to_ccmux_pane(&pane),
@@ -1941,11 +1971,12 @@ impl App {
         // lists nothing else, so the refusal had no row left to fire on. An
         // interactive session, which IS a descendant of its pane's pid
         // (PROBE §4), can no longer be selected here at all.
+        let provider = sel.provider;
         let session_id = sel.session_id.clone();
         // `pane_of_any`, not `pane_of`: a pane whose attach has exited into a
         // shell is still a pane ccmux opened and still the operator's to close
         // from here, even though nothing about the row says "open" any more.
-        let Some(pane) = self.pane_of_any(&session_id) else {
+        let Some(pane) = self.pane_of_any(provider, &session_id) else {
             self.flash("not open", MsgLevel::Warn);
             return;
         };
@@ -2107,13 +2138,16 @@ impl App {
     /// map is taken as read; `close_panes_of` refreshes first, and a refresh
     /// that failed leaves R2 refusing every kill anyway.
     fn panes_showing(&self, session_id: &str) -> Vec<PaneId> {
+        if self.pane_provider_conflict(Provider::Claude, session_id) {
+            return Vec::new();
+        }
         let mine = self.own_window.as_ref();
-        let mut out = self.map.panes_for_session(session_id);
+        let mut out = self.map.panes_for_session(Provider::Claude, session_id);
         for tab in &self.tabs {
             if Some(&tab.window) == mine {
                 continue;
             }
-            out.extend(tab.map.panes_for_session(session_id));
+            out.extend(tab.map.panes_for_session(Provider::Claude, session_id));
         }
         out.sort_by_key(PaneId::num);
         out.dedup();
@@ -2252,7 +2286,7 @@ impl App {
         // Cancelling costs one keypress and can stop nothing.
         let same = self
             .selected_session()
-            .is_some_and(|s| s.session_id == arm.session_id);
+            .is_some_and(|s| s.provider == Provider::Claude && s.session_id == arm.session_id);
         if !same {
             let label = model::truncate_end(&arm.name, LABEL_MAX);
             // Two different things bring us here and the operator can only act
@@ -2322,7 +2356,7 @@ impl App {
         let still_there = self
             .sessions
             .iter()
-            .any(|s| s.id.as_deref() == Some(arm.short_id.as_str()));
+            .any(|s| s.provider == Provider::Claude && s.id.as_deref() == Some(arm.short_id.as_str()));
         if !still_there {
             self.flash(
                 format!("session {} is gone — not deleted", arm.short_id),
@@ -2409,14 +2443,15 @@ impl App {
         // is not, so this variant spends the name to buy the warning and stays
         // inside a 34-column footer. `@ccmux_map` keeps its entry on purpose:
         // the pane is live, and `u` + `x` is the recovery.
-        let owns_pane = self.map.pane_for_session(&id).is_some();
+        let provider = sel.provider;
+        let owns_pane = self.map.pane_for_session(provider, &id).is_some();
         // Where the cursor lands, decided BEFORE the row goes away: the next
         // session below, else the one above. `reanchor_selection` re-finds it
         // by key, so it is right even though the rebuild renumbers every row —
         // and when there is no neighbour at all, `selected_key = None` parks
         // `selected` at `rows.len()` per the field contract.
         let neighbour = self.neighbour_key(self.selected);
-        if !self.hidden.dismiss(&id) {
+        if !self.hidden.dismiss_for(provider, &id) {
             return;
         }
         // The durable half: one op appended to MY fragment. Still no tmux
@@ -2424,7 +2459,7 @@ impl App {
         // which is what keeps this keypath free of `assert_in_session`'s
         // `list-panes` and the unit suite hermetic.
         let (seq, org) = (self.next_seq(), self.own_org());
-        self.hidden_log.push(HiddenOp { id: id.clone(), add: true, seq, org });
+        self.hidden_log.push(HiddenOp { provider, id: id.clone(), add: true, seq, org });
         // A fresh dismissal starts with zero strikes against it. Without this
         // an id could carry a strike across `d` -> absent poll -> `u` -> `d`:
         // `reconcile_hidden` only recomputes the strike set from `hidden` on a
@@ -2456,6 +2491,8 @@ impl App {
     /// only ADDS rows, so that key is always still there), and the cursor moves
     /// only once the restored row is known to exist.
     pub fn act_undo_dismiss(&mut self) {
+        let provider = self.hidden.ids().last()
+            .and_then(|id| self.hidden.provider_of(id)).unwrap_or_default();
         let Some(id) = self.hidden.undo() else {
             self.flash("nothing to undo", MsgLevel::Info);
             return;
@@ -2466,7 +2503,7 @@ impl App {
         // hoped, because that dismissal came out of the fold `seq_seen` was
         // just computed from.
         let (seq, org) = (self.next_seq(), self.own_org());
-        self.hidden_log.push(HiddenOp { id: id.clone(), add: false, seq, org });
+        self.hidden_log.push(HiddenOp { provider, id: id.clone(), add: false, seq, org });
         self.hidden_dirty = true;
         self.rebuild_rows();
         let visible = self.is_visible(&id);
@@ -2478,7 +2515,7 @@ impl App {
         let label = self
             .sessions
             .iter()
-            .find(|s| s.session_id == id)
+            .find(|s| s.provider == provider && s.session_id == id)
             .map(session_label)
             // Dismissed, then it ended and left the poll. Un-hiding is still
             // right (the next reconcile drops the id), but the name is no
@@ -2901,7 +2938,7 @@ impl App {
             // A session ccmux has open in a pane but that the fleet no longer
             // lists cannot be read, so it cannot be shown to be idle. Fail
             // closed: not stopped, and counted.
-            let Some(sess) = fresh.sessions.iter().find(|s| s.id.as_deref() == Some(*id)) else {
+            let Some(sess) = fresh.sessions.iter().find(|s| s.provider == Provider::Claude && s.id.as_deref() == Some(*id)) else {
                 out.failed += 1;
                 continue;
             };
@@ -3027,7 +3064,7 @@ impl App {
             // daemon that dropped it. There is no worker to restart and none
             // will be missed, so nothing is counted — unlike sub-pass A, where
             // an absent row is a session ccmux still has open in a pane.
-            let Some(sess) = fresh.sessions.iter().find(|s| s.session_id == t.session_id) else {
+            let Some(sess) = fresh.sessions.iter().find(|s| s.provider == Provider::Claude && s.session_id == t.session_id) else {
                 continue;
             };
             // A worker that exited inside the window is DORMANT now, and
@@ -3061,7 +3098,7 @@ impl App {
             // about the worker, and the three outcomes it hides need three
             // different words.
             match (self.agents_poll)() {
-                Ok(after) => match after.sessions.iter().find(|s| s.session_id == t.session_id) {
+                Ok(after) => match after.sessions.iter().find(|s| s.provider == Provider::Claude && s.session_id == t.session_id) {
                     // Gone from the fleet: same rule as above, nothing to say.
                     None => {}
                     Some(s) if s.has_worker() => out.failed += 1,
@@ -3502,13 +3539,16 @@ impl App {
         let Some((map, log)) = self.own_tab().map(|t| (t.map.clone(), t.hidden.clone())) else {
             return; // retry once the window enumeration resolves
         };
-        // Built fresh rather than merged in place, so the adopted map always
-        // carries the CURRENT schema version whatever this process started
-        // with. Interim entries win a tie: they name a pane this process
-        // opened, and the stored copy predates it.
-        let mut merged = PaneMap::new();
-        merged.panes = map.panes;
-        merged.panes.extend(std::mem::take(&mut self.map.panes));
+        // Interim entries win same-provider ties: they name a pane this
+        // process opened after the stored copy. A provider conflict is never
+        // authority to replace a stored record with another kind of session.
+        let mut merged = map;
+        for (raw, entry) in std::mem::take(&mut self.map.panes) {
+            let Some(pane) = PaneId::parse(&raw) else { continue };
+            if !merged.insert(&pane, entry) {
+                self.flash("provider conflict in pane map", MsgLevel::Warn);
+            }
+        }
         self.map = merged;
         for op in log.ops {
             if self.hidden_log.push(op) {
@@ -3548,8 +3588,11 @@ impl App {
             for (key, entry) in &legacy.panes {
                 let Some(pane) = PaneId::parse(key) else { continue };
                 if self.pane_window(&pane) == self.own_window && self.map.get(&pane).is_none() {
-                    self.map.insert(&pane, entry.clone());
-                    self.map_dirty = true;
+                    if self.map.insert(&pane, entry.clone()) {
+                        self.map_dirty = true;
+                    } else {
+                        self.flash("provider conflict in pane map", MsgLevel::Warn);
+                    }
                 }
             }
             let _ = tmux::set_user_option(&self.tmux_session, tmux::OPT_MAP, tmux::EMPTY_MAP_JSON);
@@ -3560,7 +3603,7 @@ impl App {
             let org = self.own_org();
             for (i, id) in legacy_hidden.ids().iter().enumerate() {
                 let seq = i as u64 + 1;
-                if self.hidden_log.push(HiddenOp { id: id.clone(), add: true, seq, org }) {
+                if self.hidden_log.push(HiddenOp { provider: Provider::Claude, id: id.clone(), add: true, seq, org }) {
                     self.hidden_dirty = true;
                 }
             }
@@ -3650,6 +3693,7 @@ impl App {
             self.hidden_dirty = true;
         }
         self.hidden = tmux::fold_hidden(others.into_iter().chain(std::iter::once(&self.hidden_log)));
+        self.hidden_absent.retain(|id| self.hidden.provider_of(id) != Some(Provider::Codex));
     }
 
     /// The next Lamport stamp. Monotonic per process even if the wall clock
@@ -3671,28 +3715,38 @@ impl App {
     /// skipped, so `is_open` answers exactly what it always did.
     pub fn rebuild_open(&mut self) {
         let mine = self.own_window.clone();
-        let mut union: BTreeMap<String, String> = BTreeMap::new();
+        let mut union: BTreeMap<String, (Provider, String)> = BTreeMap::new();
         for tab in &self.tabs {
             if Some(&tab.window) == mine.as_ref() {
                 continue;
             }
             for (pane, entry) in &tab.map.panes {
-                union.insert(pane.clone(), entry.session_id.clone());
+                union.insert(pane.clone(), (entry.provider, entry.session_id.clone()));
             }
         }
         for (pane, entry) in &self.map.panes {
-            union.insert(pane.clone(), entry.session_id.clone());
+            union.insert(pane.clone(), (entry.provider, entry.session_id.clone()));
         }
 
         let have_inventory = !self.panes.is_empty();
         let mut open: BTreeMap<String, OpenPane> = BTreeMap::new();
-        for (key, session_id) in union {
+        let mut conflicts = BTreeSet::new();
+        for (key, (provider, session_id)) in union {
             let Some(pane) = PaneId::parse(&key) else { continue };
             let info = self.panes.iter().find(|i| i.id == pane);
             if have_inventory && info.is_none() {
                 continue; // dead, or in a window this session cannot see
             }
+            if conflicts.contains(&session_id) {
+                continue;
+            }
+            if open.get(&session_id).is_some_and(|old| old.provider != provider) {
+                open.remove(&session_id);
+                conflicts.insert(session_id);
+                continue;
+            }
             let cand = OpenPane {
+                provider,
                 pane,
                 window_index: info.map(|i| i.window_index),
                 window: info.map(|i| i.window_id.clone()),
@@ -3749,6 +3803,9 @@ impl App {
                     open.insert(session_id, cand);
                 }
             }
+        }
+        if !conflicts.is_empty() && self.message.is_none() {
+            self.flash("provider conflict in pane map", MsgLevel::Warn);
         }
         self.open = open;
     }
@@ -5204,6 +5261,8 @@ mod tests {
     /// at the row it means: `live(bg(...))`.
     fn bg(short: &str, name: &str, state: State) -> Session {
         Session {
+            provider: Provider::Claude,
+            codex: None,
             id: Some(short.to_string()),
             pid: None,
             session_id: format!("{short}-uuid"),
@@ -5226,6 +5285,8 @@ mod tests {
 
     fn inter(uuid: &str, name: &str) -> Session {
         Session {
+            provider: Provider::Claude,
+            codex: None,
             id: None,
             pid: Some(4242),
             session_id: uuid.to_string(),
@@ -6515,6 +6576,7 @@ mod tests {
         a.map.insert(
             &bg_pane,
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "1c45d64f-uuid".into(),
                 short_id: "1c45d64f".into(),
                 name: "bt/reg-update".into(),
@@ -6523,9 +6585,9 @@ mod tests {
         );
 
         a.rebuild_open();
-        assert_eq!(a.pane_of("1c45d64f-uuid"), Some(bg_pane));
-        assert_eq!(a.pane_of("nobody"), None);
-        assert!(!a.is_open("nobody"));
+        assert_eq!(a.pane_of(Provider::Claude, "1c45d64f-uuid"), Some(bg_pane));
+        assert_eq!(a.pane_of(Provider::Claude, "nobody"), None);
+        assert!(!a.is_open(Provider::Claude, "nobody"));
     }
 
     // ── tabs ────────────────────────────────────────────────────────────────
@@ -6555,6 +6617,7 @@ mod tests {
 
     fn entry(session_id: &str) -> PaneEntry {
         PaneEntry {
+            provider: Provider::Claude,
             session_id: session_id.into(),
             short_id: session_id.chars().take(8).collect(),
             name: "n".into(),
@@ -6730,6 +6793,7 @@ mod tests {
         load(&mut a, four());
         let mut theirs = HiddenLog::new();
         theirs.push(HiddenOp {
+            provider: Provider::Claude,
             id: "bbbbbbbb-uuid".into(),
             add: true,
             seq: a.now_ms as u64 + 500,
@@ -6761,7 +6825,7 @@ mod tests {
         own(&mut a, "%1", "@1");
         a.panes = vec![pane("%1", 1, 1, 0, 34, false), pane("%2", 2, 1, 0, 34, false)];
         let mut theirs = HiddenLog::new();
-        theirs.push(HiddenOp { id: "gone-tab-uuid".into(), add: true, seq: 900, org: 2 });
+        theirs.push(HiddenOp { provider: Provider::Claude, id: "gone-tab-uuid".into(), add: true, seq: 900, org: 2 });
         a.tabs = server(&[("@1", 1, "%1", &a.hidden_log), ("@2", 2, "%2", &theirs)]);
         a.adopt_orphan_fragments();
         a.refold_hidden();
@@ -6778,6 +6842,7 @@ mod tests {
         // Adopted VERBATIM: the stamp and origin are preserved, so adoption
         // changes where an op is stored and nothing about the fold.
         assert_eq!(a.hidden_log.ops, vec![HiddenOp {
+            provider: Provider::Claude,
             id: "gone-tab-uuid".into(),
             add: true,
             seq: 900,
@@ -6842,6 +6907,7 @@ mod tests {
         let mut stored = tab("@1", 1, Some("%1"));
         stored.map.insert(&PaneId::parse("%7").expect("id"), entry("bbbbbbbb-uuid"));
         let _ = stored.hidden.push(HiddenOp {
+            provider: Provider::Claude,
             id: "cccccccc-uuid".into(),
             add: true,
             seq: 5,
@@ -6876,8 +6942,8 @@ mod tests {
         a.tabs = vec![tab("@1", 1, Some("%1")), theirs.clone()];
         a.rebuild_open();
 
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
-        assert_eq!(a.pane_of("bbbbbbbb-uuid"), PaneId::parse("%9"), "a pane in another tab");
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%5"));
+        assert_eq!(a.pane_of(Provider::Claude, "bbbbbbbb-uuid"), PaneId::parse("%9"), "a pane in another tab");
         assert_eq!(a.open["aaaaaaaa-uuid"].window_index, Some(1));
         assert_eq!(a.open["bbbbbbbb-uuid"].window_index, Some(2));
         // The flash names the tab only when it is not mine.
@@ -6888,7 +6954,7 @@ mod tests {
         // is all it takes for every process to agree it is gone.
         a.panes.retain(|p| p.id.as_str() != "%9");
         a.rebuild_open();
-        assert_eq!(a.pane_of("bbbbbbbb-uuid"), None);
+        assert_eq!(a.pane_of(Provider::Claude, "bbbbbbbb-uuid"), None);
         assert_eq!(a.tabs[1].map.panes.len(), 1, "the stale entry was not ours to remove");
 
         // Two panes for one session, one of them MINE: `Enter` and `x` take
@@ -6898,7 +6964,7 @@ mod tests {
         theirs.map.insert(&PaneId::parse("%3").expect("id"), entry("aaaaaaaa-uuid"));
         a.tabs = vec![tab("@1", 1, Some("%1")), theirs];
         a.rebuild_open();
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%5"));
     }
 
     /// THE CONSEQUENCE OF THE SHELL HANDOFF. `claude attach` used to end with
@@ -6922,16 +6988,16 @@ mod tests {
         a.map.insert(&PaneId::parse("%5").expect("id"), entry("aaaaaaaa-uuid"));
         a.tabs = vec![tab("@1", 1, Some("%1"))];
         a.rebuild_open();
-        assert!(a.is_open("aaaaaaaa-uuid"), "a live attach is open");
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+        assert!(a.is_open(Provider::Claude, "aaaaaaaa-uuid"), "a live attach is open");
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%5"));
 
         // Ctrl+Z: the attach exits, the pane latches and `exec`s a shell.
         a.panes[1].detached = true;
         a.rebuild_open();
-        assert!(!a.is_open("aaaaaaaa-uuid"), "the map may not go on claiming a shell");
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), None, "nothing jumps there any more");
+        assert!(!a.is_open(Provider::Claude, "aaaaaaaa-uuid"), "the map may not go on claiming a shell");
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), None, "nothing jumps there any more");
         assert_eq!(
-            a.pane_of_any("aaaaaaaa-uuid"),
+            a.pane_of_any(Provider::Claude, "aaaaaaaa-uuid"),
             PaneId::parse("%5"),
             "`x` must still reach the pane ccmux opened"
         );
@@ -6950,7 +7016,7 @@ mod tests {
         // report `claude`, and PROBE-FINDINGS §4 says a pane's command never
         // identifies WHICH session it is showing. `Enter` opens a fresh pane
         // instead, which is legal (PROBE §3) and cannot mis-attribute anything.
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), None);
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), None);
 
         // The pane itself may, and does: `attach_pane_cmd`'s resume path unsets
         // the option before re-running the SAME attach, so a pane detached and
@@ -6958,8 +7024,8 @@ mod tests {
         // marker, its badge, `Enter`'s jump and `R` all restored.
         a.panes[1].detached = false;
         a.rebuild_open();
-        assert!(a.is_open("aaaaaaaa-uuid"));
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%5"));
+        assert!(a.is_open(Provider::Claude, "aaaaaaaa-uuid"));
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%5"));
     }
 
     /// `act_enter` is `match self.pane_of(id) { Some(p) => jump, None => open }`
@@ -6976,7 +7042,7 @@ mod tests {
         a.tabs = vec![tab("@1", 1, Some("%1"))];
         a.panes[1].detached = true;
         a.rebuild_open();
-        assert!(a.pane_of("aaaaaaaa-uuid").is_none(), "the jump arm is unreachable");
+        assert!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid").is_none(), "the jump arm is unreachable");
 
         // And `Enter` on it reaches `act_open`, which refuses first when this
         // process has no tmux — proving which arm ran without a server.
@@ -7010,7 +7076,7 @@ mod tests {
         a.tabs = vec![tab("@1", 1, Some("%1"))];
         a.rebuild_open();
         load(&mut a, vec![bg("aaaaaaaa", "a", State::Working)]);
-        assert!(a.pane_of("aaaaaaaa-uuid").is_some(), "the jump arm is the one under test");
+        assert!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid").is_some(), "the jump arm is the one under test");
 
         a.tmux_session = "not a session name".into();
         a.panes_fresh = true;
@@ -7042,10 +7108,10 @@ mod tests {
         // %24 detached; %25 is the fresh attach `Enter` just opened.
         a.panes[1].detached = true;
         a.rebuild_open();
-        assert!(a.is_open("aaaaaaaa-uuid"), "the session IS on screen, in %25");
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%25"));
+        assert!(a.is_open(Provider::Claude, "aaaaaaaa-uuid"), "the session IS on screen, in %25");
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%25"));
         assert_eq!(
-            a.pane_of_any("aaaaaaaa-uuid"),
+            a.pane_of_any(Provider::Claude, "aaaaaaaa-uuid"),
             PaneId::parse("%25"),
             "`x` closes the pane showing the session, not the shell beside it"
         );
@@ -7053,8 +7119,8 @@ mod tests {
         // Close the attach and the shell is what is left to represent the row.
         a.panes.retain(|p| p.id.as_str() != "%25");
         a.rebuild_open();
-        assert!(!a.is_open("aaaaaaaa-uuid"));
-        assert_eq!(a.pane_of_any("aaaaaaaa-uuid"), PaneId::parse("%24"));
+        assert!(!a.is_open(Provider::Claude, "aaaaaaaa-uuid"));
+        assert_eq!(a.pane_of_any(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%24"));
 
         // A pane in ANOTHER tab that is still attached beats a detached one of
         // mine: "here" only decides between panes of equal standing.
@@ -7068,7 +7134,7 @@ mod tests {
         theirs.map.insert(&PaneId::parse("%99").expect("id"), entry("aaaaaaaa-uuid"));
         a.tabs = vec![tab("@1", 1, Some("%1")), theirs];
         a.rebuild_open();
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%99"));
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%99"));
     }
 
     /// REGRESSION. A session double-attached in two tabs used to resolve to the
@@ -7103,7 +7169,7 @@ mod tests {
         t2.map = two.clone();
         b.tabs = vec![t1.clone(), t2.clone()];
         b.rebuild_open();
-        assert_eq!(b.pane_of("aaaaaaaa-uuid"), PaneId::parse("%7"), "x must kill MY pane");
+        assert_eq!(b.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%7"), "x must kill MY pane");
         assert_eq!(b.open["aaaaaaaa-uuid"].window, WindowId::parse("@2"));
         assert_eq!(b.tab_suffix(&PaneId::parse("%7").expect("id")), "", "no jump away");
 
@@ -7114,7 +7180,7 @@ mod tests {
         a.map = one;
         a.tabs = vec![t1, t2];
         a.rebuild_open();
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%2"));
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%2"));
 
         // No own window at all (degraded, or a fixture with no inventory): both
         // panes are equally foreign and §5.5's numeric rule is all that is
@@ -7122,7 +7188,7 @@ mod tests {
         a.own_pane = None;
         a.own_window = None;
         a.rebuild_open();
-        assert_eq!(a.pane_of("aaaaaaaa-uuid"), PaneId::parse("%2"));
+        assert_eq!(a.pane_of(Provider::Claude, "aaaaaaaa-uuid"), PaneId::parse("%2"));
     }
 
     /// `x` refuses ANY tab's sidebar, not only this one's: closing another
@@ -7946,7 +8012,7 @@ mod tests {
         assert_eq!(a.pending_jump, None, "spent once it fires");
 
         // Still only the CURSOR: `n` opens nothing.
-        assert!(a.map.pane_for_session("e44654bf-uuid").is_none(), "no pane was opened");
+        assert!(a.map.pane_for_session(Provider::Claude, "e44654bf-uuid").is_none(), "no pane was opened");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -9662,6 +9728,7 @@ mod tests {
         a.map.insert(
             &pane,
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "aaaaaaaa-uuid".into(),
                 short_id: "aaaaaaaa".into(),
                 name: "bt/reg-update".into(),
@@ -9680,7 +9747,7 @@ mod tests {
             "the warning still has to fit the narrowest sidebar: {text:?}"
         );
         assert_eq!(
-            a.map.pane_for_session("aaaaaaaa-uuid"),
+            a.map.pane_for_session(Provider::Claude, "aaaaaaaa-uuid"),
             Some(pane),
             "the map entry is what `u` then `x` needs; dismissal must not touch it"
         );
@@ -9875,6 +9942,7 @@ mod tests {
         m1.insert(
             &PaneId::parse("%2").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-a".into(),
                 short_id: "aaaaaaaa".into(),
                 name: "a".into(),
@@ -9885,6 +9953,7 @@ mod tests {
         m2.insert(
             &PaneId::parse("%5").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-b".into(),
                 short_id: "bbbbbbbb".into(),
                 name: "b".into(),
@@ -10052,6 +10121,7 @@ mod tests {
         a.map.insert(
             &PaneId::parse("%6").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-c".into(),
                 short_id: "cccccccc".into(),
                 name: "c".into(),
@@ -11171,6 +11241,7 @@ mod tests {
         a.map.insert(
             &PaneId::parse("%6").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-b".into(),
                 short_id: "bbbbbbbb".into(),
                 name: "b".into(),
@@ -11201,6 +11272,7 @@ mod tests {
         a.map.insert(
             &PaneId::parse("%6").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-b".into(),
                 short_id: "bbbbbbbb".into(),
                 name: "b".into(),
@@ -11246,4 +11318,142 @@ mod tests {
             self.unwrap_or((String::new(), MsgLevel::Info))
         }
     }
+    // ── Provider persistence and routing (§12.9) ────────────────────────────
+
+    #[test]
+    fn only_complete_claude_observations_advance_claude_absence_strikes() {
+        let mut a = app();
+        a.hidden_log.push(HiddenOp { provider: Provider::Claude, id: "claude".into(), add: true, seq: 1, org: 1 });
+        a.hidden_log.push(HiddenOp { provider: Provider::Codex, id: "codex".into(), add: true, seq: 2, org: 1 });
+        a.refold_hidden();
+        a.reconcile_hidden(Provider::Codex, true);
+        a.reconcile_hidden(Provider::Claude, false);
+        assert!(a.hidden_absent.is_empty());
+        a.reconcile_hidden(Provider::Claude, true);
+        assert_eq!(a.hidden_absent, BTreeSet::from(["claude".into()]));
+        a.reconcile_hidden(Provider::Codex, true);
+        assert_eq!(a.hidden.ids(), ["claude", "codex"]);
+        a.reconcile_hidden(Provider::Claude, false);
+        assert_eq!(a.hidden.ids(), ["claude", "codex"]);
+        a.reconcile_hidden(Provider::Claude, true);
+        assert_eq!(a.hidden.ids(), ["codex"]);
+        for _ in 0..3 { a.reconcile_hidden(Provider::Claude, true); }
+        assert_eq!(a.hidden.provider_of("codex"), Some(Provider::Codex));
+        assert!(a.hidden_absent.is_empty());
+        assert_eq!(a.hidden_log.ops.len(), 1);
+    }
+
+    #[test]
+    fn mixed_version_orphan_adoption_repairs_tags_before_retirement() {
+        // These are the old binary's actual fields: deserialize/serialize
+        // adopts an op while stripping the unknown provider key.
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldOp { id: String, add: bool, seq: u64, org: u64 }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldLog { v: u32, ops: Vec<OldOp> }
+        let tagged = HiddenOp { provider: Provider::Codex,
+            id: "01a0a609-12a6-7abc-8def-0123456789ab".into(), add: true, seq: 100, org: 9 };
+        let original = HiddenLog { v: 2, ops: vec![
+            HiddenOp { provider: Provider::Claude, id: "claude".into(), add: true, seq: 99, org: 9 },
+            tagged.clone(),
+        ] };
+        let old: OldLog = serde_json::from_str(&serde_json::to_string(&original).expect("wire")).expect("old read");
+        let stripped: HiddenLog = serde_json::from_str(&serde_json::to_string(&old).expect("old write")).expect("new read");
+        assert!(stripped.ops.iter().all(|op| op.provider == Provider::Claude));
+
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false)];
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+        a.last_frags.insert(9, stripped);
+        a.adopt_orphan_fragments();
+        a.refold_hidden();
+        a.reconcile_hidden(Provider::Claude, true);
+        assert!(a.hidden_absent.contains(&tagged.id), "one old-copy absence strike");
+
+        let mut survivor = tab("@2", 2, Some("%2"));
+        survivor.hidden = original.clone();
+        a.tabs.push(survivor);
+        a.hidden_dirty = false;
+        // The next absence check itself must fold/upgrade first. Otherwise this
+        // would be the second Claude strike and erase the repaired dismissal.
+        a.reconcile_hidden(Provider::Claude, true);
+        assert_eq!(a.hidden.provider_of(&tagged.id), Some(Provider::Codex));
+        assert!(!a.hidden_absent.contains(&tagged.id));
+        assert!(a.hidden_dirty, "the metadata upgrade must be persisted");
+        let mine = a.hidden_log.ops.iter().find(|op| op.id == tagged.id).expect("adopted");
+        assert_eq!(mine, &tagged);
+        assert_eq!(a.tabs[1].hidden, original, "the peer fragment is read-only");
+        assert!(serde_json::to_string(&a.hidden_log).expect("wire").contains(r#""provider":"codex""#));
+
+        a.on_key(press('u'));
+        let undo = a.hidden_log.ops.last().expect("undo op");
+        assert_eq!((undo.provider, undo.id.as_str(), undo.add), (Provider::Codex, tagged.id.as_str(), false));
+        assert!(undo.seq > tagged.seq);
+        a.refold_hidden();
+        assert_eq!(a.hidden.provider_of(&tagged.id), None);
+    }
+
+    #[test]
+    fn losing_every_hidden_provider_tag_cannot_be_reconstructed_from_uuid_shape() {
+        let mut a = app();
+        let id = "01a0a609-12a6-7abc-8def-0123456789ab";
+        // This is what remains after ALL old adopters have stripped the tag.
+        let old = format!(r#"{{"v":2,"ops":[{{"id":"{id}","add":true,"seq":1,"org":9}}]}}"#);
+        a.hidden_log = serde_json::from_str(&old).expect("old fragment");
+        a.refold_hidden();
+        assert_eq!(a.hidden.provider_of(id), Some(Provider::Claude));
+        a.reconcile_hidden(Provider::Claude, true);
+        a.reconcile_hidden(Provider::Claude, true);
+        assert!(a.hidden.ids().is_empty(), "the documented mixed-version limit, not UUID inference");
+    }
+
+    #[test]
+    fn pane_lookups_check_provider_and_refuse_cross_tab_identity_conflicts() {
+        let mut a = app();
+        let id = "01a0a609-12a6-7abc-8def-0123456789ab";
+        a.map.insert(&pid("%2"), PaneEntry { provider: Provider::Codex, ..entry(id) });
+        a.rebuild_open();
+        assert_eq!(a.pane_of(Provider::Codex, id), Some(pid("%2")));
+        assert_eq!(a.pane_of_any(Provider::Claude, id), None);
+        assert!(!a.is_open(Provider::Claude, id));
+        assert!(a.panes_showing(id).is_empty(), "Claude delete cannot close a Codex pane");
+        let mut row = bg("456789ab", "claude", State::Working);
+        row.session_id = id.into();
+        load(&mut a, vec![row]);
+        a.act_open(SplitDir::Vertical);
+        assert!(a.message.clone().unwrap_or_default_msg().0.contains("provider conflict"));
+        a.act_open_tab();
+        assert!(a.message.clone().unwrap_or_default_msg().0.contains("provider conflict"));
+
+        let mut peer = tab("@2", 2, Some("%3"));
+        peer.map.insert(&pid("%4"), entry(id));
+        a.tabs.push(peer);
+        a.rebuild_open();
+        assert_eq!(a.pane_of_any(Provider::Claude, id), None);
+        assert_eq!(a.pane_of_any(Provider::Codex, id), None);
+        assert!(a.message.clone().unwrap_or_default_msg().0.contains("provider conflict"));
+    }
+
+    #[test]
+    fn own_map_adoption_keeps_mixed_providers_and_refuses_an_interim_overwrite() {
+        let mut a = app();
+        a.own_state_loaded = false;
+        own(&mut a, "%1", "@1");
+        let id = "01a0a609-12a6-7abc-8def-0123456789ab";
+        let mut stored = tab("@1", 1, Some("%1"));
+        stored.map.insert(&pid("%2"), PaneEntry { provider: Provider::Codex, ..entry(id) });
+        stored.map.insert(&pid("%3"), entry("stored-claude"));
+        a.tabs = vec![stored];
+        a.map.insert(&pid("%2"), entry("interim-conflict"));
+        a.map.insert(&pid("%3"), entry("newer-claude"));
+        a.adopt_own_state();
+        assert_eq!(a.map.panes["%2"].provider, Provider::Codex);
+        assert_eq!(a.map.panes["%2"].session_id, id);
+        assert_eq!(a.map.panes["%3"].session_id, "newer-claude");
+        assert!(a.message.clone().unwrap_or_default_msg().0.contains("provider conflict"));
+        let wire = serde_json::to_string(&a.map).expect("wire");
+        assert_eq!(serde_json::from_str::<PaneMap>(&wire).expect("roundtrip"), a.map);
+    }
+
 }

@@ -20,6 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
+use crate::model::{Provider, valid_codex_id};
+
 pub const WINDOW_NAME: &str = "cc";
 pub const OPT_MAP: &str = "@ccmux_map";
 pub const OPT_SIDEBAR: &str = "@ccmux_sidebar";
@@ -78,8 +80,9 @@ pub const LATCH_SHELL: &str = "shell";
 /// The LIVE map is `@ccmux_tab_map`, one per window.
 pub const EMPTY_MAP_JSON: &str = r#"{"v":1,"panes":{}}"#;
 
-/// `@ccmux_map` schema version. A different value is treated as an empty map.
+/// Claude-only maps keep the original bytes; Codex entries require v2.
 const MAP_VERSION: u32 = 1;
+const MIXED_MAP_VERSION: u32 = 2;
 /// `@ccmux_hidden` schema version. A different value is treated as empty.
 const HIDDEN_VERSION: u32 = 1;
 /// Most dismissals `@ccmux_hidden` will carry. tmux refuses a `set-option`
@@ -1557,6 +1560,7 @@ pub fn write_tab_map_uncached(
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaneEntry {
+    pub provider: Provider,
     /// `model::Session::session_id` (UUID). Opaque to this module.
     pub session_id: String,
     /// 8-hex short id. Empty only when read back from a `@ccmux_map` written
@@ -1572,17 +1576,97 @@ pub struct PaneEntry {
     pub opened_at: i64,
 }
 
-/// Serialized into `@ccmux_map`. Lives and dies with the tmux session.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Serialized into `@ccmux_tab_map`; the legacy marker stays empty v1.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneMap {
-    /// Schema version. Current = 1. A different value is treated as an empty map.
+    /// Read version. Every write derives its version from the entries.
     pub v: u32,
     /// pane_id ("%25") -> entry. BTreeMap so serialization is deterministic and
     /// "did it change" comparisons are byte-stable.
     pub panes: BTreeMap<String, PaneEntry>,
 }
 
+impl Default for PaneMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Keep the entry's standalone provider REQUIRED. Only a v1 MAP supplies the
+// Claude default; accepting a missing provider in v2 could route a Codex id to
+// a Claude verb. All writers, including t's pre-write, use this one codec.
+impl serde::Serialize for PaneMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct Entry<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            provider: Option<Provider>,
+            session_id: &'a str,
+            short_id: &'a str,
+            name: &'a str,
+            opened_at: i64,
+        }
+        #[derive(serde::Serialize)]
+        struct Map<'a> {
+            v: u32,
+            panes: BTreeMap<&'a str, Entry<'a>>,
+        }
+        let v = self.wire_version();
+        let panes = self.panes.iter().map(|(pane, entry)| {
+            (pane.as_str(), Entry {
+                provider: (v == MIXED_MAP_VERSION).then_some(entry.provider),
+                session_id: &entry.session_id,
+                short_id: &entry.short_id,
+                name: &entry.name,
+                opened_at: entry.opened_at,
+            })
+        }).collect();
+        serde::Serialize::serialize(&Map { v, panes }, serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PaneMap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Map {
+            v: u32,
+            panes: BTreeMap<String, serde_json::Value>,
+        }
+        let raw = <Map as serde::Deserialize>::deserialize(deserializer)?;
+        if !matches!(raw.v, MAP_VERSION | MIXED_MAP_VERSION) {
+            return Err(serde::de::Error::custom("unsupported pane map version"));
+        }
+        let mut panes: BTreeMap<String, PaneEntry> = BTreeMap::new();
+        for (pane, mut value) in raw.panes {
+            if raw.v == MAP_VERSION
+                && let Some(object) = value.as_object_mut()
+            {
+                // Even a malformed extra provider key in v1 was ignored by the
+                // old reader. The VERSION, never that extra field, owns it.
+                object.insert("provider".into(), serde_json::Value::String("claude".into()));
+            }
+            let entry: PaneEntry = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            if entry.provider == Provider::Codex && !valid_codex_id(&entry.session_id) {
+                return Err(serde::de::Error::custom("invalid Codex thread id in pane map"));
+            }
+            if panes.values().any(|e| e.session_id == entry.session_id && e.provider != entry.provider) {
+                return Err(serde::de::Error::custom("provider conflict in pane map"));
+            }
+            panes.insert(pane, entry);
+        }
+        Ok(PaneMap { v: raw.v, panes })
+    }
+}
+
 impl PaneMap {
+    fn wire_version(&self) -> u32 {
+        if self.panes.values().any(|e| e.provider == Provider::Codex) {
+            MIXED_MAP_VERSION
+        } else {
+            MAP_VERSION
+        }
+    }
+
     /// v = 1, empty.
     pub fn new() -> Self {
         PaneMap { v: MAP_VERSION, panes: BTreeMap::new() }
@@ -1594,26 +1678,42 @@ impl PaneMap {
         self.panes.get(pane.as_str())
     }
 
-    pub fn insert(&mut self, pane: &PaneId, entry: PaneEntry) {
+    /// Refuse a provider conflict without overwriting either identity.
+    pub fn insert(&mut self, pane: &PaneId, entry: PaneEntry) -> bool {
+        if self.panes.get(pane.as_str()).is_some_and(|old| old.provider != entry.provider)
+            || self.provider_conflict(entry.provider, &entry.session_id)
+        {
+            return false;
+        }
         self.panes.insert(pane.as_str().to_string(), entry);
+        self.v = self.wire_version();
+        true
+    }
+
+    pub fn provider_conflict(&self, provider: Provider, session_id: &str) -> bool {
+        self.panes.values().any(|e| e.session_id == session_id && e.provider != provider)
     }
 
     pub fn remove(&mut self, pane: &PaneId) {
         self.panes.remove(pane.as_str());
+        self.v = self.wire_version();
     }
 
     /// First pane currently mapped to `session_id`, lowest pane id first.
-    pub fn pane_for_session(&self, session_id: &str) -> Option<PaneId> {
-        self.panes_for_session(session_id).into_iter().next()
+    pub fn pane_for_session(&self, provider: Provider, session_id: &str) -> Option<PaneId> {
+        self.panes_for_session(provider, session_id).into_iter().next()
     }
 
     /// All panes mapped to `session_id`, ascending. Double-attach is legal
     /// (PROBE-FINDINGS §3), so this may return more than one.
-    pub fn panes_for_session(&self, session_id: &str) -> Vec<PaneId> {
+    pub fn panes_for_session(&self, provider: Provider, session_id: &str) -> Vec<PaneId> {
+        if self.provider_conflict(provider, session_id) {
+            return Vec::new();
+        }
         let mut out: Vec<PaneId> = self
             .panes
             .iter()
-            .filter(|(_, e)| e.session_id == session_id)
+            .filter(|(_, e)| e.provider == provider && e.session_id == session_id)
             .filter_map(|(k, _)| PaneId::parse(k))
             .collect();
         // Numeric, not lexicographic: `%9` must precede `%10` (§5.5).
@@ -1631,6 +1731,7 @@ impl PaneMap {
         // Unparseable keys can never appear in `alive`, so a corrupt key is
         // dropped here too and counts as a change.
         self.panes.retain(|k, _| alive.contains(k.as_str()));
+        self.v = self.wire_version();
         self.panes.len() != before
     }
 }
@@ -1640,15 +1741,12 @@ fn serialize_map(map: &PaneMap) -> String {
 }
 
 fn parse_map(raw: &str) -> PaneMap {
-    match serde_json::from_str::<PaneMap>(raw) {
-        Ok(map) if map.v == MAP_VERSION => map,
-        _ => PaneMap::new(),
-    }
+    serde_json::from_str::<PaneMap>(raw).unwrap_or_default()
 }
 
 /// Read the LEGACY session-scoped `@ccmux_map`. Any failure (unset, empty, bad
-/// JSON, `v != 1`) yields `PaneMap::new()` — never an error. Only the one-time
-/// migration reads this now; the live map is `@ccmux_tab_map`, per window.
+/// JSON, unsupported version) yields `PaneMap::new()` — never an error. Only
+/// the one-time migration reads this now; the live map is per window.
 pub fn load_map(session: &str) -> PaneMap {
     match get_user_option(session, OPT_MAP) {
         Some(raw) => parse_map(&raw),
@@ -1735,12 +1833,15 @@ pub struct HiddenSet {
     pub v: u32,
     #[serde(default)]
     pub ids: Vec<String>,
+    /// Fold metadata only. The legacy set has no provider wire field.
+    #[serde(skip)]
+    providers: BTreeMap<String, Provider>,
 }
 
 impl HiddenSet {
     /// v = 1, empty.
     pub fn new() -> Self {
-        HiddenSet { v: HIDDEN_VERSION, ids: Vec::new() }
+        HiddenSet { v: HIDDEN_VERSION, ids: Vec::new(), providers: BTreeMap::new() }
     }
 
     /// The dismissed ids, oldest first. What `model::build_rows` filters on.
@@ -1748,29 +1849,47 @@ impl HiddenSet {
         &self.ids
     }
 
+    pub fn provider_of(&self, id: &str) -> Option<Provider> {
+        self.ids.iter().any(|h| h == id)
+            .then(|| self.providers.get(id).copied().unwrap_or_default())
+    }
+
+    /// Legacy set import and callers with a Claude-only identity.
+    #[allow(dead_code)]
+    pub fn dismiss(&mut self, id: &str) -> bool {
+        self.dismiss_for(Provider::Claude, id)
+    }
+
     /// Dismiss `id`. False when it was already hidden (nothing changed).
     ///
     /// At `HIDDEN_MAX` the OLDEST dismissal is dropped, never the newest: the
     /// back of the vec is what `u` needs, and the dropped id simply reappears
     /// in the list, which is the safe direction to fail in.
-    pub fn dismiss(&mut self, id: &str) -> bool {
+    pub fn dismiss_for(&mut self, provider: Provider, id: &str) -> bool {
         if id.is_empty() || self.ids.iter().any(|h| h == id) {
             return false;
         }
         self.ids.push(id.to_string());
+        if provider == Provider::Codex {
+            self.providers.insert(id.to_string(), provider);
+        }
         while self.ids.len() > HIDDEN_MAX {
-            self.ids.remove(0);
+            let dropped = self.ids.remove(0);
+            self.providers.remove(&dropped);
         }
         true
     }
 
     /// Undo the most recent dismissal, returning the id it restored.
     pub fn undo(&mut self) -> Option<String> {
-        self.ids.pop()
+        let id = self.ids.pop()?;
+        self.providers.remove(&id);
+        Some(id)
     }
 
-    /// Drop ids that no longer appear in `live`, so the set cannot grow without
-    /// bound as sessions come and go. True when anything was dropped.
+    /// Retire absent Claude ids. Codex dismissals have no automatic retirement
+    /// because its listing is a window, not an absence proof (§12.9).
+    /// True when anything was dropped.
     ///
     /// `retain` preserves order, so removing from the middle of the stack
     /// leaves `undo` pointing at the same newest dismissal it did before.
@@ -1780,7 +1899,9 @@ impl HiddenSet {
     pub fn reconcile<'a, I: IntoIterator<Item = &'a str>>(&mut self, live: I) -> bool {
         let alive: HashSet<&str> = live.into_iter().collect();
         let before = self.ids.len();
-        self.ids.retain(|id| alive.contains(id.as_str()));
+        self.ids.retain(|id| alive.contains(id.as_str())
+            || self.providers.get(id) == Some(&Provider::Codex));
+        self.providers.retain(|id, _| self.ids.contains(id));
         self.ids.len() != before
     }
 }
@@ -1813,6 +1934,8 @@ pub fn load_hidden(session: &str) -> HiddenSet {
 /// One dismissal or restoration, stamped so every reader orders it identically.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HiddenOp {
+    #[serde(default, skip_serializing_if = "Provider::is_claude")]
+    pub provider: Provider,
     /// `model::Session::session_id` (the stable uuid).
     pub id: String,
     /// true = `d` (dismiss), false = `u` (a tombstone that restores the row).
@@ -1825,6 +1948,11 @@ pub struct HiddenOp {
 }
 
 impl HiddenOp {
+    /// Provider is metadata on an existing operation, not part of its identity.
+    pub fn identity(&self) -> (&str, bool, u64, u64) {
+        (&self.id, self.add, self.seq, self.org)
+    }
+
     /// The total order every process resolves winners by. `add` is last only to
     /// make the order total; two ops can never share a `(seq, org)` unless they
     /// are the same op, because `seq` strictly increases per process.
@@ -1853,13 +1981,33 @@ impl HiddenLog {
         HiddenLog { v: HIDDEN_LOG_VERSION, ops: Vec::new() }
     }
 
-    /// Append `op` unless byte-identical to one already held. Idempotent on
+    /// Append `op` unless its identity is already held. Idempotent on
     /// purpose: adoption of an orphaned fragment can legitimately re-offer an
     /// op this fragment already carries, and that must be a no-op, not a
     /// duplicate. Returns true when the log changed.
     pub fn push(&mut self, op: HiddenOp) -> bool {
-        if op.id.is_empty() || self.ops.contains(&op) {
+        if op.id.is_empty() {
             return false;
+        }
+        if let Some(index) = self.ops.iter().position(|cur| cur.identity() == op.identity()) {
+            // An old adopter may have stripped the optional field. A tagged
+            // copy wins in either order, including duplicates already on disk.
+            let codex = op.provider == Provider::Codex || self.ops.iter().any(|cur| {
+                cur.identity() == op.identity() && cur.provider == Provider::Codex
+            });
+            let changed = codex && self.ops[index].provider != Provider::Codex;
+            if codex {
+                self.ops[index].provider = Provider::Codex;
+            }
+            let before = self.ops.len();
+            let mut kept = false;
+            self.ops.retain(|cur| {
+                if cur.identity() != op.identity() { return true; }
+                let first = !kept;
+                kept = true;
+                first
+            });
+            return changed || self.ops.len() != before;
         }
         self.ops.push(op);
         while self.ops.len() > HIDDEN_OPS_MAX {
@@ -1903,22 +2051,25 @@ impl HiddenLog {
 /// "oldest first" contract: `model::build_rows` is unaffected and
 /// `HiddenSet::undo` still pops the newest dismissal.
 pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> HiddenSet {
-    let mut winner: BTreeMap<&str, &HiddenOp> = BTreeMap::new();
+    let mut winner: BTreeMap<&str, HiddenOp> = BTreeMap::new();
     for log in frags {
         for op in &log.ops {
-            match winner.get(op.id.as_str()) {
-                Some(cur) if cur.rank() >= op.rank() => {}
+            match winner.get_mut(op.id.as_str()) {
+                Some(cur) if cur.identity() == op.identity() => {
+                    if op.provider == Provider::Codex { cur.provider = Provider::Codex; }
+                }
+                Some(cur) if cur.rank() > op.rank() => {}
                 _ => {
-                    winner.insert(op.id.as_str(), op);
+                    winner.insert(op.id.as_str(), op.clone());
                 }
             }
         }
     }
-    let mut live: Vec<&HiddenOp> = winner.into_values().filter(|o| o.add).collect();
+    let mut live: Vec<HiddenOp> = winner.into_values().filter(|o| o.add).collect();
     live.sort_by(|a, b| (a.seq, a.org, &a.id).cmp(&(b.seq, b.org, &b.id)));
     let mut set = HiddenSet::new();
     for op in live {
-        set.dismiss(&op.id);
+        set.dismiss_for(op.provider, &op.id);
     }
     set
 }
@@ -1937,6 +2088,22 @@ pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> Hidde
 /// P1 then P2 settle a resolved disagreement to empty in two ticks.
 /// Returns true when `mine` changed.
 pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool {
+    // Upgrade BEFORE compacting/ranking: a stripped copy must not outlive the
+    // only tagged duplicate merely because the latter belonged to a dead tab.
+    let tagged: HashSet<(String, bool, u64, u64)> = mine.ops.iter()
+        .chain(others.iter().flat_map(|log| log.ops.iter()))
+        .filter(|op| op.provider == Provider::Codex)
+        .map(|op| (op.id.clone(), op.add, op.seq, op.org))
+        .collect();
+    let mut upgraded = false;
+    for op in &mut mine.ops {
+        if op.provider != Provider::Codex
+            && tagged.contains(&(op.id.clone(), op.add, op.seq, op.org))
+        {
+            op.provider = Provider::Codex;
+            upgraded = true;
+        }
+    }
     let mut best: BTreeMap<&str, (u64, u64, bool)> = BTreeMap::new();
     for log in others {
         for op in &log.ops {
@@ -1955,16 +2122,18 @@ pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool {
         }
     }
     let before = mine.ops.len();
+    let mut kept = HashSet::new();
     mine.ops.retain(|op| {
         if top.get(op.id.as_str()) != Some(&op.rank()) {
             return false; // COMPACT: superseded by a later op of my own
         }
-        match best.get(op.id.as_str()) {
+        let keep = match best.get(op.id.as_str()) {
             Some(other) => *other <= op.rank(), // P1
             None => op.add,                    // P2
-        }
+        };
+        keep && kept.insert(op.id.clone()) // coalesce same-identity copies
     });
-    mine.ops.len() != before
+    upgraded || mine.ops.len() != before
 }
 
 fn parse_hidden_log(raw: &str) -> HiddenLog {
@@ -2034,7 +2203,7 @@ mod tests {
     }
 
     fn op(id: &str, add: bool, seq: u64, org: u64) -> HiddenOp {
-        HiddenOp { id: id.into(), add, seq, org }
+        HiddenOp { provider: Provider::Claude, id: id.into(), add, seq, org }
     }
 
     fn log(ops: &[HiddenOp]) -> HiddenLog {
@@ -2043,6 +2212,7 @@ mod tests {
 
     fn entry(session_id: &str) -> PaneEntry {
         PaneEntry {
+            provider: Provider::Claude,
             session_id: session_id.into(),
             short_id: session_id.chars().take(8).collect(),
             name: "n".into(),
@@ -2743,13 +2913,13 @@ mod tests {
         }
         m.insert(&PaneId::parse("%3").expect("id"), entry("uuid-b"));
 
-        let panes = m.panes_for_session("uuid-a");
+        let panes = m.panes_for_session(Provider::Claude, "uuid-a");
         let ids: Vec<&str> = panes.iter().map(|p| p.as_str()).collect();
         assert_eq!(ids, vec!["%2", "%9", "%10"]);
-        assert_eq!(m.pane_for_session("uuid-a"), PaneId::parse("%2"));
-        assert_eq!(m.pane_for_session("uuid-b"), PaneId::parse("%3"));
-        assert_eq!(m.pane_for_session("uuid-missing"), None);
-        assert!(m.panes_for_session("uuid-missing").is_empty());
+        assert_eq!(m.pane_for_session(Provider::Claude, "uuid-a"), PaneId::parse("%2"));
+        assert_eq!(m.pane_for_session(Provider::Claude, "uuid-b"), PaneId::parse("%3"));
+        assert_eq!(m.pane_for_session(Provider::Claude, "uuid-missing"), None);
+        assert!(m.panes_for_session(Provider::Claude, "uuid-missing").is_empty());
     }
 
     #[test]
@@ -3241,12 +3411,14 @@ mod tests {
         // map persistence through @ccmux_tab_map
         let mut map = PaneMap::new();
         map.insert(&p1, PaneEntry {
+            provider: Provider::Claude,
             session_id: "uuid-a".into(),
             short_id: "1c45d64f".into(),
             name: "a b\"c".into(),
             opened_at: 1787640000000,
         });
         map.insert(&p2, PaneEntry {
+            provider: Provider::Claude,
             session_id: "uuid-b".into(),
             short_id: "629da7fc".into(),
             name: "b".into(),
@@ -3278,6 +3450,7 @@ mod tests {
         assert!(idx2 >= 2, "a tab is appended, never renumbering the first");
         let mut seed = PaneMap::new();
         seed.insert(&claude, PaneEntry {
+            provider: Provider::Claude,
             session_id: "uuid-c".into(),
             short_id: "77aa11bb".into(),
             name: "c".into(),
@@ -3336,4 +3509,218 @@ mod tests {
         assert!(TmuxError::Parse("x".into()).to_string().contains("unexpected"));
         assert!(TmuxError::NotFound("x".into()).to_string().contains("not available"));
     }
+    // ── Provider persistence (§12.9) ─────────────────────────────────────────
+
+    const CODEX_ID: &str = "01a0a609-12a6-7abc-8def-0123456789ab";
+
+    fn codex_entry() -> PaneEntry {
+        PaneEntry { provider: Provider::Codex, short_id: "456789ab".into(), ..entry(CODEX_ID) }
+    }
+
+    #[test]
+    fn conditional_maps_keep_exact_v1_bytes_and_return_to_v1() {
+        let mut m = PaneMap::new();
+        m.insert(&PaneId::parse("%2").expect("pane"), entry("uuid-a"));
+        let old = r#"{"v":1,"panes":{"%2":{"session_id":"uuid-a","short_id":"uuid-a","name":"n","opened_at":1787640000000}}}"#;
+        assert_eq!(serialize_map(&m), old);
+        assert_eq!(serde_json::to_string(&m).expect("t pre-write"), old);
+        m.v = 99; // The wire version is content-derived on EVERY write.
+        assert_eq!(serialize_map(&m), old);
+        m.insert(&PaneId::parse("%3").expect("pane"), codex_entry());
+        let mixed = serialize_map(&m);
+        let wire: serde_json::Value = serde_json::from_str(&mixed).expect("json");
+        assert_eq!(wire["v"], 2);
+        assert_eq!(wire["panes"]["%2"]["provider"], "claude");
+        assert_eq!(wire["panes"]["%3"]["provider"], "codex");
+        assert_eq!(parse_map(&mixed), m);
+        assert_eq!(serialize_map(&parse_map(&mixed)), mixed);
+        m.remove(&PaneId::parse("%3").expect("pane"));
+        assert_eq!(serialize_map(&m), old);
+        m.remove(&PaneId::parse("%2").expect("pane"));
+        assert_eq!(serialize_map(&m), EMPTY_MAP_JSON);
+        assert_eq!(EMPTY_MAP_JSON, r#"{"v":1,"panes":{}}"#);
+    }
+
+    #[test]
+    fn map_versions_own_the_provider_default() {
+        for extra in [serde_json::json!("codex"), serde_json::json!("future"),
+            serde_json::Value::Null, serde_json::json!(23)]
+        {
+            let wire = serde_json::json!({"v":1,"panes":{"%2":{"session_id":"uuid-a","provider":extra}}});
+            let m = parse_map(&wire.to_string());
+            assert_eq!(m.panes["%2"].provider, Provider::Claude);
+            assert_eq!(m.panes["%2"].short_id, "");
+            assert_eq!(m.panes["%2"].name, "");
+            assert_eq!(m.panes["%2"].opened_at, 0);
+        }
+        let v2 = r#"{"v":2,"panes":{"%2":{"provider":"claude","session_id":"uuid-a"}}}"#;
+        let m = parse_map(v2);
+        assert_eq!(m.panes["%2"].provider, Provider::Claude);
+        assert!(serialize_map(&m).starts_with(r#"{"v":1,"panes":"#));
+        for bad in [
+            r#"{"v":2,"panes":{"%2":{"session_id":"uuid-a"}}}"#,
+            r#"{"v":2,"panes":{"%2":{"provider":null,"session_id":"uuid-a"}}}"#,
+            r#"{"v":2,"panes":{"%2":{"provider":"future","session_id":"uuid-a"}}}"#,
+            r#"{"v":3,"panes":{"%2":{"provider":"claude","session_id":"uuid-a"}}}"#,
+            r#"{"v":2,"panes":{"%2":{"provider":"codex","session_id":"456789ab"}}}"#,
+        ] {
+            assert!(serde_json::from_str::<PaneMap>(bad).is_err(), "{bad}");
+            assert!(parse_map(bad).panes.is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tab_and_legacy_readers_share_the_map_codec() {
+        let mut m = PaneMap::new();
+        m.insert(&PaneId::parse("%2").expect("pane"), codex_entry());
+        let wire = serialize_map(&m);
+        let line = format!("@1\t1\t%1\t34\t{wire}\t{{\"v\":2,\"ops\":[]}}");
+        let (tabs, width) = parse_tab_lines(&line);
+        assert_eq!(width, Some(34));
+        assert_eq!(tabs[0].map, parse_map(&wire));
+        assert_eq!(tabs[0].map.panes["%2"].provider, Provider::Codex);
+    }
+
+    #[test]
+    fn provider_conflicts_do_not_overwrite_or_claim_a_pane() {
+        let pane = PaneId::parse("%2").expect("pane");
+        let mut m = PaneMap::new();
+        assert!(m.insert(&pane, codex_entry()));
+        let before = m.clone();
+        assert!(!m.insert(&pane, entry("different-id")));
+        assert!(!m.insert(&PaneId::parse("%3").expect("pane"), entry(CODEX_ID)));
+        assert_eq!(m, before);
+        assert_eq!(m.pane_for_session(Provider::Codex, CODEX_ID), Some(pane));
+        assert!(m.panes_for_session(Provider::Claude, CODEX_ID).is_empty());
+        // Even bypassing insert with corrupt persisted input cannot authorize
+        // a lookup in either direction.
+        m.panes.insert("%3".into(), entry(CODEX_ID));
+        assert!(m.panes_for_session(Provider::Codex, CODEX_ID).is_empty());
+        assert!(m.panes_for_session(Provider::Claude, CODEX_ID).is_empty());
+        assert!(parse_map(&serialize_map(&m)).panes.is_empty());
+    }
+
+    #[test]
+    fn old_map_readers_keep_claude_only_windows_but_lose_mixed_visibility() {
+        #[derive(Default, serde::Serialize, serde::Deserialize)]
+        struct OldEntry {
+            session_id: String,
+            #[serde(default)] short_id: String,
+            #[serde(default)] name: String,
+            #[serde(default)] opened_at: i64,
+        }
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct OldMap { v: u32, panes: BTreeMap<String, OldEntry> }
+        fn old_read(raw: &str) -> OldMap {
+            match serde_json::from_str::<OldMap>(raw) {
+                Ok(m) if m.v == 1 => m,
+                _ => OldMap { v: 1, panes: BTreeMap::new() },
+            }
+        }
+        let mut m = PaneMap::new();
+        m.insert(&PaneId::parse("%2").expect("pane"), entry("claude-a"));
+        let old = old_read(&serialize_map(&m));
+        assert_eq!(old.panes["%2"].session_id, "claude-a");
+        assert_eq!(serde_json::to_string(&old).expect("old write"), serialize_map(&m));
+        m.insert(&PaneId::parse("%3").expect("pane"), codex_entry());
+        let mixed = serialize_map(&m);
+        let mut owner = old_read(&mixed);
+        assert!(owner.panes.is_empty(), "old peers see no Claude panes in this window either");
+        assert_eq!(serialize_map(&m), mixed, "a read itself changes no stored map");
+        owner.panes.insert("%4".into(), OldEntry { session_id: "claude-b".into(), ..OldEntry::default() });
+        let overwritten = parse_map(&serde_json::to_string(&owner).expect("old owner write"));
+        assert_eq!(overwritten.panes.len(), 1);
+        assert!(overwritten.panes.contains_key("%4"));
+    }
+
+    #[test]
+    fn hidden_provider_is_optional_but_never_defaults_a_present_bad_value() {
+        let plain = op(CODEX_ID, true, 10, 2);
+        let mut tagged = plain.clone();
+        tagged.provider = Provider::Codex;
+        assert_eq!(plain.identity(), tagged.identity());
+        assert!(!serde_json::to_string(&plain).expect("json").contains("provider"));
+        let wire = serde_json::to_string(&log(&[tagged.clone()])).expect("json");
+        assert!(wire.contains(r#""provider":"codex""#));
+        assert_eq!(parse_hidden_log(&wire).ops, vec![tagged]);
+        for bad in [serde_json::Value::Null, serde_json::json!("future"), serde_json::json!(1)] {
+            let mut value = serde_json::to_value(&plain).expect("json");
+            value["provider"] = bad;
+            assert!(serde_json::from_value::<HiddenOp>(value).is_err());
+        }
+        let legacy: HiddenSet = serde_json::from_str(r#"{"v":1,"ids":["old"]}"#).expect("legacy");
+        assert_eq!(legacy.provider_of("old"), Some(Provider::Claude));
+        assert_eq!(legacy.provider_of("absent"), None);
+    }
+
+    #[test]
+    fn duplicate_hidden_identity_merges_codex_in_either_order() {
+        let plain = op(CODEX_ID, true, 10, 2);
+        let mut tagged = plain.clone();
+        tagged.provider = Provider::Codex;
+        for pair in [[plain.clone(), tagged.clone()], [tagged.clone(), plain.clone()]] {
+            let mut l = HiddenLog::new();
+            assert!(l.push(pair[0].clone()));
+            assert_eq!(l.push(pair[1].clone()), pair[0].provider == Provider::Claude);
+            assert_eq!(l.ops, vec![tagged.clone()]);
+            assert!(!l.push(plain.clone()));
+            let a = log(&[pair[0].clone()]);
+            let b = log(&[pair[1].clone()]);
+            assert_eq!(fold_hidden([&a, &b]).provider_of(CODEX_ID), Some(Provider::Codex));
+            assert_eq!(fold_hidden([&a, &b]), fold_hidden([&b, &a]));
+        }
+        let mut already_duplicated = log(&[plain.clone(), tagged.clone(), plain.clone()]);
+        assert!(already_duplicated.push(plain));
+        assert_eq!(already_duplicated.ops, vec![tagged]);
+    }
+
+    #[test]
+    fn provider_metadata_never_becomes_hidden_operation_rank() {
+        let mut tagged = op(CODEX_ID, true, 10, 2);
+        tagged.provider = Provider::Codex;
+        let newer = op(CODEX_ID, true, 11, 1);
+        assert_eq!(fold_hidden([&log(&[tagged.clone(), newer])]).provider_of(CODEX_ID), Some(Provider::Claude));
+        let restore = op(CODEX_ID, false, 11, 1);
+        assert!(fold_hidden([&log(&[tagged.clone(), restore])]).ids().is_empty());
+        let higher_origin = op(CODEX_ID, true, 10, 3);
+        assert_eq!(fold_hidden([&log(&[tagged, higher_origin])]).provider_of(CODEX_ID), Some(Provider::Claude));
+    }
+
+    #[test]
+    fn pruning_upgrades_duplicate_metadata_before_compacting() {
+        let plain = op(CODEX_ID, true, 10, 2);
+        let mut tagged = plain.clone();
+        tagged.provider = Provider::Codex;
+        let theirs = log(&[tagged.clone()]);
+        let mut mine = log(std::slice::from_ref(&plain));
+        assert!(prune_hidden_log(&mut mine, &[&theirs]), "metadata-only changes must be flushed");
+        assert_eq!(mine.ops, vec![tagged.clone()]);
+        assert_eq!(theirs.ops, vec![tagged.clone()], "never rewrite another fragment");
+        assert!(!prune_hidden_log(&mut mine, &[&theirs]));
+        let mut duplicates = log(&[plain, tagged.clone()]);
+        assert!(prune_hidden_log(&mut duplicates, &[]));
+        assert_eq!(duplicates.ops, vec![tagged]);
+        let newer = log(&[op(CODEX_ID, false, 11, 3)]);
+        assert!(prune_hidden_log(&mut mine, &[&newer]));
+        assert!(mine.ops.is_empty(), "a newer restore still supersedes the dismissal");
+        let mut newer = newer;
+        assert!(prune_hidden_log(&mut newer, &[&mine]));
+        assert!(newer.ops.is_empty(), "ordinary tombstone GC still works");
+    }
+
+    #[test]
+    fn codex_hidden_metadata_survives_reconcile_but_not_undo_or_cap_eviction() {
+        let mut h = HiddenSet::new();
+        h.dismiss_for(Provider::Codex, CODEX_ID);
+        h.dismiss("claude");
+        assert!(h.reconcile(std::iter::empty()));
+        assert_eq!(h.ids(), [CODEX_ID]);
+        assert_eq!(h.provider_of(CODEX_ID), Some(Provider::Codex));
+        assert_eq!(h.undo().as_deref(), Some(CODEX_ID));
+        assert_eq!(h.provider_of(CODEX_ID), None);
+        h.dismiss_for(Provider::Codex, CODEX_ID);
+        for i in 0..HIDDEN_MAX { h.dismiss(&format!("claude-{i}")); }
+        assert_eq!(h.provider_of(CODEX_ID), None, "existing cap eviction is still allowed");
+    }
+
 }

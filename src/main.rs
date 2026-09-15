@@ -914,6 +914,7 @@ mod tests {
             map.insert(
                 &PaneId::parse(m).expect("pane id"),
                 tmux::PaneEntry {
+                    provider: crate::model::Provider::Claude,
                     session_id: "aaaaaaaa-uuid".into(),
                     short_id: "aaaaaaaa".into(),
                     name: "n".into(),

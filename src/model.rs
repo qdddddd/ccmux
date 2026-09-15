@@ -7,6 +7,45 @@ use serde::Deserialize;
 
 // ── Enums ───────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    pub fn is_claude(&self) -> bool {
+        *self == Provider::Claude
+    }
+}
+
+/// Runtime metadata stays separate from Claude's pid-presence contract.
+/// The Codex parser will construct these; no Codex poll source is wired yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CodexStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active { flags: Vec<String> },
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CodexMeta {
+    pub updated_at: i64,
+    pub runtime: CodexStatus,
+}
+
+/// Validate the full address, without inferring its provider or UUID version.
+pub fn valid_codex_id(id: &str) -> bool {
+    id.len() == 36 && id.bytes().enumerate().all(|(i, b)| {
+        if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Background,
@@ -44,6 +83,9 @@ pub enum State {
     /// explicitly because otherwise it lands in `Unknown` and renders as a
     /// purple `?` under Idle — reading as broken when it is merely parked.
     Stopped,
+    /// Not loaded in this Codex server; no assertion about the last turn.
+    #[allow(dead_code)] // The Codex parser is not wired into polling yet.
+    Unloaded,
     /// Running, but stopped at a permission prompt or a question and WAITING ON
     /// THE OPERATOR.
     ///
@@ -117,8 +159,8 @@ impl Group {
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
-/// One row from `claude agents --json`. Field names mirror the CLI's JSON
-/// exactly. Identity is `session_id` and nothing else.
+/// One provider's session. Claude fields mirror `claude agents --json`.
+/// Identity is the full `session_id`; every lookup also checks `provider`.
 /// `Hash` is derived so `App` can fingerprint a whole poll in one pass and
 /// tell an unchanged fleet from a changed one; every field here is payload the
 /// CLI reported, so hashing all of them is exactly the question "did the
@@ -126,6 +168,8 @@ impl Group {
 /// `session_id` alone.
 #[derive(Debug, Clone, Hash)]
 pub struct Session {
+    pub provider: Provider,
+    pub codex: Option<CodexMeta>,
     /// 8-hex short id. `None` for `kind == Interactive`.
     pub id: Option<String>,
     /// UUID. Stable. THE primary key everywhere in ccmux.
@@ -177,7 +221,7 @@ impl Session {
     }
 
     /// Grouping rule, mirroring the stock fleet view:
-    ///   Some(Done) | Some(Stopped)    -> Group::Completed
+    ///   Some(Done) | Some(Stopped) | Some(Unloaded) -> Group::Completed
     ///   Some(Blocked)                 -> Group::Blocked
     ///   status == Waiting             -> Group::Blocked
     ///   Some(Working)                 -> Group::Working
@@ -210,9 +254,9 @@ impl Session {
     /// pins that across the whole state x status matrix.
     pub fn group(&self) -> Group {
         match &self.state {
-            // Terminal, and terminal wins. Stopped is finished-and-not-running,
-            // like Done.
-            Some(State::Done) | Some(State::Stopped) => Group::Completed,
+            // Completed wins. Unloaded is a server-loading fact, not a verdict
+            // on the last turn, but it shares this reviewable group (§12.3).
+            Some(State::Done) | Some(State::Stopped) | Some(State::Unloaded) => Group::Completed,
             Some(State::Blocked) => Group::Blocked,
             // Either axis, at every state that is still running.
             _ if self.status == Status::Waiting => Group::Blocked,
@@ -229,8 +273,8 @@ impl Session {
         self.id.is_some()
     }
 
-    /// IS A WORKER RUNNING FOR THIS SESSION? The one legitimate reading of
-    /// `pid`, and the only one — see that field for why presence is a fact
+    /// IS A CLAUDE WORKER RUNNING FOR THIS SESSION? Codex never supplies that
+    /// evidence. The one legitimate reading of `pid`, and the only one — see that field for why presence is a fact
     /// while the value is not.
     ///
     /// It is a function rather than an open-coded `pid.is_some()` at the call
@@ -239,7 +283,7 @@ impl Session {
     /// parser. A future reader who wants the number has to add a second
     /// accessor and explain themselves.
     pub fn has_worker(&self) -> bool {
-        self.pid.is_some()
+        self.provider == Provider::Claude && self.pid.is_some()
     }
 
     /// Lowercased haystack for `/` filtering: name + " " + cwd + " " + short id.
@@ -346,6 +390,8 @@ impl RawSession {
         });
 
         Some(Session {
+            provider: Provider::Claude,
+            codex: None,
             id,
             pid: self.pid,
             session_id,
@@ -756,6 +802,8 @@ mod tests {
 
     fn sess(id: Option<&str>, status: Status, state: Option<State>) -> Session {
         Session {
+            provider: Provider::Claude,
+            codex: None,
             id: id.map(str::to_string),
             // Dormant unless a test says otherwise: nothing in this module
             // reads the worker, and the safe default is "cannot see one".
@@ -1363,6 +1411,57 @@ mod tests {
         assert_eq!(s.group(), Group::Completed);
         // A stopped session is still openable: `claude attach` resumes it.
         assert!(s.is_attachable());
+    }
+
+    // ── Provider model (§12.3) ───────────────────────────────────────────────
+
+    #[test]
+    fn the_claude_parser_never_imports_provider_metadata() {
+        let json = r#"[{"sessionId":"uuid-a","id":"abcdef01","cwd":"/tmp","name":"n",
+            "provider":"codex","codex":{"runtime":"active"},"state":"unloaded"}]"#;
+        let parsed = parse_sessions(json).expect("valid Claude payload");
+        assert!(parsed.is_complete());
+        assert_eq!(parsed.sessions[0].provider, Provider::Claude);
+        assert_eq!(parsed.sessions[0].codex, None);
+        // Unloaded belongs to the Codex mapping, not to Claude's vocabulary.
+        assert_eq!(parsed.sessions[0].state, Some(State::Unknown("unloaded".into())));
+        assert!(sample().iter().all(|s| s.provider == Provider::Claude && s.codex.is_none()));
+    }
+
+    #[test]
+    fn unloaded_is_completed_but_codex_never_has_a_claude_worker() {
+        for status in [Status::Idle, Status::Busy, Status::Waiting, Status::Unknown("new".into())] {
+            let mut row = sess(Some("12345678"), status, Some(State::Unloaded));
+            row.provider = Provider::Codex;
+            row.codex = Some(CodexMeta { updated_at: 42, runtime: CodexStatus::NotLoaded });
+            assert_eq!(row.group(), Group::Completed);
+            for pid in [None, Some(42)] {
+                row.pid = pid;
+                assert!(!row.has_worker(), "even a corrupt Codex pid is not worker evidence");
+            }
+        }
+        let mut claude = sess(Some("12345678"), Status::Idle, None);
+        assert!(!claude.has_worker());
+        claude.pid = Some(42);
+        assert!(claude.has_worker());
+    }
+
+    #[test]
+    fn codex_addresses_require_uuid_form_not_a_particular_version() {
+        for good in [
+            "01a0a609-12a6-7abc-8def-0123456789ab",
+            "1c45d64f-9bba-4038-8de7-d5f112c92360",
+            "01A0A609-12A6-7ABC-8DEF-0123456789AB",
+        ] {
+            assert!(valid_codex_id(good), "{good}");
+        }
+        for bad in ["", "01234567", "01a0a60912a67abc8def0123456789ab",
+            "01a0a609_12a6-7abc-8def-0123456789ab",
+            "01a0a609-12a6-7abc-8def-0123456789ag",
+            "01a0a609-12a6-7abc-8def-0123456789ab/"]
+        {
+            assert!(!valid_codex_id(bad), "{bad}");
+        }
     }
 
 }

@@ -32,7 +32,7 @@ use ratatui::Frame;
 
 use crate::app::{App, LogsView, Mode, MsgLevel, Prompt, PromptKind};
 use crate::model::{
-    Group, Kind, Row, Session, State, Status, char_width, display_width, format_age,
+    Group, Kind, Provider, Row, Session, State, Status, char_width, display_width, format_age,
     shorten_cwd, truncate_end,
 };
 
@@ -670,7 +670,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     }
 
     let m = margin(w);
-    let open = is_open(app, &sess.session_id);
+    let open = is_open(app, sess.provider, &sess.session_id);
     // A window index of ten or more is exactly where a number stops being
     // something you can eyeball anyway, so the badge degrades to `+` — "open,
     // further along than you want to count" — rather than taking a second
@@ -678,7 +678,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     // defaults to OFF and ccmux never turns it on, so indices are NOT a
     // contiguous 1..M: `+` needs ten windows to have existed at once, not ten
     // to be alive now.
-    let badge = tab_badge_for(app, &sess.session_id).map(|i| char::from_digit(i, 10).unwrap_or('+'));
+    let badge = tab_badge_for(app, sess.provider, &sess.session_id).map(|i| char::from_digit(i, 10).unwrap_or('+'));
     let (age, field) = if w >= RAIL_MIN {
         let a = format_age(sess.started_at, app.now_ms);
         let f = display_width(&a).max(NUM_W);
@@ -1376,16 +1376,16 @@ fn selected_session(app: &App) -> Option<&Session> {
 /// already broke on the numeric part of `%N` when `open` was built, so this
 /// module and `app.rs` can no longer disagree about which pane a row names.
 #[cfg(test)]
-fn pane_key_for(app: &App, session_id: &str) -> Option<String> {
-    app.open.get(session_id).map(|o| o.pane.as_str().to_string())
+fn pane_key_for(app: &App, provider: Provider, session_id: &str) -> Option<String> {
+    app.open.get(session_id).filter(|o| o.provider == provider).map(|o| o.pane.as_str().to_string())
 }
 
 /// Membership is not enough: `OpenPane::attached` is false for a pane whose
 /// attach exited and left an interactive shell behind, and a shell is not the
 /// session being "on screen". The `▌` would otherwise stay lit forever on a
 /// pane the operator has since been using for something else entirely.
-fn is_open(app: &App, session_id: &str) -> bool {
-    app.open.get(session_id).is_some_and(|o| o.attached)
+fn is_open(app: &App, provider: Provider, session_id: &str) -> bool {
+    app.open.get(session_id).is_some_and(|o| o.provider == provider && o.attached)
 }
 
 /// Gutter column 2: the TAB the session's pane lives in, inked only when that
@@ -1424,8 +1424,8 @@ fn is_open(app: &App, session_id: &str) -> bool {
 /// picks the open marker's shade from `is_some()` rather than repeating the
 /// window comparison, so whatever this returns, the colour and the digit agree
 /// by construction. Change the rule here and both cells follow.
-fn tab_badge_for(app: &App, session_id: &str) -> Option<u32> {
-    let open = app.open.get(session_id).filter(|o| o.attached)?;
+fn tab_badge_for(app: &App, provider: Provider, session_id: &str) -> Option<u32> {
+    let open = app.open.get(session_id).filter(|o| o.provider == provider && o.attached)?;
     if open.window.is_some() && open.window == app.own_window {
         return None;
     }
@@ -1451,6 +1451,8 @@ mod tests {
 
     fn sess(n: usize, kind: Kind, status: Status, state: Option<State>) -> Session {
         Session {
+            provider: Provider::Claude,
+            codex: None,
             id: match kind {
                 Kind::Background => Some(format!("{n:08x}")),
                 Kind::Interactive => None,
@@ -1756,11 +1758,12 @@ mod tests {
         let mut app = app_with(sessions);
         app.selected = 1;
         app.rebuild_open();
-        assert!(!is_open(&app, &sid));
+        assert!(!is_open(&app, Provider::Claude, &sid));
 
         app.map.panes.insert(
             "%25".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid.clone(),
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -1771,6 +1774,7 @@ mod tests {
         app.map.panes.insert(
             "%7".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid.clone(),
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -1778,8 +1782,8 @@ mod tests {
             },
         );
         app.rebuild_open();
-        assert!(is_open(&app, &sid));
-        assert_eq!(pane_key_for(&app, &sid).as_deref(), Some("%7"));
+        assert!(is_open(&app, Provider::Claude, &sid));
+        assert_eq!(pane_key_for(&app, Provider::Claude, &sid).as_deref(), Some("%7"));
 
         let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
@@ -1803,6 +1807,7 @@ mod tests {
         app.map.panes.insert(
             "%7".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid.clone(),
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -1810,21 +1815,21 @@ mod tests {
             },
         );
         app.rebuild_open();
-        assert!(is_open(&app, &sid), "a live attach is open");
-        assert_eq!(tab_badge_for(&app, &sid), Some(2), "and it is in another tab");
+        assert!(is_open(&app, Provider::Claude, &sid), "a live attach is open");
+        assert_eq!(tab_badge_for(&app, Provider::Claude, &sid), Some(2), "and it is in another tab");
         let lit = rows_at(&app, 34, 8);
         assert!(lit.iter().any(|r| r.contains('▌')), "{lit:?}");
 
         // The attach exits; the pane is now the operator's shell.
         app.panes[1].detached = true;
         app.rebuild_open();
-        assert!(!is_open(&app, &sid), "a shell is not the session being on screen");
-        assert_eq!(tab_badge_for(&app, &sid), None, "and the badge must not point at it");
+        assert!(!is_open(&app, Provider::Claude, &sid), "a shell is not the session being on screen");
+        assert_eq!(tab_badge_for(&app, Provider::Claude, &sid), None, "and the badge must not point at it");
         let dark = rows_at(&app, 34, 8);
         assert!(!dark.iter().any(|r| r.contains('▌')), "{dark:?}");
         assert!(!dark.iter().any(|r| r.contains('2')), "the tab digit is gone too: {dark:?}");
         // Still ours, still in the map — `x` reaches it through `pane_of_any`.
-        assert_eq!(pane_key_for(&app, &sid).as_deref(), Some("%7"));
+        assert_eq!(pane_key_for(&app, Provider::Claude, &sid).as_deref(), Some("%7"));
     }
 
     /// One string per terminal row, so a test can say "the age column is on the
@@ -1857,6 +1862,7 @@ mod tests {
         app.map.panes.insert(
             "%7".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid,
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -2576,6 +2582,7 @@ mod tests {
             app.map.panes.insert(
                 "%7".into(),
                 PaneEntry {
+                    provider: Provider::Claude,
                     session_id: sid,
                     short_id: "00000001".into(),
                     name: "n".into(),
@@ -2765,6 +2772,7 @@ mod tests {
         app.map.panes.insert(
             "%7".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid,
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -2809,6 +2817,7 @@ mod tests {
         app.own_pane = PaneId::parse("%1");
         app.own_window = crate::tmux::WindowId::parse("@2");
         app.map.panes.insert("%7".into(), PaneEntry {
+            provider: Provider::Claude,
             session_id: sid,
             short_id: "00000001".into(),
             name: "n".into(),
@@ -2965,6 +2974,7 @@ mod tests {
         app.map.panes.insert(
             "%7".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid,
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -2999,6 +3009,7 @@ mod tests {
         app.map.panes.insert(
             "%7".into(),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: sid,
                 short_id: "00000001".into(),
                 name: "n".into(),
@@ -3452,6 +3463,7 @@ mod tests {
         app.own_pane = PaneId::parse("%1");
         app.own_window = crate::tmux::WindowId::parse("@2");
         app.map.panes.insert("%7".into(), PaneEntry {
+            provider: Provider::Claude,
             session_id: sid,
             short_id: "00000001".into(),
             name: "n".into(),
@@ -3526,6 +3538,7 @@ mod tests {
         app.own_pane = PaneId::parse("%1");
         app.own_window = crate::tmux::WindowId::parse("@2");
         app.map.panes.insert("%7".into(), PaneEntry {
+            provider: Provider::Claude,
             session_id: sid,
             short_id: "00000001".into(),
             name: "n".into(),
@@ -3599,6 +3612,7 @@ mod tests {
         let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
         let sid = app.sessions[0].session_id.clone();
         app.map.panes.insert("%7".into(), PaneEntry {
+            provider: Provider::Claude,
             session_id: sid,
             short_id: "00000001".into(),
             name: "n".into(),
@@ -3666,6 +3680,20 @@ mod tests {
                 "{name}: gray must be more prominent than dim"
             );
         }
+    }
+
+    #[test]
+    fn a_foreign_provider_map_cannot_light_a_claude_rows_existing_badges() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Idle, None)]);
+        let id = app.sessions[0].session_id.clone();
+        app.map.panes.insert("%2".into(), PaneEntry {
+            provider: Provider::Codex, session_id: id.clone(), short_id: "00000001".into(),
+            name: "foreign".into(), opened_at: 0,
+        });
+        app.rebuild_open();
+        assert!(!is_open(&app, Provider::Claude, &id));
+        assert_eq!(tab_badge_for(&app, Provider::Claude, &id), None);
+        assert_eq!(pane_key_for(&app, Provider::Claude, &id), None);
     }
 
 }

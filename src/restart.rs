@@ -45,7 +45,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::model::{Group, Kind, Session, State};
+use crate::model::{Group, Kind, Provider, Session, State};
 use crate::tmux::{self, PaneId, PaneInfo, TabInfo};
 
 /// The env var that tells a fresh sidebar it is the second half of an `R`, and
@@ -311,7 +311,7 @@ pub enum Verdict {
 pub fn agent_verdict(s: &Session) -> Verdict {
     // BEFORE the group: `Stopped` and `Done` share the Completed heading and
     // must not share this answer.
-    if s.state == Some(State::Stopped) {
+    if s.provider != Provider::Claude || s.state == Some(State::Stopped) {
         return Verdict::NotRunning;
     }
     match s.group() {
@@ -399,6 +399,7 @@ pub fn headless_targets(
     let mut seen: BTreeSet<&str> = BTreeSet::new();
     let mut out: Vec<Headless> = sessions
         .iter()
+        .filter(|s| s.provider == Provider::Claude)
         .filter(|s| s.has_worker())
         .filter(|s| s.kind == Kind::Background)
         .filter(|s| !claimed(s.session_id.as_str()))
@@ -488,6 +489,9 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
         // `BTreeMap`, so the order is deterministic and two runs of `R` issue
         // the same commands in the same order.
         for (raw, entry) in &tab.map.panes {
+            if entry.provider != Provider::Claude {
+                continue; // Codex panes are never restarted or handed to Claude.
+            }
             let Some(pane) = PaneId::parse(raw) else {
                 continue;
             };
@@ -953,6 +957,7 @@ mod tests {
             m.insert(
                 &PaneId::parse(pane).expect("pane id"),
                 PaneEntry {
+                    provider: Provider::Claude,
                     session_id: format!("sid-{short}"),
                     short_id: (*short).to_string(),
                     name: "n".into(),
@@ -1175,6 +1180,8 @@ mod tests {
     /// has to say so — see `live`.
     fn sess(short: &str, state: Option<State>, status: Status) -> Session {
         Session {
+            provider: Provider::Claude,
+            codex: None,
             id: Some(short.to_string()),
             pid: None,
             session_id: format!("{short}-uuid"),
@@ -1556,6 +1563,7 @@ mod tests {
         tabs[0].map.insert(
             &PaneId::parse("%4").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-cccccccc".into(),
                 short_id: String::new(),
                 name: "n".into(),
@@ -1566,6 +1574,7 @@ mod tests {
         tabs[0].map.insert(
             &PaneId::parse("%9").expect("pane id"),
             PaneEntry {
+                provider: Provider::Claude,
                 session_id: "sid-dddddddd".into(),
                 short_id: "dddddddd".into(),
                 name: "n".into(),
@@ -1903,4 +1912,48 @@ mod tests {
             assert!(cmd.contains(&tmux::sh_quote(a)), "{a:?} missing from {cmd:?}");
         }
     }
+    #[test]
+    fn codex_is_never_a_headless_target_even_with_a_pid_or_a_claude_id() {
+        let claude = live(sess("aaaaaaaa", Some(State::Done), Status::Idle));
+        for state in [None, Some(State::Working), Some(State::Blocked), Some(State::Done), Some(State::Unloaded)] {
+            let codex = Session { provider: Provider::Codex, state, ..claude.clone() };
+            assert!(!codex.has_worker());
+            assert_eq!(agent_verdict(&codex), Verdict::NotRunning);
+            for fleet in [vec![codex.clone(), claude.clone()], vec![claude.clone(), codex.clone()]] {
+                let targets = headless_targets(&fleet, &BTreeSet::new(), &BTreeSet::new());
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].session_id, claude.session_id);
+            }
+            assert!(headless_targets(&[codex], &BTreeSet::new(), &BTreeSet::new()).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_codex_pane_never_enters_the_restart_plan_or_agent_ids() {
+        let id = "01a0a609-12a6-7abc-8def-0123456789ab";
+        let mut t = tab("@1", Some("%1"), &[("%2", "aaaaaaaa")]);
+        t.map.insert(&PaneId::parse("%3").expect("pane"), PaneEntry {
+            provider: Provider::Codex, session_id: id.into(), short_id: "456789ab".into(),
+            name: "codex".into(), opened_at: 0,
+        });
+        for detached in [false, true] {
+            let mut codex = pane("%3", "@1");
+            codex.detached = detached;
+            let panes = vec![pane("%1", "@1"), pane("%2", "@1"), codex];
+            let p = plan(&[t.clone()], &panes, None);
+            assert_eq!(ids(&p), ["%1", "%2"]);
+            assert_eq!(p.agent_ids(), ["aaaaaaaa"]);
+            assert!(!p.held.contains(id));
+            assert!(!p.held.contains("456789ab"));
+        }
+        // The old reader's v!=1 rule loses Claude records as well. R cannot
+        // derive held protection from the empty map it sees in that window.
+        let wire: serde_json::Value = serde_json::to_value(&t.map).expect("wire");
+        assert_eq!(wire["v"], 2);
+        t.map = PaneMap::new();
+        let p = plan(&[t], &[pane("%1", "@1"), pane("%2", "@1"), pane("%3", "@1")], None);
+        assert!(p.held.is_empty());
+        assert!(p.agent_ids().is_empty());
+    }
+
 }
