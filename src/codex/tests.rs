@@ -1555,17 +1555,19 @@ fn production_connector_enforces_frame_and_aggregate_message_limits() {
 
 #[test]
 fn production_connector_tries_the_next_prepared_address_after_refusal() {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused = closed.local_addr().unwrap();
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Keep the port reserved on .1; no suite listener binds .2. Dropping a
+    // listener to fabricate refusal lets another parallel test reuse its port.
+    let refused = SocketAddr::from(([127, 0, 0, 2], reserved.local_addr().unwrap().port()));
     let (address, server) = local_server(|mut stream| {
         read_upgrade(&mut stream);
         stream.write_all(b"HTTP/1.1 401 Denied\r\nContent-Length: 0\r\n\r\n").unwrap();
     });
     let mut client = loopback_client(address);
     client.prepared.addresses.insert(0, refused);
-    drop(closed);
     let (_, result, _) = bounded_poll(client);
     server.join().unwrap();
+    drop(reserved);
     assert_kind(&result, CodexFailureKind::Authentication);
 }
 
