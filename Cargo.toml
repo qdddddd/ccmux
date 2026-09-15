@@ -11,3 +11,6 @@ chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+# tungstenite trace/debug logs can include credentials or echoed server text.
+log = { version = "0.4", features = ["max_level_off"] }

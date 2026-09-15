@@ -9,6 +9,9 @@
 
 mod agents;
 mod app;
+// Read-only Codex module; app integration follows in a separate step.
+#[allow(dead_code)]
+mod codex;
 mod model;
 mod restart;
 mod tmux;
