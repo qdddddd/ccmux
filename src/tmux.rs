@@ -3658,20 +3658,22 @@ mod tests {
         let plain = op(CODEX_ID, true, 10, 2);
         let mut tagged = plain.clone();
         tagged.provider = Provider::Codex;
+        let unrelated = op("claude", true, 9, 2);
         for pair in [[plain.clone(), tagged.clone()], [tagged.clone(), plain.clone()]] {
-            let mut l = HiddenLog::new();
+            let mut l = log(std::slice::from_ref(&unrelated));
             assert!(l.push(pair[0].clone()));
             assert_eq!(l.push(pair[1].clone()), pair[0].provider == Provider::Claude);
-            assert_eq!(l.ops, vec![tagged.clone()]);
+            assert_eq!(l.ops, vec![unrelated.clone(), tagged.clone()]);
             assert!(!l.push(plain.clone()));
+            assert_eq!(l.ops, vec![unrelated.clone(), tagged.clone()]);
             let a = log(&[pair[0].clone()]);
             let b = log(&[pair[1].clone()]);
             assert_eq!(fold_hidden([&a, &b]).provider_of(CODEX_ID), Some(Provider::Codex));
             assert_eq!(fold_hidden([&a, &b]), fold_hidden([&b, &a]));
         }
-        let mut already_duplicated = log(&[plain.clone(), tagged.clone(), plain.clone()]);
+        let mut already_duplicated = log(&[unrelated.clone(), plain.clone(), tagged.clone(), plain.clone()]);
         assert!(already_duplicated.push(plain));
-        assert_eq!(already_duplicated.ops, vec![tagged]);
+        assert_eq!(already_duplicated.ops, vec![unrelated, tagged]);
     }
 
     #[test]

@@ -1079,8 +1079,13 @@ impl App {
     /// An `Err` poll never reaches here: nothing is concluded from a poll we
     /// did not get.
     fn reconcile_hidden(&mut self, provider: Provider, complete: bool) {
-        // Merge provider metadata before consulting any old absence strikes.
-        self.refold_hidden();
+        if self.degraded {
+            // No peer fragments: the larger in-memory set is authoritative.
+            self.hidden_absent.retain(|id| self.hidden.provider_of(id) != Some(Provider::Codex));
+        } else {
+            // Merge provider metadata before consulting any old absence strikes.
+            self.refold_hidden();
+        }
         if provider != Provider::Claude || !complete {
             return;
         }
@@ -11344,6 +11349,128 @@ mod tests {
     }
 
     #[test]
+    fn degraded_polls_preserve_dismissals_beyond_the_op_log_cap() {
+        let mut a = app();
+        a.degraded = true;
+        let sessions: Vec<_> = (0..140)
+            .map(|i| live(bg(&format!("{i:08x}"), "listed", State::Working))).collect();
+        load(&mut a, sessions.clone());
+        for _ in &sessions { a.on_key(press('d')); }
+        assert_eq!(a.hidden.ids().len(), 140);
+        assert_eq!(a.hidden_log.ops.len(), 128, "the op log is capped independently");
+        assert!(session_rows(&a).is_empty());
+        let hidden = a.hidden.clone();
+
+        for dropped in [0, 1] {
+            a.apply_poll(Ok(model::Payload { sessions: sessions.clone(), dropped }));
+            a.rebuild_rows();
+            assert_eq!(a.hidden.ids().len(), hidden.ids().len());
+            assert_eq!(a.hidden, hidden, "degraded mode keeps the in-memory set");
+            assert!(session_rows(&a).is_empty());
+        }
+    }
+
+    #[test]
+    fn degraded_polls_preserve_dismissals_after_undo_churn() {
+        let mut a = app();
+        a.degraded = true;
+        let sessions: Vec<_> = (0..100)
+            .map(|i| live(bg(&format!("{i:08x}"), "listed", State::Working))).collect();
+        load(&mut a, sessions.clone());
+        for _ in &sessions { a.on_key(press('d')); }
+        let hidden = a.hidden.clone();
+        for _ in 0..15 {
+            a.on_key(press('u'));
+            a.on_key(press('d'));
+        }
+        assert_eq!(a.hidden, hidden);
+        assert_eq!(a.hidden_log.ops.len(), 128, "the op log is capped independently");
+
+        for dropped in [0, 1] {
+            a.apply_poll(Ok(model::Payload { sessions: sessions.clone(), dropped }));
+            a.rebuild_rows();
+            assert_eq!(a.hidden.ids().len(), hidden.ids().len());
+            assert_eq!(a.hidden, hidden, "undo churn must not evict unrelated dismissals");
+            assert!(session_rows(&a).is_empty());
+        }
+    }
+
+    #[test]
+    fn an_incomplete_poll_clears_a_strike_after_a_peer_repairs_the_provider() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+        let tagged = HiddenOp { provider: Provider::Codex,
+            id: "01a0a609-12a6-7abc-8def-0123456789ab".into(), add: true, seq: 100, org: 9 };
+        a.hidden_log.push(HiddenOp { provider: Provider::Claude, ..tagged.clone() });
+        a.refold_hidden();
+        a.reconcile_hidden(Provider::Claude, true);
+        assert!(a.hidden_absent.contains(&tagged.id));
+
+        let mut peer = tab("@2", 2, Some("%2"));
+        peer.hidden.push(tagged.clone());
+        a.tabs.push(peer);
+        a.reconcile_hidden(Provider::Claude, false);
+        assert_eq!(a.hidden.provider_of(&tagged.id), Some(Provider::Codex));
+        assert!(!a.hidden_absent.contains(&tagged.id), "repair clears even an old Claude strike");
+    }
+
+    #[test]
+    fn degraded_reconciliation_clears_codex_strikes_without_refolding() {
+        let mut a = app();
+        a.degraded = true;
+        a.hidden.dismiss_for(Provider::Codex, "codex");
+        a.hidden_absent.insert("codex".into());
+        assert!(a.hidden_log.ops.is_empty());
+        a.reconcile_hidden(Provider::Claude, false);
+        assert_eq!(a.hidden.provider_of("codex"), Some(Provider::Codex));
+        assert!(a.hidden_absent.is_empty());
+    }
+
+    #[test]
+    fn orphan_adoption_persists_a_metadata_only_provider_upgrade() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.panes = vec![pane("%1", 1, 1, 0, 34, false)];
+        a.tabs = vec![tab("@1", 1, Some("%1"))];
+        let tagged = HiddenOp { provider: Provider::Codex,
+            id: "01a0a609-12a6-7abc-8def-0123456789ab".into(), add: true, seq: 100, org: 9 };
+        a.hidden_log.push(HiddenOp { provider: Provider::Claude, ..tagged.clone() });
+        a.hidden_dirty = false;
+        a.last_frags.insert(9, HiddenLog { v: 2, ops: vec![tagged.clone()] });
+
+        a.adopt_orphan_fragments();
+        assert!(a.hidden_dirty, "the only change is the provider tag");
+        assert_eq!(a.hidden_log.ops, vec![tagged.clone()]);
+        for _ in 0..2 { a.reconcile_hidden(Provider::Claude, true); }
+        assert_eq!(a.hidden.ids(), std::slice::from_ref(&tagged.id));
+        assert_eq!(a.hidden.provider_of(&tagged.id), Some(Provider::Codex));
+        assert_eq!(a.hidden_log.ops, vec![tagged]);
+    }
+
+    #[test]
+    fn own_adoption_persists_a_metadata_only_provider_upgrade() {
+        let mut a = app();
+        own(&mut a, "%1", "@1");
+        a.own_state_loaded = false;
+        let tagged = HiddenOp { provider: Provider::Codex,
+            id: "01a0a609-12a6-7abc-8def-0123456789ab".into(), add: true, seq: 100, org: 9 };
+        let mut stored = tab("@1", 1, Some("%1"));
+        stored.hidden.push(tagged.clone());
+        a.tabs = vec![stored];
+        a.hidden_log.push(HiddenOp { provider: Provider::Claude, ..tagged.clone() });
+        a.hidden_dirty = false;
+
+        a.adopt_own_state();
+        assert!(a.hidden_dirty, "the stored tag must upgrade the interim copy");
+        assert_eq!(a.hidden_log.ops, vec![tagged.clone()]);
+        for _ in 0..2 { a.reconcile_hidden(Provider::Claude, true); }
+        assert_eq!(a.hidden.ids(), std::slice::from_ref(&tagged.id));
+        assert_eq!(a.hidden.provider_of(&tagged.id), Some(Provider::Codex));
+        assert_eq!(a.hidden_log.ops, vec![tagged]);
+    }
+
+    #[test]
     fn mixed_version_orphan_adoption_repairs_tags_before_retirement() {
         // These are the old binary's actual fields: deserialize/serialize
         // adopts an op while stripping the unknown provider key.
@@ -11353,15 +11480,15 @@ mod tests {
         struct OldLog { v: u32, ops: Vec<OldOp> }
         let tagged = HiddenOp { provider: Provider::Codex,
             id: "01a0a609-12a6-7abc-8def-0123456789ab".into(), add: true, seq: 100, org: 9 };
-        let original = HiddenLog { v: 2, ops: vec![
-            HiddenOp { provider: Provider::Claude, id: "claude".into(), add: true, seq: 99, org: 9 },
-            tagged.clone(),
-        ] };
+        let unrelated = HiddenOp { provider: Provider::Claude,
+            id: "c1-uuid".into(), add: true, seq: 99, org: 9 };
+        let original = HiddenLog { v: 2, ops: vec![unrelated.clone(), tagged.clone()] };
         let old: OldLog = serde_json::from_str(&serde_json::to_string(&original).expect("wire")).expect("old read");
         let stripped: HiddenLog = serde_json::from_str(&serde_json::to_string(&old).expect("old write")).expect("new read");
         assert!(stripped.ops.iter().all(|op| op.provider == Provider::Claude));
 
         let mut a = app();
+        a.sessions = vec![live(bg("c1", "still listed", State::Working))];
         own(&mut a, "%1", "@1");
         a.panes = vec![pane("%1", 1, 1, 0, 34, false)];
         a.tabs = vec![tab("@1", 1, Some("%1"))];
@@ -11385,6 +11512,11 @@ mod tests {
         assert_eq!(mine, &tagged);
         assert_eq!(a.tabs[1].hidden, original, "the peer fragment is read-only");
         assert!(serde_json::to_string(&a.hidden_log).expect("wire").contains(r#""provider":"codex""#));
+        assert!(a.hidden.ids().contains(&unrelated.id));
+        assert!(a.hidden_log.ops.contains(&unrelated));
+        a.reconcile_hidden(Provider::Claude, true);
+        assert!(a.hidden.ids().contains(&unrelated.id), "a live Claude dismissal survives repair");
+        assert!(a.hidden_log.ops.contains(&unrelated), "repair preserves unrelated durable ops");
 
         a.on_key(press('u'));
         let undo = a.hidden_log.ops.last().expect("undo op");

@@ -3686,7 +3686,9 @@ mod tests {
     fn a_foreign_provider_map_cannot_light_a_claude_rows_existing_badges() {
         let mut app = app_with(vec![sess(1, Kind::Background, Status::Idle, None)]);
         let id = app.sessions[0].session_id.clone();
-        app.map.panes.insert("%2".into(), PaneEntry {
+        app.own_window = crate::tmux::WindowId::parse("@1");
+        app.panes = vec![pane_in("%1", 1, 0, 1), pane_in("%7", 2, 34, 2)];
+        app.map.panes.insert("%7".into(), PaneEntry {
             provider: Provider::Codex, session_id: id.clone(), short_id: "00000001".into(),
             name: "foreign".into(), opened_at: 0,
         });
@@ -3694,6 +3696,19 @@ mod tests {
         assert!(!is_open(&app, Provider::Claude, &id));
         assert_eq!(tab_badge_for(&app, Provider::Claude, &id), None);
         assert_eq!(pane_key_for(&app, Provider::Claude, &id), None);
+        let dark = rows_at(&app, 34, 8);
+        let row = dark.iter().find(|r| r.contains("session number")).expect("session row");
+        assert!(!row.contains('▌'));
+        assert!(!row.contains('2'), "no foreign tab digit: {row}");
+
+        app.map.panes.get_mut("%7").expect("entry").provider = Provider::Claude;
+        app.rebuild_open();
+        assert!(is_open(&app, Provider::Claude, &id));
+        assert_eq!(tab_badge_for(&app, Provider::Claude, &id), Some(2));
+        assert_eq!(pane_key_for(&app, Provider::Claude, &id).as_deref(), Some("%7"));
+        let lit = rows_at(&app, 34, 8);
+        let row = lit.iter().find(|r| r.contains("session number")).expect("session row");
+        assert!(row.starts_with("▌2"), "the control exercises both gutter cells: {row}");
     }
 
 }
