@@ -1481,7 +1481,8 @@ key-repeat/release events double every keystroke.
 
 ### 4.2 Polling policy — pinned, so nobody invents a thread
 
-**AMENDED BY §12.5:** the shared gate, per-provider backoff, and Codex's whole-poll budget.
+**AMENDED BY §12.5:** per-provider backoff, Codex's whole-poll budget, and
+its startup-only gate exception; all other forces still outrank the gate.
 
 **Polling is synchronous, on the event-loop thread. No threads, no channels, no
 async runtime.** `claude agents --json` costs 0.21s (PROBE-FINDINGS §1); the
@@ -2031,7 +2032,11 @@ Claude pane.
 
 ### 6.8 Footer (row H-1)
 
-**AMENDED BY §12.6:** independent provider errors and the Codex degraded marker.
+**AMENDED BY §12.6:** independent provider errors and the Codex degraded
+marker. For Claude too, including Codex OFF, standing `poll_error` is one
+truncated line; the blanket overflow rule below no longer applies to it.
+Provider diagnostics use guarded, rate-limited transition flashes and an
+explicit-`r` exception; armed warnings and transient messages still wrap.
 
 Priority order — the first applicable wins:
 
@@ -3287,7 +3292,9 @@ variable would have every sidebar respawn every other one on startup, forever.
 
 ## 9. Error and edge handling
 
-**AMENDED BY §§12.5–12.6, 12.10:** partial Codex observations, degradation, and evidence limits.
+**AMENDED BY §§12.5–12.6, 12.10:** partial Codex observations, degradation,
+and evidence limits. Claude-only users also get one-line standing errors and
+guarded, rate-limited diagnostic flashes (§9.1); standing errors do not wrap.
 
 Governing principle: **the sidebar never dies and never blanks.** Every failure
 degrades to a message in the footer over the last known-good list. `unwrap()`,
@@ -3295,6 +3302,12 @@ degrades to a message in the footer over the last known-good list. `unwrap()`,
 `Mutex` poisoning that cannot occur single-threaded.
 
 ### 9.1 `claude agents --json` exits non-zero
+
+**AMENDED BY §12.6:** even with Codex OFF, standing Claude `poll_error`
+stays on one truncated footer line, superseding §6.8's blanket overflow rule.
+First failure, recovery-to-failure, and category changes queue guarded,
+rate-limited diagnostics; failed explicit `r` bypasses the cooldown. The
+existing Claude success/error and row-retention policies below remain.
 
 - Keep `app.sessions` and `app.rows` exactly as they are — the previous list
   stays on screen and stays navigable.
@@ -3816,8 +3829,11 @@ Add these global CLI options, accepted by the launcher and `sidebar`:
 An absent or empty effective URL means OFF. Do not read a token, resolve a
 hostname, inspect Codex state, prepare a client, connect, or show a Codex error
 in this case, even if a token-file variable is present. Claude-only windows
-keep byte-identical v1 maps (§12.9). The standing-error layout correction in
-§12.6 also applies to Claude when Codex is OFF; other Claude behavior remains.
+keep byte-identical v1 maps (§12.9). Two §12.6 changes ALSO apply to
+Claude-only users: standing poll errors occupy one truncated footer line,
+and first failure/recovery-to-failure/category changes queue guarded,
+rate-limited diagnostic flashes, with failed explicit `r` exempt from the
+cooldown. Other Claude polling, row-retention, and verb behavior remains.
 
 **v1 accepts only loopback `ws://`.** URL syntax validation requires a host
 that is either `localhost` (case-insensitive, NO trailing dot), an IPv4
@@ -3864,6 +3880,9 @@ pub struct CodexClient { /* private */ }
 /// Carries only a bounded, redacted diagnostic, never a raw transport error.
 #[derive(Debug)]
 pub struct CodexError { /* private */ }
+impl CodexError {
+    pub fn diagnostic(&self) -> &CodexDiagnostic; // category + text (§12.5)
+}
 impl std::fmt::Display for CodexError {}
 impl std::error::Error for CodexError {}
 
@@ -3873,11 +3892,14 @@ pub const POLL_TIMEOUT: std::time::Duration =
 pub const HISTORY_DAYS: i64 = 7;
 ```
 
-**Prepare lazily inside the first due, gated Codex attempt in `tick()`.**
+**Prepare lazily inside the first due Codex attempt in `tick()` (§12.5).**
 `main` resolves only non-secret settings; it does no DNS or credential-file
-IO. `first_frame` must already have drawn before preparation. A shut poll
-gate defers preparation as well as polling, including sidebars started by
-`t`, heal, or `R`. `prepare` opens no app-server connection.
+IO. `first_frame` must already have drawn before preparation. Only Codex's
+PROCESS-START force is gate-conditioned: an offscreen/detached process started
+by the launcher, `t`, heal, or `R` waits for the visibility wake-up edge unless
+another force intervenes. Explicit `r`, post-verb, and wake-up forces outrank
+the gate and backoff; they may trigger first preparation too. `prepare` opens
+no app-server connection. Claude's forced first poll is unchanged.
 
 Memoize the preparation result, success OR failure. Automatic attempts never
 prepare again: a prepared client retries on the normal poll backoff; without
@@ -3886,15 +3908,18 @@ This keeps automatic retries free of DNS/file IO, including auth failures.
 
 **Explicit `r` requests fresh preparation before its forced Codex poll.**
 Set a pending reload flag in the key handler; consume it inside the next
-gated tick, not in the key handler or inline `act_force_refresh`. Coalesce
-repeated pending requests. Post-verb refreshes and visibility wake-ups force
-polling but do not reload preparation. A successful reload atomically replaces
-the client's prepared addresses/credential while preserving its §12.5 polling
-bookkeeping for this fixed endpoint. A failed reload keeps the previous client,
-if any, and reports
-the preparation failure for that attempt; do not immediately hide it with a
-poll using the old client. Later automatic attempts may use that old client.
-A failed initial preparation can be retried with `r` too.
+tick, not in the key handler or inline `act_force_refresh`. This force runs
+through a shut gate. Coalesce repeated pending requests. Post-verb refreshes
+and visibility wake-ups force polling but do not reload preparation. A
+successful reload atomically replaces the client's prepared addresses/credential
+while preserving its §12.5 polling bookkeeping for this fixed endpoint. A
+failed reload keeps the previous client, if any, and reports the preparation
+failure for that attempt; do not immediately hide it with a poll using the old
+client. Later automatic attempts may use that old client's verified loopback
+addresses. A rejected non-loopback reload reads no new token and connects to
+none of the new addresses; its attach refusal survives a successful old-client
+poll and clears only after successful `r` preparation. Without a prior client,
+a rejected initial preparation makes no connection. `r` can retry that too.
 
 Both initial preparation and explicit reload are OUTSIDE the 1,000 ms RPC
 deadline but INSIDE the tick's elapsed-time measurement. DNS/filesystem
@@ -4078,6 +4103,16 @@ another endpoint, or an implicitly started daemon.
 
 ```rust
 // src/codex.rs; Session remains in model.rs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexFailureKind {
+    Configuration, Credential, Connection, Authentication,
+    Timeout, Protocol, Incomplete,
+}
+#[derive(Debug, Clone)]
+pub struct CodexDiagnostic {
+    pub kind: CodexFailureKind,      // assigned at the failure's origin
+    pub message: String,             // redacted, at most 120 characters
+}
 pub struct CodexObservation {
     pub sessions: Vec<Session>,      // eligible rows actually observed
     pub complete: bool,              // complete for THIS window + loaded union
@@ -4085,7 +4120,7 @@ pub struct CodexObservation {
     // Provenance for start-time stabilization, including the cutoff page.
     // Contains only IDs whose metadata came from this attempt's thread/list.
     pub history_metadata_ids: BTreeSet<String>,
-    pub diagnostic: Option<String>,  // redacted reason when incomplete
+    pub diagnostic: Option<CodexDiagnostic>, // present iff incomplete
 }
 impl CodexClient {
     // Same effective endpoint; no IO. Keep exclusions and read-attempt order.
@@ -4112,15 +4147,17 @@ that headroom while capping the new provider's recurring contribution to a
 synchronous input stall. With the measured 210 ms Claude poll, an ordinary
 combined pass costs about 0.63 s. Codex being enabled accepts that cost.
 A timed-out Claude child can still consume its existing 5 s budget before
-this one-second budget, and preparation has the separate latency limit in
-§12.2. Keep the existing slow-tick buffered-input drain over the WHOLE tick.
+this one-second budget. Preparation has NO latency bound: DNS/filesystem IO
+is outside that RPC deadline but inside the timed tick (§12.2). Keep the
+existing slow-tick buffered-input drain over the WHOLE tick.
 No background thread is introduced to hide the stall.
 
-**The existing gate and ladder apply per provider.** The tmux visibility
-inventory and flat tick cadence are shared. Each enabled provider has its own
-last-attempt time, force flag, fail streak, idle streak, fingerprint, and last
-good rows. Use §4.2's same idle ladder (four unchanged complete observations,
-then doubling to 30 s) and failure interval (10 s after three failures);
+**The existing ladder applies per provider; forces have explicit precedence.**
+The tmux visibility inventory and flat tick cadence are shared. Each enabled
+provider has its own last-attempt time, force state, fail streak, idle streak,
+fingerprint, and last good rows. Use §4.2's same idle ladder (four unchanged
+complete observations, then doubling to 30 s) and failure interval (10 s after
+three failures);
 its effective interval is `max(idle_interval, fail_interval)`.
 When both are due in one tick, poll Claude then Codex, including any pending
 Codex preparation in its turn. A failure of either does not skip the other.
@@ -4128,14 +4165,28 @@ A partial Codex observation or preparation failure counts as a failure for
 its backoff and resets its idle ladder; a complete observation clears only
 its own failure. A skipped provider attempt changes none of these counters.
 
-A keypress collapses both idle ladders but does not force either connection.
-`r`, post-verb refresh, and the visibility wake-up edge owe a forced attempt
-to each enabled provider on the next gated tick, including through failure
-backoff. Only explicit `r` also owes a preparation reload and a full diagnostic
-flash if the attempt fails (§§12.2, 12.6). Carry that user-request flag until
-the attempt runs; a closed gate must not consume it. Refreshing panes,
-rebuilding rows, pinning width, and flushing tab state still run when neither
-provider is due.
+For enabled Codex, the due predicate is, in this order:
+
+1. A pending explicit `r`, post-verb refresh, or visibility wake-up force
+   makes the attempt due, THROUGH a shut gate and either backoff.
+2. Otherwise, `watchers()` other than `Onscreen` or `Unknown` makes it
+   not due. Do not consume the process-start force on this skip.
+3. Otherwise, a pending process-start force makes it due; without a force,
+   compare time since its last attempt with its effective interval.
+
+Track the process-start force separately from the other causes. On any actual
+attempt consume the forces it satisfies, including startup; an initial `r`
+prepares only once. A hidden `R`-respawned sidebar therefore defers Codex's
+startup preparation/poll while Claude still takes its forced first poll.
+The next visibility wake-up forces an attempt. An explicit `r` or post-verb
+force arriving first also runs while hidden. This is the ONLY departure from
+§4.2's force-before-gate rule; automatic timer attempts remain gated.
+
+An ordinary keypress collapses both idle ladders but does not force either
+connection. Only explicit `r` also owes a preparation reload and a diagnostic
+if the attempt fails (§§12.2, 12.6). Carry that user-request flag until its
+forced attempt runs; do not gate it away. Refreshing panes, rebuilding rows,
+pinning width, and flushing tab state still run when neither provider is due.
 
 **Codex's idle fingerprint is a projection, not `Session::hash`.** Order rows
 by full `Thread.id`, then hash provider, full ID, parsed name, cwd, shared
@@ -4168,25 +4219,30 @@ does. Claude retains its existing fingerprint.
    break ties by full ID. Advance the sequence when a request is actually
    attempted, including one that fails or exhausts the deadline. Unread IDs
    keep their place for the next attempt. Do not load or subscribe.
-4. Deduplicate by `Thread.id`; apply the following persistent/top-level
-   filter to BOTH `L`'s metadata and `H`. Require `ephemeral == false`
-   and absent/null `parentThreadId`. Classify `Thread.source` by the
-   schema's three `SessionSource.oneOf` branches:
+4. Deduplicate by valid full `Thread.id`; apply this persistent/top-level
+   filter to BOTH `L`'s metadata and `H`, BEFORE validating eligible-row
+   fields. An affirmative `ephemeral == true` OR non-null `parentThreadId`
+   is sufficient immutable exclusion, even with an unfamiliar source.
+   Otherwise classify `Thread.source` by its outer branch:
 
    - Eligible source: exactly one of the strings
-     `cli|vscode|exec|appServer|unknown`.
-   - Deliberate exclusion: an object whose only key is `subAgent` with a
-     schema-valid `SubAgentSource` value (all subtypes, including `review`,
-     `compact`, `memory_consolidation`, `{"other":<string>}`, and
-     `thread_spawn`), or whose only key is `custom` with a string value.
-     `ThreadSourceKind` cannot return custom sources in history; including
-     them through `L` alone would make them disappear on idle unload.
-     These exclusions cause NO parser loss, drift, failure backoff, or
-     degradation. Neither do valid ephemeral or non-null-parent exclusions.
-   - Unrecognized: any other string, unknown/extra source-object key, or
-     wrong value type, including `{"custom":1}` and
-     `{"custom":"x","extra":1}`. Report drift, skip, and mark incomplete.
+     `cli|vscode|exec|appServer|unknown`. Eligible rows must also have
+     `ephemeral == false` and absent/null `parentThreadId`.
+   - Deliberate exclusion: an object whose ONLY key is `subAgent`, WHATEVER
+     its value, or whose only key is `custom` with a string value. Never
+     require a current-schema `SubAgentSource` subtype to exclude a subagent;
+     a newer subtype is still outside scope. `ThreadSourceKind` cannot return
+     custom sources in history; including them through `L` alone would make
+     them disappear on idle unload. All these exclusions are cacheable and
+     cause NO parser loss, drift, failure backoff, or degradation.
+   - Unrecognized, absent an earlier sufficient exclusion: any other string,
+     unknown/extra source-object key, or malformed branch, including
+     `{"custom":1}`, `{"custom":"x","extra":1}`, and
+     `{"subAgent":"review","extra":1}`. Report drift, skip, and mark
+     incomplete. Unknown nested subAgent values alone NEVER take this path.
 
+   A sufficient exclusion does not need otherwise-unused row fields to parse;
+   a malformed identity/envelope still cannot supply exclusion coverage.
    `forkedFromId` alone does NOT make a thread a subagent: an ordinary TUI
    fork is eligible.
 5. Convert the remaining union to Sessions using §12.3. Loaded membership is
@@ -4194,12 +4250,15 @@ does. Claude retains its existing fingerprint.
    `Thread.status`, even if a thread unloaded between steps 1 and 3.
 
 **Cache only immutable exclusion verdicts as coverage.** `CodexClient` keeps
-a process-local cache keyed by full ID for well-formed metadata proving
-`ephemeral == true`, non-null parent, subAgent source, or custom source.
-A cached exclusion covers that loaded ID without a new metadata read. Do not
-cache a parser error, failed read, or genuinely unrecognized source as an
-exclusion. Fresh fetched metadata still undergoes validation; an observed
-contradiction invalidates the verdict and makes that attempt incomplete.
+a process-local cache keyed by valid full ID for any sufficient exclusion
+in step 4: `ephemeral == true`, non-null parent, any sole-key subAgent object,
+or a sole-key custom object with string value. A cached exclusion covers that
+loaded ID without a new metadata read. A parser error, failed read, or
+unrecognized source WITHOUT sufficient exclusion evidence never covers an ID.
+Fresh fetched metadata still undergoes step 4; evidence contradicting a cached
+verdict invalidates that verdict and makes the attempt incomplete. An
+unfamiliar nested subAgent value or source on an independently excluded row
+is not such a contradiction.
 
 Drop an exclusion and its scheduling record when a complete `L` no longer
 contains its ID. Do not infer that from a partial census. A new process starts
@@ -4223,11 +4282,13 @@ from history remain eligible: an empty thread, empty fork, or index lag is
 not a scope exclusion. The fingerprint above cannot mistake read-time fallback
 timestamps for work.
 
-Missing ID/cwd/timestamps/ephemeral/source, invalid required types, failed
-metadata reads, malformed envelopes/JSON, repeated cursors, invalid cursors,
-non-descending history, conflicting duplicate rows, protocol errors, and
-deadline expiry make the attempt INCOMPLETE. Identical duplicate rows are
-coalesced. A malformed row cannot authorize an early history cutoff.
+Missing/invalid IDs, failed metadata reads, malformed envelopes/JSON,
+repeated or invalid cursors, non-descending history, conflicting duplicate
+rows, protocol errors, and deadline expiry make the attempt INCOMPLETE.
+For rows not covered by a sufficient step-4 exclusion, missing/invalid
+cwd/timestamps/ephemeral/source and other required fields do too. Identical
+duplicate rows are coalesced. An exclusion does not authorize a cutoff:
+early history termination still requires valid descending timestamps.
 Unknown status/flag STRINGS are retained under §12.3, not dropped.
 An ignored server request alone is not incompleteness (§12.4).
 
@@ -4278,11 +4339,16 @@ Show Codex-specific help additions only when Codex is enabled. Explain the
 last-turn outcome unknown”, and the launch-target map limitation (§12.7).
 Say “n creates a Claude session; create Codex threads in the Codex TUI”.
 
-Codex is degraded when its preparation/polling fails or its observation is
-incomplete; OFF is not degraded. Retain rows and pane actions on degradation.
+Each enabled provider starts `NotYetObserved` in a fresh process: neither
+healthy nor degraded, with no standing error. Codex becomes degraded when
+preparation/polling fails or its observation is incomplete; OFF has no provider
+state or diagnostic. Retain rows and pane actions on degradation.
 Missing/down server, authentication refusal, unsupported RPC, and bad payload
 do not fall back to Claude or clear Claude's errors. A complete Codex poll
-clears its degradation; a complete Claude poll does not.
+makes it healthy; a Claude poll cannot change that state. Claude retains its
+existing `Ok`/`Err` health policy, including successful partial-payload handling.
+A first failure from `NotYetObserved` IS diagnostic-worthy, but only queues a
+message under the delivery rules below; it never overwrites an existing flash.
 
 Valid `systemError`/unknown-state rows are row warnings, not provider failures.
 Known `systemError` warns `codex runtime error: <tail-eight>`; do not call it
@@ -4317,19 +4383,71 @@ providers, including when Codex is OFF:
   in its width; do not also reserve/repeat it on the footer or each line.
   For an unwrapped body it occupies the normal footer prefix. Truncate
   safely when even the prefix cannot fit.
-- Flash the full bounded provider diagnostic at Error level on
-  healthy-to-degraded, on a changed reason, and after a failed explicit
-  `r` attempt, using the existing flash duration. No repeat flash for an
-  unchanged automatic failure. Apply the same rule to Claude's poll error.
-  Coalesce diagnostics that need flashing in the same tick, in Claude/Codex
-  order, so the second failed provider cannot overwrite the first's reason.
-  `r` makes a missed reason available again; post-verb/wake-up forced polls
-  alone do not renew an unchanged error flash.
+- Provider diagnostics use the SAME transient wrapping and Error level,
+  but must be queued and delivered through the guard below. This applies to
+  Claude's poll errors even when Codex is OFF.
 
-Row warnings use the flash/drift priority and its delivery guard; a higher
-priority body or overlay covering one has not “seen” it. Long-lived server
-failure must leave the detail block and selectable list intact once a
-transient flash expires.
+**Compare reason categories, never diagnostic text.** Assign a finite
+category at the failure's origin, separate from its bounded display reason:
+
+| Provider | Category | Origin |
+|---|---|---|
+| Codex | `Configuration` | Invalid settings or a rejected non-loopback resolution |
+| Codex | `Credential` | Token-file/read/format failure |
+| Codex | `Connection` | Resolver, connect, or transport IO failure |
+| Codex | `Authentication` | Authentication refusal |
+| Codex | `Timeout` | Whole-poll deadline expiry |
+| Codex | `Protocol` | WebSocket/RPC/envelope incompatibility or failure |
+| Codex | `Incomplete` | Remaining listing/metadata loss or inconsistency |
+| Claude | `CommandUnavailable` | `AgentsError::NotFound` |
+| Claude | `CommandFailed` | `AgentsError::Cmd`, including the existing timeout representation |
+| Claude | `InvalidPayload` | `AgentsError::Parse` |
+
+Do not create categories from stderr, exit codes, RPC text, IDs, or addresses.
+Preparation errors expose their `CodexDiagnostic`; incomplete observations
+carry one (§§12.2, 12.5). Claude keeps its existing bounded reason construction.
+Varying text within a category updates the standing reason and an already
+pending automatic diagnostic, but is NOT a new diagnostic event.
+
+**Queue diagnostics; never overwrite the message slot.** First failure,
+healthy-to-degraded, and a change of failure CATEGORY are automatic candidates.
+A failed explicit `r` is a candidate regardless of prior health/category.
+Keep at most one pending diagnostic per provider. Coalesce automatic candidates
+to the latest category/reason. A pending explicit-`r` result takes precedence:
+only a later failed explicit `r` replaces it; later automatic failures still
+update standing state. Recovery clears a pending AUTOMATIC diagnostic; a
+pending explicit-`r` result remains labelled `agents refresh failed: <reason>`
+or `codex refresh failed: <reason>` so it describes that operation, not current
+health. An unchanged failure alone never creates another candidate.
+
+**Automatic diagnostic cooldown = 30 seconds per provider.** Record monotonic
+time whenever that provider's diagnostic is actually posted. No later
+automatic candidate may post before that time plus 30 s, even across recovery
+or category changes. Keep/coalesce an eligible candidate pending during the
+cooldown; if it remains degraded, retry delivery when the cooldown expires.
+Time passing alone creates no candidate and no periodic reminder. Explicit
+`r` bypasses this cooldown, but still records its posting time and obeys the
+message/coverage guard. Post-verb and wake-up forces do NOT bypass it. Thirty
+seconds limits repeated four-second detail-block interruptions from a flapping
+provider without suppressing the standing error or an operator's retry.
+
+Post only when `app.message` is empty, the footer is uncovered (`Mode::Normal`),
+and no `Ctrl-x` warning owns it. Use the same empty-slot guard as drift;
+otherwise leave diagnostics pending, without starting their `MSG_TTL`.
+Retry from the event-loop tick beside message expiry/drift delivery, not only
+on provider polls. Coalesce providers ready to post in the same tick in
+Claude/Codex order; a provider still in cooldown stays pending. A posted
+message gets the existing full `MSG_TTL`; polling cannot replace it or reset
+its timer. Later user messages may still replace it, and `r` can recall a
+missed reason. Cooldown counts from posting even if later covered/replaced.
+
+In particular, `FinishRestart`'s summary, including `Codex panes skipped: <N>`,
+keeps its full `MSG_TTL` when the fresh process's first preparation/poll fails.
+That failure is pending until the summary expires and the footer is uncovered.
+The same protection applies to all existing operation and drift messages.
+Row warnings retain their own delivery/seen guard; a higher-priority body or
+overlay covering one has not “seen” it. Long-lived or flapping provider failure
+must leave detail/list space available between these bounded transient flashes.
 
 Use bounded, redacted diagnostics such as `connection refused`,
 `authentication failed`, `unsupported thread/list`, `incomplete listing`,
@@ -4530,12 +4648,18 @@ pub struct PaneMap {
 
 **An unreadable map is NOT write-protected.** This corrects §9.8's claim
 that an unrecognized fragment is not rewritten. An old sidebar reading
-ANOTHER tab's v2 map sees empty and does not write it. An old sidebar that
-OWNS that window adopts empty; its first subsequent map change writes v1 over
-the option and loses ALL that window's records, including Claude records.
-The surviving panes then remain unmapped under §5.3. Conditional versions
-confine this risk to windows containing a Codex entry; they do not make a
-mixed v2 window safe to hand back to an old binary.
+ANOTHER tab's v2 map sees empty and does not write that option, but loses
+cross-tab visibility of ALL its records, including Claude panes. It shows no
+open marker/badge for them, and `Enter`/`o` can open duplicate Claude panes
+instead of finding the existing ones. An old-image `R` also omits those
+records from `Plan::held`, losing that map-derived protection against its
+headless-agent restart pass; other restart guards still apply.
+
+An old sidebar that OWNS the mixed window adopts empty; its first subsequent
+map change writes v1 over the option and loses ALL that window's records,
+including Claude records. The surviving panes then remain unmapped under
+§5.3. Conditional versions preserve Claude-only windows, but neither make a
+mixed v2 window fully visible to old peers nor safe to hand back to an old owner.
 
 **HiddenOp adds an OPTIONAL wire field, defaulting only an absent field to
 Claude.** `HiddenLog.v` remains **2**. Keep the existing log caps, rank, clock,
@@ -4625,8 +4749,11 @@ refines the contract; it does not turn unrun experiments into live findings.
   were not part of the §9 lifecycle probes: **UNMEASURED** here.
 - Both generated schemas define the custom-source branch. It is excluded
   because history's `ThreadSourceKind` cannot return it, not because it is
-  malformed. No live custom-source thread was probed; fixture coverage
-  establishes ccmux's classification, not server lifecycle behavior.
+  malformed. Any sole-key subAgent object is also excluded, without testing
+  its value against today's subtype schema. Ephemeral/non-null-parent evidence
+  independently excludes unfamiliar sources. These are scope decisions, not
+  server capability tests. No live custom-source or future-subtype thread was
+  probed; fixtures must verify classification, not server lifecycle behavior.
 - Loaded empty threads can fail remote resume before a rollout exists.
   The two empty `tui-new` reads returned read-time fallback timestamps;
   materialization restored its earlier creation time. That behavior was not
@@ -4662,9 +4789,15 @@ refines the contract; it does not turn unrun experiments into live findings.
   failure-path latency. The original probe did not prove hard deadlines
   under stalled connect/close; §12.5 is tested with a controlled transport.
   Initial/later explicit `r` preparation is outside the RPC deadline and
-  can block on DNS/filesystem IO. Lazy gated execution preserves the first
-  frame, and the whole-tick drain protects buffered input; it does not bound
-  resolver latency. Automatic retries perform no preparation IO.
+  can block on DNS/filesystem IO with NO separate latency bound. Lazy execution
+  after `first_frame` and within the timed tick preserves the initial frame
+  and drains buffered input; it does not bound resolver latency. Only Codex's
+  process-start force is gate-conditioned; explicit `r`, post-verb, and wake-up
+  forces bypass the gate. Automatic retries perform no preparation IO.
+  A rejected initial non-loopback resolution makes no connection; a rejected
+  `r` reload may leave automatic polls using old verified loopback addresses,
+  while attach stays refused. Resolver-rejection/reload behavior requires
+  fixtures; no live host-configuration experiment was run.
 - Schema/source review found that a JSON-RPC error reply can win an
   app-server pending callback and turn an approval into a denial; broadcast
   auth refresh requests can also reach a lister. The probes left approvals
@@ -4672,23 +4805,30 @@ refines the contract; it does not turn unrun experiments into live findings.
   denial. v1 sends no reply and continues its bounded reads (§12.4).
 - Conditional map versions preserve Claude-only v1 bytes. They do NOT
   protect a mixed v2 window from an older OWNER adopting it as empty and
-  overwriting it on its first map change. Other-tab readers do not write
-  that map. §12.9 pins this mixed-version limit and its simulated test.
+  overwriting it on its first map change. Old other-tab readers leave that
+  option untouched but cannot see even its Claude panes: markers/badges are
+  missing, `Enter`/`o` may duplicate panes, and an old-image `R` lacks their
+  `Plan::held` protection. Other restart guards still apply. §12.9 pins both
+  mixed-version limits; test them with fixtures, not a live upgrade experiment.
 - **UNMEASURED:** desktop or differently versioned cross-runtime writers.
   The brief second 0.153.4 stdio server was refused by an existing writer,
   but `notLoaded` on our endpoint never proves global writer absence.
   Let the official TUI report contention; do not search for or stop the writer.
 
-The one-line standing-error layout, transient error delivery, per-thread
-runtime-warning episodes, and two-cell provider marker are UI contracts
-to verify with fixtures/render tests below, not claims of new live measurements.
+The one-line standing-error layout, guarded diagnostic delivery, 30-second
+per-provider automatic cooldown, per-thread runtime-warning episodes, and
+two-cell provider marker are UI contracts to verify with fixtures/render tests,
+not new live measurements. Fresh providers are `NotYetObserved`; their first
+failure queues a diagnostic behind any restart summary. Reason categories
+bound deduplication even when stderr varies; explicit `r` bypasses only the
+cooldown. Both footer changes apply to Claude-only users too.
 
 ### 12.11 Acceptance tests (§10)
 
 **Unit/fixture tests run without tmux, Claude, a live app-server, or credentials.**
 Use redacted fixtures tied to the measured server schema. New behavior must
-have these tests; existing Claude tests remain authoritative except for the
-explicit shared footer correction in §12.6.
+have these tests; existing Claude tests remain authoritative except for
+§12.6's shared standing-error layout and guarded diagnostic-delivery changes.
 
 - **Parser and mapping:** `Thread.id != Thread.sessionId`; two UUIDv7 IDs
   with the same head and distinct tails; full-ID addressing; optional name
@@ -4699,14 +4839,18 @@ explicit shared footer correction in §12.6.
   `State::Working`, Working/`?`, detail `unknown`; a known blocking flag
   still gives Blocked/`▲`. Unloaded uses only its `◇` branch. No synthetic
   Codex pid or `has_worker` inference.
-- **Source branches:** exercise all five eligible strings and every
-  schema-valid subAgent subtype, including `memory_consolidation`,
-  `other`, and `thread_spawn`. A loaded-only `{"custom":"x"}` is excluded
-  without drift/degradation/incompleteness, so that otherwise complete
-  observation can remove an unrelated aged-out cached row. Wrong types,
-  extra source keys, unknown strings/keys, `{"custom":1}`, and
-  `{"custom":"x","extra":1}` retain drift+skip+incomplete. Test malformed
-  subAgent values too; a filter is not permission to accept bad required data.
+- **Source branches:** exercise all five eligible strings and current
+  subAgent subtypes, including `memory_consolidation`, `other`, and
+  `thread_spawn`. ANY sole-key subAgent object is deliberately excluded:
+  include an unknown future subtype, null, numbers, arrays, and objects that
+  do not match today's `SubAgentSource`. No drift, degradation, parser loss,
+  or failure-backoff effect. A loaded-only `{"custom":"x"}` behaves likewise,
+  allowing an otherwise complete observation to remove an unrelated aged-out
+  row. Affirmative ephemeral/non-null-parent exclusions take precedence over
+  unfamiliar or malformed sources in BOTH union halves. Without a sufficient
+  exclusion, wrong types, unknown strings/keys, `{"custom":1}`,
+  `{"custom":"x","extra":1}`, and `{"subAgent":"review","extra":1}`
+  retain drift+skip+incomplete. Invalid identity/envelopes never cover an ID.
 - **Union/completeness:** multi-page loaded and history fixtures, cutoff
   equality and crossing, out-of-window loaded rows, metadata reuse/read
   fallback, identical/conflicting duplicates, cursor loops, missing metadata,
@@ -4719,9 +4863,12 @@ explicit shared footer correction in §12.6.
   successful reads per attempt and n > k stable loaded-only excluded IDs,
   all n are covered within `ceil(n/k)` attempts, and a later attempt is
   complete without re-reading those exclusions. Cover ephemeral, parent,
-  subAgent, and custom verdicts. Evict on absence from complete `L`, retain
-  on a partial census, and read again on re-entry. Never cache malformed
-  metadata or read errors as exclusions. Test contradictory fresh metadata.
+  subAgent, and custom verdicts, including future/malformed nested subAgent
+  payloads and ephemeral/parent rows with unfamiliar sources. Evict on absence
+  from complete `L`, retain on a partial census, and read again on re-entry.
+  Never cache a parse/read failure WITHOUT sufficient exclusion evidence;
+  malformed custom/extra-key sources stay incomplete and uncached unless
+  independently excluded. Test contradictory fresh metadata.
   Successful `r` reloads between partial polls preserve exclusions/order.
   Eligible loaded-only IDs still require fresh reads; n > k such IDs remain
   incomplete while scheduling rotates through them. Failed/expired reads
@@ -4752,20 +4899,29 @@ explicit shared footer correction in §12.6.
   `ws://127.0.0.2:8965`, and `ws://[::1]:8965`; reject non-loopback
   literals, LAN/Tailscale/other hostnames, `localhost.`, `wss://`,
   userinfo, query, and fragment before DNS/token IO or attach. Mock a
-  localhost resolution containing a non-loopback address: no token read,
-  connection, or subsequent attach while that rejection remains active.
+  localhost resolution containing a non-loopback address in TWO cases:
+  rejected initial preparation reads no token, makes no connection, and
+  refuses attach; rejected `r` reload with an existing client reads no NEW
+  token, connects to none of the new addresses, and refuses attach, but later
+  automatic polls may use the old client's verified loopback addresses.
+  A successful old-client poll does not lift that attach refusal.
 - **Preparation/scheduling/input:** first_frame precedes initial preparation.
-  A hidden/quiesced sidebar does not prepare; its first due visible attempt
-  does exactly once. Memoize success and failure. Explicit `r` schedules
-  reload in the next gated tick; post-verb/wake-up refreshes do not.
+  A hidden/quiesced sidebar's PROCESS-START force does not prepare/poll Codex;
+  `Onscreen` or `Unknown` permits it. In a hidden `R`-respawned sidebar,
+  Claude still takes its forced first poll. `r` and post-verb Codex forces run
+  through a shut gate and both backoffs; either can trigger first preparation.
+  Wake-up also forces an attempt. Consume startup on that actual attempt;
+  initial `r` prepares exactly once. Memoize success and failure. Explicit
+  `r` reloads in the next tick; post-verb/wake-up attempts do not reload.
   Successful reload replaces prepared addresses/credential but retains polling
   bookkeeping; failed reload preserves the prior client/rows and reports the
-  preparation error. `r` retries with no prior
-  client too. Automatic failure backoff never resolves DNS or reads a token.
-  A fake slow preparation plus polls crosses `SLOW_TICK`; buffered keys,
-  including `Ctrl-x`, drain before dispatch. Test fresh, heal, `t`, and
-  post-`R` paths. Separate provider streaks/force flags, no counters on
-  skips, and a skipped explicit refresh does not consume its diagnostic flag.
+  preparation error. `r` retries with no prior client too. Automatic failure
+  backoff never resolves DNS or reads a token. A fake slow preparation plus
+  polls crosses `SLOW_TICK`; buffered keys, including `Ctrl-x`, drain before
+  dispatch. Test fresh, heal, `t`, and post-`R` paths. Separate provider
+  streaks/forces; automatic/startup gate skips change no counters and leave
+  the startup force pending. Explicit-`r` diagnostic intent lasts until its
+  attempt runs, and its pending delivery then obeys §12.6.
 - **PaneMap:** v1 imports as Claude. A Claude-only map serializes byte-for-byte
   like the old v1 writer, without provider keys, including the empty marker.
   A mixed map writes v2 with required providers and full keys; removing the
@@ -4773,10 +4929,12 @@ explicit shared footer correction in §12.6.
   Codex `t` pre-write is v2, before its sidebar starts. Missing/unknown v2
   provider, malformed Codex full ID, and unsupported versions fail closed.
   Exercise legacy and tab-map readers. Simulate both old-reader roles:
-  another-tab reader leaves v2 untouched; an old OWNER adopts empty and
-  loses that mixed window's records on its first map change. A Claude-only
-  window survives old-owner adoption. Different-provider lookup cannot claim
-  a pane; loss of a poll row does not remove a live pane record.
+  another-tab reader leaves v2 untouched but sees none of its Claude panes,
+  loses their marker/badge, can open duplicates through `Enter`/`o`, and
+  contributes none of those records to old `R`'s `Plan::held`. An old OWNER
+  adopts empty and loses that mixed window's records on its first map change.
+  A Claude-only window survives old-owner adoption. Different-provider lookup
+  cannot claim a pane; loss of a poll row does not remove a live pane record.
 - **Hidden compatibility:** absent provider defaults Claude without changing
   HiddenLog v2; Codex field round-trips; dedup uses exactly the old identity.
   Test both orders of Codex/stripped duplicate merge in push/fold/prune and
@@ -4805,6 +4963,27 @@ explicit shared footer correction in §12.6.
   for a later error, including error -> idle -> error before the first flash
   expires; failed/skipped/missing observations do not. It occupies
   flash/drift priority and never becomes schema drift or provider failure.
+- **Provider diagnostic delivery:** a fresh enabled provider starts
+  `NotYetObserved`; its first failure queues a diagnostic. Test both initial
+  preparation and poll failures after `FinishRestart`: the summary with
+  `Codex panes skipped: <N>` keeps its full `MSG_TTL`, then the diagnostic
+  posts when uncovered. Filter/help/prompt/logs, an armed `Ctrl-x`, and an
+  existing operation/drift message defer posting without starting a timer.
+  Release the footer while polls are gated/backed off; event-loop delivery
+  still runs. Coalesce pending diagnostics per provider and ready providers
+  in Claude/Codex order. Explicit-`r` results survive recovery as labelled
+  operation failures; recovery cancels pending automatic diagnostics.
+- **Diagnostic categories/cooldown:** a fake clock alternates Codex complete/
+  incomplete observations at the base interval, including changing raw reason
+  text. Automatic diagnostics post at most once per 30 s; recovery and
+  category changes do not reset that clock. Vary Claude `Cmd` stderr/exit
+  codes and repeat the case with Codex OFF: all remain `CommandFailed`,
+  with no text-driven event or active-message timer reset. A pending candidate
+  may post after cooldown if still degraded; expiry alone creates no reminder.
+  A failed explicit `r` bypasses cooldown but not the message/coverage guard,
+  records its posting time, and wins over pending automatic candidates.
+  A post-verb/wake-up failure has no cooldown exemption. Same-tick coalescing
+  must not include a provider still in cooldown. Error text stays bounded.
 - **Rendering and provider errors:** retain the existing width/height matrix.
   At widths 34 and 20, the two-cell `> ` stays inside the name budget and
   leaves the gutter/age rails fixed; stored names, map names, and flash
@@ -4813,9 +4992,12 @@ explicit shared footer correction in §12.6.
   keeps the selected row visible. Repeat with Claude-only and combined
   standing errors. A Claude `Ctrl-x` arm and transient error still wrap at
   34x8. Test the prefix exactly once in wrapped/unwrapped messages and tiny
-  widths. Healthy-to-degraded, reason change, and failed `r` each flash;
-  identical automatic failures do not. Coalesce same-tick provider failures
-  without losing either diagnostic; ordinary detail returns after expiry.
+  widths. First failure, healthy-to-degraded, and CATEGORY changes queue
+  diagnostics subject to the guard/cooldown; failed `r` bypasses only the
+  cooldown. Identical-category text changes do not re-flash. Render R's summary
+  until expiry, then the queued diagnostic. Alternating observations and
+  varying Claude stderr leave ordinary detail/list space available between
+  rate-limited flashes; standing reasons remain truncated on one line.
 
 **Ignored live tests** are opt-in and separate from those fixtures.
 They require explicit `CCMUX_CODEX_LIVE_TEST=1`, an explicitly supplied
