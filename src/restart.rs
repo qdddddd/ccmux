@@ -2003,9 +2003,11 @@ mod tests {
         let p = plan(&[a, b], &[pane("%1", "@1"), pane("%2", "@1"), parked, pane("%4", "@2")], None);
         assert_eq!(p.codex, 2);
         assert_eq!(p.claude + p.detached + p.unattachable, 0);
+        assert_eq!(p.skipped(), 0);
         assert!(p.agent_ids().is_empty());
         assert_eq!(ids(&p), ["%1", "%4"]);
-        assert_eq!(note(&Report { sidebars: 2, codex: p.codex, ..Report::default() }),
+        assert_eq!(note(&Report { sidebars: p.sidebars, panes: p.claude,
+            skipped: p.skipped(), codex: p.codex, ..Report::default() }),
             "restarted 2 sidebars, 0 panes; Codex panes skipped: 2");
     }
 

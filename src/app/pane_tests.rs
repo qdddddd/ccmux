@@ -322,7 +322,22 @@ fn foreign_provider_records_cannot_jump_or_close_and_a_missing_map_says_not_open
 }
 
 #[test]
-fn configuration_and_resolution_refusals_precede_tmux_but_x_needs_no_codex_config() {
+fn enter_jumps_to_an_attached_codex_pane_after_a_rejected_reload() {
+    with_sidebar(|a, server| {
+        let pane = map_pane(a, server, 1, &row(), "");
+        a.codex.open_rejected = true;
+        assert_eq!(key(a, KeyCode::Enter), Action::Redraw);
+        assert_eq!(a.message.as_ref().unwrap().0, "jumped to pane 2");
+        let s = server.borrow();
+        assert!(!s.calls("list-panes").is_empty(), "jump requires fresh inventory");
+        assert_eq!(s.calls("select-pane").len(), 1);
+        assert_eq!(s.calls("select-pane")[0].last().unwrap(), &pane);
+        assert!(s.calls("split-window").is_empty() && s.calls("new-window").is_empty());
+    });
+}
+
+#[test]
+fn configuration_and_resolution_refuse_new_panes_but_x_needs_no_codex_config() {
     for bad in ["off", "syntax", "unsafe-resolution"] {
         with_sidebar(|a, server| {
             let pane = map_pane(a, server, 1, &row(), "1");
@@ -335,9 +350,15 @@ fn configuration_and_resolution_refusals_precede_tmux_but_x_needs_no_codex_confi
                 "codex localhost resolved outside loopback — open unavailable"
             } else { "codex not configured — open unavailable" };
             for code in [KeyCode::Enter, KeyCode::Char('o'), KeyCode::Char('s'), KeyCode::Char('t')] {
+                server.borrow_mut().calls.clear();
                 key(a, code);
                 assert_eq!(a.message.as_ref().unwrap().0, text);
-                assert!(server.borrow().calls.is_empty());
+                if code == KeyCode::Enter {
+                    assert!(server.borrow().calls.iter().all(|args|
+                        matches!(args[0].as_str(), "list-panes" | "list-windows")));
+                } else {
+                    assert!(server.borrow().calls.is_empty());
+                }
             }
             press(a, 'x');
             assert_eq!(server.borrow().calls("kill-pane")[0].last().unwrap(), &pane);
@@ -440,7 +461,7 @@ fn r_from_a_codex_row_restarts_only_sidebars_and_claude_and_reports_each_skip_on
         assert!(s.calls("respawn-pane")[0].last().unwrap().contains("claude attach deadbeef"));
         assert!(!s.calls("respawn-pane")[0].last().unwrap().contains("CODEX_REMOTE_TOKEN"));
         let note = &a.message.as_ref().unwrap().0;
-        assert_eq!(note.matches("Codex panes skipped: 2").count(), 1);
+        assert_eq!(note, "restarted 1 sidebar, 1 pane, 0 agents (1 not restarted); Codex panes skipped: 2");
         assert!(agents::test_spawn::calls().is_empty());
     });
 }

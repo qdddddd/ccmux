@@ -230,7 +230,8 @@ A restarted agent keeps its id, name and conversation. Its age resets, because
 the start time is the worker's. Pane scrollback is lost.
 
 `R` checks that the new binary runs before it restarts anything. If it does not,
-nothing is touched and the footer shows the error.
+nothing is touched and the footer shows the error. It also requires Codex flag
+support, even with Codex disabled, so `R` cannot roll back to a pre-Codex build.
 
 ## Safety
 
@@ -241,9 +242,9 @@ nothing is touched and the footer shows the error.
   2 s runs `claude rm`, which deletes the session and its git worktree.
   `claude rm` refuses a worktree with uncommitted or unpushed work.
 - The footer names the session while the delete window is open.
-  Moving the cursor does **not** close it, and a second press on another row
-  deletes nothing. A press within 750 ms of the previous one is ignored, so a
-  held key deletes nothing.
+  Moving between Claude rows does **not** close it; a second press on another
+  row deletes nothing. Selecting a Codex row closes it. A press within 750 ms
+  of the previous one is ignored, so a held key deletes nothing.
 - A delete closes the panes parked on that session, but not a pane you turned
   into a shell with `s`.
 - `R` also runs `claude stop` and `claude respawn`, only on idle or done agents,

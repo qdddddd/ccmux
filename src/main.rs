@@ -1325,15 +1325,15 @@ mod tests {
                 "{name} does not name the verb the second press runs"
             );
         }
-        // The Safety section used to close the delete window on a cursor move.
-        // It does not: `arm_hint` names the captured row precisely BECAUSE the
-        // cursor is free to move while the window is open, and the move is
-        // answered at the next press, which refuses. SPEC had this right and
-        // the README did not, which made the README the only doc misstating
-        // the lifetime of the one irreversible verb.
+        // Moving among Claude rows preserves the captured delete target;
+        // selecting Codex closes that window (§12.8).
         assert!(
-            README.contains("Moving the cursor does **not** close it"),
-            "README does not say the delete window survives a cursor move"
+            README.contains("Moving between Claude rows does **not** close it"),
+            "README does not preserve the delete window across Claude rows"
+        );
+        assert!(
+            README.contains("Selecting a Codex row closes it."),
+            "README omits the Codex selection exception"
         );
         assert!(
             !README.contains("`q`, moving the cursor\n  to another row"),

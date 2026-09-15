@@ -1999,7 +1999,6 @@ impl App {
             self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
             return;
         }
-        if self.refuse_codex_open() { return; }
         let Some(sel) = self.selected_session() else {
             return;
         };

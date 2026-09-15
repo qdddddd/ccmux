@@ -157,7 +157,11 @@ impl Fixture {
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(pane) = pane { command.env("TMUX_PANE", pane); }
         let mut child = command.spawn().unwrap();
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        // Invalid pane targets exit before reading; that can close the pipe
+        // before this write. Exit/output/trace assertions still check the result.
+        if let Err(error) = child.stdin.take().unwrap().write_all(input.as_bytes()) {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= deadline {
@@ -177,6 +181,15 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+#[test]
+fn fixture_tolerates_a_child_closing_stdin_before_the_input_is_written() {
+    let fixture = Fixture::new();
+    let out = fixture.run("exec 0<&-; exit 2", None, &"s\n".repeat(65_536));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
+    assert!(fixture.trace().is_empty());
 }
 
 #[test]
