@@ -1,5 +1,7 @@
 # ccmux — Implementation Spec v1
 
+**AMENDED BY §§11–12:** tabs and opt-in Codex sessions extend the original scope.
+
 Authoritative. Derived from and consistent with `PROBE-FINDINGS.md`; every tmux
 mechanism below was additionally re-verified on this machine (tmux 3.4) during
 spec authoring. Where this document and an engineer's intuition disagree, this
@@ -12,6 +14,8 @@ sidebar pinned on the left, Claude Code TUIs in the panes to its right.
 ---
 
 ## 0. Ownership, parallelism, and the day-0 stub commit
+
+**AMENDED BY §12.3:** provider ownership and the new Codex module dependencies.
 
 The file split is fixed. Nobody edits a file they do not own.
 
@@ -78,6 +82,8 @@ ccmux sidebar          # the ratatui explorer; runs INSIDE the left pane
 ```
 
 ### 1.1 CLI surface (`src/main.rs`, clap derive)
+
+**AMENDED BY §12.2:** Codex options, precedence, and propagation to child sidebars.
 
 ```rust
 #[derive(clap::Parser)]
@@ -327,6 +333,8 @@ full height throughout and is never given a share of it.
 
 ## 2. Blast-radius rules (non-negotiable)
 
+**AMENDED BY §§12.1, 12.8:** Codex ownership, pane closing, and restart exclusions.
+
 These exist because tmux silently defaults an omitted or empty `-t` to the
 *caller's current pane*. During spec authoring an empty `-t` variable caused
 three stray panes to be created in an unrelated live session. That class of bug
@@ -365,6 +373,8 @@ resolve from the current poll.
 Signatures below are authoritative. Bodies are the owner's business.
 
 ### 3.1 `src/model.rs` — owner: Scaffold
+
+**AMENDED BY §12.3:** provider identity, Codex metadata, and the Unloaded state.
 
 Pure data + parsing + grouping + formatting. No IO, no process spawning, no
 tmux, no ratatui. Fully unit-testable.
@@ -542,6 +552,8 @@ pub fn truncate_end(s: &str, max: usize) -> String;
 **Consumes:** nothing in-crate.
 
 ### 3.2 `src/tmux.rs` — owner: Tmux
+
+**AMENDED BY §12.9:** PaneMap v2 and compatible provider metadata in hidden ops.
 
 Every tmux interaction in the program. No ratatui, no `claude`, no knowledge of `model::Session`. The pane map stores
 session ids as opaque strings so this module stays decoupled.
@@ -933,6 +945,8 @@ pub fn sh_join(parts: &[&str]) -> String;
 
 ### 3.3 `src/agents.rs` — owner: Agents
 
+**AMENDED BY §§12.4, 12.7:** read-only Codex RPC and provider-aware verb signatures.
+
 Everything that shells out to `claude`, plus the shell-command templates for
 panes. Builds strings; never runs tmux.
 
@@ -1160,6 +1174,8 @@ pub fn list_viewport_rows(total_height: u16) -> u16;
 `tmux::PaneId` (for `Display` only).
 
 ### 3.5 `src/app.rs` — owner: Integrator
+
+**AMENDED BY §§12.2, 12.5, 12.8:** Codex configuration, independent polls, and routing.
 
 State, event loop body, keymap dispatch, actions. All IO orchestration.
 
@@ -1465,6 +1481,8 @@ key-repeat/release events double every keystroke.
 
 ### 4.2 Polling policy — pinned, so nobody invents a thread
 
+**AMENDED BY §12.5:** the shared gate, per-provider backoff, and Codex's whole-poll budget.
+
 **Polling is synchronous, on the event-loop thread. No threads, no channels, no
 async runtime.** `claude agents --json` costs 0.21s (PROBE-FINDINGS §1); the
 default interval is 2500 ms; `event::poll` uses a 120 ms slice. Worst-case input
@@ -1593,6 +1611,8 @@ N tabs, at most one is `Onscreen`, so N-1 of them are already silent.
 ---
 
 ## 5. The session → pane map
+
+**AMENDED BY §§12.7, 12.9:** provider-aware v2 maps and Codex launch-target identity.
 
 PROBE-FINDINGS §4 is decisive: a pane's cmdline does not identify the session it
 displays (panes opened from the stock fleet view all read `claude agents`).
@@ -1830,6 +1850,8 @@ coloured `Blocked 2` alone, truncated to W. Header rows are never selectable;
 
 ### 6.4 Session rows — one line each
 
+**AMENDED BY §§12.3, 12.6:** Codex labels, status mapping, and the Unloaded glyph.
+
 Fixed-width row, left to right:
 
 ```
@@ -1960,6 +1982,8 @@ Name budget is always computed as `W.saturating_sub(fixed_cols)` and passed to
 
 ### 6.5 Detail block (rows H-4..=H-2)
 
+**AMENDED BY §12.6:** Codex provider/state detail text.
+
 Three lines describing the **selected** session, all `p.gray` except values:
 
 ```
@@ -2007,6 +2031,8 @@ Claude pane.
 
 ### 6.8 Footer (row H-1)
 
+**AMENDED BY §12.6:** independent provider errors and the Codex degraded marker.
+
 Priority order — the first applicable wins:
 
 1. `Mode::Filter` → `/<buffer>▏`, `p.yellow`
@@ -2027,6 +2053,8 @@ and wraps rather than clipping.
 ---
 
 ## 7. Shell quoting — the one hard rule
+
+**AMENDED BY §12.7:** quote the Codex wrapper; read the token only inside its pane.
 
 **RULE Q1 — argv everywhere.** Every external command is built with
 `std::process::Command::new(prog).args([...])`. ccmux never spawns `sh -c`, never
@@ -2090,6 +2118,8 @@ agent and return immediately`).
 ---
 
 ## 8. The keymap
+
+**AMENDED BY §12.8:** Codex attach/close behavior and exact deferred-verb refusals.
 
 Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 
@@ -2646,6 +2676,8 @@ lose.
 
 ### 8.10 `t` — open in a new tab
 
+**AMENDED BY §§12.2, 12.8–12.9:** propagate Codex settings and pre-write the v2 map.
+
 ```
 1. degraded -> flash "not inside tmux — tabs unavailable" (Warn); return
 2. sel = selected_session() or return
@@ -2710,6 +2742,8 @@ tab-cycling key: `Enter` on a row in another tab already switches, and tmux's
 own bindings remain.
 
 ### 8.11 `R` — restart the binaries in place
+
+**AMENDED BY §§12.2, 12.8:** propagate Codex settings but skip all Codex panes/threads.
 
 For the moment after `cargo install` replaced `ccmux` or `claude` on disk: every
 ccmux process in the session restarts, every AGENT that is not busy is brought
@@ -3253,6 +3287,8 @@ variable would have every sidebar respawn every other one on startup, forever.
 
 ## 9. Error and edge handling
 
+**AMENDED BY §§12.5–12.6, 12.10:** partial Codex observations, degradation, and evidence limits.
+
 Governing principle: **the sidebar never dies and never blanks.** Every failure
 degrades to a message in the footer over the last known-good list. `unwrap()`,
 `expect()`, and `panic!` are forbidden in `sidebar` code paths outside of
@@ -3386,7 +3422,11 @@ the CLI omits `id`, so a **listed** row can reach it.
 
 ## 10. Acceptance criteria and tests
 
+**AMENDED BY §12.11:** Codex fixture/unit tests and separately opted-in ignored live tests.
+
 ### 10.1 Unit tests (no tmux, no `claude`; run in CI)
+
+**AMENDED BY §12.11:** add parser, mapping, union, compatibility, and verb-routing fixtures.
 
 **model.rs (Scaffold)**
 - `parse_sessions` on the exact 4-element payload in PROBE-FINDINGS §1 yields 4
@@ -3480,6 +3520,8 @@ the CLI omits `id`, so a **listed** row can reach it.
 
 ### 10.2 Integration checks (manual, against a throwaway session)
 
+**AMENDED BY §12.11:** Codex live tests use only registered probes and `ccmux-probe`.
+
 Run **only** against `--session ccmux-test-<something>`. Never against `ccmux`
 while the operator is using it, and never against `agents` or `dev`.
 
@@ -3516,6 +3558,8 @@ Do not build these; do not leave hooks for them.
 ---
 
 ## 11. Tabs — per-window state and its concurrency model
+
+**AMENDED BY §§12.2, 12.9:** Codex settings propagation and mixed-version wire compatibility.
 
 A **tab** is a tmux window of ccmux's own session, and **every tab carries its
 own pinned sidebar pane running its own ccmux process**. That is a deliberate
@@ -3579,6 +3623,8 @@ so there is nothing to gate and no tmux spawn — which is what keeps the unit
 suite's seeding seam hermetic now that writes are pane-targeted.
 
 ### 11.3 `@ccmux_tab_hidden` — a shared set, still one writer per option
+
+**AMENDED BY §12.9:** optional provider, identity-based dedup, and Codex retirement exclusion.
 
 A dismissal is about the SESSION LIST, which is the same list in every tab, so
 its effect must be session-wide. Session-wide and single-writer are reconciled
@@ -3722,6 +3768,778 @@ A session open in two tabs shows the tab `Enter` would take you to, which is als
 the one `x` acts on — this sidebar's own tab whenever the session has a pane
 there (§5.5), so the badge is blank exactly when the pane is on screen in front
 of you. The digit therefore never lies about where the verbs go.
+
+---
+
+## 12. Codex sessions — v1 amendment
+
+**This section amends §§0–11 where it says so; the remaining Claude contract
+stands.** It is grounded in [PROBE-FINDINGS §9](PROBE-FINDINGS.md#9-codex-app-server-probes--2026-09-16),
+including the reviewed corrections. It is a contract for implementation, not a
+claim that the implementation already exists.
+
+### 12.1 Scope and ownership (§§2, 3.3, 8, 10.3)
+
+Codex is opt-in, with ONE configured app-server endpoint per ccmux workspace.
+v1 adds listing, grouping, filtering, navigation, `a`, `d/u`, `r`,
+`Enter/o/s/t` remote attach, and `x`. The official Codex TUI owns every
+conversation mutation. The sidebar owns its pane and dismissal records.
+
+**No Codex creation, stop, interrupt, archive, delete, logs, or restart verb.**
+No filesystem database/session-index reader, daemon discovery/start, service
+management, Unix transport, persistent subscription, poll thread, async runtime,
+or external websocket-helper process. In particular, `thread/start`,
+`turn/start`, `turn/interrupt`, `thread/resume`, `thread/unsubscribe`,
+`thread/archive`, and `thread/delete` are NOT sidebar RPC methods.
+The lifecycle probes used mutations on disposable threads; production v1 does
+not inherit that authority.
+
+R1–R3 and §11.4 apply unchanged to both providers. All pane actions stay on the
+configured tmux socket and inside the ccmux session. No process discovery or
+`/proc` scan is added for Codex. Client termination is limited to the mapped
+pane-close path (§12.8); never kill a client by PID or touch its server.
+R4's Claude confirmation gates remain; a Codex row refuses `Ctrl-x` before
+opening any destructive-action state.
+
+### 12.2 Configuration and propagation (§§1.1, 3.5, 8.10–8.11)
+
+Add these global CLI options, accepted by the launcher and `sidebar`:
+
+| Option | Environment fallback | Default / precedence |
+|---|---|---|
+| `--codex-url <URL>` | `CCMUX_CODEX_URL` | disabled; explicit flag wins |
+| `--codex-token-file <PATH>` | `CCMUX_CODEX_TOKEN_FILE` | no implicit path; explicit flag wins |
+| no new binary flag | `CCMUX_CODEX_BIN` | `codex`; one executable, not shell text |
+
+An absent or empty effective URL means OFF. Do not read a token, resolve a
+hostname, inspect Codex state, connect, or show a Codex error in this case,
+even if a token-file variable is present. Claude's runtime/UI behavior remains
+the same; the map serialization upgrade in §12.9 is independent of opt-in.
+
+An enabled URL must use `ws://`, have a host, and contain no userinfo, query,
+or fragment. Authentication belongs only in the header/environment mechanism,
+never in a URL that will be stored in a pane command. Hostnames and IPv4/IPv6
+literals are accepted. There is no default endpoint or discovery fallback.
+The token-file path is required, made absolute against the launching process's
+cwd once, and carried as a path. Reject a non-regular file, unreadable file,
+or empty credential as a Codex configuration failure, not a Claude failure.
+Remove trailing LF as shell command substitution does; reject any remaining
+CR/LF. No credential bytes may enter Debug/Display, errors, argv, tmux options,
+logs, or fixtures.
+
+The non-secret configuration surface is authoritative:
+
+```rust
+// src/codex.rs
+pub struct CodexConfig {
+    pub url: String,
+    pub token_file: std::path::PathBuf,
+    pub bin: String,
+}
+
+/// Private prepared addresses and credential; never serialized or Debug-printed.
+pub struct CodexClient { /* private */ }
+
+/// Carries only a bounded, redacted diagnostic, never a raw transport error.
+#[derive(Debug)]
+pub struct CodexError { /* private */ }
+impl std::fmt::Display for CodexError {}
+impl std::error::Error for CodexError {}
+
+pub fn prepare(config: &CodexConfig) -> Result<CodexClient, CodexError>;
+pub const POLL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(1000);
+pub const HISTORY_DAYS: i64 = 7;
+```
+
+Resolve DNS and read the credential during `prepare`, before entering the
+sidebar event loop. `prepare` opens no app-server connection. Its result is
+process-local; the timed poll does no DNS lookup or credential-file IO.
+A preparation failure leaves Codex degraded and Claude usable. Correcting
+setup, changing DNS, or rotating the sidebar credential takes a new sidebar
+process (`R` re-runs preparation). This startup work is outside the poll
+deadline and is not a claim of bounded DNS/filesystem latency. A server that
+is merely down is different: prepared polls retry it on the normal failure
+backoff. The pane wrapper reads its token file anew on each attach attempt.
+
+**Propagate the resolved answer, not the ambient environment.** Launcher
+creation/heal, `t`, self-`R` exec, and other-sidebars' `R` respawns carry the
+effective URL, absolute token-file path, and binary choice. Generated commands
+pass URL/path as quoted CLI words and set the resolved `CCMUX_CODEX_BIN` for
+the child, e.g. with `env` and one quoted `NAME=value` argv word. OFF is also
+explicit: `--codex-url ''` overrides a stale URL in tmux's environment.
+No token value is forwarded. Existing width/theme/socket/interval and restart
+handoff rules remain. Self-exec canonicalizes these Codex options instead of
+relying on the original argv having contained environment-derived settings.
+As today, `R` gives other sidebars the invoking sidebar's effective settings.
+
+The endpoint is fixed for the workspace. Changing it is not a pane migration;
+use a separate ccmux session for another endpoint. `R` never rewrites the
+commands of already-open Codex panes.
+
+### 12.3 Provider, identity, and state (§§0, 3.1–3.5)
+
+The module boundary changes are explicit: `model` owns `Provider`;
+`tmux` may now consume that model type. New `codex` consumes `model` and owns
+configuration, the read-only transport, and Codex parsing. `agents` may consume
+`CodexConfig` and `PaneEntry` for the provider-dispatch builders below, alongside
+its existing model types and `sh_quote`. `app` integrates both poll sources;
+`main` prepares configuration. Neither `model` nor `codex` imports `tmux`,
+`agents`, or `app`; no dependency cycle or new process/thread owner is added.
+
+The following additions are authoritative; existing fields remain:
+
+```rust
+// src/model.rs
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash,
+         serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider { #[default] Claude, Codex }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CodexStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active { flags: Vec<String> },
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CodexMeta {
+    pub updated_at: i64,             // epoch milliseconds; window eligibility
+    pub runtime: CodexStatus,        // preserves known AND unknown flag strings
+}
+
+// Session gains:
+// pub provider: Provider,
+// pub codex: Option<CodexMeta>,
+// State gains:
+// Unloaded,
+```
+
+Every Claude parser result has `provider=Claude, codex=None`. Every Codex
+result has `provider=Codex, codex=Some(...), kind=Background, pid=None`.
+`Background` here permits the shared row/pane UI; it is not evidence of a
+Claude worker. `has_worker()` remains the Claude pid-presence question and
+returns false for Codex. No Codex eligibility decision calls it.
+
+**Keep `session_id: String` as the key.** For Codex it is the full
+`Thread.id`, preserved for addressing. NEVER copy `Thread.sessionId` into
+it: that value is shared by threads in a session tree. Never address by a
+short ID or infer provider from a UUID version. A non-empty UUID-form
+`Thread.id` is required; a malformed address drops the row and makes the
+observation incomplete. The displayed/filterable `Session.id` is the last
+eight hex digits, lowercased, with UUID separators excluded. UUIDv7 heads were
+shared on the probed host. Claude keeps its existing short ID.
+
+Provider accompanies every session, pane entry, captured verb target, and
+hidden op. A lookup for a Session/PaneEntry must match its provider as well
+as its full key. A same-key/different-provider conflict is refused and reported,
+never overwritten or routed to Claude. This adds routing checks, not a new
+composite key throughout app.rs.
+
+Codex `started_at = Thread.createdAt * 1000`; group sorting and displayed age
+remain creation-based (§3.1), not last-turn age. The seven-day window uses
+`Thread.updatedAt * 1000` separately, with checked integer conversion.
+Display `Thread.cwd` exactly through the existing path shortener. Do not
+substitute the pane cwd, launch thread's cwd, or the last turn's cwd.
+Use nonblank `Thread.name`, else the first nonblank line of `Thread.preview`,
+else `Codex <display-id>`; strip terminal controls before rendering.
+
+State mapping is resolved in this order. Flag arrays are sorted/deduplicated
+for stable equality/fingerprints, while every unknown value remains available
+to drift reporting.
+
+| Codex runtime value | Shared status / state | Group | Glyph / meaning |
+|---|---|---|---|
+| `notLoaded` | Idle / Unloaded | Completed | `◇`, unloaded; resume via TUI |
+| `idle` | Idle / None | Idle | `○`, ready for input |
+| `systemError` | Unknown("systemError") / None | Idle | `?`, runtime error |
+| `active` with either known blocking flag | Waiting / Blocked | Blocked | `▲`, needs the operator |
+| `active` with an empty flag array | Busy / Working | Working | `●`, working |
+| `active` with only unknown flags | Unknown(raw flags) / None | Idle | `?`, unrecognized active state |
+| unrecognized status tag | Unknown(raw tag) / None | Idle | `?`, unrecognized state |
+
+Known blocking flags are exactly `waitingOnApproval` and
+`waitingOnUserInput`. **A known blocking flag wins even when unknown flags
+are also present.** The row stays Blocked/`▲`; report the unknown flags
+separately through `note_drift`. Unknown-only flags must not become Working
+or Blocked by guesswork. A missing/malformed status object or malformed active
+flag array is a dropped row, not `idle`; extra unrelated JSON fields are ignored.
+
+`State::Unloaded` joins Done/Stopped in `group()`'s first Completed branch,
+but keeps its own glyph and text. It asserts only “not loaded in this server”.
+It says nothing about the last turn's success or a writer in another runtime.
+`systemError` keeps a visible `?` and a provider-labelled warning; it is a
+valid row, not a failed poll and not a stopped thread.
+
+### 12.4 Read-only RPC contract (§3.3)
+
+Use a small synchronous Rust WebSocket JSON-RPC client (tungstenite's
+synchronous API with explicitly constructed TCP connections/timeouts).
+One new connection per Codex poll, closed/dropped before returning. Do not call
+a library convenience connector that performs unbounded DNS or hides a
+per-request timeout reset on the UI thread.
+
+The only outbound request methods and their complete v1 parameters are:
+
+| Method | Parameters |
+|---|---|
+| `initialize` | `{"clientInfo":{"name":"ccmux","version":<ccmux version>},"capabilities":{"experimentalApi":true}}` |
+| `thread/loaded/list` | `{"limit":100,"cursor":null}`; replace cursor on subsequent pages |
+| `thread/list` | `{"limit":100,"cursor":null,"sortKey":"updated_at","sortDirection":"desc","archived":false,"sourceKinds":["cli","vscode","exec","appServer","unknown"],"modelProviders":[],"useStateDbOnly":true}`; replace cursor on subsequent pages |
+| `thread/read` | `{"threadId":<full Thread.id>,"includeTurns":false}` |
+
+Send the `initialized` notification with `params:{}` after successful
+initialization. No `cwd`, `searchTerm`, `sectionId`, or `originators`
+filter is sent: this is the configured server's fleet, not the launching cwd.
+No `model/list`, turn/item-history read, resume, or unsubscribe is needed.
+Bearer authentication is an HTTP upgrade header from the private prepared
+credential; it is never a URL parameter.
+
+Dispatch by FIELD PRESENCE, not truthiness: `method+id` is a server request,
+`method` without `id` a notification, `id` without `method` a response.
+ID `0` and string IDs are valid. Match responses to requests; an error response
+is not data. Ignore notifications as a source of session rows. A lister never
+subscribes, so a server request is unexpected: answer it with the same ID and
+JSON-RPC `-32601` / `Method not found`, mark this observation incomplete,
+and close. Never accept/decline an approval or run a requested tool. The reply
+must fit the remaining deadline; expiry closes the socket instead of extending
+the poll. Do not log raw messages/headers in an error.
+
+Record the server identity/version supplied by `initialize` for diagnostics.
+The installed CLI's generated schema is NOT a capability test: probes used
+CLI 0.154.0 with server 0.153.4, whose `thread/list` lacked `originators`.
+Use the actual responses to the subset above; an unsupported method/parameter
+degrades Codex. Do not retry with a scan-and-repair listing, private storage,
+another endpoint, or an implicitly started daemon.
+
+### 12.5 Poll budget, union, and completeness (§§4.2, 9)
+
+`CodexClient::poll` and the observation it returns are authoritative:
+
+```rust
+// src/codex.rs; Session remains in model.rs.
+pub struct CodexObservation {
+    pub sessions: Vec<Session>,      // eligible rows actually observed
+    pub complete: bool,              // complete for THIS window + loaded union
+    pub cutoff_ms: i64,
+    pub diagnostic: Option<String>,  // redacted reason when incomplete
+}
+impl CodexClient {
+    pub fn poll(&mut self, now_ms: i64) -> CodexObservation;
+}
+```
+
+**One 1,000 ms monotonic deadline for the whole Codex poll.** Start it before
+TCP connect; charge every address attempt, WebSocket upgrade, initialization,
+request write, response/notification handling, page, metadata read, and close
+against the SAME deadline. Socket read/write/connect timeouts use only the
+remaining budget. A deadline-aware stream must re-check it before EACH
+underlying read/write, including inside upgrade/frame decoding loops; a peer
+sending fragments must not renew the budget. A per-call one-second timeout
+is not this contract.
+At expiry, stop sending, drop the connection without waiting for a close
+handshake, and return incomplete with the rows already decoded. No additional
+grace period is added for cleanup. Decode/response handling must check the
+deadline too; apply bounded WebSocket message sizes.
+
+Measured cold-connection p95 was 422.5 ms. One second gives more than twice
+that headroom while capping the new provider's contribution to a synchronous
+input stall. With the measured 210 ms Claude poll, an ordinary combined pass
+costs about 0.63 s, not §4.2's former 0.21 s. That cost is accepted only when
+Codex is enabled. A timed-out Claude child can still consume its existing
+5 s budget before this one-second budget; this amendment does not pretend to
+make a six-second combined failure a responsive frame. Keep the existing
+slow-tick buffered-input drain. No background thread is introduced to hide it.
+
+**The existing gate and ladder apply per provider.** The tmux visibility
+inventory and flat tick cadence are shared. Each enabled provider has its own
+last-attempt time, force flag, fail streak, idle streak, fingerprint, and last
+good rows. Use §4.2's same idle ladder (four unchanged complete observations,
+then doubling to 30 s) and failure interval (10 s after three failures);
+its effective interval is `max(idle_interval, fail_interval)`.
+When both are due in one tick, poll Claude then Codex. A failure of either
+does not skip the other. A partial Codex observation counts as a failure for
+its backoff and resets its idle ladder; a complete observation clears only
+its own failure. A skipped provider attempt changes none of these counters.
+
+A keypress collapses both idle ladders but does not force either connection.
+`r`, post-verb refresh, and the visibility wake-up edge owe a forced attempt
+to each enabled provider on the next tick, including through failure backoff,
+as §4.2 already does for Claude. The changing clock, cutoff, and “age” text are
+not fingerprint inputs; provider and parsed session fields are. Refreshing
+panes, rebuilding rows, pinning width, and flushing tab state still run when
+neither provider is due.
+
+**One attempt constructs this union, in this order:**
+
+1. Fix `cutoff_ms = now_ms - 7 * 24 * 60 * 60 * 1000` for the entire attempt.
+   Follow `thread/loaded/list.nextCursor` to null; keep the unique full IDs
+   as `L`. A first page is not a complete loaded census.
+2. Follow the DB-only `thread/list` cursors in `updated_at desc` order.
+   Keep the fetched metadata, including any old rows on the last fetched
+   page, for reuse. Stop at null or after a valid descending page crosses
+   strictly below the cutoff. Rows exactly at the cutoff are in-window.
+   The eligible history half `H` contains only rows at/after the cutoff.
+   Seven days is a product choice: a week of reviewable work survives the
+   measured 30-minute idle unload, while the history walk has a fixed horizon.
+   There is no extra history-window flag in v1.
+3. For every ID in `L` without fetched metadata, call
+   `thread/read(includeTurns:false)`, in full-ID lexical order. Do not read
+   turns, subscribe, or load it to obtain metadata.
+4. Deduplicate by `Thread.id`; apply the following filter to BOTH `L`'s
+   metadata and `H`. Include only `ephemeral == false`, no non-null
+   `parentThreadId`, and top-level source `cli|vscode|exec|appServer|unknown`.
+   Exclude every `subAgent*` source, including the structured
+   `{"subAgent":...}` family regardless of its subtype. `forkedFromId`
+   alone does NOT make a thread a subagent: an ordinary TUI fork is eligible.
+5. Convert the remaining union to Sessions using §12.3. Loaded membership is
+   an inclusion reason, not a status value: use the latest returned
+   `Thread.status`, even if a thread unloaded between steps 1 and 3.
+
+Missing ID/cwd/timestamps/ephemeral/source, invalid required types, failed
+metadata reads, malformed envelopes/JSON, repeated cursors, invalid cursors,
+non-descending history, conflicting duplicate rows, protocol errors, and
+deadline expiry make the attempt INCOMPLETE. Identical duplicate rows are
+coalesced. A malformed row cannot authorize an early history cutoff.
+An unrecognized source cannot be guessed top-level; preserve the drift value,
+skip that row, and mark incomplete. Deliberate, well-formed subagent/ephemeral
+exclusions are not parser loss. Unknown status/flag STRINGS are retained under
+§12.3, not dropped.
+
+**Applying an incomplete Codex observation is an upsert, never a replacement.**
+Update/add the valid eligible rows it did return; preserve every other known
+row of that provider. Do not age a cached row out merely because time advanced
+while observations are incomplete. No new row is invented from a failed read.
+A complete observation may replace that provider's row cache, including
+removing rows now outside its declared scope; it says nothing about global
+deletion. Claude keeps its existing payload-application policy within its
+own cache, including the rule that parse loss supplies no absence evidence.
+A complete Claude snapshot cannot remove a Codex row or retire a Codex
+dismissal, and vice versa. Pane records are reconciled only against
+tmux pane existence, never against either provider's listing.
+
+Successful pagination is not a transactional snapshot of a changing server.
+Detectable inconsistent results become incomplete; no claim is made that
+undetectable concurrent changes cannot transiently alter membership. There is
+no destructive action based on such an absence in Codex v1.
+
+### 12.6 Rows, detail text, and errors (§§6.4–6.8, 9)
+
+Keep the four-column gutter and every existing width threshold. Prefix a
+Codex row's displayed name with `codex: ` INSIDE the name budget; never add a
+provider column or move the glyph/age rails. Claude names remain unchanged.
+At narrow widths the ordinary truncation rules apply. Codex's filter haystack
+contains `codex`, name, `Thread.cwd`, tail-eight display ID, and full
+`Thread.id`; Claude keeps its existing haystack. Filtering must not require
+a unique short-ID suffix.
+
+`Unloaded` uses the one-cell hollow diamond `◇` (U+25C7), `p.gray`,
+before the generic Completed glyph rule. It never uses `■` or `✓`.
+The selected row's middle detail line is
+`id      <tail-eight> codex unloaded`; other Codex states replace the last
+word with `idle`, `working`, `blocked`, `systemError`, or `unknown`.
+The name and cwd occupy the existing other two detail lines. Preserve full
+unknown status/flag values in the provider-labelled drift warning, rather
+than squeezing them into that status word. The help overlay defines unloaded
+as “not loaded in this server; Enter resumes; last-turn outcome unknown”.
+The `a` key includes/excludes Unloaded along with the Completed group.
+Show the Codex-specific help additions only when Codex is enabled.
+
+Codex is degraded when its preparation/polling fails or its observation is
+incomplete; OFF is not degraded. Retain rows and pane actions on
+degradation. Missing/down server, authentication refusal, unsupported RPC,
+and bad payload do not fall back to Claude or clear Claude's errors.
+Valid `systemError`/unknown-state rows are row warnings, not provider failures.
+Known `systemError` warns `codex runtime error: <tail-eight>`; do not describe
+it as unmodelled or advise updating ccmux for that known value. Actual unknown
+status/flag strings use the provider-labelled drift path and its existing
+warning-delivery rules.
+
+The header poll indicator is red if either enabled provider is degraded.
+When Codex is degraded, reserve the footer prefix `[codex!] ` in red
+(truncated safely at tiny widths), then apply the existing footer-body
+priority: filter, destructive window, flash/drift message, provider errors,
+hint. Errors at that priority read `codex degraded: <reason>`; if both
+providers failed, show `agents: <reason>; codex degraded: <reason>`.
+Keep the existing wrap into the detail block. A warning covered by a higher
+priority body has not been “seen” for drift retirement.
+
+Use bounded, redacted diagnostics such as `connection refused`,
+`authentication failed`, `unsupported thread/list`, `incomplete listing`,
+or `poll timed out after 1000ms`. No request body, response excerpt containing
+headers, token, or token-bearing command is logged. A complete Codex poll
+clears its degradation; a complete Claude poll does not.
+
+### 12.7 Attach command and parked panes (§§3.3, 5.3, 7)
+
+The provider-dispatch signatures replace the bare-ID public verb surface:
+
+```rust
+// src/agents.rs; private Claude-only command builders may still use short IDs.
+pub fn stop(session: &Session) -> Result<(), AgentsError>;
+pub fn respawn(session: &Session) -> Result<(), AgentsError>;
+pub fn delete(session: &Session) -> Result<(), AgentsError>;
+pub fn logs(session: &Session, lines: usize) -> Result<String, AgentsError>;
+pub fn dispatch_background(
+    provider: Provider, cwd: &str, task: &str
+) -> Result<Option<String>, AgentsError>;
+pub fn attach_pane_cmd(
+    session: &Session, codex: Option<&CodexConfig>
+) -> Result<String, AgentsError>;
+pub fn attach_entry_cmd(
+    entry: &PaneEntry, codex: Option<&CodexConfig>
+) -> Result<String, AgentsError>;
+```
+
+Add `AgentsError::UnsupportedProvider { provider: Provider, verb: &'static str }`
+and `AgentsError::NotConfigured(Provider)`. Provider guards run BEFORE any
+Claude short-ID lookup or subprocess. All Claude stop/delete/respawn gates
+still apply; `R` cannot bypass the provider guard. Dispatch requires an
+explicit provider even when no row is selected. Pure string builders must not
+read a token or connect.
+
+For Codex, the attach invocation constructed INSIDE the pane is exactly this
+shape, with `<bin>`, `<url>`, `<token-file>`, and `<Thread.id>` independently
+quoted by §7:
+
+```sh
+CODEX_REMOTE_TOKEN="$(cat <token-file>)" <bin> --remote <url> \
+  --remote-auth-token-env CODEX_REMOTE_TOKEN resume <Thread.id>
+```
+
+Do not evaluate the command substitution while building the string or when
+calling tmux. The tmux command contains the token FILE path only. Never use a
+literal token flag, a tmux environment option, or a persisted token value.
+The configured `CCMUX_CODEX_BIN` is the executable word, not a shell fragment.
+No `--cwd`, model, approval, or sandbox override is added by attach: resume
+keeps the thread's settings. An attach is attempted for any valid Codex row,
+including Unloaded, Unknown, or stale rows; only the official TUI can settle
+writer contention or an empty-history error.
+
+The Codex wrapper uses §3.3's same loop, latch, and park contract, substituting
+the remote invocation and a provider-labelled outcome:
+
+1. Immediately before EACH attempt, validate the pane's own `TMUX_PANE`
+   as a nonempty `%<digits>` target and clear `@ccmux_detached`.
+   Use the configured tmux socket. An invalid target exits 2 before any tmux
+   call; never fall through to an empty target.
+2. Run the remote invocation, capture `rc=$?` immediately, set the pane's
+   latch to `1`, and print
+   `[ccmux] Codex attach exited (rc=<rc>). resume: <safe command>`.
+   The printed command contains the literal `$(cat <quoted path>)`, never
+   its expansion; supply it as an argument to a fixed printf format.
+3. Print `[ccmux] enter=resume  s=shell  q=close pane: ` and `read ans`;
+   EOF means `q`. Enter/any unlisted answer repeats the SAME launch target.
+   `q/Q` exits with the attach's rc. `s/S` sets the latch to `shell`,
+   then explicitly hands off to the existing `$SHELL -l` fallback.
+   Never start an interactive shell automatically, and never `cd` in the
+   wrapper. No credential is exported into that shell.
+
+The parked pane remains mapped; it loses open marker, badge, and Enter jump
+eligibility until its own loop clears the latch. `x` can close it. Failed
+attach, missing binary, missing/rotated token, writer contention, and empty
+rollout follow this same park path. The sidebar does not repair a failed
+resume by starting a turn or deleting the map entry.
+
+**The pane map records the launch target, not the current TUI thread.**
+`/resume`, `/fork`, and `/new` can change the displayed thread without
+changing PID or argv. ccmux does not scrape `/status`, inspect processes, or
+retarget its map. Enter's jump and `x` continue to refer to the pane launched
+for that row; resuming a parked wrapper returns to its original target.
+The help text must state this limitation. It is why the displayed open marker
+is a claim about a ccmux launch, not proof of current thread attachment.
+
+### 12.8 Verb routing and restart (§§8–9)
+
+The following table is authoritative for a selected Codex row. Provider refusal
+precedes short-ID checks, modal creation, and every Claude call.
+
+| Verb | Codex behavior / exact footer text |
+|---|---|
+| `Enter` | refresh pane inventory, jump to an attached matching launch record, else open with §12.7 |
+| `o/s` | unconditional new vertical/horizontal split with §12.7; retain §8.4 geometry/focus rules |
+| `t` | new tab with §12.7; write its v2 map before starting its sidebar, then propagate §12.2 settings |
+| `x` | close one mapped live pane, including a parked pane, through the existing R2-gated kill path; `closed pane <index>[ in tab <N>] — Codex work stays on server` |
+| `d` | append a Codex dismissal; no RPC or immediate tmux write |
+| `u` | undo the newest folded dismissal by identity/provider; no RPC |
+| `r` | existing layout refresh plus forced polls for both enabled providers |
+| `Ctrl-x` | Warn: `Codex stop/delete unavailable in v1 — use the Codex TUI`; no delete window, confirmation, stop, or archive |
+| `L` | Warn: `Codex logs unavailable in v1 — use the Codex TUI`; no log overlay or history RPC |
+| `n` | Warn: `Codex new unavailable in v1 — create it in the Codex TUI`; no prompt or dispatch |
+| `R` | global ccmux/Claude restart under the rules below; never a Codex restart |
+| navigation, `/`, `a`, `?`, `q/Esc` | existing behavior, including Codex rows and provider-specific help |
+| `c`, `S`, other unbound keys | remain unbound; no new aliases |
+
+With a Claude selection or no selection, `n` retains its Claude behavior;
+the prompt captures `Provider::Claude`, not a provider chosen later by the
+cursor. There is no provider toggle in the v1 prompt. `u` uses the hidden
+winner's provider, never the currently selected row's. Moving from a Claude
+row to a Codex row disarms any pending Claude `Ctrl-x` window, as a selection
+change already must.
+
+Open/tab refusals in tmux-degraded mode remain exactly
+`not inside tmux — open unavailable`,
+`not inside tmux — tabs unavailable`, and for `x`,
+`not inside tmux — close unavailable`.
+A Codex open without enabled, syntactically valid `CodexConfig` says
+`codex not configured — open unavailable`. Credential/DNS preparation failure
+or a failed poll does not prohibit opening the official TUI from valid
+non-secret settings; the pane performs its own fresh token read/connection.
+No-match `x` still says `not open`; all sidebar-protection and foreign-window
+map-write rules remain. Codex `x` never sends an interrupt, unsubscribe,
+archive, or stop RPC, even for a Working or Blocked row. The gate probes
+established survival of active work and pending approval after client loss.
+
+**`R` skips every Codex pane before considering attachment or worker state.**
+The fresh-image restart plan may target sidebars and Claude panes only.
+Count live Codex pane IDs once in a separate skipped count, including parked
+ones; do not also count them as detached/unattachable Claude panes. Append
+`Codex panes skipped: <N>` to the restart summary when N is nonzero.
+Do not stop/respawn a Codex thread, re-run its pane command, inspect its client
+process, or touch its server/service. `restart::headless_targets` and each
+fresh pre-action check require `Provider::Claude` BEFORE `has_worker()`.
+A mapped Codex `short_id` must never enter `Plan::agent_ids`.
+Selecting a Codex row does not turn this global sidebar restart into an error.
+
+The low-level stop/delete/respawn/log/dispatch façade independently returns
+unsupported-provider for Codex, even if a caller missed the UI guard.
+If accidentally requested directly, restart refusal is
+`Codex restart unavailable in v1`. Tests must prove no Claude command can
+receive a Codex display ID or full Thread.id.
+
+### 12.9 PaneMap v2 and hidden-op compatibility (§§3.2, 5, 11)
+
+**PaneMap changes to v2; HiddenLog does not change version.** They are
+different formats with different old-reader failure modes.
+
+```rust
+// src/tmux.rs; existing fields retain their types.
+pub struct PaneEntry {
+    pub provider: Provider,
+    pub session_id: String,       // full native identity / launch target
+    pub short_id: String,        // Claude address OR Codex display-only tail
+    pub name: String,
+    pub opened_at: i64,
+}
+pub struct PaneMap {
+    pub v: u32,                  // new writers: 2
+    pub panes: BTreeMap<String, PaneEntry>,
+}
+```
+
+1. A v1 map is readable by new code: every entry becomes Claude, regardless
+   of any extra provider field; preserve the existing defaults for absent
+   `short_id`, `name`, and `opened_at`. Convert the in-memory map to v2.
+2. Every new map write, including `t`'s uncached pre-write and legacy empty
+   ownership marker, is v2. Every v2 entry MUST carry `provider:"claude"`
+   or `provider:"codex"`. Missing/unknown provider in v2 is invalid, not an
+   implicit Claude entry. Keep the existing corrupt/unsupported-map
+   fail-safe: read it as empty, never reinterpret it as v1. Reject a malformed
+   v2 Codex full thread ID before it becomes a pane-action target.
+3. The new reader reads v1 and v2 in both the legacy `load_map` and per-tab
+   `list_tabs` paths. New writers never downgrade another tab. An old binary
+   reads v2 as empty by its existing version check and therefore skips those
+   panes; it must not be expected to manage Codex panes during an upgrade.
+4. All single-writer, adoption, marker-presence, live-pane intersection,
+   attached-first/own-tab tie-breaking, and own-window-only map mutations
+   remain. Every map lookup also checks provider (§12.3). A provider failure
+   or an aged-out history row does not delete a live pane's record.
+
+**HiddenOp adds an OPTIONAL wire field, defaulting only an absent field to
+Claude.** `HiddenLog.v` remains **2**. Keep the existing log caps, rank, clock,
+and window ownership; do not replace the log with a new format that an old
+adopter would read as empty.
+
+```rust
+pub struct HiddenOp {
+    pub id: String,
+    pub add: bool,
+    pub seq: u64,
+    pub org: u64,
+    // serde default = Claude; omit Claude when serializing, emit "codex" otherwise.
+    pub provider: Provider,
+}
+impl HiddenOp {
+    pub fn identity(&self) -> (&str, bool, u64, u64); // (id, add, seq, org)
+}
+// HiddenSet retains ids() / undo ordering and gains provider lookup:
+impl HiddenSet {
+    pub fn provider_of(&self, id: &str) -> Option<Provider>;
+}
+```
+
+A present malformed/unknown provider is a parse error, not a Claude default.
+Legacy session-wide hidden IDs and provider-less existing ops import as Claude.
+A Codex `d` writes `provider:"codex"`; a new `u` copies the effective
+provider of the dismissal it restores, even when that row is no longer listed.
+The fold retains provider alongside the winning ID so reconciliation and undo
+never have to guess from the current sessions.
+
+**Duplicate identity excludes provider.** For copies with the same
+`(id, add, seq, org)`, merge provider as
+`Claude ⊔ Claude = Claude`, all other pairs `= Codex`.
+This merge is commutative, associative, and idempotent; enumeration order cannot
+turn a Codex dismissal into a retirable Claude dismissal.
+
+- `HiddenLog::push` coalesces exact identities, upgrades a held copy to Codex
+  if either copy is Codex, and returns dirty on that metadata upgrade.
+- `fold_hidden` merges duplicate metadata BEFORE choosing the per-ID winner.
+  Winner rank remains `(seq, org, add)`; provider is not an ordering component.
+  A newer restore or dismissal still wins regardless of provider.
+- Before `prune_hidden_log` compacts or compares ranks, a process upgrades
+  its own same-identity copies from any Codex-tagged duplicate visible in the
+  fold/adoption inputs. Mark its own fragment dirty; never write another
+  window's fragment. Orphan adoption uses the same `push` merge and preserves
+  `id/add/seq/org`, so re-offering a stripped copy cannot undo the upgrade.
+- Recompute provider metadata before any absence reconciliation and remove
+  Codex IDs from any previously accumulated Claude absence-strike set.
+
+**No automatic retirement of Codex dismissals in v1.** Neither absence from
+the seven-day window nor a complete loaded/list traversal, an error, a
+`notLoaded` read, or even a separately observed archive/deletion retires one.
+Do not add targeted reads to decide retirement. Explicit `u`, a newer
+winning op, existing cap eviction, and the existing fragment/session lifetime
+rules remain the ways it can cease to hide a row; ordinary tombstone GC still
+works. Claude retains two complete Claude observations of absence before
+retirement. Codex snapshots cannot advance that counter; incomplete/skipped
+Claude observations cannot advance it either.
+
+**The conflict rule's limit is explicit.** It protects an identity whenever
+at least one Codex-tagged copy remains available to the new reader. An old
+binary may adopt a fragment, strip the optional field when serializing, and
+retire its own copy as Claude; if EVERY surviving copy lost the tag before a
+new reader observed it, a merge cannot reconstruct that evidence. Do not infer
+provider from UUID shape. During that mixed-version window a Codex dismissal
+can still reappear and be restored with `d`; this does not erase unrelated
+Claude dismissals. The rule is not a claim that old binaries obey the new
+retirement policy.
+
+### 12.10 Measured limits (§9 and PROBE-FINDINGS §9)
+
+The following are part of the contract's scope, not details an implementation
+may silently “fix” by expanding its authority:
+
+- The attach gate passed for CLI **0.154.0** / server **0.153.4**. Generated
+  installed-CLI bindings do not prove a running server capability. Parse
+  responses defensively; unsupported protocol degrades only Codex.
+- The three supported last-client completion tests are `active-pane-valid`,
+  `active-sigkill`, and `active-graceful-valid`. The initial `active-pane`
+  attempt showed zero-client progress but completed AFTER reattach; it is not
+  a fourth completion proof and has no RPC `completion_check`.
+- Loaded empty threads can fail remote resume before a rollout exists.
+  Their fallback timestamps can also change before the first persisted turn.
+  Do not create a turn to make one resumable or use timestamps as identity.
+- Attach did not advance `updatedAt` for loaded or unloaded persisted
+  threads. Unsubscribed idle threads unloaded after about **30 minutes**.
+  Both facts require the recent-history half of the union.
+- `/resume`, `/fork`, and `/new` invalidate a pane's launch identity
+  without changing its argv. The map deliberately remains a launch record.
+  `/new` takes default thread settings/cwd. The materialization turn's cwd
+  override did NOT change `Thread.cwd`; only model/effort persisted back.
+- The old loaded-outside-listing source breakdown is **UNVERIFIED** because
+  the retained `extra.py` differs from the script that emitted it. Neither
+  those counts nor those source proportions are acceptance evidence.
+  Source/persistence filtering is required by the protocol and scope, not
+  inferred from that breakdown.
+- **UNMEASURED:** recovery after an external state-index fault; no live
+  storage was damaged to induce one. Do not add scan-and-repair fallback.
+- **UNMEASURED:** large-history, saturated-server, and failure-path latency.
+  The 0.42 s p95 is one host/population, not a service-level guarantee.
+  The original probe also did not prove hard deadlines under stalled
+  connect/close; §12.5 is an implementation requirement tested below.
+- **UNMEASURED:** desktop or differently versioned cross-runtime writers.
+  The brief second 0.153.4 stdio server was refused by an existing writer,
+  but `notLoaded` on our endpoint never proves global writer absence.
+  Let the official TUI report contention; do not search for or stop the writer.
+
+### 12.11 Acceptance tests (§10)
+
+**Unit/fixture tests run without tmux, Claude, a live app-server, or credentials.**
+Use redacted fixtures tied to the measured server schema. New behavior must
+have these tests; existing Claude tests remain authoritative.
+
+- **Parser and mapping:** `Thread.id != Thread.sessionId`; two UUIDv7 IDs
+  with the same head and distinct tails; full-ID addressing; optional name
+  fallback; seconds-to-ms conversion; malformed required fields; unknown
+  extra fields; every status row in §12.3; both blocking flags, mixed
+  known/unknown flags, unknown-only flags, duplicate flags, `systemError`,
+  and malformed flag arrays. Known `systemError` warns as a runtime error,
+  not schema drift. Blocked iff `▲`; Unloaded iff its own `◇`
+  branch applies. No synthetic Codex pid or `has_worker` inference.
+- **Union/completeness:** multi-page loaded and history fixtures, cutoff
+  equality and crossing, out-of-window loaded rows, metadata reuse/read
+  fallback, idempotent duplicates, cursor loops, missing metadata,
+  conflicting data, order violations, parse loss, and expiry mid-page/read.
+  Apply persistent/top-level exclusions to both halves; retain a top-level
+  fork and exclude subagent variants/nonnull parents. Incomplete results
+  upsert known rows without deleting any; complete scope replacement may age
+  them out without touching hidden ops or pane maps. A provider failure and
+  complete snapshot of its peer must not erase its rows.
+- **Protocol and deadline:** fake transport and clock exercise initialize/
+  initialized order, exact method/parameter allowlist, ID zero/string
+  dispatch, unrelated notifications, unexpected server requests and
+  `-32601`, auth/upgrade/method errors, and one budget consumed across
+  connect/write/pages/read/close, including fragmented upgrade/frame reads
+  that make progress without finishing before the deadline. Expiry must not
+  start another request or
+  wait on close. Assert that errors/logs/command text contain no test secret.
+- **Scheduling/configuration:** OFF makes zero Codex preparation/connection
+  calls; explicit options beat environment; absolute path resolution;
+  launcher/heal/`t`/self-exec/other-sidebar restart preserve enabled AND
+  disabled settings and binary overrides despite a conflicting tmux
+  environment. Separate provider success/failure/idle streaks, shared gate,
+  force refresh, and no counters on skips. Preparation failure leaves Claude
+  usable; `R` reloads prepared addresses/credential.
+- **PaneMap:** v1 imports as Claude and writes v2; v2 round-trips provider and
+  full key; missing/unknown v2 provider and unsupported versions fail closed.
+  Exercise both legacy and tab-map readers. Simulated old v1 reader sees v2
+  as empty. Different-provider lookup cannot claim a pane; loss of a poll
+  row does not remove a live pane record.
+- **Hidden compatibility:** absent provider defaults Claude without changing
+  HiddenLog v2; Codex field round-trips; dedup uses exactly the old identity.
+  Test both orders of Codex/stripped duplicate merge in push/fold/prune and
+  orphan adoption, including persisting a metadata-only upgrade. Test
+  newer undo winning over an older Codex op, no duplicate undo target, and
+  no provider tie-break in rank. Simulate an old adopter dropping the field:
+  a surviving tagged copy repairs it, unrelated Claude dismissals survive,
+  and the all-copies-stripped limitation is represented explicitly.
+  Codex never retires by absence/window aging; only complete Claude
+  observations advance Claude's two-strike rule. Hidden `u` works when
+  its Codex row has aged out or the provider is down.
+- **Verbs/wrappers/UI:** drive keys through `on_key`, assert each refusal
+  string and absence of RPC/subprocess/modal side effects. Test provider
+  routing in the lower-level façade too. `Enter/o/s/t/x` keep the existing
+  pane-ownership/focus rules; `t` seeds the map before sidebar creation.
+  Snapshot the remote wrapper with hostile path/name inputs, literal
+  command substitution, no token bytes, validated latch target, parked
+  retry to the launch ID, rc propagation, and explicit-only shell handoff.
+  `R` plans no Codex pane/agent action and counts skips once. Render existing
+  width/height matrices with mixed providers, Unloaded, drift, and provider
+  degradation; the gutter stays four columns.
+
+**Ignored live tests** are opt-in and separate from those fixtures.
+They require explicit `CCMUX_CODEX_LIVE_TEST=1`, an explicitly supplied
+endpoint/token file, and ONLY `tmux -L ccmux-probe` with inherited
+`TMUX/TMUX_PANE` removed and an empty throwaway server verified first.
+No default-socket command, service restart/configuration change, or mutation
+of a pre-existing thread is permitted. A dedicated test harness may create
+and name `ccmux-probe-` threads, keep a registry, run trivial luna/low turns,
+and archive ONLY those IDs at the end; never delete them. Record CLI/server
+versions. Test-only mutation access is not exported by the production lister.
+
+Keep ignored cases for multi-attach, verified graceful/abrupt last-client
+exit with active completion, pending approval replay, natural idle unload,
+non-loading/non-subscribing reads, loaded/unloaded resume and unchanged
+`updatedAt`, DB-only freshness/pagination/poll cost, and the in-TUI
+identity/default-cwd behavior. A contention test may use a tightly bounded
+owned stdio process, never a second long-lived server. Live deadline/failure
+experiments use a controlled test endpoint, not fault injection into DuDu's
+server. Always archive the registered probe threads and remove the throwaway
+tmux server on exit; report any cleanup failure rather than calling the gate
+passed.
 
 ---
 

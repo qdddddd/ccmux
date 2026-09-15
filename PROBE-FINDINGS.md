@@ -570,7 +570,8 @@ any further mutation, then named with `thread/name/set` and a
 `ccmux-probe-` prefix. The approval probe alone used `"untrusted"`.
 The TUI-created fork/new threads were identified from that owned pane's
 `/status` and registered separately. Every model turn used luna/low; the
-`/new` default reset described below was corrected before sending its turn.
+`/new` materialization turn explicitly overrode the inherited model, effort,
+and turn cwd; the thread's own cwd remained the default described below.
 
 ### Versions and protocol surface
 
@@ -667,7 +668,13 @@ The TUI-created fork/new threads were identified from that owned pane's
   (`thread/resume` error `-32600`). After a first turn had started,
   ordinary remote resume succeeded.
   That initial pane kill is excluded from the active-TUI gate evidence.
-  Its turn did independently complete after the creating RPC client closed.
+  That initial turn (`01a0a609-12a6-7560-82dd-e95c5e8d24d4`) made progress
+  through two model rounds with zero clients after its creator closed at
+  01:06:52. Pane `%7` reattached at 01:08:11; the rollout's `task_complete`
+  was at 01:08:23, about 12 s after reattach. It did not complete with zero
+  clients. No RPC `completion_check` exists for this turn; review correlated
+  the client events with the server rollout. The three gate rows above are
+  the separate, supported completion tests.
   A separate first graceful-quit attempt left `/quit` in the composer;
   only the delayed-input repeat with a verified exited client counts above.
   **Consequence:** retain the deferral of Codex `n`; loaded membership alone
@@ -761,10 +768,13 @@ The TUI-created fork/new threads were identified from that owned pane's
   including those created directly over WebSocket RPC.
   The poll used
   `sourceKinds:["cli","vscode","exec","appServer","unknown"]` and
-  `modelProviders:[]`. At the pagination check, four loaded IDs were absent
-  from this historical list: three had source `vscode`, one had a structured
-  `subAgent` source; two were ephemeral. All four were idle and recently
-  updated. **Consequence:** query loaded IDs separately, read missing metadata,
+  `modelProviders:[]`. The logged loaded-outside-listing breakdown reports
+  four IDs: three `vscode`, one structured `subAgent`, two ephemeral, all idle
+  and recent. **Provenance gap — UNVERIFIED:** the 01:16:18 run predates the
+  surviving `extra.py` (mtime 01:18:31), and its JSON-encoded counter keys do
+  not match that file's code. The breakdown and its counts cannot be reproduced
+  from the retained script and must not be used as acceptance evidence.
+  **Consequence:** query loaded IDs separately, read missing metadata,
   and apply the persistent/top-level filters to that union too. Do not narrow
   the historical list to `appServer` source alone.
 
@@ -830,11 +840,17 @@ The TUI-created fork/new threads were identified from that owned pane's
   `resume 01a0a605-c1c8-7960-a4c1-c32f0c4b3002`, the original launch target.
   `/new` also reset cwd from the probe directory to `/home/qdu` and model
   from luna/low to the server default, astra/max; no turn was sent using that
-  default. Its cleanup turn explicitly overrode cwd and model back to the
-  probe directory and luna/low.
+  default. `register_new.py` applied `cwd=<probe directory>`, luna, and low
+  effort to its materialization `turn/start`, not to thread configuration.
+  Model and effort persisted back, but **Thread.cwd stayed `/home/qdu`**:
+  live `thread/read` and rollout `session_meta` agree, and listing filtered to
+  the probe cwd omits `tui-new`. This was a turn-level override, not a cleanup
+  turn that moved the thread.
   **Consequence:** document the accepted v1 limitation that the pane map
   records the launch target. It cannot track current identity through argv,
   and `/new` must not be assumed to inherit the selected thread's settings.
+  Its listed cwd is the TUI/server default, not the pane's launch thread's cwd
+  or a later turn's cwd override; ccmux must display `Thread.cwd`.
 
 - **Unmaterialized thread timestamps need caution.**
   Method: read the empty `tui-new` twice before its first turn.
