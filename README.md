@@ -1,35 +1,32 @@
 # ccmux
 
-A tmux-backed, neovim-style frontend for Claude Code sessions.
+A tmux-backed, neovim-style frontend for Claude Code background sessions.
 
-`claude agents` gives you a fleet view. `ccmux` gives you a workspace: a
-persistent session explorer pinned to the **left** of a tmux window, with the
-real Claude Code TUIs — full fidelity, full transcript — living in splits to its
-right.
-
-tmux does the hard part (it is the PTY substrate, so sessions survive detach and
-SSH drops). ccmux adds the sidebar, the "open this session into a split" verb,
-and the layout orchestration that makes the two feel like one app.
+`claude agents` gives you a fleet view. ccmux gives you a workspace: a session
+list pinned to the left of a tmux window, with the real Claude Code TUIs open in
+splits to its right. tmux keeps everything alive across detaches and SSH drops.
 
 ```
-┌──────────────────┬───────────────────────┬───────────────────────┐
-│ ccmux   18       │                       │                       │
-│ ── Blocked (1) ──│                       │                       │
-│  ▲ client statem… │                       │                       │
-│ ── Working (2) ──│                       │                       │
-│ ▌● bt/reg-update │   live Claude TUI     │   live Claude TUI     │
-│  ◐ kernel bugs   │                       │                       │
-│ ── Idle (4) ─────│   ✶ Thundering… 3m    │   ✶ Bunning… 16m      │
-│  ○ alpha/opt    │   >                   │   >                   │
-│ ── Completed ────│                       │                       │
-│  ✓ alpha/axioma │                       │                       │
-├──────────────────┤                       │                       │
-│ name  af/reg-…   │                       │                       │
-│ id    1c45d64f   │                       │                       │
-│ cwd   ~/…/bin    │                       │                       │
-│ j/k move ⏎ open  │                       │                       │
-└──────────────────┴───────────────────────┴───────────────────────┘
-      34 cols                    splits fill the rest
+┌──────────────────┬───────────────────────┐
+│ ccmux  5       ● │                       │
+│── Blocked (1) ───│                       │
+│  ▲ review auth pr│                       │
+│                  │                       │
+│── Working (2) ───│   live Claude TUI     │
+│▌ ● api/refactor  │                       │
+│  ◐ flaky test    │   ✶ Refactoring… 3m   │
+│                  │   >                   │
+│── Idle (1) ──────│                       │
+│  ○ docs/readme   │                       │
+│                  │                       │
+│── Completed ─────│                       │
+│  ✓ bump deps     │                       │
+├──────────────────┤                       │
+│ name  api/refac… │                       │
+│ id    3f9a07c2   │                       │
+│ cwd   ~/src/api  │                       │
+│ j/k move ⏎ open  │                       │
+└──────────────────┴───────────────────────┘
 ```
 
 ## Install
@@ -38,651 +35,193 @@ and the layout orchestration that makes the two feel like one app.
 cargo install --path .
 ```
 
-Requires `tmux` and the `claude` CLI on `PATH`. Rust 1.94+ (edition 2024).
+Requires `tmux` and the `claude` CLI on `PATH`, and Rust with edition 2024.
 
 ## Launch
 
 ```sh
-ccmux                       # create-or-attach the `ccmux` tmux session
-ccmux --session work        # a differently named session
-ccmux --width 40 --dark     # wider sidebar, dark palette
+ccmux                     # create or attach the `ccmux` tmux session
+ccmux --session work      # a differently named session
+ccmux --width 40 --dark   # wider sidebar, dark palette
 ```
 
-Running `ccmux` again from another terminal attaches the **same** session — no
-second window, no second sidebar. Running it from *inside* its own session is a
-no-op. If the sidebar was quit with `q`, re-running `ccmux` re-inserts it on the
-left at the pinned width, and the panes it had opened are still mapped.
-
-The sidebar is normally started for you. To run it directly (it works standalone
-outside tmux, in degraded mode — see below):
-
-```sh
-ccmux sidebar --interval 2500
-```
-
-### Options
+Running `ccmux` again from another terminal attaches the same session. If a
+sidebar was quit with `q`, running `ccmux` puts it back.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--session <NAME>` | `ccmux` | tmux session to create/attach. `[A-Za-z0-9_-]{1,64}` |
-| `--width <COLS>` | `34` | Pinned sidebar width, clamped to `20..=120` |
-| `--light` | on | Light gruvbox palette (the default) |
-| `--dark` | off | Dark gruvbox palette, for a dark terminal background; mutually exclusive with `--light` |
+| `--session <NAME>` | `ccmux` | tmux session name, `[A-Za-z0-9_-]{1,64}` |
+| `--width <COLS>` | `34` | Sidebar width, clamped to `20..=120` |
+| `--light` / `--dark` | light | Palette. Not auto-detected |
+| `-L`, `--socket <NAME>` | tmux default | Use a separate tmux server |
+| `--interval <MS>` | `2500` | Poll interval, for `ccmux sidebar` only |
 
-### Theme
+The palette can also be set with `CCMUX_THEME=dark`. A flag wins over the
+variable. `CCMUX_CLAUDE_BIN` overrides the `claude` binary, and
+`CCMUX_TMUX_SOCKET` is the variable form of `--socket`.
 
-The palette is **not** auto-detected — `COLORFGBG` is unset under kitty and most
-modern terminals, and an OSC 11 background query could not be verified end to end
-through tmux, so ccmux does not gamble on one at startup.
+## Keys
 
-It defaults to **light**, because a wrong guess is not symmetric: dark `fg`
-(`#ebdbb2`) on a light ground is 1.21:1 and simply cannot be read, while light
-`fg` (`#3c3836`) on a dark ground still resolves. The safer default is the one
-whose failure mode is merely ugly.
-
-On a dark terminal background:
-
-```sh
-export CCMUX_THEME=dark       # in your shell rc, or
-ccmux --dark                  # per invocation
-```
-
-`--light`/`--dark` beat `CCMUX_THEME`, which beats the light default. The launcher
-resolves the choice and forwards the answer to the sidebar pane, so it holds even
-though the pane may not inherit the variable.
-| `-L`, `--socket <NAME>` | tmux default | Use `tmux -L <NAME>`, a separate tmux server |
-| `--interval <MS>` | `2500` | *(`sidebar` only)* `claude agents --json` poll interval, when something is watching |
-
-`CCMUX_CLAUDE_BIN` overrides the `claude` binary. `CCMUX_TMUX_SOCKET` is an
-environment-variable equivalent of `--socket`.
-
-## Keymap
-
-### Normal mode
-
-| Key | Action | Destructive |
-|---|---|---|
-| `j`, `Down` | Next session (skips group headers) | no |
-| `k`, `Up` | Previous session | no |
-| `g` | First session | no |
-| `G` | Last session | no |
-| `Ctrl-d` | Down half a viewport | no |
-| `Ctrl-u` | Up half a viewport | no |
-| `Tab` | First row of the next non-empty group | no |
-| `Shift-Tab` | Previous non-empty group | no |
-| `Enter` | Jump to the session's pane, or open it in a vertical split. A pane you have detached from is no longer showing the session, so `Enter` opens a fresh one instead of jumping there | no |
-| `o` | Open in a **vertical** split (vim geometry: side by side), then spread the panes evenly across the width | no |
-| `s` | Open in a **horizontal** split (vim geometry: stacked), then spread the panes evenly down the height | no |
-| `t` | Open in a **new tab** — a tmux window with its own pinned sidebar — and switch to it | no |
-| `x` | Close the pane showing a session — the agent keeps running, because background agents are daemon-owned and outlive their pane. Still closes a pane you have detached from, even though nothing marks it as open any more | no |
-| `Ctrl-x` | **Stop the session** — immediately, no confirmation. Press it **again within two seconds** to **delete** the session and its git worktree, and close every pane ccmux still had parked on it — a pane you took to the `s` shell is yours and stays. A second press inside 750 ms is read as a held key or a buffered burst and ignored — the window stays open, so press again | **yes** |
-| `n` | Dispatch a new background session with a typed task — the cwd field takes `~` paths, `Tab`-completes directories, and offers to create a missing directory (see below). The cursor moves onto the new session as soon as it is listed; it is still not opened | no |
-| `L` | `claude logs` for this session, ANSI-stripped, in an overlay | no |
-| `d` | **Dismiss** the selected session from this list. A view filter: the agent keeps running and its pane stays open — dismissing a row that has a ccmux pane says so, because the row was the only way to reach `x` and `Enter` for it | no |
-| `u` | Undo the most recent `d` | no |
-| `/` | Filter by name, cwd, or short id | no |
-| `a` | Toggle visibility of the Completed group | no |
-| `r` | Force refresh, **and** re-assert the layout: spread the content panes evenly and put the sidebar back on its pinned width. Neither happens on a timer — the width is re-asserted only when it is actually wrong, the even pass runs only on `o`/`s`/`x`, and both stand down while a pane is zoomed — so `r` is the way back for a window you have rearranged with tmux's own keys. It ends a zoom, because re-laying a window does, and says so | no |
-| `R` | **Restart ccmux in place** after an upgrade — this sidebar, every other tab's sidebar, every pane ccmux opened, and every **running agent** that is not busy, whether or not it has a pane. Windows, panes and layout are kept exactly as they are (see *Restarting after an upgrade*) | no |
-| `?` | Help overlay | no |
-| `q` | Quit the sidebar. Sessions and panes are untouched | no |
-| `Esc` | Close an open delete window if there is one; else clear the filter if one is active; otherwise does nothing | no |
-
-`o` and `s` are named for vim's geometry, not tmux's: `o` = vertical =
-side-by-side, `s` = horizontal = stacked.
-
-tmux's own `split-window` halves whichever pane it lands on, so a fourth `o`
-would leave a 20-column sliver next to a 42-column pane. ccmux re-lays the
-window after a split, and after an `x` that closed a pane **in the tab you are
-looking at**, so the panes it opened share the axis evenly — the sidebar keeps
-its pinned width, and the leftover cells are handed out one apiece rather than
-piled on one pane, so no two panes differ by more than a column (83 content
-columns over three panes is 28 + 28 + 27). Evening happens **only** on those two
-keys, never on the poll tick, so a border you drag with the mouse stays where
-you put it. A window holding a mix of `o` and `s` is a tree rather than a row or
-a column, and is left exactly as you built it — as is the other tab's geometry
-when `x` reaches across tabs to close a pane there.
-
-`Enter` and `x` reach across tabs: `Enter` on a session open in another tab
-switches to that window and selects its pane, and `x` closes a pane wherever it
-lives — except a sidebar, which no tab will let you close.
-
-### Detaching: `Ctrl-Z` parks the pane, enter puts you back
-
-`Ctrl+Z` inside an attached session is **not** a suspend. `claude attach` holds
-the terminal in raw mode, so the tty never generates `SIGTSTP`; claude reads the
-keystroke as "detach" and exits. There is no stopped job and nothing for `fg` to
-resume — the agent itself is unaffected, because it is daemon-owned and was
-never a child of the pane.
-
-So the pane is yours the moment you press it. Instead of dying, or sitting on a
-"press enter to close" prompt, it prints one line and waits:
-
-```
-[ccmux] attach exited (rc=0). resume: claude attach 1c45d64f
-[ccmux] enter=resume  s=shell  q=close pane:
-```
-
-- **enter** re-runs that exact attach, in the same pane, with the whole
-  transcript back. It is the closest thing to `fg` that is honest here, and it
-  is one key rather than a retyped command.
-- **`s`** hands the pane to your login shell (`$SHELL -l`), in the same
-  directory, with the resume command in the scrollback above the prompt.
-- **`q`** (or `Ctrl-D`) closes the pane, carrying out the attach's own exit
-  code.
-
-The exit code is always shown, so an attach that failed for real — the session
-was stopped between the poll and the keypress, say — says `rc=1` above the same
-prompt instead of vanishing.
-
-**Why the shell is behind a key.** An interactive shell runs your startup files,
-and it runs them in a pane whose `$TMUX` points at the tmux server ccmux is
-using. A startup file that touches tmux therefore touches *that* server: on the
-machine this was measured on, one unconditional login shell took a throwaway
-server from 1 session and 2 panes to 3 sessions and 15, because the rc chain
-ends up calling `tmux new -s dev -d` and tmux-resurrect's `restore.sh`, which
-restored a saved workspace straight over the live ccmux session. ccmux cannot
-vet your dotfiles, so it does not run them on its own initiative — `s` is your
-say-so, exactly like typing `zsh` would be. (If your own rc does something like
-that, guarding it with a check for `$TMUX` is worth doing anyway.)
-
-The sidebar stops claiming that pane the moment you detach. The `▌` goes out,
-the tab badge disappears, `Enter` opens a fresh pane rather than sending you
-back to a prompt you left, and `R` will not respawn it. What does not change is
-ownership: it is still a pane ccmux opened, so `x` still closes it — and a
-session you **delete** (`Ctrl-x` twice) has its parked panes closed for you
-rather than left offering a resume that cannot work. Resume it
-with **enter** and the sidebar takes it back — the pane says so itself. Attach
-by hand from the `s` shell and it does **not**: from the outside a `claude`
-process does not say which session it is showing, so that pane stays yours, and
-`Enter` gives the session a pane of its own. The `s` shell is yours in the
-same way: the pane tells ccmux it has become a shell, a delete leaves it alone
-whatever you are running in it, and you close it yourself — `x` while its row
-is still listed, or `exit`, like any shell.
-
-### Overlays and modes
-
-| Mode | Keys |
+| Key | Action |
 |---|---|
-| Filter (`/`) | Type to filter live · `Ctrl-w` word · `Ctrl-u` clear · `Enter` commit · `Esc` clear and leave |
-| Prompt (`n`) | `Tab` to the cwd field — and, once there, directory completion · `Shift-Tab` back to the task · `Enter` run (from either field) · `Esc` cancel · `Home`/`End`/arrows/`Backspace`/`Delete` edit |
-| Help (`?`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · any other key closes |
-| Logs (`L`) | `j`/`k` scroll · `Ctrl-d`/`Ctrl-u` page · `g`/`G` top/bottom · `q`/`Esc` close |
+| `j` / `k`, arrows | Next / previous session |
+| `g` / `G` | First / last session |
+| `Ctrl-d` / `Ctrl-u` | Half a page down / up |
+| `Tab` / `Shift-Tab` | Next / previous group |
+| `Enter` | Jump to the session's pane, or open it in a vertical split |
+| `o` / `s` | Open in a side-by-side / stacked split |
+| `t` | Open in a new tab |
+| `x` | Close the session's pane. The agent keeps running |
+| `Ctrl-x` | Stop the session. Press again within 2 s to **delete** it |
+| `n` | Dispatch a new background session |
+| `L` | Show the session's logs |
+| `d` / `u` | Hide the row from the list / undo the last hide |
+| `/` | Filter by name, cwd or short id |
+| `a` | Show or hide the Completed group |
+| `r` | Refresh, and re-assert the layout |
+| `R` | Restart ccmux and idle agents after an upgrade |
+| `?` | Help |
+| `q` | Quit the sidebar. Sessions and panes are untouched |
+| `Esc` | Cancel a pending delete, or clear the filter |
+| `Ctrl-c` | Quit from any mode |
 
-`Ctrl-c` quits from any mode; `q` quits from Normal. Pasted text is never
-executed as keys — it is discarded in Normal and taken as literal text in the
-filter and the prompts.
+`o` and `s` follow vim's naming: `o` puts panes side by side, `s` stacks them.
 
-### Dispatching into a new directory
+Inside the overlays, `j`/`k`, `Ctrl-d`/`Ctrl-u` and `g`/`G` scroll. In the
+`n` prompt, `Tab` moves between the task and cwd fields and `Enter` submits.
+Pasted text is never run as keys.
 
-`n` prefills the cwd with the selected row's — accept it, type the task, and
-one `Enter` dispatches, same as ever. To send the session somewhere else,
-`Tab` jumps to the cwd field: type a path (`~` and `~/x` expand; a tilde
-anywhere else is a literal file name; `~user` is refused), and `Tab` completes
-directory names as you go — unique prefixes complete through to `.../name/`,
-ambiguous ones extend to the common prefix or report `N matches`.
+## The list
 
-If the directory does not exist, `Enter` does not reject it outright: the
-footer says so, the hint line switches to `⏎ create cwd + run`, and a second
-`Enter` creates it and dispatches — the flash names the created path. Only ONE
-level is ever created: the parent must already exist, so a typo'd deep path is
-refused (`parent does not exist: …`) rather than materialised as a tree.
-Anything already occupying the name — a file, a dangling symlink — is refused,
-never overwritten. Editing either field, `Esc`, or leaving the prompt drops
-the offer. This `mkdir` is the only write ccmux ever makes to the filesystem.
+Only background sessions are listed: those started with `claude --bg` or `n`.
+Interactive sessions cannot be attached into a split, so they are left out.
 
-Either way the cursor follows the session you just dispatched. It does not
-happen at submit time — `claude --bg` returns before the daemon lists the
-session — so ccmux remembers the short id it printed and moves the selection
-onto the row the moment the row appears, however the list has re-sorted by
-then. Nothing is opened: `Enter` is still yours to press.
-
-The cursor is yours the moment you reach for it. Any key that is about the
-cursor drops the pending jump before it can fire — the moves (`j` `k` `g` `G`
-`Tab` `Ctrl-d` `Ctrl-u`, including one that is already at the end of the list
-and moves nothing), and every key that acts on the row under it (`Enter` `o`
-`s` `t` `x` `Ctrl-x` `L` `d` `u`). So a jump can never arrive between the two
-presses of `Ctrl-x` and change what the second one deletes. `r`, `/`, `a` and
-`n` itself do not cancel it. If `/` is hiding the new session the footer says
-`dispatched <name> — filtered out` and your filter is left alone — and if the
-filter line is still open, that line waits until the footer is yours again to
-read. If the session never turns up within a few polls, the cursor simply
-stays put.
-
-## Reading the list
-
-Sessions are grouped as `claude agents` groups them, with **Blocked** hoisted to
-the top: **Blocked**, **Working**, **Idle**, **Completed**. A blocked session is
-stopped at a permission prompt or a question and cannot advance until you answer
-it, so it is the first thing on screen.
+Groups run **Blocked**, **Working**, **Idle**, **Completed**.
 
 | Glyph | Meaning |
 |---|---|
-| `▲` yellow | **Blocked — waiting on you.** A permission prompt or a question |
-| `●` orange | Working, actively generating |
+| `▲` yellow | Blocked on a permission prompt or question |
+| `●` orange | Working |
 | `◐` blue | Working, waiting on input |
 | `○` gray | Idle |
 | `✓` green | Completed |
-| `■` gray | Stopped with `Ctrl-x`; the conversation is kept, `o` resumes it |
-| `?` purple | A status or state this build does not recognize |
-| `▌` aqua | Open in a ccmux pane in the tab you are looking at (column 1) |
-| `▌` neutral | Open, but in **another** tab. A gruvbox neutral rather than a second aqua, so the two markers differ in hue — warm grey against green — and not merely in depth, which is what lets this one still read as a colour on the light ground. It is the more prominent of the two either way: deeper on the light theme, paler on the dark one, since a dark ground emphasises upwards |
-| `5` | Which tab (column 2), in the same shade as the `▌` beside it, so `▌5` reads as one token. Blank means the tab you are looking at; `+` means a tab number of ten or more |
+| `■` gray | Stopped. Opening it resumes it |
+| `?` purple | A state this build does not recognize. The footer names it |
+| `▌` aqua | Open in a pane in this tab |
+| `▌` grey | Open in a pane in another tab |
+| `2` | The tab it is open in. `+` means tab 10 or higher |
 
-When `claude agents` reports a `state` or `status` this build has no variant for,
-the row still renders (`?` purple) and still groups — and the footer says so by
-name: `unmodelled state "…" — update ccmux`. Two such values, `stopped` and
-`blocked`, shipped unnoticed before that warning existed.
+`d` hides a row from the list and nothing else: the agent keeps running and its
+pane stays open. Hidden rows are kept for the life of the tmux session.
 
-Each value is announced once, but "once" means once it has actually been on
-screen: if a keypress message overwrites the warning, or the help overlay is
-covering the footer when it lands, it comes back on a later poll rather than
-being spent unread. `cargo test -- --ignored live_state_and_status` asks the
-running fleet the same question, and is worth running after a `claude` upgrade.
+## Layout
 
-### Tabs
+The sidebar keeps its width. ccmux checks it on every poll and resizes it only
+when it is wrong, so a split or a manual resize heals on the next tick.
 
-`t` puts a session in its own tmux window and takes you there. Every tab gets
-its own pinned sidebar, so the list is on screen wherever you are. Only the tab
-you are looking at polls (see *Polling* below), so the extra tabs are close to
-free.
+`o`, `s` and `x` spread the panes ccmux opened evenly along the split axis. A
+window mixing `o` and `s` panes is a tree, and is left as you built it. Panes
+are never re-evened on a timer, so a border you drag stays put.
 
-The header says `tab 2` — tmux's own window number, so `prefix-2` goes there —
-once a second tab exists, and the badge in the second gutter column says which
-tab each open session is in. Nothing is shown while there is only one tab.
+A zoomed pane (`prefix z`) stays zoomed. The automatic resizing above pauses
+while the window is zoomed.
 
-The open marker `▌` says the same thing in colour: aqua for a session open in
-this tab, a neutral warm grey for one parked in another. The two differ in hue
-and not just in weight, which is what keeps the second one legible as a colour
-rather than as dark text. Both cells take one ink, decided once from the badge,
-so the shade and the digit cannot end up disagreeing about where a session is.
+`r` puts the layout back by hand: it re-evens the panes and re-pins the sidebar,
+even through a zoom. The footer says when it changed something.
 
-A session you open in two tabs is "here" in both: each tab's badge stays blank,
-its marker keeps the aqua, `Enter` does not move you, and `x` closes the pane in
-the tab you are actually looking at.
+## Tabs
 
-There is no close-tab key: a tab ends when its last pane does, the way tmux
-already ends windows. If you quit a tab's sidebar with `q` while its Claude
-panes are still there, that tab has no sidebar until you detach and run `ccmux`
-again, which heals every tab that is missing one. A window you made yourself
-with `prefix-c` is never touched, and neither is a tab `t` is still building.
+`t` opens a session in a new tmux window with its own sidebar. Once a second tab
+exists, the header shows which tab you are in and the list shows where each
+session is open. `Enter` and `x` work across tabs.
 
-Dismissals (`d`/`u`) are shared across tabs, because the session list is the
-same list in every tab. Two tabs dismissing different rows in the same interval
-both stick: each sidebar writes only its own window's state, so neither can
-revert the other.
+A tab closes when its last pane does. Running `ccmux` again restores any tab's
+missing sidebar. Windows you create yourself are never touched.
 
-### Restarting after an upgrade
+## Detaching
 
-`cargo install --path .` replaces the binary on disk, but the sidebar you are
-looking at is still the old image, and so is every `claude attach` client in
-every pane. A `claude` upgrade is worse: a background agent keeps the version it
-was launched with for its whole life, so it can be days behind the CLI you just
-installed. `R` restarts all of them **in place**: every window, every pane,
-every pane id and the whole layout stay exactly as they are — only the processes
-change. There is no confirmation, and none is needed (see *Safety*).
+`Ctrl-z` in an attached pane detaches from the session. The agent keeps running.
+The pane then waits instead of closing:
 
-What it restarts, and how:
+```
+[ccmux] attach exited (rc=0). resume: claude attach 3f9a07c2
+[ccmux] enter=resume  s=shell  q=close pane:
+```
 
-| | mechanism | what survives |
-|---|---|---|
-| this sidebar | `exec(2)` — the process image is replaced | the pane, by construction: tmux is never told |
-| the other tabs' sidebars | `respawn-pane -k` | the pane id, its geometry, the layout |
-| the panes ccmux opened, still attached | `respawn-pane -k` with `claude attach <id>` | the **agent** — it is daemon-owned and outlives its client |
-| the **agents** behind those panes, when idle or done | `claude stop <id>`, and the pane's own `claude attach` is the resume | the conversation and the transcript |
-| **running agents nobody has open**, when idle or done | `claude respawn <id>` | the conversation and the transcript |
-| an agent that is **working** or **blocked** | nothing — skipped and counted as `busy` | the work in flight |
-| an agent you **stopped** yourself | nothing at all, and nothing is reported | it stays stopped |
-| a session with **no worker running** | nothing at all | it stays finished — it is not started |
-| a pane you detached from | nothing — skipped and counted | whatever you have been doing in it |
-| an agent open in **another ccmux**, or in a `claude attach` you ran yourself | nothing — it is somebody's terminal | that terminal |
+- **enter** re-attaches in the same pane.
+- **s** gives you a login shell in the pane. It is behind a key because shell
+  startup files that touch tmux would run against the ccmux server.
+- **q** closes the pane.
 
-**Nothing else is touched.** A pane is restarted only if ccmux can prove it
-created it — it is a tab's recorded sidebar, or it is in that tab's pane map. A
-pane you opened yourself inside the ccmux session, with `prefix-"` or
-`prefix-%`, is in neither, and `R` leaves it alone: whatever is running in it
-keeps running, with the same pid.
+While a pane is detached, the sidebar no longer counts it as open, and `R`
+leaves it alone. `x` still closes it.
 
-**The agents.** Restarting an attach client changes nothing about the version
-doing the work: the agent is a separate, daemon-owned process, and it runs
-whatever `claude` was current when it was dispatched until it dies. `R` refreshes
-it, and which mechanism applies is the only difference between the two kinds of
-agent it reaches:
+## Dispatching with `n`
 
-* an agent **open in a ccmux pane** is stopped with `claude stop <id>`, and that
-  pane's respawned `claude attach <id>` is the resume;
-* an agent **nobody has open** is restarted with `claude respawn <id>`, the
-  CLI's own verb for "pick up the current Claude Code version", which needs no
-  terminal at all.
+`n` asks for a task and a working directory, prefilled from the selected row.
+The directory field expands `~` and `Tab`-completes. If the directory does not
+exist, a second `Enter` creates it. Only one level is created, and never over an
+existing file.
 
-Either way it comes back as a genuinely new process on the binary that is
-installed now, under the same id, with the conversation kept and the transcript
-intact.
+The cursor moves to the new session once it is listed. Moving the cursor
+yourself first cancels that.
 
-**One thing does not come back: the name.** A resumed worker comes up without
-the session's display name and with its start time reset, so while it runs the
-row shows the bare 8-hex id instead of the task text and the age reads as
-seconds. The record itself is fine — the name reappears the moment the session
-stops — and `/` still finds it by id or directory in the meantime. This is the
-CLI's behaviour on any resume, `stop` + `attach` included, so it is not new; what
-is new is that the no-pane route reaches agents you never opened here. There is
-no way for ccmux to put it back: the CLI has no rename, and passing `--name` to
-a resume starts a *copy* of the conversation instead, which is worse.
+## Restarting after an upgrade
 
-The rule that decides is **whether a worker is running**. `R` restarts running
-agents; it never starts one. A session that has finished and whose worker has
-exited is not on an old version — it is not on any version — so `R` leaves it
-exactly where it is and says nothing about it. That is most of a busy fleet:
-nine of seventeen sessions here, on an average afternoon.
+After `cargo install` or a `claude` upgrade, the running processes still use
+the old binaries. `R` restarts them in place. Windows, panes and layout stay
+as they are.
 
-It also never touches an agent that is **working** or **blocked** — the two top
-groups in the list. A working agent is mid-task, a blocked one is holding a
-question for you, and `claude stop` would take either. Those keep their old
-version until they finish, which is the trade that lets `R` stay safe to press
-at any moment. The footer names them: `2 busy`. State is re-read from
-`claude agents --json` immediately before each stop, so a session that picks up
-work while `R` is running is left alone from the next one onwards.
+| Target | What `R` does |
+|---|---|
+| This sidebar | `exec` |
+| Other tabs' sidebars | `respawn-pane` |
+| Panes ccmux opened | `respawn-pane` with `claude attach` |
+| Idle or done agents in those panes | `claude stop`, then the pane re-attaches |
+| Idle or done running agents with no pane | `claude respawn` |
+| Working or blocked agents | Skipped, and counted as `busy` |
+| Stopped or finished sessions | Skipped, never started |
+| Detached panes | Skipped, and counted as `skipped` |
+| Agents attached anywhere else on the machine | Skipped |
 
-**A session you stopped yourself stays stopped.** `Ctrl-x`'s first press stops
-an agent on purpose; `R` used to undo that, because a stopped session sits under
-**Completed** next to the finished ones and the rule read the heading. It no
-longer does. A stopped session is not restarted, is not resumed, and is not
-counted in the footer — there is nothing to report about an agent that is not
-running. Press `Enter` on the row when you want it back.
+A restarted agent keeps its id, name and conversation. Its age resets, because
+the start time is the worker's. Pane scrollback is lost.
 
-A pane you **detached from** is skipped, even though ccmux did open it. Once
-`Ctrl-Z` has parked it — and especially once `s` has left a shell in it — the map
-entry says who created the pane and nothing about what is in it, and respawning
-a shell you have been working in for an hour with `claude attach` would destroy
-it. The footer counts those, one per pane:
-`restarted 2 sidebars, 1 pane (1 skipped)`. Resume the pane with enter and it
-becomes a restart target again.
-
-Its **agent** is left alone too, and deliberately: a pane ccmux is leaving alone
-is still a pane, so its session stays with the pane and is never picked up by
-the no-pane route instead. You parked it; being stopped and restarted behind
-your back is not what `skipped` means.
-
-**An agent open somewhere else is not a no-pane agent.** `claude agents` lists
-every session on the machine, while everything ccmux knows about panes is scoped
-to its own tmux session — so a second ccmux workspace's pane, or a
-`claude attach` you ran by hand in any window, is invisible to the map. Both
-`claude stop` and `claude respawn` kill an attach client, which would leave that
-window sitting on `Session <id> has exited.` So before the no-pane route runs at
-all, `R` looks for a live `claude attach <id>` process anywhere on this machine
-and takes every session it finds out of scope. If that look cannot be made, the
-whole no-pane route is skipped and the footer says `paneless pass skipped` —
-not being able to see is not the same as seeing nobody. What it cannot cover is
-an attach on a *different* machine against a shared daemon.
-
-The footer then says what happened, from the new image: `restarted 3 sidebars,
-4 panes, 2 agents (1 busy, 1 skipped)`. Successes are in the head, exceptions in
-the parenthesis, and each gets its own word — `failed` is a pane that did not
-come back, `not restarted` an agent still on the old binary, `left stopped` an
-agent that was halted and that nothing came back to resume, `busy` a running
-agent deliberately left alone, `skipped` a pane deliberately left alone,
-`paneless pass skipped` a whole population `R` could not see well enough to
-touch. A line too wide for the sidebar wraps rather than truncating.
-
-If the tmux reads themselves fail — the session was renamed out from under
-ccmux, say — there is no report at all, only `cannot read this session's panes —
-restarted this sidebar only`. `R` will not plan from a blank inventory: with no
-panes to be seen, every agent on the machine would look like nobody's.
-
-Nothing is reported about an agent that was **not running** — one you had
-stopped, or one whose worker had already exited. `busy` is a claim that an agent
-is at work and keeping its old version, and a halted session is not that, so it
-gets no word rather than a misleading one.
-
-`left stopped` is the only one of those that asks anything of you, and it is
-rare: it needs a pane to be killed or to fail its respawn in the moment between
-the stop and the re-attach, or a `claude respawn` to halt an agent and then
-fail to bring it back — which `R` establishes by re-reading the fleet rather
-than by guessing from the error.
-The agent is halted and ccmux has nothing left that
-would resume it, so press `Enter` on the row to open it again. An agent is
-counted as restarted only once a pane has actually come back holding it — a
-stop is half a restart, and the footer does not claim the other half before it
-has happened. It is a count of what was
-actually restarted, not a plan announced in advance — the sidebar you pressed
-`R` in restarts first, and the image that comes up is the one that restarts
-everything else.
-
-One agent that will not stop does not cost the others theirs: the stop is
-attempted for each in turn, a failure is counted, and the pass carries on. Every
-stop lands **before** any pane is respawned, because the respawned
-`claude attach` is what resumes the session — the other order would leave you
-looking at a pane whose agent had just been halted underneath it. The agents in
-panes are stopped first, since their resume is that pane pass and every moment
-before it is a moment they sit halted; the ones nobody has open follow, each a
-single `claude respawn` that halts and restarts inside the daemon, so there is
-no moment in which one of them is stopped with nothing on its way.
-
-The pass is not instant — about a second per agent, and up to 80 s against a
-`claude` that has wedged — so the restarted sidebar **draws a frame first** and
-says `restarting the session…` while it works. Keys struck at it during that
-window are discarded rather than replayed when it finishes: they were aimed at
-a screen that had not been updated yet, and one of them could be a `Ctrl-x`
-landing on a row you never chose.
-
-That order is the safety property. `respawn-pane -k` has no undo: it kills the
-pane, runs the new command, and if that command exits the pane closes and the
-window layout collapses with it. So `R` spends none of them until the new binary
-has proven it runs, by running. If the binary is broken, or the path is wrong,
-or the `exec` fails anyway, the sidebar re-enters its screen, says
-`restart failed: …`, and every pane in the session is exactly where it was.
-
-Two things do not survive, both by nature. The panes' **scrollback** is gone,
-because the commands in them were restarted — the agents' transcripts are not,
-and `L` still shows them. And a `d`/`u` pressed in **another** tab within the
-last poll interval reverts, because that sidebar is killed before it flushes;
-dismissals in the tab you press `R` in are flushed first, and everything already
-written to tmux — the pane map and the dismissal set are tmux *window* options —
-comes back untouched.
-
-`R` re-resolves the binary from `argv[0]` rather than from `current_exe()`, and
-that is not a detail: once `cargo install` has renamed a new file over the old
-path, `current_exe()` answers `…/ccmux (deleted)` and `/proc/self/exe` still
-opens the **old** image, so the obvious implementation would either fail or
-restart the very binary you just replaced while reporting success.
-
-Then it runs it. `<ccmux> --version` has to spawn, exit 0 and print `ccmux`
-before `R` will hand the session over to it — an execute bit is not proof that a
-file can be executed, and "the binary was replaced seconds ago" is exactly the
-situation that produces a truncated download, a wrong-architecture build or one
-linked against a library that is no longer installed. A candidate that fails
-that check is refused with a message and nothing is restarted.
-
-### Which sessions are listed
-
-Only **background** sessions — the ones started with `claude --bg` or with `n`.
-
-Interactive sessions are never listed. There is no `claude attach` for one, so
-it cannot be opened into a split; and an interactive session hosted by Claude
-Desktop has no tmux pane to jump to either, so such a row is permanently
-un-openable. Rather than show rows that nothing can act on, ccmux excludes them
-when a poll is applied.
-
-ccmux has no verb for starting one either: start interactive Claude in a tmux
-pane yourself, the ordinary way.
-
-### Dismissing a row
-
-`claude` has no delete verb — `claude stop` parks a session, it does not remove
-it — so `d` hides a row **from this view** and nothing more. It runs no
-`claude` command, kills no pane, and the agent goes on working. `u` undoes the
-most recent `d`; the header keeps counting the hidden session in its total, so
-the list reads `5/6` while one row is dismissed.
-
-The use it was built for is the row you are finished with but `claude` will not
-stop reporting. A completed or stopped session keeps coming back in every poll,
-and `a` only hides the whole Completed group at once. `d` takes out the one row
-you named.
-
-If the dismissed session has a pane ccmux opened, the footer says
-`hidden — pane open, u to undo` in yellow rather than naming the row. The pane
-is deliberately left alone, but the row was the only place `x` and `Enter`
-could be reached from, so that pane now has no affordance until `u` brings the
-row back. Its `@ccmux_map` entry is kept for exactly that reason.
-
-Dismissals are kept in the `@ccmux_hidden` tmux user option, next to
-`@ccmux_map`, for the same reason: their correct lifetime is exactly the tmux
-session's. Kill the tmux session and they are gone; quit and relaunch the
-sidebar and they are still there — the option is written on the next poll and
-again when the sidebar exits, so a `d` or a `u` in the last poll interval
-before `q` is not lost.
-
-A dismissed session that ends and leaves the poll is dropped from the set once
-**two consecutive complete polls** agree it is gone, so the set cannot grow
-without bound. Two consecutive, because one poll is not proof: `claude agents`
-can exit 0 and still under-report — a malformed row is skipped rather than
-being fatal, and a hiccup can return `[]`. Dropping an id also drops the `u`
-that would restore it, so a single bad poll must not be able to do it. A poll
-that is known to have lost rows concludes nothing at all.
+`R` checks that the new binary runs before it restarts anything. If it does not,
+nothing is touched and the footer shows the error.
 
 ## Safety
 
-- Closing a pane with `x` does **not** stop the agent: background sessions are
-  daemon-owned and outlive their pane. Only background sessions are listed, so
-  `x` can never reach a process that dies with its pane.
-- `R` restarts processes but destroys nothing: it only respawns panes ccmux
-  itself created, and every pane comes straight back. Nothing is killed until
-  the new binary is proven to run — it is run, and then it is the process doing
-  the respawning — so a failed upgrade costs a message rather than your
-  sidebars. That is why it has no confirmation: an arm belongs on a verb with no
-  undo, and `Ctrl-x`'s second press is the only one of those.
-- `R` also runs `claude stop` and `claude respawn` — **recoverable** verbs, and
-  never `claude rm`. Everything it stops it puts straight back, a moment later,
-  by the pane's own `claude attach`; `claude respawn` halts and restarts in a
-  single call and never leaves a gap at all. The conversation is kept either
-  way; the display name is not, and comes back when the session next stops (see
-  *The agents*). A busy agent keeps its old version until it finishes, which is
-  the whole reason `R` is safe to press at any moment.
-- **`R` only ever restarts agents that are already running.** A session with no
-  worker — finished, or one you stopped — is left completely alone: not stopped,
-  not resumed, not started. That is the line that keeps a single keypress from
-  turning a fleet of finished conversations into a fleet of live processes. A
-  session you stopped with `Ctrl-x` stays stopped; `Enter` on its row is what
-  brings it back, and nothing else does.
-- **`R` reaches beyond ccmux's own panes, so it first checks that nobody else is
-  looking.** `claude agents` lists every session on the machine while ccmux's
-  pane records cover only its own tmux session, and stopping a session kills
-  whatever `claude attach` is attached to it. So the no-pane route excludes
-  every session that has a live `claude attach` process anywhere on this
-  machine — another ccmux workspace, another tmux server, a plain terminal — and
-  when that check cannot be made it does not run at all. Absent evidence never
-  authorises the act.
-- `Ctrl-x` is the only verb that can **delete** a session, and the only stop
-  that reaches a **working or blocked** one — `R`'s stop refuses those, and puts
-  everything it does stop straight back. The first press **stops** —
-  recoverable: the conversation is kept and `Enter` resumes it. Only a **second press within two seconds** deletes: it
-  runs `claude rm <id>`, which removes the session **and its git worktree**, so
-  uncommitted work in that worktree goes with it. Nothing undoes that; `u`
-  undoes a dismissal, never a delete.
-- A delete that went through also **closes every pane** ccmux had that session
-  open in — in every tab, a pane you had already detached from and left parked
-  included. The prompt those panes park on offers a resume, and after
-  `claude rm` there is nothing left to resume; leaving them meant pressing `q`
-  in a pane with nothing to show. A pane you answered `s` in is **not** closed:
-  it is your shell now, whatever is running in it or attached from it, and
-  the pane itself tells ccmux so; you close it yourself, with `x` while its
-  row is still listed or with `exit` like any shell. Only the delete does
-  this. The first press leaves its pane parked on purpose: a stopped session
-  is still there, and **enter** resumes it. The panes are closed the way `x`
-  closes one — never a sidebar, never a pane outside ccmux's own session — and
-  only after `claude rm` has returned success, so a refusal reaches no pane at
-  all.
-- `claude rm` refuses rather than destroying unpushed work: a worktree holding
-  unpushed commits or uncommitted changes is **kept**, and ccmux shows the
-  refusal in full. The pane is left exactly as it was, still showing the
-  session and the refusal — a refused delete closes nothing. That is a
-  backstop, not the safety model — a worktree with nothing outstanding is
-  deleted without further question.
-- While that two-second window is open the footer says so, names the session,
-  and says what delete takes. It outranks every other footer message, so the
-  warning cannot be pushed off screen while the verb is loaded.
-- The window is closed by: two seconds passing, `Esc`, `q`, a second press
-  (whether it deleted or refused), or anything that leaves the list (`/`, `n`,
-  `?`, `L`). Moving the cursor does **not** close it — the warning keeps naming
-  the session it is loaded against, and the next press refuses.
-- The second press deletes **only** the session the first press stopped. The id
-  is captured at the first press and never re-read, so a poll that re-sorts the
-  list in between cannot change the target — and if the cursor has moved to a
-  different row, the second press deletes nothing and stops nothing.
-- Mis-fire is defended in three layers. Pasted text is discarded in Normal mode
-  and cannot produce a Ctrl chord anyway. A `Ctrl-x` arriving within 750 ms of
-  the previous one is ignored — it says `too fast — press Ctrl+X again` and
-  leaves the window open — and every press restarts that clock, including when
-  it returns from the `claude stop` it blocked in, so a buffered burst of any
-  length performs exactly one stop. And a qualifying second press does not
-  delete on the spot: it settles for a beat first, and a further `Ctrl-x` inside
-  that beat cancels it.
-- 750 ms rather than something snappier because of the held key. A terminal
-  reports key presses but not releases, so a hold's first auto-repeat is
-  indistinguishable from a deliberate second press — and every stock auto-repeat
-  delay (GNOME 500 ms, KDE 600 ms, X11 660 ms) is under 750 ms, so at any of
-  them a hold never even schedules a delete. Holding `Ctrl-x` down stops one
-  session and deletes nothing. The deliberate second press has the rest of the
-  two seconds; it is meant to be a press you made after reading the warning.
-- With the Completed group hidden (`a`), the row you just stopped leaves the
-  list and the cursor falls to its neighbour. The second press then refuses —
-  `<name> left the list — nothing deleted` — because the cursor is no longer on
-  the session it stopped. This is deliberate: the alternative would stop the
-  neighbour. The same happens under a `/` filter written against the worktree
-  path, because `claude stop` moves a session's reported directory back to the
-  parent. Clear the filter (or press `a`) and press `Ctrl-x` twice on the
-  stopped row: on an already-stopped session the first press only arms.
-- `d` removes a row from the list only. It is not a stop, not a kill, and not a
-  delete — nothing outside ccmux's own view state changes, and `u` puts it back.
-- Every tmux command that names a pane carries a validated target and is scoped
-  to the ccmux session, without exception. Panes in your other tmux sessions are
-  never split, resized, killed — or even focused. ccmux does not enumerate the
-  tmux server at all; it lists only its own session's panes.
+- `x` closes a pane and never stops the agent.
+- `d` only hides a row.
+- `Ctrl-x` is the only verb that can **delete** a session. The first press stops
+  it; the conversation is kept and `Enter` resumes it. A second press within
+  2 s runs `claude rm`, which deletes the session and its git worktree.
+  `claude rm` refuses a worktree with uncommitted or unpushed work.
+- The footer names the session while the delete window is open.
+  Moving the cursor does **not** close it, and a second press on another row
+  deletes nothing. A press within 750 ms of the previous one is ignored, so a
+  held key deletes nothing.
+- A delete closes the panes parked on that session, but not a pane you turned
+  into a shell with `s`.
+- `R` also runs `claude stop` and `claude respawn`, only on idle or done agents,
+  and resumes each one straight away. It never deletes anything and never starts
+  a session that was not running.
+- Every tmux command is scoped to the ccmux session. Panes in your other
+  sessions are never touched.
 
 ## Polling
 
-The sidebar refreshes by running `claude agents --json --all` every 2.5 s. It
-does that **only while something is watching it**:
-
-- A sidebar in a tmux window that no client is rendering polls nothing. With
-  three tabs, one polls and two are silent.
-- A session with no attached client — you detached, or went home — polls
-  nothing at all.
-- A listing that comes back identical four times running widens the gap, 5 s
-  to 10 s to 20 s to 30 s, for as long as nothing moves.
-
-"Watching" is counted per WINDOW, not per session, so a second client attached
-through a grouped session (`tmux new-session -t ccmux`) keeps the window it is
-displaying on the fast path even though the original session shows no clients
-of its own.
-
-All of it is answered by the same `tmux list-panes` the sidebar already runs
-each tick, so the check costs nothing, and none of it can make the sidebar slow
-when it matters: switching back to the tab refreshes it on that tick, any
-keypress puts it back on 2.5 s, and `r` always polls right now. The tick itself
-never slows down — not for the gate and not for a failing `claude` — because it
-is what notices you coming back. Nothing runs in a background thread; a paused
-sidebar is paused, not queued.
-
-If tmux cannot say who is watching — the sidebar is outside tmux, or a
-`list-panes` failed this tick — it polls. The gate closes on evidence, never on
-a guess.
-
-While polling is paused the header dot goes hollow (`○` dim) instead of solid,
-so the frame tmux replays when you switch back tells you the list is a moment
-stale rather than pretending it is live. It is not an error: a failed poll is
-still a red dot and a footer message.
-
-To keep a tab polling regardless, keep it on screen. There is no flag to
-disable the gate — a sidebar nobody can see has nothing to show.
+The sidebar runs `claude agents --json --all` every 2.5 s, but only while its
+window is on screen. A list that stops changing is polled less often, down to
+every 30 s. A keypress or `r` restores the fast rate. The header dot is hollow
+while polling is paused.
 
 ## Degraded mode
 
-`ccmux sidebar` outside tmux still runs: polling, grouping, filtering, `L`, `n`,
-`Ctrl-x`, `d`, `u`, and all navigation work; the header indicator turns yellow and
-the pane-related verbs (`Enter`, `o`, `s`, `x`) refuse with a message. The
-session→pane map and the dismissed set are kept in memory only. This is what makes the sidebar
-developable without a tmux server.
+`ccmux sidebar` also runs outside tmux. The list, filtering, `n`, `L`,
+`Ctrl-x`, `d` and `u` work. `Enter`, `o`, `s`, `t`, `x` and `R` refuse
+with a message.
 
 ## Development
 
@@ -692,21 +231,19 @@ cargo test
 cargo clippy --all-targets
 ```
 
-Two live tests are `#[ignore]`d so CI never spawns `tmux` or `claude`:
+Tests that drive a real tmux server or `claude` are `#[ignore]`d. Run them by
+name, one at a time, because the tmux socket is process-global:
 
 ```sh
-cargo test -- --ignored live_round_trip   # tmux, pinned to the `ccmux` socket
-cargo test -- --ignored live_poll         # `claude agents --json`, read-only
+cargo test -- --ignored --nocapture live_even_layout
 ```
 
-Run them one at a time — the tmux socket is process-global.
-
-Exercise the launcher against a throwaway tmux server, never your own:
+Try the launcher against a throwaway tmux server:
 
 ```sh
-ccmux --socket ccmux --session ccmux-test-a
-tmux -L ccmux kill-server        # cleanup, reaches nothing else
+ccmux --socket ccmux-test --session scratch
+tmux -L ccmux-test kill-server
 ```
 
-`SPEC.md` is the implementation contract; `PROBE-FINDINGS.md` records the
-environment behaviour it was derived from.
+`SPEC.md` is the implementation contract. `PROBE-FINDINGS.md` records the tmux
+and `claude` behaviour it is based on.
