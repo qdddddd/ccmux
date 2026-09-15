@@ -398,6 +398,11 @@ impl Watchers {
     }
 }
 
+pub struct DriftFlash {
+    text: String,
+    labels: BTreeSet<String>,
+}
+
 pub struct App {
     // config
     pub tmux_session: String,
@@ -537,7 +542,7 @@ pub struct App {
     pub drift_pending: BTreeSet<String>,
     /// The exact warning text `announce_drift` last put in the footer, kept so
     /// the next poll can tell "it ran its course" from "something stomped it".
-    pub drift_flash: Option<String>,
+    pub drift_flash: Option<DriftFlash>,
 
     // ── poll gate (SPEC §4.2, amended) ──────────────────────────────────────
     //
@@ -1003,34 +1008,55 @@ impl App {
     /// detached would wait for a client to come back. The moment the footer
     /// actually frees up is a tick, not a poll, so the retry lives on the tick.
     pub fn tick_drift(&mut self) -> bool {
+        self.announce_warnings(Instant::now())
+    }
+
+    fn announce_warnings(&mut self, now: Instant) -> bool {
         let before = self.message.clone();
-        self.announce_runtime(Instant::now());
-        self.announce_drift();
+        // Settle both deliveries before either can occupy the newly free slot.
+        self.settle_runtime(now);
+        self.settle_drift();
+        self.post_runtime(now);
+        self.post_drift();
         self.message != before
     }
 
     /// Post the pending drift warning when the footer can actually carry it,
     /// and retire values only once their warning has been seen through.
     fn announce_drift(&mut self) {
+        self.settle_runtime(Instant::now());
+        self.settle_drift();
+        self.post_drift();
+    }
+
+    fn settle_drift(&mut self) {
         // First settle the fate of the warning posted last time. Delivery is
         // OBSERVED, never assumed.
-        if let Some(txt) = self.drift_flash.clone() {
-            let still_ours = matches!(&self.message, Some((m, _)) if *m == txt);
+        if let Some(flight) = &self.drift_flash {
+            let still_ours = matches!(&self.message, Some((m, _)) if *m == flight.text);
             if still_ours && !self.footer_is_covered() {
                 // On screen and still counting down. Leave it be.
                 return;
             }
-            self.drift_flash = None;
+            let flight = self.drift_flash.take().unwrap();
             if self.message.is_none() && !self.footer_is_covered() {
                 // Gone, with nothing in its place and nothing over it: it ran
                 // its whole window where it could be read. That is as much as
                 // this can honestly check, and it is enough to stop nagging.
-                self.drift_seen.append(&mut self.drift_pending);
+                // Labels arriving after this text was posted were never
+                // named or counted in it; leave them queued for their own flash.
+                for label in flight.labels {
+                    self.drift_pending.remove(&label);
+                    self.drift_seen.insert(label);
+                }
             }
             // Otherwise it was clobbered by another flash or hidden behind an
             // overlay. `drift_pending` still holds the values; a later poll
             // posts them again.
         }
+    }
+
+    fn post_drift(&mut self) {
         if self.drift_pending.is_empty() || self.footer_is_covered() || self.message.is_some() {
             return;
         }
@@ -1042,7 +1068,7 @@ impl App {
             0 => format!("unmodelled {first} — update ccmux"),
             n => format!("unmodelled {first} +{n} more — update ccmux"),
         };
-        self.drift_flash = Some(msg.clone());
+        self.drift_flash = Some(DriftFlash { text: msg.clone(), labels: self.drift_pending.clone() });
         self.flash(msg, MsgLevel::Warn);
     }
 
@@ -2217,11 +2243,6 @@ impl App {
     /// and the press stamps it AGAIN on the way out, which is the half that
     /// makes the guard measure what it claims to. See the re-stamp below.
     pub fn act_ctrl_x(&mut self) -> Action {
-        if self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
-            self.disarm_ctrl_x();
-            self.flash("Codex stop/delete unavailable in v1 — use the Codex TUI", MsgLevel::Warn);
-            return Action::Redraw;
-        }
         let now = Instant::now();
         let gap = self
             .cx_last_press
@@ -2229,6 +2250,11 @@ impl App {
             .unwrap_or(CX_MIN_GAP);
         self.cx_last_press = Some(now);
 
+        if self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
+            self.disarm_ctrl_x();
+            self.flash("Codex stop/delete unavailable in v1 — use the Codex TUI", MsgLevel::Warn);
+            return Action::Redraw;
+        }
         if gap < CX_MIN_GAP {
             // Buffered burst, or auto-repeat. It acts on nothing, and it
             // CANCELS a settling delete: a second chord this soon after the one
@@ -11675,8 +11701,8 @@ mod tests {
         assert!(!got.iter().any(|(pane, _)| pane == "%2"));
         let sidebar = got.iter().find(|(pane, _)| pane == "%4").unwrap();
         assert!(sidebar.1.contains("'CCMUX_CODEX_BIN=/custom/codex bin'"));
-        assert!(sidebar.1.contains("--codex-url ws://127.0.0.1:8965"));
-        assert!(sidebar.1.contains("--codex-token-file '/absolute/token file'"));
+        assert!(sidebar.1.contains("--codex-url=ws://127.0.0.1:8965"));
+        assert!(sidebar.1.contains("'--codex-token-file=/absolute/token file'"));
         assert!(a.message.as_ref().unwrap().0.ends_with("Codex panes skipped: 1"));
     }
 

@@ -2759,7 +2759,8 @@ panes, pane ids, geometry and the layout are all preserved.
 THE IMAGE THAT PRESSES `R` KILLS NOTHING.
 1. degraded -> flash "not inside tmux — restart unavailable" (Warn); return Redraw
 2. exe = restart::exe_path() or flash "cannot find the ccmux binary — not restarting" (Error); return Redraw
-3. restart::probe(exe): RUN it. `<exe> --version` must spawn, exit 0 within
+3. restart::probe(exe): RUN it with --codex-url= --codex-token-file= --version;
+   it must accept those propagated flags, spawn and exit 0 within
    PROBE_TIMEOUT (3 s) and name itself `ccmux`; otherwise flash
    "<why> — not restarting" (Error) and return Redraw
 4. pending_restart = { exe }; return Action::Restart
@@ -3211,13 +3212,15 @@ truncated download, an ELF for the wrong architecture, a script whose
 interpreter is not installed and a build linked against a `.so` that is no
 longer on the system are all regular files with the execute bit set, and all of
 them are exactly what "the binary was replaced seconds ago" produces.
-`restart::probe` spawns `<exe> --version` — stdin `/dev/null`, stdout a pipe,
+`restart::probe` spawns `<exe> --codex-url= --codex-token-file= --version`
+— stdin `/dev/null`, stdout a pipe,
 stderr discarded, so nothing can write over the alternate screen — and requires
 that it spawn at all (where `execve`'s own ENOENT / ENOEXEC / EACCES land), exit
 within `PROBE_TIMEOUT`, exit **0** (where a missing shared library's 127 and a
 startup panic's 101 land), and print a first word of `ccmux` (so a `$PATH`
 lookup that found a namesake is refused rather than `exec`d). A build too old to
-answer `--version` is refused; that is the conservative direction, and under the
+accept the propagated Codex flags, even when OFF, or answer `--version` is
+refused; that is the conservative direction, and under the
 ordering above a refusal costs one flash.
 
 **No confirmation and no arm.** `Ctrl+X` has a two-press window because its
@@ -3431,7 +3434,7 @@ the CLI omits `id`, so a **listed** row can reach it.
 | `claude` is not on `PATH` | Every verb returns `AgentsError::NotFound`; the footer shows `agents: claude not found on PATH`. The sidebar still runs. `CCMUX_CLAUDE_BIN` overrides the path. |
 | Terminal is resized mid-modal | `Event::Resize` only sets `needs_draw`; all overlays recompute their `Rect` from `f.area()` each frame. |
 | `format_age` on a future `startedAt` | Clamps to `"0s"`. |
-| A session's `name` contains newlines or ANSI | Rendered through `truncate_end` into a ratatui `Span`; ratatui does not interpret control bytes, so this is a display artifact, never an injection. It never reaches a shell (Q1/Q4). |
+| A session string contains terminal controls or ANSI | A ratatui `Span` is NOT an escaping boundary: raw controls can reach the terminal backend. `shorten_cwd` strips controls and CSI/OSC payloads from both providers' displayed cwd before elision; the stored cwd stays unchanged for identity and filtering. `truncate_end` alone does not sanitize names. Shell isolation remains Q1/Q4. |
 
 ---
 
@@ -3934,9 +3937,16 @@ The pane wrapper independently reads its token file on each attach attempt.
 **Propagate the resolved answer, not the ambient environment.** Launcher
 creation/heal, `t`, self-`R` exec, and other-sidebars' `R` respawns carry the
 effective URL, absolute token-file path, and binary choice. Generated commands
-pass URL/path as quoted CLI words and set the resolved `CCMUX_CODEX_BIN` for
-the child, e.g. with `env` and one quoted `NAME=value` argv word. OFF is also
-explicit: `--codex-url ''` overrides a stale URL in tmux's environment.
+pass URL/path as quoted `--flag=value` CLI words, so a leading `-` in a
+value cannot become an option. Validate the URL before forwarding: replace any
+rejected non-empty URL with the fixed invalid value `invalid`, preserving the
+Codex configuration error without exposing userinfo/query credentials in argv.
+Set the resolved `CCMUX_CODEX_BIN` for the child. With `env`, use a fixed
+`/bin/sh -c 'exec "$0" "$@"'` trampoline before the executable and argv: `env`
+otherwise mistakes executable paths containing `=` for assignments.
+OFF is explicit: `--codex-url=` overrides a stale URL in tmux's environment.
+`R` probes support for these flags before exec (§8.11), so pre-Codex binaries
+are refused even when OFF; dropping the flags would lose that override.
 No token value is forwarded. Existing width/theme/socket/interval and restart
 handoff rules remain. Self-exec canonicalizes these Codex options instead of
 relying on the original argv having contained environment-derived settings.

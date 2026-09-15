@@ -230,8 +230,8 @@ fn codex_tab_seeds_v2_before_sidebar_and_propagates_only_nonsecret_settings() {
         assert_eq!(wire["panes"]["%10"]["session_id"], ID);
         let cmd = s.calls[sidebar].last().unwrap();
         assert!(cmd.contains("'CCMUX_CODEX_BIN=/fixture/codex bin'"));
-        assert!(cmd.contains("--codex-url ws://127.0.0.1:8965"));
-        assert!(cmd.contains("--codex-token-file '/missing/fixture/token file'"));
+        assert!(cmd.contains("--codex-url=ws://127.0.0.1:8965"));
+        assert!(cmd.contains("'--codex-token-file=/missing/fixture/token file'"));
         assert!(!cmd.contains("CODEX_REMOTE_TOKEN="));
         assert_eq!(s.calls("select-pane").last().unwrap().last().unwrap(), "%10");
         assert!(a.map.panes.is_empty(), "new tab has its own writer");

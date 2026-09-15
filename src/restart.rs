@@ -837,7 +837,8 @@ fn which(name: &Path) -> Option<PathBuf> {
 /// passes `runnable`; every one of them leaves this pane dead if it is `exec`d.
 ///
 /// So the candidate is RUN, in a child, before this process hands itself over:
-/// `<exe> --version`, which touches no tmux server, no `claude` daemon and no
+/// `<exe> --codex-url= --codex-token-file= --version`, which touches no
+/// tmux server, no `claude` daemon and no
 /// terminal — stdin is `/dev/null`, stdout a pipe and stderr discarded, so a
 /// chatty or broken binary cannot scribble over the alternate screen. It must
 ///
@@ -850,7 +851,8 @@ fn which(name: &Path) -> Option<PathBuf> {
 ///   * name itself `ccmux`, so a `$PATH` lookup that found somebody else's
 ///     binary of that name is refused instead of `exec`d.
 ///
-/// A ccmux so old that it has no `--version` fails the third test and the
+/// A ccmux too old to accept the propagated Codex flags (even OFF), or
+/// `--version`, fails the third test and the
 /// restart is refused. That is the conservative direction, and under the
 /// `exec`-first ordering a refusal costs exactly one flash: no pane has been
 /// killed, because none is killed until the new image is up.
@@ -865,7 +867,7 @@ fn probe_within(exe: &Path, timeout: Duration) -> Result<(), String> {
     use std::process::{Command, Stdio};
 
     let mut child = Command::new(exe)
-        .arg("--version")
+        .args(["--codex-url=", "--codex-token-file=", "--version"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1796,7 +1798,8 @@ mod tests {
     /// these cannot collide, and per-pid so two `cargo test` runs cannot.
     fn script(name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("ccmux-probe-{}-{name}", std::process::id()));
+        let dir = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/tmp")
+            .join(format!("ccmux-probe-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let f = dir.join("ccmux");
         std::fs::write(&f, body).expect("write");
@@ -1887,6 +1890,29 @@ mod tests {
         scrub(&f);
     }
 
+    #[test]
+    fn a_pre_codex_binary_is_refused_before_explicit_off_can_kill_the_sidebar() {
+        let f = script("pre-codex", "#!/bin/sh\n\
+            for arg do case \"$arg\" in --codex-*) exit 2;; esac; done\n\
+            printf 'ccmux 0.1.0\\n'\n");
+        let plain = std::process::Command::new("/bin/sh").arg(&f).arg("--version").output().unwrap();
+        assert!(plain.status.success());
+        assert_eq!(plain.stdout, b"ccmux 0.1.0\n");
+        let error = settled(&f, PROBE_TIMEOUT).unwrap_err();
+        assert!(error.contains("does not run") && error.contains('2'), "{error}");
+        scrub(&f);
+    }
+
+    #[test]
+    fn the_probe_checks_exactly_the_nonsecret_propagated_flags() {
+        let f = script("codex-flags", "#!/bin/sh\n\
+            [ \"$#\" = 3 ] && [ \"$1\" = '--codex-url=' ] \
+            && [ \"$2\" = '--codex-token-file=' ] && [ \"$3\" = '--version' ] || exit 2\n\
+            printf 'ccmux 0.1.0\\n'\n");
+        assert_eq!(settled(&f, PROBE_TIMEOUT), Ok(()));
+        scrub(&f);
+    }
+
     /// `exec` keeps the pid, so a token that IS the pid is a handoff only the
     /// process that wrote it can claim. Anything else — a variable inherited
     /// from a tmux environment, most of all — must not start a restart pass,
@@ -1915,8 +1941,8 @@ mod tests {
     #[test]
     fn the_sidebar_command_is_the_resolved_binary_plus_my_own_argv() {
         let cmd = sidebar_command(Path::new("/opt/ccmux"), &crate::settings::CodexSettings::default()).expect("build");
-        assert!(cmd.starts_with("env CCMUX_CODEX_BIN=codex /opt/ccmux"), "{cmd:?}");
-        assert!(cmd.ends_with("--codex-url '' --codex-token-file ''"));
+        assert!(cmd.starts_with("env CCMUX_CODEX_BIN=codex /bin/sh -c 'exec \"$0\" \"$@\"' /opt/ccmux"), "{cmd:?}");
+        assert!(cmd.ends_with("--codex-url= --codex-token-file="));
         let args: Vec<String> = std::env::args().skip(1).collect();
         for a in &args {
             assert!(cmd.contains(&tmux::sh_quote(a)), "{a:?} missing from {cmd:?}");

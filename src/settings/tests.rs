@@ -42,7 +42,7 @@ fn canonical_args_pin_on_and_off_over_conflicting_tmux_environment() {
             "--codex-token-file", "stale", "--interval", "9000"].map(Into::into);
         let args = s.args(original);
         let expected: Vec<OsString> = ["sidebar", "--socket", "ccmux-smoke", "--interval", "9000",
-            "--codex-url", url, "--codex-token-file", "/resolved/token"].map(Into::into).into();
+            &format!("--codex-url={url}"), "--codex-token-file=/resolved/token"].map(Into::into).into();
         assert_eq!(args, expected);
         assert_eq!(s.args(args.clone()), args, "canonicalization is idempotent");
     }
@@ -56,8 +56,9 @@ fn command_quotes_each_nonsecret_word_without_reading_token_path() {
     };
     let cmd = s.command(Path::new("/opt/ccmux build"), [OsString::from("sidebar")]).unwrap();
     let bin = format!("CCMUX_CODEX_BIN={}", s.bin);
-    assert_eq!(cmd, tmux::sh_join(&["env", &bin, "/opt/ccmux build", "sidebar",
-        "--codex-url", &s.url, "--codex-token-file", s.token_file.to_str().unwrap()]));
+    assert_eq!(cmd, tmux::sh_join(&["env", &bin, "/bin/sh", "-c", "exec \"$0\" \"$@\"", "/opt/ccmux build",
+        "sidebar", &format!("--codex-url={}", s.url),
+        &format!("--codex-token-file={}", s.token_file.to_str().unwrap())]));
     assert!(!cmd.contains("CODEX_REMOTE_TOKEN"));
 }
 
@@ -72,5 +73,53 @@ fn every_allowed_host_and_invalid_url_uses_the_client_validator() {
         let error = s.config().err().unwrap();
         assert_eq!(error.kind, CodexFailureKind::Configuration);
         assert!(!error.message.contains("secret"));
+    }
+}
+
+
+#[test]
+fn commands_execute_paths_containing_equals_and_preserve_bin_and_argv() {
+    struct Fixture(PathBuf);
+    impl Drop for Fixture {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+    let root = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/tmp")
+        .join(format!("ccmux-settings-{}", std::process::id()));
+    let dir = Fixture(root);
+    let build = dir.0.join("build=rel ' $(false)");
+    std::fs::create_dir_all(&build).unwrap();
+    let exe = build.join("ccmux");
+    // An existing shell image avoids races from execing a just-written script.
+    std::os::unix::fs::symlink("/bin/sh", &exe).unwrap();
+    for url in ["", "ws://127.0.0.1:8965"] {
+        let settings = CodexSettings {
+            url: url.into(), token_file: "/fixture/token ' file".into(),
+            bin: "/opt/a b' $(false) codex".into(),
+        };
+        let probe = r#"printf '%s\0' "$CCMUX_CODEX_BIN" "$0" "$@""#;
+        let args = ["-c", probe, "sidebar", "--session", "scratch"].map(OsString::from);
+        let cmd = settings.command(&exe, args).unwrap();
+        let output = std::process::Command::new("/bin/sh").args(["-c", &cmd]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let expected = [&settings.bin, "sidebar", "--session", "scratch",
+            &format!("--codex-url={url}"), "--codex-token-file=/fixture/token ' file"].join("\0") + "\0";
+        assert_eq!(output.stdout, expected.as_bytes());
+    }
+}
+
+#[test]
+fn rejected_urls_are_forwarded_as_invalid_without_copying_private_values() {
+    for url in ["ws://user:fixture-secret@127.0.0.1:8965",
+        "ws://127.0.0.1:8965/?token=fixture-secret", "-h", "--", "--dark"]
+    {
+        let settings = CodexSettings { url: url.into(), ..CodexSettings::default() };
+        let args = settings.args(["sidebar"].map(Into::into));
+        assert_eq!(args, ["sidebar", "--codex-url=invalid", "--codex-token-file="].map(OsString::from));
+        let command = settings.command(Path::new("/ccmux"), ["sidebar"].map(Into::into)).unwrap();
+        assert!(!command.contains("fixture-secret"));
+        assert!(command.ends_with("--codex-url=invalid --codex-token-file="));
+        let child = CodexSettings { url: "invalid".into(), ..CodexSettings::default() };
+        assert!(child.enabled());
+        assert_eq!(child.config().err().unwrap().message, settings.config().err().unwrap().message);
     }
 }

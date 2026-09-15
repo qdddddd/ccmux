@@ -878,7 +878,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ccmux", "--dark", "-L", "ccmux"]).expect("parse");
         let cmd = sidebar_command(&cli, 34, &settings::CodexSettings::default()).expect("build");
         assert!(cmd.contains(" sidebar --session ccmux --width 34 --dark --socket ccmux"));
-        assert!(cmd.ends_with("--codex-url '' --codex-token-file ''"));
+        assert!(cmd.ends_with("--codex-url= --codex-token-file="));
     }
 
     #[test]
@@ -1366,19 +1366,65 @@ mod tests {
             // Launcher create/heal and t all consume this one command builder.
             let launch = sidebar_command(&cli, 34, &settings).unwrap();
             assert!(launch.contains(&tmux::sh_quote(&format!("CCMUX_CODEX_BIN={}", settings.bin))));
-            assert!(launch.contains(&format!("--codex-url {}", tmux::sh_quote(url))));
-            assert!(launch.contains("--codex-token-file '/absolute/token file'"));
+            assert!(launch.contains(&tmux::sh_quote(&format!("--codex-url={url}"))));
+            assert!(launch.contains("'--codex-token-file=/absolute/token file'"));
             let pending = restart::Pending { exe: "/new/ccmux".into() };
             let command = exec_command(&pending, &settings);
             let args: Vec<_> = command.get_args().collect();
-            assert!(args.ends_with(&[OsStr::new("--codex-url"), OsStr::new(url),
-                OsStr::new("--codex-token-file"), OsStr::new("/absolute/token file")]));
+            assert!(args.ends_with(&[OsStr::new(&format!("--codex-url={url}")),
+                OsStr::new("--codex-token-file=/absolute/token file")]));
             assert!(command.get_envs().any(|(key, value)| key == "CCMUX_CODEX_BIN"
                 && value == Some(OsStr::new("/custom/codex bin"))));
             let peer = restart::sidebar_command(&pending.exe, &settings).unwrap();
             assert!(peer.contains(&tmux::sh_quote(&format!("CCMUX_CODEX_BIN={}", settings.bin))));
-            assert!(peer.ends_with(&format!("--codex-url {} --codex-token-file '/absolute/token file'", tmux::sh_quote(url))));
+            assert!(peer.ends_with(&format!("{} '--codex-token-file=/absolute/token file'", tmux::sh_quote(&format!("--codex-url={url}")))));
             assert!(!launch.contains("CODEX_REMOTE_TOKEN") && !peer.contains("CODEX_REMOTE_TOKEN"));
+        }
+    }
+
+    #[test]
+    fn propagated_codex_values_cannot_be_reparsed_as_flags() {
+        use std::ffi::OsString;
+        for url in ["ws://localhost:8965", "-x", "--", "-h", "--dark"] {
+            for token in ["-rel", "-h", "--", "--dark"] {
+                let settings = settings::CodexSettings {
+                    url: url.into(), token_file: token.into(), ..settings::CodexSettings::default()
+                };
+                let argv = settings.args(["ccmux", "sidebar"].map(OsString::from));
+                let cli = Cli::try_parse_from(argv).expect("forwarded values must never be options");
+                let forwarded = if codex::validate_url(url).is_ok() { url } else { "invalid" };
+                assert_eq!(cli.codex_url.as_deref(), Some(forwarded));
+                assert_eq!(cli.codex_token_file.as_deref(), Some(token));
+                assert!(matches!(cli.cmd, Some(Cmd::Sidebar { .. })));
+                assert!(!cli.dark);
+            }
+        }
+    }
+
+    #[test]
+    fn no_launch_or_restart_path_forwards_a_rejected_private_url() {
+        use std::ffi::OsStr;
+        let cli = Cli::try_parse_from(["ccmux", "--socket", "ccmux-smoke"]).unwrap();
+        for url in ["ws://user:fixture-secret@127.0.0.1:8965",
+            "ws://127.0.0.1:8965/?token=fixture-secret"]
+        {
+            // Resolve from the environment, so the original URL is never argv.
+            let settings = settings::CodexSettings::resolve(None, Some("/fixture/token".into()),
+                |key| if key == "CCMUX_CODEX_URL" { Some(url.into()) } else { None }, None);
+            let launch = sidebar_command(&cli, 34, &settings).unwrap();
+            let pending = restart::Pending { exe: "/new/ccmux".into() };
+            let peer = restart::sidebar_command(&pending.exe, &settings).unwrap();
+            let command = exec_command(&pending, &settings);
+            let args: Vec<_> = command.get_args().collect();
+            assert!(args.contains(&OsStr::new("--codex-url=invalid")));
+            for text in [launch, peer, format!("{command:?}")] {
+                assert!(!text.contains("fixture-secret") && !text.contains("user:")
+                    && !text.contains("token="), "{text}");
+            }
+            let cli = Cli::try_parse_from(settings.args(["ccmux", "sidebar"].map(Into::into))).unwrap();
+            let child = settings::CodexSettings::resolve(cli.codex_url, cli.codex_token_file, |_| None, None);
+            assert!(child.enabled());
+            assert_eq!(child.config().err().unwrap().message, settings.config().err().unwrap().message);
         }
     }
 

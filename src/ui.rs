@@ -1187,18 +1187,20 @@ const KEYS: &[(&str, &str)] = &[
 /// real content without importing `ui` (the DAG stays acyclic).
 const CODEX_KEYS: &[(&str, &str)] = &[
     (">", "Codex session"),
-    ("◇", "not loaded in this server"),
-    ("", "last-turn outcome unknown"),
-    ("Enter/o/s/t", "open Codex TUI"),
-    ("x", "close pane; work continues"),
-    ("R", "Codex panes are skipped"),
-    ("n", "creates a Claude session"),
-    ("", "create Codex in Codex TUI"),
+    ("◇", "not loaded in server"),
+    ("", "last outcome unknown"),
+    ("Enter", "open/jump Codex TUI"),
+    ("o/s/t", "open Codex TUI"),
+    ("x", "close pane; work stays"),
+    ("", "on server"),
+    ("R", "Codex panes skipped"),
+    ("n", "creates Claude session"),
+    ("", "new Codex: Codex TUI"),
     ("map", "records launch target"),
     ("", "/resume /new /fork"),
     ("", "change TUI, not map"),
-    ("enter", "parked: retry launch id"),
-    ("C-x/L", "use Codex TUI for stop/logs"),
+    ("enter", "parked: resume launch"),
+    ("C-x/L", "stop/logs: Codex TUI"),
 ];
 
 pub fn help_line_count(codex: bool) -> usize {

@@ -557,7 +557,44 @@ pub fn format_age(started_at_ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// Terminal text is not escaped by ratatui. Strip controls and whole escape
+/// sequences before path elision, keeping the original cwd in the model.
+fn clean_display_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escape = match c {
+            '\x1b' => chars.next(),
+            '\u{9b}' => Some('['),
+            '\u{9d}' => Some(']'),
+            '\u{90}' => Some('P'),
+            '\u{9e}' => Some('^'),
+            '\u{9f}' => Some('_'),
+            c if !c.is_control() => { out.push(c); continue; }
+            _ => continue,
+        };
+        match escape {
+            Some('[') => {
+                for c in chars.by_ref() { if ('@'..='~').contains(&c) { break; } }
+            }
+            Some(']') | Some('P') | Some('^') | Some('_') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' || c == '\u{9c}'
+                        || (c == '\x1b' && chars.next_if_eq(&'\\').is_some())
+                    { break; }
+                }
+            }
+            Some(c) if (' '..='/').contains(&c) => {
+                for c in chars.by_ref() { if ('0'..='~').contains(&c) { break; } }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// `home` is `std::env::var("HOME").ok()`, passed in so this stays pure.
+/// Strip controls/ANSI for display only, then:
 /// 1. Replace a leading `home` with `~`.
 /// 2. If the result fits `max`, return it.
 /// 3. Otherwise drop leading path components, replacing them with `…/`, until
@@ -576,7 +613,7 @@ pub fn shorten_cwd(cwd: &str, home: Option<&str>, max: usize) -> String {
         return String::new();
     }
 
-    let mut s = cwd.to_string();
+    let mut s = clean_display_text(cwd);
     if let Some(h) = home.filter(|h| !h.is_empty()) {
         if s == h {
             s = "~".to_string();
@@ -1221,6 +1258,26 @@ mod tests {
         assert_eq!(shorten_cwd("/home/devxx/a", Some("/home/dev"), 24), "/home/devxx/a");
         // no home given
         assert_eq!(shorten_cwd("/home/dev/a", None, 24), "/home/dev/a");
+    }
+
+    #[test]
+    fn shorten_cwd_strips_terminal_sequences_before_measuring() {
+        for cwd in [
+            "/home/dev/a\x1b]0;PWNED\x07b\x1b[2J\r\n\t",
+            "/home/dev/a\x1b]0;PWNED\x1b\\b\x1b[1;2H\x7f",
+            "/home/dev/a\u{9d}PWNED\u{9c}b\u{9b}2J",
+            "/home/dev/a\x1bPPWNED\x1b\\b\x1b(B",
+            "/home/dev/ab\x1b]unterminated",
+            "/home/dev/ab\x1b[12;",
+        ] {
+            assert_eq!(shorten_cwd(cwd, Some("/home/dev"), 100), "~/ab");
+            for max in 0..12 {
+                let shown = shorten_cwd(cwd, Some("/home/dev"), max);
+                assert!(!shown.chars().any(char::is_control));
+                assert!(display_width(&shown) <= max);
+                assert!(!shown.contains("PWNED"));
+            }
+        }
     }
 
     #[test]

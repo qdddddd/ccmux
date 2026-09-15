@@ -126,14 +126,44 @@ fn codex_help_is_opt_in_and_matches_scroll_geometry() {
     assert!(!plain.contains("Codex"));
     app.codex.settings.url = "ws://localhost".into();
     app.help_lines = help_line_count(true);
-    let enabled = rows_at(&app, 80, 60).join("\n");
-    assert!(enabled.contains("not loaded in this server"));
-    assert!(enabled.contains("creates a Claude session"));
+    let enabled = rows_at(&app, 34, 60).join("\n");
+    for (key, action) in CODEX_KEYS {
+        assert!(display_width(key) <= 10 && display_width(action) <= 22, "{key}: {action}");
+        let line = enabled.lines().find(|line| line.contains(action)).expect(action);
+        assert!(!line.contains('…'), "{line}");
+    }
+    assert!(enabled.contains("not loaded in server"));
+    assert!(enabled.contains("creates Claude session"));
     assert!(enabled.contains("records launch target"));
     assert!(enabled.contains("open Codex TUI"));
-    assert!(enabled.contains("Codex panes are skipped"));
+    assert!(enabled.contains("Codex panes skipped"));
     assert!(enabled.contains("change TUI, not map"));
-    assert!(enabled.contains("parked: retry launch id"));
+    assert!(enabled.contains("parked: resume launch"));
     assert!(!enabled.contains("pane actions unavailable"));
     assert_eq!(help_line_count(true), help_line_count(false) + CODEX_KEYS.len());
+}
+
+
+#[test]
+fn both_providers_cwd_render_without_controls_at_every_size() {
+    let cwd = "/safe/a\x1b]0;PWNED\x07b\x1b[2J\r\n\t\x7f\u{9d}PWNED\u{9c}";
+    for provider in [Provider::Claude, Provider::Codex] {
+        let mut row = codex_row(crate::model::CodexStatus::Idle, Status::Idle, None);
+        row.provider = provider;
+        if provider == Provider::Claude { row.codex = None; }
+        row.cwd = cwd.into();
+        let app = app_with(vec![row]);
+        for &(w, h) in SIZES {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw(f, &app)).unwrap();
+            for cell in term.backend().buffer().content() {
+                assert!(!cell.symbol().chars().any(char::is_control), "{provider:?} {w}x{h}: {cell:?}");
+            }
+            let text = rows_at(&app, w, h).join("\n");
+            assert!(!text.contains("PWNED"), "{provider:?} {w}x{h}: {text}");
+        }
+        assert!(rows_at(&app, 34, 24).join("\n").contains("/safe/ab"));
+        assert_eq!(app.sessions[0].cwd, cwd, "render must not change the stored path");
+        assert!(app.sessions[0].filter_haystack().contains(&cwd.to_lowercase()));
+    }
 }

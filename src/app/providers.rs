@@ -237,11 +237,11 @@ impl App {
                 self.codex.apply(&observation);
                 self.sessions.retain(|s| s.provider != Provider::Codex);
                 self.sessions.extend(self.codex.rows.values().cloned());
-                self.note_drift(&observation.sessions);
                 for raw in observation.source_drift {
                     let label = format!("codex source {raw}");
                     if !self.drift_seen.contains(&label) { self.drift_pending.insert(label); }
                 }
+                self.note_drift(&observation.sessions);
                 if observation.complete {
                     self.diagnostics.codex.success();
                 } else {
@@ -325,7 +325,7 @@ impl App {
         { self.drift_pending.insert(label); }
     }
 
-    pub(super) fn announce_runtime(&mut self, now: Instant) {
+    pub(super) fn settle_runtime(&mut self, now: Instant) {
         let covered = self.footer_is_covered();
         if let Some(flight) = &self.diagnostics.runtime_flash {
             let ours = self.message.as_ref().is_some_and(|(text, _)| text == &flight.text);
@@ -336,7 +336,10 @@ impl App {
                 && warning.episode == flight.episode
             { warning.seen = true; }
         }
-        if self.message.is_some() || covered { return; }
+    }
+
+    pub(super) fn post_runtime(&mut self, now: Instant) {
+        if self.message.is_some() || self.footer_is_covered() { return; }
         let Some((id, warning)) = self.diagnostics.runtime.iter().find(|(id, warning)|
             !warning.seen && self.sessions.iter().any(|row| &row.session_id == *id
                 && row.provider == Provider::Codex

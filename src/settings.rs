@@ -67,15 +67,24 @@ impl CodexSettings {
                 out.push(arg);
             }
         }
-        out.extend([OsString::from("--codex-url"), OsString::from(&self.url),
-            OsString::from("--codex-token-file"), self.token_file.as_os_str().to_owned()]);
+        // Invalid URLs may contain credentials. Keep the child's configuration
+        // invalid without copying the rejected value into argv or tmux options.
+        let url = if self.url.is_empty() || crate::codex::validate_url(&self.url).is_ok() {
+            self.url.as_str()
+        } else { "invalid" };
+        let mut token = OsString::from("--codex-token-file=");
+        token.push(&self.token_file);
+        out.extend([OsString::from(format!("--codex-url={url}")), token]);
         out
     }
 
     pub fn command(&self, exe: &Path, args: impl IntoIterator<Item = OsString>) -> Option<String> {
         let args = self.args(args);
         let bin_env = format!("CCMUX_CODEX_BIN={}", self.bin);
-        let mut words = vec!["env", bin_env.as_str(), exe.to_str()?];
+        // env treats even an absolute program path containing '=' as an
+        // assignment. A fixed shell executable ends that scan; the launch
+        // target and arguments stay positional data, not shell source.
+        let mut words = vec!["env", bin_env.as_str(), "/bin/sh", "-c", "exec \"$0\" \"$@\"", exe.to_str()?];
         for arg in &args { words.push(arg.to_str()?); }
         Some(tmux::sh_join(&words))
     }

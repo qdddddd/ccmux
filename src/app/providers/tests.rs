@@ -242,7 +242,9 @@ fn failed_reload_keeps_old_client_and_rows_but_skips_that_poll() {
     assert_eq!(calls(), ["prepare", "codex poll", "reload"]);
     assert_eq!(a.sessions.len(), 1);
     assert!(a.codex.open_rejected && a.codex_error().is_some());
+    assert_eq!((a.codex.fail_streak, a.codex.idle_streak), (1, 0));
     poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    assert_eq!(a.codex.fail_streak, 0);
     assert_eq!(calls().last(), Some(&"codex poll"));
     assert!(a.codex.open_rejected, "automatic success cannot clear the address latch");
     SCRIPT.with(|s| s.borrow_mut().reload_error = None);
@@ -449,27 +451,27 @@ fn runtime_warning_is_once_per_observed_episode_and_full_id() {
     poll(&mut a, vec![r.clone()], true);
     assert!(a.codex_error().is_none());
     assert!(a.drift_pending.is_empty());
-    a.announce_runtime(now);
+    a.announce_warnings(now);
     let deadline = a.msg_deadline;
     poll(&mut a, vec![r.clone()], true);
-    a.announce_runtime(now + Duration::from_secs(1));
+    a.announce_warnings(now + Duration::from_secs(1));
     assert_eq!(a.msg_deadline, deadline);
     a.message = None;
-    a.announce_runtime(now + MSG_TTL);
+    a.announce_warnings(now + MSG_TTL);
     assert!(a.diagnostics.runtime[&r.session_id].seen);
     poll(&mut a, vec![r.clone()], false);
-    a.announce_runtime(now + Duration::from_secs(10));
+    a.announce_warnings(now + Duration::from_secs(10));
     assert!(a.message.is_none());
     poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
     assert!(!a.diagnostics.runtime.contains_key(&r.session_id));
     poll(&mut a, vec![r.clone()], true);
-    a.announce_runtime(now + Duration::from_secs(11));
+    a.announce_warnings(now + Duration::from_secs(11));
     assert_eq!(a.message.as_ref().unwrap().0, "codex runtime error: 00000001");
     let mut another = row(2, CodexStatus::SystemError);
     another.id = r.id.clone(); // Same display suffix, different warning identity.
     poll(&mut a, vec![r, another.clone()], true);
     a.message = None;
-    a.announce_runtime(now + Duration::from_secs(15));
+    a.announce_warnings(now + Duration::from_secs(15));
     assert!(!a.diagnostics.runtime[&another.session_id].seen);
     assert_eq!(a.diagnostics.runtime_flash.as_ref().unwrap().id, another.session_id);
 }
@@ -480,23 +482,23 @@ fn runtime_coverage_absence_and_recovery_do_not_mark_new_episode_seen() {
     let now = Instant::now();
     let r = row(1, CodexStatus::SystemError);
     poll(&mut a, vec![r.clone()], true);
-    a.announce_runtime(now);
+    a.announce_warnings(now);
     a.mode = Mode::Help;
-    a.announce_runtime(now + Duration::from_secs(1));
+    a.announce_warnings(now + Duration::from_secs(1));
     a.message = None;
     a.mode = Mode::Normal;
     poll(&mut a, vec![], true);
-    a.announce_runtime(now + Duration::from_secs(5));
+    a.announce_warnings(now + Duration::from_secs(5));
     assert!(a.message.is_none());
     assert!(!a.diagnostics.runtime[&r.session_id].seen);
     poll(&mut a, vec![r.clone()], true);
-    a.announce_runtime(now + Duration::from_secs(6));
+    a.announce_warnings(now + Duration::from_secs(6));
     a.flash("unrelated message", MsgLevel::Info);
     poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
     assert_eq!(a.message.as_ref().unwrap().0, "unrelated message");
     poll(&mut a, vec![r.clone()], true);
     a.message = None;
-    a.announce_runtime(now + Duration::from_secs(10));
+    a.announce_warnings(now + Duration::from_secs(10));
     assert!(!a.diagnostics.runtime[&r.session_id].seen);
 }
 
@@ -592,4 +594,256 @@ fn codex_complete_poll_never_retires_a_claude_absence_strike() {
     assert!(a.hidden_absent.contains(&gone.session_id));
     a.apply_poll(Ok(payload(vec![])));
     assert!(!a.hidden.ids().contains(&gone.session_id));
+}
+
+
+#[test]
+fn incomplete_observations_back_off_reset_idle_and_complete_recovers() {
+    let mut a = configured();
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    a.codex.idle_streak = 6;
+    for _ in 0..3 {
+        let mut obs = observation(vec![row(1, CodexStatus::Idle)], false);
+        obs.diagnostic = Some(error(CodexFailureKind::Timeout));
+        queue(obs);
+        a.codex.force = true;
+        assert!(a.poll_codex());
+    }
+    assert_eq!(a.codex.fail_streak, 3);
+    assert_eq!(a.codex.idle_streak, 0);
+    assert_eq!(a.codex.interval(a.interval), BACKOFF);
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    assert_eq!(a.codex.fail_streak, 0);
+    assert_eq!(a.codex.interval(a.interval), a.interval);
+}
+
+#[test]
+fn post_verb_wake_and_backoff_never_reload_a_prepared_client() {
+    let mut a = configured();
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    for _ in 0..4 { poll(&mut a, vec![row(1, CodexStatus::Idle)], false); }
+    assert!(a.codex.fail_streak >= FAIL_BACKOFF_AT);
+    a.codex.last_attempt = Some(Instant::now() - BACKOFF);
+    assert!(a.poll_codex());
+    assert!(!calls().contains(&"reload"), "automatic backoff reloaded");
+    a.act_force_refresh();
+    assert!(a.poll_codex());
+    assert!(!calls().contains(&"reload"), "post-verb reloaded");
+    watched_by(&mut a, 1, false);
+    a.observe_watchers();
+    watched_by(&mut a, 1, true);
+    a.observe_watchers();
+    assert!(a.poll_codex());
+    assert!(!calls().contains(&"reload"), "wake reloaded");
+    assert_eq!(calls().iter().filter(|c| **c == "prepare").count(), 1);
+    assert!(!a.diagnostics.codex.explicit_refresh);
+}
+
+#[test]
+fn explicit_codex_r_marks_the_attempt_and_bypasses_diagnostic_cooldown() {
+    let mut a = configured();
+    let now = Instant::now();
+    poll(&mut a, vec![], false);
+    assert!(a.deliver_diagnostics(now));
+    assert!(a.message.as_ref().unwrap().0.starts_with("codex degraded:"));
+    a.message = None;
+    a.degraded = true;
+    key(&mut a, KeyCode::Char('r'));
+    assert!(a.codex.reload && a.codex.force);
+    queue(observation(vec![], false));
+    assert!(a.poll_codex());
+    assert_eq!(calls(), ["prepare", "codex poll", "reload", "codex poll"]);
+    assert!(a.deliver_diagnostics(now + Duration::from_secs(1)));
+    assert!(a.message.as_ref().unwrap().0.starts_with("codex refresh failed:"));
+    assert!(!a.codex.reload && !a.diagnostics.codex.explicit_refresh);
+}
+
+#[test]
+fn explicit_claude_only_r_marks_the_attempt_and_bypasses_diagnostic_cooldown() {
+    let mut a = app();
+    let now = Instant::now();
+    a.agents_poll = || Err(AgentsError::Cmd { code: 1, stderr: "boom".into() });
+    a.force_poll = true;
+    assert!(a.poll_providers());
+    assert!(a.deliver_diagnostics(now));
+    assert_eq!(a.message.as_ref().unwrap().0, "agents: boom");
+    a.message = None;
+    a.degraded = true;
+    key(&mut a, KeyCode::Char('r'));
+    assert!(a.diagnostics.claude.explicit_refresh);
+    assert!(a.poll_providers());
+    assert!(a.deliver_diagnostics(now + Duration::from_secs(1)));
+    assert_eq!(a.message.as_ref().unwrap().0, "agents refresh failed: boom");
+    assert!(!a.diagnostics.claude.explicit_refresh);
+}
+
+#[test]
+fn post_verb_claude_failure_never_becomes_an_explicit_refresh() {
+    let mut a = app();
+    let now = Instant::now();
+    a.agents_poll = || Err(AgentsError::Cmd { code: 1, stderr: "boom".into() });
+    a.force_poll = true;
+    assert!(a.poll_providers());
+    assert!(a.deliver_diagnostics(now));
+    a.message = None;
+    a.act_force_refresh();
+    assert!(!a.diagnostics.claude.explicit_refresh);
+    assert!(a.poll_providers());
+    assert!(!a.deliver_diagnostics(now + Duration::from_secs(1)));
+    a.agents_poll = || Err(AgentsError::NotFound("missing".into()));
+    a.act_force_refresh();
+    assert!(a.poll_providers());
+    assert!(!a.deliver_diagnostics(now + Duration::from_secs(2)));
+    assert!(a.deliver_diagnostics(now + DIAGNOSTIC_COOLDOWN));
+    assert!(a.message.as_ref().unwrap().0.starts_with("agents:"));
+}
+
+#[test]
+fn codex_polls_on_its_own_clock_when_claude_is_not_due() {
+    let mut a = configured();
+    a.idle_streak = 99;
+    a.last_agents = Instant::now();
+    a.codex.startup = false;
+    a.codex.last_attempt = Instant::now().checked_sub(Duration::from_secs(60));
+    assert!(!a.poll_due());
+    assert!(!a.poll_providers());
+    assert_eq!(calls(), ["prepare", "codex poll"]);
+}
+
+#[test]
+fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
+    let mut a = configured();
+    let mut working = claude();
+    working.status = Status::Busy;
+    working.state = Some(State::Working);
+    a.apply_poll(Ok(payload(vec![working])));
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    a.rebuild_rows();
+    key(&mut a, KeyCode::Char('G'));
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
+    agents::test_spawn::reset();
+    let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+    a.on_key(ctrl_x);
+    assert!(a.cx_last_press.is_some());
+    assert!(a.stop_arm.is_none());
+    poll(&mut a, vec![], true);
+    a.rebuild_rows();
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    for _ in 0..3 { a.on_key(ctrl_x); }
+    assert_eq!(a.message.as_ref().unwrap().0, "too fast — press Ctrl+X again");
+    assert!(agents::test_spawn::joined().is_empty(), "a buffered refusal stopped a neighbour");
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
+}
+
+#[test]
+fn codex_ctrl_x_closes_a_claude_delete_window_before_returning_to_claude() {
+    let mut a = configured();
+    let mut working = claude();
+    working.status = Status::Busy;
+    working.state = Some(State::Working);
+    a.apply_poll(Ok(payload(vec![working])));
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    a.rebuild_rows();
+    key(&mut a, KeyCode::Char('g'));
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    agents::test_spawn::reset();
+    let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+    a.on_key(ctrl_x);
+    assert!(a.stop_arm.is_some());
+    assert_eq!(agents::test_spawn::joined(), ["stop 12345678"]);
+    key(&mut a, KeyCode::Char('j'));
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
+    a.cx_last_press = Some(Instant::now() - Duration::from_secs(1));
+    a.on_key(ctrl_x);
+    assert_eq!(a.message.as_ref().unwrap().0, "Codex stop/delete unavailable in v1 — use the Codex TUI");
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none() && a.arm_hint().is_none());
+    key(&mut a, KeyCode::Char('k'));
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    a.cx_last_press = Some(Instant::now() - Duration::from_secs(1));
+    a.on_key(ctrl_x);
+    if let Some(pending) = a.pending_delete.as_mut() { pending.at -= CX_SETTLE; }
+    a.tick_stop_arm();
+    assert_eq!(agents::test_spawn::joined(), ["stop 12345678", "stop 12345678"]);
+    assert!(!agents::test_spawn::joined().iter().any(|call| call.starts_with("rm ")));
+    assert_eq!(calls(), ["prepare", "codex poll"]);
+}
+
+#[test]
+fn a_single_codex_poll_counts_source_and_flag_drift_in_the_same_flash() {
+    let mut a = configured();
+    let mut obs = observation(vec![row(1, CodexStatus::Active { flags: vec!["futureFlag".into()] })], false);
+    obs.source_drift.insert(r#"{"custom":1}"#.into());
+    queue(obs);
+    assert!(a.poll_codex());
+    let text = &a.message.as_ref().unwrap().0;
+    assert!(text.contains("futureFlag") && text.contains("+1 more"), "{text}");
+    let announced = a.drift_pending.clone();
+    assert_eq!(announced.len(), 2);
+    a.message = None;
+    a.msg_deadline = None;
+    a.tick_drift();
+    assert_eq!(a.drift_seen, announced);
+    assert!(a.drift_pending.is_empty() && a.message.is_none());
+}
+
+#[test]
+fn drift_arriving_during_another_providers_flash_is_not_retired_unseen() {
+    let mut a = configured();
+    let mut c = claude();
+    c.status = Status::Unknown("futureStatus".into());
+    a.apply_poll(Ok(payload(vec![c])));
+    let first = a.message.clone();
+    poll(&mut a, vec![row(1, CodexStatus::Active { flags: vec!["futureFlag".into()] })], true);
+    assert_eq!(a.message, first);
+    a.message = None;
+    a.msg_deadline = None;
+    assert!(a.tick_drift());
+    assert_eq!(a.drift_seen, BTreeSet::from([r#"status "futureStatus""#.into()]));
+    assert!(a.message.as_ref().unwrap().0.contains("futureFlag"));
+    assert_eq!(a.drift_pending.len(), 1);
+    a.message = None;
+    a.msg_deadline = None;
+    assert!(!a.tick_drift());
+    assert_eq!(a.drift_seen.len(), 2);
+    assert!(a.drift_pending.is_empty());
+}
+
+#[test]
+fn drift_delivery_settles_before_a_runtime_warning_takes_the_slot() {
+    let mut a = configured();
+    let now = Instant::now();
+    let runtime = row(1, CodexStatus::SystemError);
+    poll(&mut a, vec![runtime.clone(), row(2, CodexStatus::Unknown("futureStatus".into()))], true);
+    assert!(a.message.as_ref().unwrap().0.starts_with("unmodelled"));
+    a.message = None;
+    a.msg_deadline = None;
+    assert!(a.announce_warnings(now + MSG_TTL));
+    assert!(a.drift_seen.iter().any(|value| value.contains("futureStatus")));
+    assert_eq!(a.message.as_ref().unwrap().0, "codex runtime error: 00000001");
+    a.message = None;
+    a.msg_deadline = None;
+    assert!(!a.announce_warnings(now + MSG_TTL + MSG_TTL));
+    assert!(a.diagnostics.runtime[&runtime.session_id].seen);
+    assert!(a.drift_pending.is_empty() && a.message.is_none());
+}
+
+#[test]
+fn runtime_delivery_settles_before_a_pending_drift_warning_takes_the_slot() {
+    let mut a = configured();
+    let now = Instant::now();
+    let runtime = row(1, CodexStatus::SystemError);
+    poll(&mut a, vec![runtime.clone()], true);
+    assert!(a.announce_warnings(now));
+    let first = a.message.clone();
+    poll(&mut a, vec![runtime.clone(), row(2, CodexStatus::Unknown("futureStatus".into()))], true);
+    assert_eq!(a.message, first);
+    a.message = None;
+    a.msg_deadline = None;
+    assert!(a.announce_warnings(now + MSG_TTL));
+    assert!(a.diagnostics.runtime[&runtime.session_id].seen);
+    assert!(a.message.as_ref().unwrap().0.contains("futureStatus"));
+    a.message = None;
+    a.msg_deadline = None;
+    assert!(!a.announce_warnings(now + MSG_TTL + MSG_TTL));
+    assert!(a.drift_pending.is_empty() && a.message.is_none());
 }
