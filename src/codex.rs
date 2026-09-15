@@ -28,6 +28,9 @@ pub const POLL_TIMEOUT: Duration = Duration::from_millis(1000);
 pub const HISTORY_DAYS: i64 = 7;
 const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const MAX_TOKEN: u64 = 16 * 1024;
+// Short kernel waits avoid coarse timer-wheel slack on a one-second timeout.
+// Each retry still spends the original whole-poll budget.
+const IO_SLICE: Duration = Duration::from_millis(50);
 const URL_ERROR: &str =
     "codex url must be loopback ws:// (localhost, 127.0.0.0/8, or [::1])";
 
@@ -154,15 +157,21 @@ fn endpoint(url: &str) -> Result<Endpoint, CodexError> {
     let uri: Uri = url.parse().map_err(|_| invalid())?;
     let authority = uri.authority().ok_or_else(invalid)?;
     let host = authority.host();
-    let bare = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    let bracketed = host.strip_prefix('[').and_then(|s| s.strip_suffix(']'));
+    let bare = bracketed.unwrap_or(host);
     let literal = bare.parse::<IpAddr>().ok();
-    if !bare.eq_ignore_ascii_case("localhost") && !literal.is_some_and(|ip| ip.is_loopback()) {
-        return Err(invalid());
-    }
+    let valid_host = if bracketed.is_some() {
+        matches!(literal, Some(IpAddr::V6(ip)) if ip.is_loopback())
+    } else {
+        bare.eq_ignore_ascii_case("localhost")
+            || matches!(literal, Some(IpAddr::V4(ip)) if ip.is_loopback())
+    };
+    if !valid_host { return Err(invalid()); }
     // Reject an invalid/empty explicit port instead of silently using 80.
     let suffix = authority.as_str().strip_prefix(host).ok_or_else(invalid)?;
     let port = if suffix.is_empty() { 80 } else {
-        suffix.strip_prefix(':').and_then(|s| s.parse::<u16>().ok())
+        suffix.strip_prefix(':').filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<u16>().ok())
             .filter(|p| *p != 0).ok_or_else(invalid)?
     };
     Ok(Endpoint { host: bare.to_owned(), port, literal, uri })
@@ -284,27 +293,46 @@ struct TimedStream<'a, S> {
     deadline: Deadline<'a>,
 }
 
+fn retry_io(error: &io::Error) -> bool {
+    matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
 impl<S: SocketIo> Read for TimedStream<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read_timeout(self.deadline.remaining()?)?;
-        let result = self.inner.read(buf);
-        self.deadline.remaining()?;
-        result
+        loop {
+            self.inner.read_timeout(self.deadline.remaining()?.min(IO_SLICE))?;
+            let result = self.inner.read(buf);
+            self.deadline.remaining()?;
+            match result {
+                Err(error) if retry_io(&error) => continue,
+                result => return result,
+            }
+        }
     }
 }
 
 impl<S: SocketIo> Write for TimedStream<'_, S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write_timeout(self.deadline.remaining()?)?;
-        let result = self.inner.write(buf);
-        self.deadline.remaining()?;
-        result
+        loop {
+            self.inner.write_timeout(self.deadline.remaining()?.min(IO_SLICE))?;
+            let result = self.inner.write(buf);
+            self.deadline.remaining()?;
+            match result {
+                Err(error) if retry_io(&error) => continue,
+                result => return result,
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.write_timeout(self.deadline.remaining()?)?;
-        let result = self.inner.flush();
-        self.deadline.remaining()?;
-        result
+        loop {
+            self.inner.write_timeout(self.deadline.remaining()?.min(IO_SLICE))?;
+            let result = self.inner.flush();
+            self.deadline.remaining()?;
+            match result {
+                Err(error) if retry_io(&error) => continue,
+                result => return result,
+            }
+        }
     }
 }
 

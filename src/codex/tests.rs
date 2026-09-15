@@ -1,5 +1,6 @@
 //! Fixtures follow the measured 0.153.4 response subset in PROBE-FINDINGS §9.
-//! No test in this file opens a socket, reads a credential, or calls a daemon.
+//! Tests use fake IO, test-owned loopback listeners and temporary fixture tokens.
+//! Only the ignored live test can contact a daemon or read an external credential.
 
 use super::*;
 use std::{cell::{Cell, RefCell}, collections::VecDeque, rc::Rc};
@@ -65,6 +66,8 @@ struct Script {
     history: BTreeMap<String, Value>,
     reads: BTreeMap<String, Value>,
     rpc_errors: BTreeSet<String>,
+    response_ids: BTreeMap<String, Value>,
+    read_costs: BTreeMap<String, Duration>,
     incoming: VecDeque<(Duration, Value)>,
     ahead: Vec<Value>,
     sent: Vec<Value>,
@@ -83,6 +86,7 @@ impl Default for Script {
             loaded: BTreeMap::from([(String::new(), response_page(vec![], None))]),
             history: BTreeMap::from([(String::new(), response_page(vec![], None))]),
             reads: BTreeMap::new(), rpc_errors: BTreeSet::new(),
+            response_ids: BTreeMap::new(), read_costs: BTreeMap::new(),
             incoming: VecDeque::new(), ahead: Vec::new(), sent: Vec::new(), read_ids: Vec::new(),
             connect_cost: Duration::ZERO, send_cost: Duration::ZERO, receive_cost: Duration::ZERO,
             read_cost: Duration::ZERO, close_cost: Duration::ZERO, closes: 0,
@@ -134,15 +138,16 @@ impl Transport for FakeTransport {
             "thread/read" => {
                 let id = value["params"]["threadId"].as_str().unwrap();
                 script.read_ids.push(id.into());
-                cost += script.read_cost;
+                cost += script.read_costs.get(id).copied().unwrap_or(script.read_cost);
                 script.reads.get(id).cloned().map(|thread| json!({"thread":thread}))
             }
             _ => panic!("request outside read-only allowlist"),
         };
+        let response_id = script.response_ids.get(method).unwrap_or(&value["id"]);
         let response = match data {
             Some(data) if !script.rpc_errors.contains(method) =>
-                json!({"id":value["id"],"result":data}),
-            _ => json!({"id":value["id"],"error":{"code":-32601,"message":SECRET,"data":SECRET}}),
+                json!({"id":response_id,"result":data}),
+            _ => json!({"id":response_id,"error":{"code":-32601,"message":SECRET,"data":SECRET}}),
         };
         script.incoming.push_back((cost, response));
         Ok(())
@@ -221,27 +226,34 @@ fn name_fallback_and_control_stripping() {
 #[test]
 fn all_status_rows_and_flags_map_without_worker_inference() {
     let cases = [
-        (json!({"type":"notLoaded"}), Status::Idle, Some(State::Unloaded), Group::Completed),
-        (json!({"type":"idle"}), Status::Idle, None, Group::Idle),
-        (json!({"type":"systemError"}), Status::Unknown("systemError".into()), None, Group::Idle),
-        (json!({"type":"active","activeFlags":[]}), Status::Busy, Some(State::Working), Group::Working),
+        (json!({"type":"notLoaded"}), Status::Idle, Some(State::Unloaded), Group::Completed, CodexStatus::NotLoaded),
+        (json!({"type":"idle"}), Status::Idle, None, Group::Idle, CodexStatus::Idle),
+        (json!({"type":"systemError"}), Status::Unknown("systemError".into()), None, Group::Idle, CodexStatus::SystemError),
+        (json!({"type":"active","activeFlags":[]}), Status::Busy, Some(State::Working), Group::Working,
+            CodexStatus::Active { flags: vec![] }),
         (json!({"type":"active","activeFlags":["waitingOnApproval"]}),
-            Status::Waiting, Some(State::Blocked), Group::Blocked),
+            Status::Waiting, Some(State::Blocked), Group::Blocked,
+            CodexStatus::Active { flags: vec!["waitingOnApproval".into()] }),
         (json!({"type":"active","activeFlags":["waitingOnUserInput"]}),
-            Status::Waiting, Some(State::Blocked), Group::Blocked),
+            Status::Waiting, Some(State::Blocked), Group::Blocked,
+            CodexStatus::Active { flags: vec!["waitingOnUserInput".into()] }),
         (json!({"type":"active","activeFlags":["zFuture","waitingOnApproval","aFuture","zFuture"]}),
-            Status::Waiting, Some(State::Blocked), Group::Blocked),
+            Status::Waiting, Some(State::Blocked), Group::Blocked,
+            CodexStatus::Active { flags: vec!["aFuture".into(), "waitingOnApproval".into(), "zFuture".into()] }),
         (json!({"type":"active","activeFlags":["zFuture","aFuture","zFuture"]}),
-            Status::Unknown("aFuture, zFuture".into()), Some(State::Working), Group::Working),
-        (json!({"type":"future"}), Status::Unknown("future".into()), None, Group::Idle),
+            Status::Unknown("aFuture, zFuture".into()), Some(State::Working), Group::Working,
+            CodexStatus::Active { flags: vec!["aFuture".into(), "zFuture".into()] }),
+        (json!({"type":"future"}), Status::Unknown("future".into()), None, Group::Idle,
+            CodexStatus::Unknown("future".into())),
     ];
-    for (runtime, status, state, group) in cases {
+    for (runtime, status, state, group, expected) in cases {
         let mut row = thread(1);
         row["status"] = runtime;
         let parsed = eligible(&row);
         assert_eq!(parsed.status, status);
         assert_eq!(parsed.state, state);
         assert_eq!(parsed.group(), group);
+        assert_eq!(parsed.codex.as_ref().unwrap().runtime, expected);
         assert!(!parsed.has_worker());
     }
     let mut row = thread(1);
@@ -711,7 +723,7 @@ fn error_responses_are_not_data_and_do_not_trigger_fallbacks() {
 fn malformed_envelopes_and_unmatched_response_ids_are_protocol_errors() {
     for value in [
         json!([]), json!({}), json!({"method":null,"id":0}),
-        json!({"id":999,"result":{}}), json!({"id":"0","result":{}}),
+        json!({"id":999,"result":{"userAgent":"fixture"}}), json!({"id":"0","result":{"userAgent":"fixture"}}),
         json!({"id":0,"result":{},"error":{}}),
         json!({"id":0,"error":{"code":"bad","message":SECRET}}),
         json!({"id":0,"error":{"code":-32601}}),
@@ -813,12 +825,16 @@ fn address_attempts_get_only_the_remaining_budget() {
 struct Wire {
     input: VecDeque<u8>,
     output: Rc<RefCell<Vec<u8>>>,
-    timeouts: Rc<RefCell<Vec<Duration>>>,
+    timeouts: Rc<RefCell<Vec<(bool, Duration, Duration)>>>,
     clock: FakeClock,
     read_chunk: usize,
     write_chunk: usize,
     read_cost: Duration,
     write_cost: Duration,
+    flush_cost: Duration,
+    read_errors: VecDeque<io::ErrorKind>,
+    write_errors: VecDeque<io::ErrorKind>,
+    flush_errors: VecDeque<io::ErrorKind>,
 }
 
 impl Wire {
@@ -827,7 +843,8 @@ impl Wire {
             input: bytes.into(), output: Rc::new(RefCell::new(Vec::new())),
             timeouts: Rc::new(RefCell::new(Vec::new())), clock: clock.clone(),
             read_chunk: usize::MAX, write_chunk: usize::MAX,
-            read_cost: Duration::ZERO, write_cost: Duration::ZERO,
+            read_cost: Duration::ZERO, write_cost: Duration::ZERO, flush_cost: Duration::ZERO,
+            read_errors: VecDeque::new(), write_errors: VecDeque::new(), flush_errors: VecDeque::new(),
         }
     }
 }
@@ -835,6 +852,7 @@ impl Wire {
 impl Read for Wire {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.clock.advance(self.read_cost);
+        if let Some(error) = self.read_errors.pop_front() { return Err(error.into()); }
         let len = buf.len().min(self.read_chunk).min(self.input.len());
         for byte in buf.iter_mut().take(len) { *byte = self.input.pop_front().unwrap(); }
         Ok(len)
@@ -844,20 +862,25 @@ impl Read for Wire {
 impl Write for Wire {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.clock.advance(self.write_cost);
+        if let Some(error) = self.write_errors.pop_front() { return Err(error.into()); }
         let len = buf.len().min(self.write_chunk);
         self.output.borrow_mut().extend_from_slice(&buf[..len]);
         Ok(len)
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        self.clock.advance(self.flush_cost);
+        if let Some(error) = self.flush_errors.pop_front() { return Err(error.into()); }
+        Ok(())
+    }
 }
 
 impl SocketIo for Wire {
     fn read_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.timeouts.borrow_mut().push(timeout);
+        self.timeouts.borrow_mut().push((false, self.clock.time.get(), timeout));
         Ok(())
     }
     fn write_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.timeouts.borrow_mut().push(timeout);
+        self.timeouts.borrow_mut().push((true, self.clock.time.get(), timeout));
         Ok(())
     }
 }
@@ -905,7 +928,7 @@ fn fragmented_upgrade_checks_deadline_inside_library_read_loop() {
     assert_eq!(error.diagnostic.kind, CodexFailureKind::Timeout);
     assert!(!format!("{error:?} {error}").contains(SECRET));
     assert_eq!(clock.time.get(), POLL_TIMEOUT);
-    assert_eq!(*timeouts.borrow().last().unwrap(), Duration::from_millis(40));
+    assert_eq!(timeouts.borrow().last().unwrap().2, Duration::from_millis(40));
 }
 
 #[test]
@@ -927,19 +950,27 @@ fn upgrade_frame_decode_and_partial_writes_do_not_renew_deadline() {
     let mut transport = WsTransport { socket, deadline };
     assert_eq!(transport.receive().unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
     assert_eq!(clock.time.get(), POLL_TIMEOUT);
-    assert!(timeouts.borrow().windows(2).all(|w| w[1] <= w[0]));
+    assert!(timeouts.borrow().iter().any(|(write, _, _)| *write));
+    for (_, at, timeout) in timeouts.borrow().iter() {
+        assert_eq!(*timeout, (POLL_TIMEOUT - *at).min(IO_SLICE));
+    }
 
     let clock = FakeClock::default();
     let deadline = Deadline::new(&clock);
     let mut wire = Wire::new(&clock, vec![]);
     wire.write_chunk = 1;
     wire.write_cost = Duration::from_millis(40);
+    let timeouts = wire.timeouts.clone();
     let output = wire.output.clone();
     let mut transport = raw_transport(wire, deadline);
     assert_eq!(transport.send(json!({"method":"initialize","params":{}}))
         .unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
     let length = output.borrow().len();
     assert_eq!(length, 25);
+    for (write, at, timeout) in timeouts.borrow().iter() {
+        assert!(*write);
+        assert_eq!(*timeout, (POLL_TIMEOUT - *at).min(IO_SLICE));
+    }
     assert!(transport.close().is_err());
     assert_eq!(output.borrow().len(), length); // no close bytes after expiry
 }
@@ -1049,6 +1080,8 @@ fn url_validation_accepts_only_cli_supported_loopback_forms() {
         "ws://user@localhost:8965", "ws://localhost:8965?token=x",
         "ws://localhost:8965#fragment", "ws://[::2]:8965", "ws://[::ffff:127.0.0.1]:8965",
         "ws://2130706433:8965", "ws://127.1:8965", "ws://localhost:",
+        "ws://[127.0.0.1]:8965", "ws://[localhost]:8965", "ws://localhost:+8965",
+        "ws://[127.0.0.1]:+8965", "ws://localhost:89x5",
         "ws://localhost:65536", "ws://localhost:0", "ws://local%68ost:8965",
     ] {
         let error = validate_url(url).unwrap_err();
@@ -1164,4 +1197,496 @@ fn validated_urls_build_real_upgrade_requests_without_dns_or_tls() {
         assert_eq!(text.matches(SECRET).count(), 1);
         assert!(text.contains(&format!("authorization: Bearer {SECRET}\r\n")));
     }
+}
+
+
+// ── Review regressions: framing, fair reads and immutable cache coverage ────
+
+struct WireConnector(Option<Wire>);
+
+impl Connector for WireConnector {
+    fn connect<'a>(&mut self, _: &Prepared, deadline: Deadline<'a>)
+        -> Result<Box<dyn Transport + 'a>, CodexError>
+    {
+        Ok(Box::new(raw_transport(self.0.take().unwrap(), deadline)))
+    }
+}
+
+fn empty_poll_wire(clock: &FakeClock) -> Wire {
+    let replies = [
+        json!({"id":0,"result":{"userAgent":"fixture"}}),
+        json!({"id":"ccmux-1","result":response_page(vec![], None)}),
+        json!({"id":"ccmux-2","result":response_page(vec![], None)}),
+    ];
+    Wire::new(clock, replies.iter().flat_map(|value| frame_bytes(&value.to_string())).collect())
+}
+
+#[test]
+fn interrupted_and_slice_timed_out_io_is_retried_without_degrading_the_poll() {
+    for kind in [io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+        let clock = FakeClock::default();
+        let mut wire = empty_poll_wire(&clock);
+        wire.read_errors.push_back(kind);
+        wire.write_errors.push_back(kind);
+        wire.flush_errors.push_back(kind);
+        wire.read_cost = Duration::from_millis(1);
+        wire.write_cost = Duration::from_millis(1);
+        wire.flush_cost = Duration::from_millis(1);
+        let result = client().poll_with(NOW, &clock, &mut WireConnector(Some(wire)));
+        assert!(result.complete, "{kind:?}: {:?}", result.diagnostic);
+        assert!(clock.time.get() < POLL_TIMEOUT);
+    }
+}
+
+#[test]
+fn repeated_interruption_and_slice_timeouts_expire_the_original_deadline() {
+    for kind in [io::ErrorKind::Interrupted, io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+        for operation in ["read", "write", "flush"] {
+            let clock = FakeClock::default();
+            let mut wire = empty_poll_wire(&clock);
+            let errors = VecDeque::from(vec![kind; 20]);
+            let cost = Duration::from_millis(100);
+            match operation {
+                "read" => { wire.read_errors = errors; wire.read_cost = cost; }
+                "write" => { wire.write_errors = errors; wire.write_cost = cost; }
+                "flush" => { wire.flush_errors = errors; wire.flush_cost = cost; }
+                _ => unreachable!(),
+            }
+            let timeouts = wire.timeouts.clone();
+            let result = client().poll_with(NOW, &clock, &mut WireConnector(Some(wire)));
+            assert_kind(&result, CodexFailureKind::Timeout);
+            assert_eq!(clock.time.get(), POLL_TIMEOUT, "{kind:?} {operation}");
+            assert!(timeouts.borrow().len() >= 10, "every retry must re-arm");
+            for (_, at, timeout) in timeouts.borrow().iter() {
+                assert_eq!(*timeout, (POLL_TIMEOUT - *at).min(IO_SLICE));
+            }
+        }
+    }
+}
+
+#[test]
+fn write_and_flush_timeouts_use_the_remaining_budget_even_below_one_slice() {
+    for flush in [false, true] {
+        let clock = FakeClock::default();
+        let deadline = Deadline::new(&clock);
+        clock.advance(POLL_TIMEOUT - Duration::from_millis(35));
+        let mut wire = Wire::new(&clock, vec![]);
+        if flush {
+            wire.flush_cost = Duration::from_millis(10);
+            wire.flush_errors.push_back(io::ErrorKind::Interrupted);
+        } else {
+            wire.write_cost = Duration::from_millis(10);
+            wire.write_errors.push_back(io::ErrorKind::Interrupted);
+        }
+        let timeouts = wire.timeouts.clone();
+        let mut stream = TimedStream { inner: wire, deadline };
+        if flush { stream.flush().unwrap(); } else { assert_eq!(stream.write(b"x").unwrap(), 1); }
+        assert_eq!(*timeouts.borrow(), vec![
+            (true, Duration::from_millis(965), Duration::from_millis(35)),
+            (true, Duration::from_millis(975), Duration::from_millis(25)),
+        ]);
+    }
+}
+
+#[test]
+fn otherwise_valid_responses_require_the_exact_id_and_id_type() {
+    let clock = FakeClock::default();
+    for wrong in [json!(999), json!("0"), json!("ccmux-0")] {
+        let mut client = client();
+        let mut script = Script::default();
+        script.response_ids.insert("initialize".into(), wrong);
+        let mut connector = FakeConnector::new(&clock, script);
+        assert_kind(&client.poll_with(NOW, &clock, &mut connector), CodexFailureKind::Protocol);
+        assert!(client.server_identity().is_none());
+        assert_eq!(connector.script.borrow().sent.len(), 1);
+    }
+    for wrong in [json!("ccmux-9"), json!(999), json!("1"), json!(null)] {
+        let mut client = client();
+        let mut first = FakeConnector::new(&clock, excluded_fleet(1));
+        assert!(client.poll_with(NOW, &clock, &mut first).complete);
+        let exclusions = client.exclusions.clone();
+        let attempted = client.attempted.clone();
+        let mut script = Script::default();
+        script.response_ids.insert("thread/loaded/list".into(), wrong);
+        let mut connector = FakeConnector::new(&clock, script);
+        assert_kind(&client.poll_with(NOW, &clock, &mut connector), CodexFailureKind::Protocol);
+        assert_eq!(client.exclusions, exclusions);
+        assert_eq!(client.attempted, attempted);
+    }
+    let mut script = fleet(vec![], vec![id(1)]);
+    script.reads.insert(id(1), thread(1));
+    script.response_ids.insert("thread/read".into(), json!("wrong-read-id"));
+    let (result, _) = poll(script);
+    assert_kind(&result, CodexFailureKind::Protocol);
+    assert!(result.sessions.is_empty());
+}
+
+#[test]
+fn an_expired_read_moves_behind_other_loaded_threads() {
+    let clock = FakeClock::default();
+    let mut client = client();
+    for attempt in 1..=3 {
+        let mut script = fleet(vec![], vec![id(1), id(2)]);
+        script.reads = (1..=2).map(|n| (id(n), thread(n))).collect();
+        script.read_costs.insert(id(1), POLL_TIMEOUT);
+        let mut connector = FakeConnector::new(&clock, script);
+        let previous = client.attempted.get(&id(1)).copied().unwrap_or(0);
+        let result = client.poll_with(NOW, &clock, &mut connector);
+        assert_kind(&result, CodexFailureKind::Timeout);
+        assert!(client.attempted[&id(1)] > previous);
+        if attempt == 1 {
+            assert_eq!(connector.script.borrow().read_ids, vec![id(1)]);
+        } else {
+            assert_eq!(connector.script.borrow().read_ids, vec![id(2), id(1)]);
+            assert_eq!(result.sessions[0].session_id, id(2));
+        }
+    }
+}
+
+#[test]
+fn reload_between_partial_polls_preserves_read_counter_and_fairness() {
+    let clock = FakeClock::default();
+    let mut client = client();
+    let mut observed = BTreeSet::new();
+    for _ in 0..3 {
+        let mut script = fleet(vec![], (1..=3).map(id).collect());
+        script.reads = (1..=3).map(|n| (id(n), thread(n))).collect();
+        script.read_cost = Duration::from_millis(600);
+        let mut connector = FakeConnector::new(&clock, script);
+        let result = client.poll_with(NOW, &clock, &mut connector);
+        assert_kind(&result, CodexFailureKind::Timeout);
+        assert_eq!(result.sessions.len(), 1);
+        observed.insert(result.sessions[0].session_id.clone());
+        let before = (client.sequence, client.attempted.clone());
+        client.replace_prepared(super::tests::client());
+        assert_eq!((client.sequence, client.attempted.clone()), before);
+    }
+    assert_eq!(observed, (1..=3).map(id).collect());
+}
+
+#[test]
+fn partial_loaded_cursors_preserve_unseen_exclusions_and_read_order() {
+    let clock = FakeClock::default();
+    for tail in [json!("p2"), json!(12), json!(""), json!(false)] {
+        let mut client = client();
+        let mut connector = FakeConnector::new(&clock, excluded_fleet(3));
+        assert!(client.poll_with(NOW, &clock, &mut connector).complete);
+        let before = (client.exclusions.clone(), client.attempted.clone());
+        let mut script = Script::default();
+        script.loaded.insert("".into(), response_page(vec![json!(id(1))], Some("p2")));
+        script.loaded.insert("p2".into(), json!({"data":[id(2)], "nextCursor":tail}));
+        let mut connector = FakeConnector::new(&clock, script);
+        assert_kind(&client.poll_with(NOW, &clock, &mut connector), CodexFailureKind::Incomplete);
+        assert_eq!((client.exclusions.clone(), client.attempted.clone()), before);
+        let mut connector = FakeConnector::new(&clock, excluded_fleet(3));
+        assert!(client.poll_with(NOW, &clock, &mut connector).complete);
+        assert!(connector.script.borrow().read_ids.is_empty());
+    }
+}
+
+#[test]
+fn independent_exclusions_with_unfamiliar_sources_do_not_contradict_cached_source_exclusions() {
+    let clock = FakeClock::default();
+    for source in [json!("future"), json!({"custom":1}), json!({"subAgent":"x","extra":1})] {
+        for parent in [false, true] {
+            let mut client = client();
+            let mut connector = FakeConnector::new(&clock, excluded_fleet(3));
+            assert!(client.poll_with(NOW, &clock, &mut connector).complete);
+            assert_eq!(client.exclusions[&id(2)], Exclusion::SubAgent);
+            assert_eq!(client.exclusions[&id(3)], Exclusion::Custom);
+            let rows = [2,3].into_iter().map(|n| {
+                let mut row = json!({"id":id(n),"source":source,"updatedAt":NOW/1000});
+                if parent { row["parentThreadId"] = json!(id(100)); }
+                else { row["ephemeral"] = json!(true); }
+                row
+            }).collect();
+            let mut connector = FakeConnector::new(&clock, fleet(rows, (1..=3).map(id).collect()));
+            let result = client.poll_with(NOW, &clock, &mut connector);
+            assert!(result.complete, "{:?}", result.diagnostic);
+            assert!(result.source_drift.is_empty());
+            for n in [2,3] { assert!(client.exclusions.contains_key(&id(n))); }
+        }
+    }
+}
+
+#[test]
+fn fingerprint_changes_when_only_normalized_runtime_flags_change() {
+    for (before, after) in [
+        (json!(["waitingOnApproval"]), json!(["waitingOnApproval","futureFlag"])),
+        (json!(["a, b"]), json!(["a","b"])),
+    ] {
+        let mut row = thread(1);
+        row["status"] = json!({"type":"active","activeFlags":before});
+        let before = eligible(&row);
+        row["status"]["activeFlags"] = after;
+        let after = eligible(&row);
+        assert_eq!((&before.status, &before.state), (&after.status, &after.state));
+        assert_ne!(fingerprint(&[before]), fingerprint(&[after]));
+    }
+}
+
+
+// ── Production connector against test-owned loopback sockets only ──────────
+
+fn loopback_client(address: SocketAddr) -> CodexClient {
+    prepare_with(&config(&format!("ws://{address}")),
+        |_, _| panic!("loopback fixture must not resolve"),
+        |_| Ok(SECRET.into())).ok().unwrap()
+}
+
+fn local_server(
+    serve: impl FnOnce(TcpStream) + Send + 'static,
+) -> (SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || {
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                    serve(stream);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("test listener accept: {error}"),
+            }
+        }
+    });
+    (address, worker)
+}
+
+/// A broken deadline must fail the test instead of hanging the entire suite.
+/// Server helpers also have bounded waits and own every socket they touch.
+fn bounded_poll(mut client: CodexClient) -> (CodexClient, CodexObservation, Duration) {
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let start = Instant::now();
+        let result = client.poll(NOW);
+        let _ = send.send((client, result, start.elapsed()));
+    });
+    let result = receive.recv_timeout(Duration::from_secs(2)).expect("poll exceeded test watchdog");
+    worker.join().unwrap();
+    result
+}
+
+fn read_upgrade(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        assert!(bytes.len() < 8192, "unbounded test request head");
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn production_connector_sends_auth_and_classifies_upgrade_denials() {
+    for code in [401, 403] {
+        let (address, server) = local_server(move |mut stream| {
+            let head = read_upgrade(&mut stream);
+            assert!(head.contains(&format!("authorization: Bearer {SECRET}\r\n")),
+                "production connector omitted the fixture Authorization header");
+            let reply = format!("HTTP/1.1 {code} Denied\r\nContent-Length: {}\r\n\r\n{SECRET}", SECRET.len());
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let (_, result, _) = bounded_poll(loopback_client(address));
+        server.join().unwrap();
+        assert_kind(&result, CodexFailureKind::Authentication);
+    }
+}
+
+#[test]
+fn stalled_upgrade_and_rpc_obey_the_one_second_wall_budget() {
+    for after_upgrade in [false, true] {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (address, server) = local_server(move |mut stream| {
+            if after_upgrade {
+                let mut socket = tungstenite::accept(stream).unwrap();
+                assert!(socket.read().unwrap().is_text()); // initialize, never answered
+                let _ = wait.recv_timeout(Duration::from_secs(3));
+            } else {
+                read_upgrade(&mut stream); // never finish the HTTP upgrade
+                let _ = wait.recv_timeout(Duration::from_secs(3));
+            }
+        });
+        let (_, result, elapsed) = bounded_poll(loopback_client(address));
+        let _ = release.send(());
+        server.join().unwrap();
+        assert_kind(&result, CodexFailureKind::Timeout);
+        assert!(elapsed >= POLL_TIMEOUT, "{elapsed:?}");
+        // Kernel scheduling is not an exact clock; keep a small measured allowance.
+        assert!(elapsed <= POLL_TIMEOUT + Duration::from_millis(10), "{elapsed:?}");
+    }
+}
+
+#[test]
+fn production_connector_enforces_frame_and_aggregate_message_limits() {
+    use tungstenite::protocol::frame::{Frame, coding::{Data, OpCode}};
+    for fragmented in [false, true] {
+        let (address, server) = local_server(move |stream| {
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let request: Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "initialize");
+            let reply = json!({"id":request["id"],"result":{"userAgent":"x".repeat(MAX_MESSAGE)}}).to_string();
+            if fragmented {
+                let split = reply.len()/2;
+                for (text, opcode, last) in [(&reply[..split], Data::Text, false), (&reply[split..], Data::Continue, true)] {
+                    // A correct client may close as soon as the oversized length is known.
+                    if socket.send(Message::Frame(Frame::message(text.to_owned(), OpCode::Data(opcode), last))).is_err() {
+                        break;
+                    }
+                }
+            } else {
+                let _ = socket.send(Message::Text(reply.into()));
+            }
+        });
+        let (client, result, _) = bounded_poll(loopback_client(address));
+        server.join().unwrap();
+        assert_kind(&result, CodexFailureKind::Protocol);
+        assert!(client.server_identity().is_none(), "oversized initialize was accepted");
+    }
+}
+
+#[test]
+fn production_connector_tries_the_next_prepared_address_after_refusal() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = closed.local_addr().unwrap();
+    let (address, server) = local_server(|mut stream| {
+        read_upgrade(&mut stream);
+        stream.write_all(b"HTTP/1.1 401 Denied\r\nContent-Length: 0\r\n\r\n").unwrap();
+    });
+    let mut client = loopback_client(address);
+    client.prepared.addresses.insert(0, refused);
+    drop(closed);
+    let (_, result, _) = bounded_poll(client);
+    server.join().unwrap();
+    assert_kind(&result, CodexFailureKind::Authentication);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn production_tcp_connect_charges_time_waiting_for_a_full_accept_queue() {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" { fn listen(fd: std::ffi::c_int, backlog: std::ffi::c_int) -> std::ffi::c_int; }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // Re-listen on this test's own fd with a tiny backlog, not the host default.
+    assert_eq!(unsafe { listen(listener.as_raw_fd(), 1) }, 0);
+    let address = listener.local_addr().unwrap();
+    let mut queued = Vec::new();
+    let mut full = false;
+    for _ in 0..8 {
+        match TcpStream::connect_timeout(&address, Duration::from_millis(20)) {
+            Ok(stream) => queued.push(stream),
+            Err(error) if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                full = true;
+                break;
+            }
+            Err(error) => panic!("queue fixture failed: {error}"),
+        }
+    }
+    assert!(full && !queued.is_empty(), "fixture did not saturate its accept queue");
+    let (_, result, elapsed) = bounded_poll(loopback_client(address));
+    drop(listener);
+    drop(queued);
+    assert_kind(&result, CodexFailureKind::Timeout);
+    assert!(elapsed >= POLL_TIMEOUT && elapsed < POLL_TIMEOUT + Duration::from_millis(100), "{elapsed:?}");
+}
+
+// ── Real credential IO, exclusively in private temporary fixture dirs ─────
+
+struct TokenDir(PathBuf);
+
+impl TokenDir {
+    fn new() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/tmp");
+        std::fs::create_dir_all(&root).unwrap();
+        loop {
+            let path = root.join(format!("ccmux-token-test-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create fixture dir: {error}"),
+            }
+        }
+    }
+
+    fn config(&self, file: &str) -> CodexConfig {
+        CodexConfig { token_file: self.0.join(file), ..config("ws://127.0.0.1:8965") }
+    }
+}
+
+impl Drop for TokenDir {
+    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+}
+
+fn credential_error(result: Result<CodexClient, CodexError>) {
+    let error = match result { Err(error) => error, Ok(_) => panic!("invalid fixture token accepted") };
+    assert_eq!(error.diagnostic.kind, CodexFailureKind::Credential);
+    assert!(!format!("{error} {error:?}").contains(SECRET));
+}
+
+#[test]
+fn real_token_reader_rejects_invalid_files_and_trims_only_trailing_lf() {
+    let dir = TokenDir::new();
+    for value in [SECRET.to_owned(), format!("{SECRET}\n"), format!("{SECRET}\n\n")] {
+        std::fs::write(dir.0.join("token"), value).unwrap();
+        let client = prepare(&dir.config("token")).expect("regular fixture token accepted");
+        assert_eq!(client.prepared.token, SECRET);
+        assert!(!format!("{:?}", client.prepared.authorization).contains(SECRET));
+    }
+    std::os::unix::fs::symlink(dir.0.join("token"), dir.0.join("symlink")).unwrap();
+    assert!(prepare(&dir.config("symlink")).is_ok());
+    for value in [String::new(), "\n".into(), format!("{SECRET}\r\n"),
+        format!("{SECRET}\r"), format!("{SECRET}\nsecond"), "x".repeat(MAX_TOKEN as usize + 1)]
+    {
+        std::fs::write(dir.0.join("token"), value).unwrap();
+        credential_error(prepare(&dir.config("token")));
+    }
+    credential_error(prepare(&dir.config("")));
+    credential_error(prepare(&dir.config("missing")));
+}
+
+#[test]
+fn real_token_reader_rejects_fifo_and_symlink_without_waiting_for_a_writer() {
+    let dir = TokenDir::new();
+    assert!(std::process::Command::new("mkfifo").arg(dir.0.join("fifo")).status().unwrap().success());
+    std::os::unix::fs::symlink(dir.0.join("fifo"), dir.0.join("symlink")).unwrap();
+    for name in ["fifo", "symlink"] {
+        let config = dir.config(name);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || { let _ = send.send(prepare(&config)); });
+        credential_error(receive.recv_timeout(Duration::from_secs(2)).expect("FIFO blocked credential preparation"));
+        worker.join().unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_token_reader_bounds_sparse_file_reads_before_allocating_its_size() {
+    // A child with a memory ceiling makes an unbounded-read regression fail
+    // without allocating a GiB in the operator's test process.
+    if std::env::var("CCMUX_TOKEN_READER_CHILD").as_deref() == Ok("1") {
+        let config = CodexConfig {
+            token_file: std::env::current_dir().unwrap().join("sparse-token"),
+            ..config("ws://127.0.0.1:8965")
+        };
+        credential_error(prepare(&config));
+        return;
+    }
+    let dir = TokenDir::new();
+    File::create(dir.0.join("sparse-token")).unwrap().set_len(1024 * 1024 * 1024).unwrap();
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", "ulimit -c 0; ulimit -v 262144; exec \"$@\"", "ccmux-token-limit"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "codex::tests::real_token_reader_bounds_sparse_file_reads_before_allocating_its_size"])
+        .env("CCMUX_TOKEN_READER_CHILD", "1").current_dir(&dir.0).output().unwrap();
+    assert!(output.status.success(), "bounded reader failed: {}", String::from_utf8_lossy(&output.stderr));
 }
