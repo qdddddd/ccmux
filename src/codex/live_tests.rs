@@ -26,6 +26,14 @@ const SOCKET: &str = "ccmux-probe";
 const MODEL: &str = "gpt-5.6-luna";
 const CASE_TIMEOUT: Duration = Duration::from_secs(360);
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
+// Keep the sleep long enough for /quit and the active witness. Give command
+// exit and the final model round separate budgets, including outer deadlines.
+const COMMAND_EXIT_TIMEOUT: Duration = Duration::from_secs(60 + 30);
+const FINAL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(180);
+const ACTIVE_OBSERVER_TIMEOUT: Duration = Duration::from_secs(
+    15 + COMMAND_EXIT_TIMEOUT.as_secs() + FINAL_RESPONSE_TIMEOUT.as_secs() + 30);
+const ACTIVE_CASE_TIMEOUT: Duration = Duration::from_secs(
+    CASE_TIMEOUT.as_secs() + ACTIVE_OBSERVER_TIMEOUT.as_secs());
 static SERIAL: Mutex<()> = Mutex::new(());
 
 // All post-mutation observations share a monotonic deadline. The snapshot is
@@ -442,6 +450,15 @@ impl LiveRpc<'_> {
             |row| row["status"] == "completed")
     }
 
+    fn active_completed(&mut self, id: &str, turn: &str) -> Result<Value> {
+        self.wait_turn(id, turn, "successful sleep command completion",
+            COMMAND_EXIT_TIMEOUT, sleep_completed)?;
+        // Start the model's budget only once command completion is observed.
+        // Repeated completed-command rows must not keep renewing this wait.
+        self.wait_turn(id, turn, "completed turn with successful sleep and final done",
+            FINAL_RESPONSE_TIMEOUT, active_completion_ready)
+    }
+
     fn thread_state(&mut self, id: &str, status: &str, loaded: bool) -> Result<Value> {
         let wait = self.wait.scoped(Duration::from_secs(15));
         wait.until(&format!("thread {id} status {status}, loaded={loaded}"), || {
@@ -640,7 +657,7 @@ struct Harness<'a> {
 }
 
 impl<'a> Harness<'a> {
-    fn new(clock: &'a dyn Clock) -> Result<Self> {
+    fn new(clock: &'a dyn Clock, budget: Duration) -> Result<Self> {
         let config = settings(|key| std::env::var(key).ok())?;
         let base = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME missing"))?)
             .join(".local/tmp");
@@ -661,7 +678,7 @@ impl<'a> Harness<'a> {
         let client = prepare(&config)?;
         eprintln!("live registry: {}", root.join("registry.jsonl").display());
         Ok(Self {
-            config, client, clock, end:clock.now() + CASE_TIMEOUT, work, run,
+            config, client, clock, end:clock.now() + budget, work, run,
             registry:Rc::new(RefCell::new(Registry { journal:Some(journal), ..Registry::default() })),
             panes:BTreeSet::new(), clients:BTreeMap::new(), launches:BTreeMap::new(),
             server_started:false, _lock:guard,
@@ -686,8 +703,9 @@ impl<'a> Harness<'a> {
         // Set this before spawning: a failed command can still have created it.
         // Cleanup checks the exact run's session and pane inventory before kill.
         self.server_started = true;
+        let keepalive = self.end.saturating_sub(self.clock.now()).as_secs().saturating_add(60).to_string();
         let pane = self.tmux(&["new-session","-d","-s",&self.run,"-x","180","-y","48",
-            "-P","-F","#{pane_id}","/usr/bin/sleep","600"])?;
+            "-P","-F","#{pane_id}","/usr/bin/sleep",&keepalive])?;
         self.remember_pane(pane.trim())?;
         let mut version = Command::new(&self.config.bin);
         version.arg("--version").env_remove("TMUX").env_remove("TMUX_PANE")
@@ -954,10 +972,10 @@ fn with_cleanup<T>(
     }
 }
 
-fn run(case: impl FnOnce(&mut Harness<'_>) -> Result<()>) {
+fn run(budget: Duration, case: impl FnOnce(&mut Harness<'_>) -> Result<()>) {
     let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let clock = MonotonicClock(Instant::now());
-    let mut harness = Harness::new(&clock).unwrap_or_else(|error| panic!("{error}"));
+    let mut harness = Harness::new(&clock, budget).unwrap_or_else(|error| panic!("{error}"));
     let result = with_cleanup(&mut harness, |h| h.setup().and_then(|_| case(h)), Harness::cleanup);
     if let Err(error) = result { panic!("live case FAILED: {error}"); }
 }
@@ -972,7 +990,7 @@ fn unchanged(before: &Value, after: &Value) -> Result<()> {
 #[test]
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_multi_attach_and_loaded_unloaded_resume() {
-    run(|h| {
+    run(CASE_TIMEOUT, |h| {
         let mut creator = h.creator()?;
         let id = creator.materialize(&h.name("resume"))?;
         creator.close()?;
@@ -1004,7 +1022,7 @@ fn live_multi_attach_and_loaded_unloaded_resume() {
 #[test]
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_metadata_reads_do_not_load_or_subscribe() {
-    run(|h| {
+    run(CASE_TIMEOUT, |h| {
         let mut creator = h.creator()?;
         let id = creator.materialize(&h.name("reads"))?;
         let mut creator = Some(creator);
@@ -1065,7 +1083,7 @@ fn owned_metadata(rows: &BTreeMap<String, Value>, ids: &[&str]) -> Value {
 #[test]
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_db_freshness_pagination_and_poll_cost() {
-    run(|h| {
+    run(CASE_TIMEOUT, |h| {
         let mut creator = h.creator()?;
         let first = creator.materialize(&h.name("index-a"))?;
         creator.history_ids(true, false, 1, &[&first])?;
@@ -1122,13 +1140,16 @@ fn live_db_freshness_pagination_and_poll_cost() {
     });
 }
 
+fn sleep_completed(row: &Value) -> bool {
+    row["items"].as_array().is_some_and(|items| items.iter().any(|i|
+        i["type"] == "commandExecution" && i["status"] == "completed" && i["exitCode"] == 0
+        && i["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60"))))
+}
+
 fn active_completion_ready(row: &Value) -> bool {
-    row["status"] == "completed" && row["items"].as_array().is_some_and(|items| {
-        items.iter().any(|i| i["type"] == "commandExecution" && i["exitCode"] == 0
-            && i["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60")))
-        && items.iter().any(|i| i["type"] == "agentMessage"
-            && i["text"].as_str().is_some_and(|s| s.trim() == "done"))
-    })
+    row["status"] == "completed" && sleep_completed(row)
+        && row["items"].as_array().is_some_and(|items| items.iter().any(|i|
+            i["type"] == "agentMessage" && i["text"].as_str().is_some_and(|s| s.trim() == "done")))
 }
 
 fn active_exit(h: &mut Harness<'_>, graceful: bool) -> Result<()> {
@@ -1147,13 +1168,12 @@ fn active_exit(h: &mut Harness<'_>, graceful: bool) -> Result<()> {
     if graceful { h.quit(&pane)?; } else { h.kill_pane(&pane)?; }
     // Observers never resume/subscribe. Missing or partial rows may settle, but
     // observing only completion cannot prove an ACTIVE turn survived exit.
-    let mut observer = h.rpc(Duration::from_secs(120))?;
+    let mut observer = h.rpc(ACTIVE_OBSERVER_TIMEOUT)?;
     let row = observer.turn(&id, &turn)?;
     ensure!(row["status"] == "inProgress", "no active witness after last client exit: {}",
         observer.wait.describe(&row));
     h.record(json!({"event":"zero_client_active","id":id,"turn":turn,"graceful":graceful}))?;
-    observer.wait_turn(&id, &turn, "completed turn with successful sleep and final done",
-        Duration::from_secs(90), active_completion_ready)?;
+    observer.active_completed(&id, &turn)?;
     let subscription = observer.request("thread/unsubscribe", json!({"threadId":id}))?;
     ensure!(matches!(subscription["status"].as_str(), Some("notSubscribed" | "notLoaded")),
         "completion observer subscribed: {}", observer.wait.describe(&subscription));
@@ -1164,13 +1184,13 @@ fn active_exit(h: &mut Harness<'_>, graceful: bool) -> Result<()> {
 #[test]
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_active_turn_survives_graceful_last_client_exit() {
-    run(|h| active_exit(h, true));
+    run(ACTIVE_CASE_TIMEOUT, |h| active_exit(h, true));
 }
 
 #[test]
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_active_turn_survives_abrupt_last_client_exit() {
-    run(|h| active_exit(h, false));
+    run(ACTIVE_CASE_TIMEOUT, |h| active_exit(h, false));
 }
 
 // These tests exercise the harness safety gates without env changes, network,
@@ -1446,7 +1466,8 @@ fn live_missing_and_unknown_turn_status_timeout_with_last_observation() {
 fn live_active_completion_waits_for_items_after_the_completed_status() {
     let clock = WaitClock::default();
     let pause = |d| clock.advance(d);
-    let command = json!({"type":"commandExecution","command":"/usr/bin/sleep 60","exitCode":0});
+    let command = json!({"type":"commandExecution","command":"/usr/bin/sleep 60",
+        "status":"completed","exitCode":0});
     let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, vec![
         turn_page(json!({"id":"turn","status":"inProgress"})),
         turn_page(json!({"id":"turn","status":"completed"})),
@@ -1462,6 +1483,74 @@ fn live_active_completion_waits_for_items_after_the_completed_status() {
     // A completed first observation is still NOT an inProgress witness.
     assert!(turn_visible(&row));
     assert_ne!(row["status"], "inProgress");
+}
+
+fn sleep_turn_row(command_done: bool, turn_done: bool) -> Value {
+    let mut items = vec![json!({"type":"commandExecution","command":"/bin/zsh -c '/usr/bin/sleep 60'",
+        "status":if command_done { "completed" } else { "inProgress" },
+        "exitCode":if command_done { json!(0) } else { Value::Null }})];
+    if turn_done { items.push(json!({"type":"agentMessage","text":"done"})); }
+    json!({"id":"turn","status":if turn_done { "completed" } else { "inProgress" },"items":items})
+}
+
+#[test]
+fn live_exit_completion_allows_sleep_then_a_slow_final_model_round() {
+    let clock = WaitClock::default();
+    // Setup/attach/exit already spent most of the ordinary case budget.
+    clock.advance(Duration::from_secs(300));
+    let pause = |d| clock.advance(d);
+    let pending = turn_page(sleep_turn_row(false, false));
+    let command_done = turn_page(sleep_turn_row(true, false));
+    let mut rows = vec![pending.clone()]; // active witness after last-client exit
+    rows.extend(vec![pending; 240]); // a full 60-second sleep still remains
+    rows.push(command_done.clone());
+    rows.extend(vec![command_done; 600]); // final model round takes another 150 seconds
+    rows.push(turn_page(sleep_turn_row(true, true)));
+    let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, rows,
+        ACTIVE_OBSERVER_TIMEOUT.min(ACTIVE_CASE_TIMEOUT.saturating_sub(clock.now())));
+    assert_eq!(rpc.turn(WAIT_ID, "turn").unwrap()["status"], "inProgress");
+    assert!(active_completion_ready(&rpc.active_completed(WAIT_ID, "turn").unwrap()));
+    assert_eq!(clock.now(), Duration::from_secs(510));
+    assert!(sent.borrow().iter().all(|v| v["method"] == "thread/turns/list"));
+}
+
+#[test]
+fn live_exit_final_round_deadline_is_not_renewed_and_preserves_last_row() {
+    let clock = WaitClock::default();
+    let pause = |d| clock.advance(d);
+    let mut command_done = sleep_turn_row(true, false);
+    command_done["items"][0]["aggregatedOutput"] = json!(WAIT_SECRET);
+    let mut rows = vec![turn_page(sleep_turn_row(false, false)); 240];
+    rows.push(turn_page(command_done.clone()));
+    rows.extend(vec![turn_page(command_done); 721]); // no terminal response
+    let (mut rpc, _) = scripted_live_rpc(&clock, &pause, rows, ACTIVE_OBSERVER_TIMEOUT);
+    let error = rpc.active_completed(WAIT_ID, "turn").unwrap_err().to_string();
+    assert_eq!(clock.now(), Duration::from_secs(60 + 180));
+    assert!(error.contains("timed out waiting for completed turn with successful sleep and final done"));
+    assert!(error.contains("last observed:") && error.contains("\"status\":\"inProgress\""));
+    assert!(error.contains("\"status\":\"completed\"") && error.contains("\"exitCode\":0"));
+    assert!(error.contains("redacted") && !error.contains(WAIT_SECRET));
+}
+
+#[test]
+fn live_exit_command_wait_is_bounded_and_requires_successful_completion() {
+    let completed = sleep_turn_row(true, false);
+    assert!(sleep_completed(&completed));
+    for (field, value) in [
+        ("status", json!("inProgress")), ("status", Value::Null), ("exitCode", json!(1)),
+    ] {
+        let mut pending = completed.clone();
+        pending["items"][0][field] = value;
+        assert!(!sleep_completed(&pending));
+        let clock = WaitClock::default();
+        let pause = |d| clock.advance(d);
+        let (mut rpc, _) = scripted_live_rpc(&clock, &pause, vec![turn_page(pending); 361],
+            ACTIVE_OBSERVER_TIMEOUT);
+        let error = rpc.active_completed(WAIT_ID, "turn").unwrap_err().to_string();
+        assert_eq!(clock.now(), Duration::from_secs(90));
+        assert!(error.contains("timed out waiting for successful sleep command completion"));
+        assert!(error.contains("last observed:"));
+    }
 }
 
 #[test]

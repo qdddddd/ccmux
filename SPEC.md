@@ -5050,9 +5050,13 @@ creator connection for the case's creation work and keep it through each
 turn/start, progress observation, and terminal notification. Its connection
 budget is the case budget, not an observer's short RPC budget. Give each
 luna/low turn a 120 s monotonic lifecycle deadline starting BEFORE turn/start;
-waiting for completion does not renew it. The overall case budget is 360 s
-to accommodate two such turns plus setup/index observations. Short-lived
-observers cannot create threads or start turns.
+waiting for completion does not renew it. Ordinary cases have a 360 s budget
+to accommodate two such turns plus setup/index observations. The two active
+exit cases have 675 s: the same 360 s setup allowance plus a 315 s observer
+budget. Their turn continues under the separate post-handoff waits below,
+not the creator's pre-handoff deadline. Short-lived observers cannot create
+threads or start turns. The throwaway server's placeholder sleep must outlast
+the selected case budget, including a cleanup margin.
 
 On the subscribed creator, wait for the matching `turn/completed`
 notification BEFORE checking history/index visibility; an immediate history
@@ -5065,8 +5069,16 @@ raw wire content. Failures/timeouts still drop clients and run archive cleanup;
 they never count as survival evidence.
 
 For fresh read-only observers after handoff, turn visibility is bounded by
-15 s and completion by 90 s. Thread state / history visibility waits use 15 s;
-foreground command start uses 45 s, capped by its creator turn's deadline.
+15 s. In BOTH active exit cases, allow 90 s for the 60 s sleep command to
+finish (30 s observation margin), requiring command status `completed` and
+exit code 0. Only AFTER observing that command completion, start a fixed
+180 s wait for terminal turn status plus final `done`; repeated command
+completion rows do not renew it. Keep the sleep at 60 s so graceful quit and
+the active witness have room to finish. The observer connection budget is
+315 s: 15 + 90 + 180, plus 30 s for connection/close overhead; neither its
+outer deadline nor the case budget may silently retain the old short cap.
+Thread state / history visibility waits use 15 s; foreground command start
+uses 45 s, capped by its creator turn's deadline.
 Missing rows and absent/unrecognized statuses remain pending. Explicit
 `failed` or `interrupted` in a creator's terminal notification or an observer's
 turn row fails immediately with the redacted `error` payload. Timeouts name
@@ -5074,7 +5086,10 @@ the condition and last observation. Scope RPC I/O to the active wait deadline
 using a test-only transport hook; production polling keeps its fixed deadline.
 Offline fixtures must prove one creator transport survives through terminal,
 buffered/mismatched notifications do not misroute, pending close is refused,
-observer mutations are refused, and handoff requires both witnesses.
+observer mutations are refused, and handoff requires both witnesses. A fake
+clock must cover slow setup followed by the full sleep and a slow final
+model round, bounded command/final waits, and timeout diagnostics retaining
+the last observed command and turn states with redaction.
 
 For TUI readiness, wait for the composer (30 s), the literal slash command
 echo (10 s), then send Enter once and wait for `/status` to identify the
