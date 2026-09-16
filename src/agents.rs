@@ -892,6 +892,13 @@ fn codex_attach_cmd(id: &str, config: &CodexConfig, socket: Option<&str>) -> Res
     ))
 }
 
+// The ignored live harness needs the real wrapper on its fixed throwaway
+// socket without changing the process-wide socket used by other tests.
+#[cfg(test)]
+pub(crate) fn codex_probe_attach_cmd(id: &str, config: &CodexConfig) -> Result<String, AgentsError> {
+    codex_attach_cmd(id, config, Some("ccmux-probe"))
+}
+
 // ── ANSI ────────────────────────────────────────────────────────────────────
 
 /// Strip CSI (`ESC [ ... final`), OSC (`ESC ] ... BEL | ESC \`), and two-char

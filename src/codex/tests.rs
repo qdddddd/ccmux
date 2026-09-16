@@ -1157,25 +1157,6 @@ fn credential_and_resolver_failures_never_echo_io_text() {
 }
 
 #[test]
-#[ignore = "requires an explicitly configured, controlled Codex test endpoint"]
-fn live_read_only_observation() {
-    assert_eq!(std::env::var("CCMUX_CODEX_LIVE_TEST").as_deref(), Ok("1"));
-    let config = CodexConfig {
-        url: std::env::var("CCMUX_CODEX_URL").expect("explicit test endpoint"),
-        token_file: std::env::var_os("CCMUX_CODEX_TOKEN_FILE").expect("explicit test token file").into(),
-        bin: "codex".into(),
-    };
-    let mut client = match prepare(&config) {
-        Ok(client) => client,
-        Err(error) => panic!("{error}"),
-    };
-    let result = client.poll(chrono::Utc::now().timestamp_millis());
-    assert!(result.complete, "{:?}", result.diagnostic);
-    assert!(client.server_identity().is_some());
-}
-
-
-#[test]
 fn validated_urls_build_real_upgrade_requests_without_dns_or_tls() {
     for url in ["ws://127.0.0.1:8965","ws://LOCALHOST:8965","ws://[::1]:8965"] {
         let endpoint = endpoint(url).ok().unwrap();

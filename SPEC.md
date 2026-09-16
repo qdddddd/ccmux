@@ -5009,28 +5009,100 @@ have these tests; existing Claude tests remain authoritative except for
   varying Claude stderr leave ordinary detail/list space available between
   rate-limited flashes; standing reasons remain truncated on one line.
 
-**Ignored live tests** are opt-in and separate from those fixtures.
-They require explicit `CCMUX_CODEX_LIVE_TEST=1`, an explicitly supplied
-loopback endpoint/token file, and ONLY `tmux -L ccmux-probe` with inherited
-`TMUX/TMUX_PANE` removed and an empty throwaway server verified first.
-No default-socket command, service restart/configuration change, or mutation
-of a pre-existing thread is permitted. A dedicated test harness may create
-and name `ccmux-probe-` threads, keep a registry, run trivial luna/low turns,
-and archive ONLY those IDs at the end; never delete them. Record CLI/server
-versions. Test-only mutation access is not exported by the production lister.
+**Ignored live tests** are opt-in and separate from those fixtures. The five
+cases in `codex::live_tests` share one harness. Require
+`CCMUX_CODEX_LIVE_TEST=1`, `CCMUX_CODEX_LIVE_URL`, and an absolute
+`CCMUX_CODEX_LIVE_TOKEN_FILE`; do NOT fall back to the production
+`CCMUX_CODEX_URL` / `CCMUX_CODEX_TOKEN_FILE` / `CCMUX_CODEX_BIN` variables.
+`CCMUX_CODEX_LIVE_BIN` optionally selects the CLI, defaulting to `codex`.
+Missing opt-in/settings fail before credential reads or connections.
 
-Keep ignored cases for multi-attach, verified graceful/abrupt last-client
-exit with active completion, pending approval replay, natural idle unload,
-non-loading/non-subscribing reads, loaded/unloaded resume and unchanged
-`updatedAt`, DB-only freshness/pagination/poll cost, and the in-TUI
-identity/default-cwd behavior. A contention test may use a tightly bounded
-owned stdio process, never a second long-lived server. Live deadline/failure,
-credential rotation, and resolver experiments use a controlled test endpoint
-and temporary token file, not fault injection into DuDu's server, credential,
-or host configuration. Do not send an error reply to a live approval to test
-§12.4. Always archive the registered probe threads and remove the throwaway
-tmux server on exit; report any cleanup failure rather than calling the gate
-passed.
+The harness serializes cases and takes a process-exclusion lock under
+`~/.local/tmp/`. Use ONLY `tmux -L ccmux-probe`, with inherited
+`TMUX`, `TMUX_PANE`, and `CODEX_REMOTE_TOKEN` removed from host commands.
+Require that socket to have no existing server/sessions before any connection
+or thread creation; never adopt or kill an existing server. Start it with
+`-f /dev/null` so user tmux configuration/hooks do not participate. No
+default-socket command, service restart/configuration change, or mutation
+of a pre-existing thread is permitted.
+
+Create only persistent `ccmux-probe-` threads in a unique probe cwd, with
+luna/low and per-thread read-only sandbox / never-approve policy. Record every
+returned ID in the in-memory ownership set and durable `registry.jsonl`
+BEFORE naming or sending turns; the name must carry the prefix. Record the
+installed CLI version and server `initialize.userAgent` (the latter is the
+server's self-report, not proof from the installed binary). Keep registries
+and result summaries under `~/.local/tmp/`; no credentials, raw wire errors,
+turn content, or pane captures go into logs. Test-only mutation access remains
+separate from the production lister's read-only method enum.
+
+The shipped cases are:
+
+- **Multi-attach and loaded/unloaded resume:** two real remote TUIs identify
+  the same launch thread through `/status`; one exits while the other remains.
+  Attach must preserve `updatedAt`, measured across a timestamp-second
+  boundary. Resume both a loaded thread and an unloaded persisted fixture.
+  The fixture archives and unarchives ONLY its registered thread, then
+  requires absent loaded membership and `notLoaded` before opening it. If
+  archive/unarchive no longer produces that fixture, fail setup; do not claim
+  natural unload timing was tested. Compare timestamps from AFTER fixture
+  preparation, since archive/unarchive itself is outside the attach claim.
+- **Non-loading/non-subscribing reads:** exercise `thread/list` (DB-only),
+  `thread/loaded/list`, and `thread/read(includeTurns:false)` on separate
+  fresh connections against both loaded and unloaded owned threads.
+  `thread/unsubscribe` must report `notSubscribed` or `notLoaded`,
+  respectively; loaded membership and `updatedAt` must remain unchanged.
+- **DB-only freshness, pagination, and poll cost:** materialize two owned
+  threads with trivial turns; DB-only must see each BEFORE scan-and-repair.
+  Compare metadata before/after a scan restricted to the unique probe cwd.
+  Follow loaded/history cursors with page size 1 across both owned IDs.
+  Run five complete production observations over the real population,
+  require both owned rows, and record durations/p95 against the 1,000 ms
+  production poll budget. Do not copy other threads' content into artifacts.
+- **Graceful last-client exit with active completion:** after an owned
+  foreground `sleep 60` starts, attach the real TUI, close its creating RPC
+  client, and `/quit`. Require the production park wrapper's rc=0/latch.
+- **Abrupt last-client exit with active completion:** the same setup, but
+  kill ONLY the registered pane. In BOTH exit cases, require the SAME turn
+  to be active after client exit, then complete with successful command
+  exit and final `done`, using read-only observers with no reattach.
+  Verify exit of the client descendants recorded under each owned pane
+  (PID plus start time, no argv/environ reads). These cases cover `kill-pane`,
+  not a separate native-client SIGKILL.
+
+Always close the owned clients and archive ONLY registered thread IDs;
+never delete. Cleanup runs after case failure/panic as well as success,
+attempts every registered ID, and verifies archival in DB-only history.
+Remove the throwaway server only after verifying its owned session/pane
+inventory. Any archive, verification, or tmux cleanup failure FAILS the case;
+a passing body never overrides failed cleanup. Offline harness tests cover
+opt-in isolation, fixed socket/environment removal, mutation ownership,
+and continued cleanup after an individual archive failure.
+
+Run only these ignored cases, not the older unrelated ignored tests:
+
+```sh
+CCMUX_CODEX_LIVE_TEST=1 \
+CCMUX_CODEX_LIVE_URL=ws://127.0.0.1:8965 \
+CCMUX_CODEX_LIVE_TOKEN_FILE=/home/qdu/.config/agents/codex-serve.token \
+cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1
+```
+
+**Probe-established facts, not shipped live cases:** natural ~30-minute idle
+unload, pending-approval survival/replay, native-client SIGKILL, and in-TUI
+`/resume` / `/fork` / `/new` identity and default-cwd behavior remain the
+recorded observations in `PROBE-FINDINGS.md` §9 and the evidence limits in
+§12.10. They need manual re-probing after a Codex upgrade before extending
+those claims to the new version. A pass of the bounded suite does not
+revalidate them. The long idle wait and interactive approval/identity flows
+are intentionally outside the automatic harness.
+
+Cross-runtime contention also remains probe-only (§9), not a shipped ignored
+case. Future contention tests may use a tightly bounded owned stdio process,
+never a second long-lived server. Live deadline/failure, credential rotation,
+and resolver experiments require a controlled test endpoint and temporary
+token file, not fault injection into DuDu's server, credential, or host
+configuration. Do not send an error reply to a live approval to test §12.4.
 
 ---
 
