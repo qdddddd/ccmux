@@ -361,6 +361,10 @@ fn websocket_config() -> WebSocketConfig {
 }
 
 trait Transport {
+    // The ignored harness scopes individual observation waits within its
+    // longer connection lifetime. Production polls retain one fixed deadline.
+    #[cfg(test)]
+    fn set_deadline(&mut self, _end: Duration) {}
     fn send(&mut self, value: Value) -> Result<(), CodexError>;
     fn receive(&mut self) -> Result<Value, CodexError>;
     fn close(&mut self) -> Result<(), CodexError>;
@@ -372,6 +376,12 @@ struct WsTransport<'a, S> {
 }
 
 impl<S: SocketIo> Transport for WsTransport<'_, S> {
+    #[cfg(test)]
+    fn set_deadline(&mut self, end: Duration) {
+        self.deadline.end = end;
+        self.socket.get_mut().deadline.end = end;
+    }
+
     fn send(&mut self, value: Value) -> Result<(), CodexError> {
         self.deadline.check()?;
         self.socket.send(Message::Text(value.to_string().into())).map_err(ws_error)?;

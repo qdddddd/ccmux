@@ -4,7 +4,7 @@
 use super::*;
 use anyhow::{Result, bail, ensure};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fs::{self, OpenOptions},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -16,17 +16,123 @@ use std::{
 };
 
 fn live_error(error: CodexError) -> anyhow::Error {
+    // Preserve the category without the production poll's fixed 1000 ms text.
     if error.diagnostic.kind == CodexFailureKind::Timeout {
-        anyhow::anyhow!("live RPC deadline expired")
-    } else {
-        error.into()
-    }
+        CodexError::new(CodexFailureKind::Timeout, "live RPC deadline expired").into()
+    } else { error.into() }
 }
 
 const SOCKET: &str = "ccmux-probe";
 const MODEL: &str = "gpt-5.6-luna";
 const CASE_TIMEOUT: Duration = Duration::from_secs(240);
 static SERIAL: Mutex<()> = Mutex::new(());
+
+// All post-mutation observations share a monotonic deadline. The snapshot is
+// retained across retries, including a final socket timeout, for diagnosis.
+#[derive(Clone)]
+struct Waiter<'a> {
+    deadline: Deadline<'a>,
+    pause: &'a dyn Fn(Duration),
+    token: Rc<str>,
+    io_end: Rc<Cell<Duration>>,
+}
+
+struct IoScope { end: Rc<Cell<Duration>>, previous: Duration }
+
+impl Drop for IoScope {
+    fn drop(&mut self) { self.end.set(self.previous); }
+}
+
+impl<'a> Waiter<'a> {
+    fn new(deadline: Deadline<'a>, token: &str) -> Self {
+        Self::with_pause(deadline, token, &thread::sleep)
+    }
+
+    fn with_pause(deadline: Deadline<'a>, token: &str, pause: &'a dyn Fn(Duration)) -> Self {
+        Self { deadline, pause, token:token.into(), io_end:Rc::new(Cell::new(deadline.end)) }
+    }
+
+    fn scoped(&self, budget: Duration) -> Self {
+        Self { deadline:Deadline { clock:self.deadline.clock,
+            end:self.deadline.end.min(self.deadline.clock.now() + budget) }, ..self.clone() }
+    }
+
+    fn describe(&self, value: &Value) -> String {
+        fn scrub(value: &Value, token: &str) -> Value {
+            let text = |s: &str| {
+                let replaced = if token.is_empty() { s.to_owned() } else { s.replace(token, "[redacted]") };
+                let clean = clean_text(&replaced);
+                let clean = if token.is_empty() { clean } else { clean.replace(token, "[redacted]") };
+                // Keep both ends of large fields (notably the TUI header and
+                // prompt), leaving room for sibling status/error fields.
+                if clean.chars().count() <= 1000 { clean } else {
+                    let head: String = clean.chars().take(500).collect();
+                    let tail: String = clean.chars().rev().take(500).collect::<Vec<_>>().into_iter().rev().collect();
+                    format!("{head}...[truncated]...{tail}")
+                }
+            };
+            match value {
+                Value::String(s) => json!(text(s)),
+                Value::Array(items) => Value::Array(items.iter().map(|v| scrub(v, token)).collect()),
+                Value::Object(fields) => Value::Object(fields.iter().map(|(key, value)| {
+                    let sensitive = matches!(key.to_ascii_lowercase().replace(['_','-'], "").as_str(),
+                        "authorization" | "token" | "accesstoken" | "apikey" | "secret");
+                    (text(key), if sensitive { json!("[redacted]") } else { scrub(value, token) })
+                }).collect()),
+                _ => value.clone(),
+            }
+        }
+        // Redact BEFORE JSON escaping and truncation (tokens may contain quotes).
+        let rendered = scrub(value, &self.token).to_string();
+        let mut chars = rendered.chars();
+        let mut bounded: String = chars.by_ref().take(4096).collect();
+        if chars.next().is_some() { bounded.push_str("...[truncated]"); }
+        bounded
+    }
+
+    fn until<T>(&self, condition: &str, mut observe: impl FnMut() -> Result<(Option<T>, Value)>) -> Result<T> {
+        let previous = self.io_end.replace(self.io_end.get().min(self.deadline.end));
+        let _scope = IoScope { end:self.io_end.clone(), previous };
+        let mut last = json!("not observed yet");
+        loop {
+            if self.deadline.remaining().is_err() {
+                bail!("timed out waiting for {condition}; last observed: {}", self.describe(&last));
+            }
+            let result = match observe() {
+                Ok((result, snapshot)) => { last = snapshot; result }
+                Err(error) => {
+                    let timed_out = self.deadline.remaining().is_err() || error.downcast_ref::<CodexError>()
+                        .is_some_and(|e| e.diagnostic.kind == CodexFailureKind::Timeout);
+                    let details = self.describe(&json!({"observation":last,"read_error":error.to_string()}));
+                    if timed_out { bail!("timed out waiting for {condition}; last observed: {details}"); }
+                    bail!("while waiting for {condition}; last observed: {details}");
+                }
+            };
+            if self.deadline.remaining().is_err() {
+                bail!("timed out waiting for {condition}; last observed: {}", self.describe(&last));
+            }
+            if let Some(result) = result { return Ok(result); }
+            (self.pause)(self.deadline.remaining()?.min(Duration::from_millis(250)));
+        }
+    }
+
+    fn turn_failure(&self, id: &str, turn: &str, row: &Value) -> Result<()> {
+        if matches!(row["status"].as_str(), Some("failed" | "interrupted")) {
+            bail!("owned turn {turn} on {id} {}; error: {}", row["status"],
+                self.describe(&row["error"]));
+        }
+        Ok(())
+    }
+}
+
+fn turn_visible(row: &Value) -> bool {
+    matches!(row["status"].as_str(), Some("inProgress" | "completed"))
+}
+
+fn thread_snapshot(id: &str, row: &Value, loaded: bool) -> Value {
+    json!({"id":id,"loaded":loaded,"status":row.get("status"),
+        "updatedAt":row.get("updatedAt"),"name":row.get("name")})
+}
 
 fn settings(get: impl Fn(&str) -> Option<String>) -> Result<CodexConfig> {
     ensure!(get("CCMUX_CODEX_LIVE_TEST").as_deref() == Some("1"),
@@ -152,21 +258,27 @@ struct LiveRpc<'a> {
     work: PathBuf,
     next_id: u64,
     events: Vec<Value>,
+    wait: Waiter<'a>,
 }
 
 impl LiveRpc<'_> {
     fn exchange(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.transport.send(json!({"id":id,"method":method,"params":params})).map_err(live_error)?;
+        self.transport.set_deadline(self.wait.io_end.get());
+        self.transport.send(json!({"id":id,"method":method,"params":params}))
+            .map_err(|error| live_error(error).context(format!("sending live RPC {method}")))?;
         loop {
-            let value = self.transport.receive().map_err(live_error)?;
+            self.transport.set_deadline(self.wait.io_end.get());
+            let value = self.transport.receive()
+                .map_err(|error| live_error(error).context(format!("receiving live RPC {method}")))?;
             if value.get("method").is_some() {
                 self.event(value);
                 continue;
             }
             ensure!(value["id"] == id, "live RPC response id mismatch");
-            ensure!(value.get("error").is_none(), "live RPC {method} rejected (body withheld)");
+            ensure!(value.get("error").is_none(), "live RPC {method} rejected: {}",
+                self.wait.describe(&value["error"]));
             return value.get("result").cloned().ok_or_else(|| anyhow::anyhow!("live RPC missing result"));
         }
     }
@@ -213,30 +325,78 @@ impl LiveRpc<'_> {
         Ok(self.request("thread/read", json!({"threadId":id,"includeTurns":false}))?["thread"].clone())
     }
 
-    fn turn(&mut self, id: &str, turn: &str) -> Result<Value> {
+    fn turn_once(&mut self, id: &str, turn: &str) -> Result<Value> {
         let result = self.request("thread/turns/list", json!({
             "threadId":id,"limit":1,"sortDirection":"desc","itemsView":"full"
         }))?;
-        let value = result["data"].as_array().and_then(|rows| rows.iter().find(|v| v["id"] == turn))
-            .ok_or_else(|| anyhow::anyhow!("latest turn missing"))?;
-        Ok(value.clone())
+        // The index can lag turn/start, and a visible row can lack status.
+        // Neither is a terminal result for the newly requested turn.
+        Ok(result["data"].as_array().and_then(|rows| rows.iter().find(|v| v["id"] == turn))
+            .cloned().unwrap_or(Value::Null))
+    }
+
+    fn wait_turn(
+        &mut self, id: &str, turn: &str, condition: &str, budget: Duration,
+        ready: impl Fn(&Value) -> bool,
+    ) -> Result<Value> {
+        let wait = self.wait.scoped(budget);
+        wait.until(&format!("{condition} (thread {id}, turn {turn})"), || {
+            let row = self.turn_once(id, turn)?;
+            wait.turn_failure(id, turn, &row)?;
+            let snapshot = json!({"thread":id,"turn":turn,"row":row});
+            Ok((ready(&row).then_some(row), snapshot))
+        })
+    }
+
+    fn turn(&mut self, id: &str, turn: &str) -> Result<Value> {
+        self.wait_turn(id, turn, "turn visibility", Duration::from_secs(15), turn_visible)
     }
 
     fn completed(&mut self, id: &str, turn: &str) -> Result<Value> {
-        loop {
-            let value = self.turn(id, turn)?;
-            match value["status"].as_str() {
-                Some("completed") => return Ok(value),
-                Some("inProgress") => thread::sleep(Duration::from_millis(500)),
-                _ => bail!("owned turn failed or interrupted"),
-            }
-        }
+        self.wait_turn(id, turn, "turn completion", Duration::from_secs(90),
+            |row| row["status"] == "completed")
+    }
+
+    fn thread_state(&mut self, id: &str, status: &str, loaded: bool) -> Result<Value> {
+        let wait = self.wait.scoped(Duration::from_secs(15));
+        wait.until(&format!("thread {id} status {status}, loaded={loaded}"), || {
+            let membership = self.loaded(100)?.0.contains(id);
+            let row = self.read(id)?;
+            let snapshot = thread_snapshot(id, &row, membership);
+            Ok(((membership == loaded && row["status"]["type"] == status).then_some(row), snapshot))
+        })
+    }
+
+    fn history_ids(&mut self, db: bool, archived: bool, limit: u64, ids: &[&str])
+        -> Result<(BTreeMap<String, Value>, usize)>
+    {
+        let wait = self.wait.scoped(Duration::from_secs(15));
+        wait.until(&format!("history visibility db_only={db}, archived={archived}, ids={ids:?}"), || {
+            let (rows, pages) = self.history(db, archived, limit)?;
+            let snapshot = json!({"pages":pages,"owned_rows":ids.iter()
+                .map(|id| json!({"id":id,"row":rows.get(*id)})).collect::<Vec<_>>()});
+            let ready = ids.iter().all(|id| rows.contains_key(*id));
+            Ok((ready.then_some((rows, pages)), snapshot))
+        })
+    }
+
+    fn loaded_ids(&mut self, limit: u64, ids: &[&str]) -> Result<(BTreeSet<String>, usize)> {
+        let wait = self.wait.scoped(Duration::from_secs(15));
+        wait.until(&format!("loaded pagination containing {ids:?}"), || {
+            let (rows, pages) = self.loaded(limit)?;
+            let snapshot = json!({"count":rows.len(),"pages":pages,
+                "membership":ids.iter().map(|id| json!({"id":id,"loaded":rows.contains(*id)})).collect::<Vec<_>>()});
+            let ready = ids.iter().all(|id| rows.contains(*id));
+            Ok((ready.then_some((rows, pages)), snapshot))
+        })
     }
 
     fn materialize(&mut self, name: &str) -> Result<String> {
         let id = self.create(name)?;
         let turn = self.start_turn(&id, "Reply exactly indexed. Do not use tools.")?;
         self.completed(&id, &turn)?;
+        self.thread_state(&id, "idle", true)?;
+        self.history_ids(true, false, 100, &[&id])?;
         Ok(id)
     }
 
@@ -282,7 +442,8 @@ impl LiveRpc<'_> {
     }
 
     fn close(mut self) -> Result<()> {
-        self.transport.close().map_err(live_error)?;
+        self.transport.set_deadline(self.wait.io_end.get());
+        self.transport.close().map_err(|error| live_error(error).context("closing live RPC client"))?;
         Ok(())
     }
 }
@@ -339,6 +500,29 @@ fn clients_exited(clients: &[ProcessStamp]) -> Result<bool> {
     Ok(true)
 }
 
+fn composer_ready(snapshot: &Value) -> bool {
+    let screen = snapshot["screen"].as_str().unwrap_or("");
+    snapshot["latch"] == "" && !screen.contains("[ccmux] Codex attach exited")
+        && !screen.contains("Resuming session") && !screen.contains("model:     loading")
+        && screen.lines().rev().find(|line| line.trim_start().starts_with('›'))
+            .is_some_and(|line| !line.contains("Error:"))
+}
+
+fn command_visible(snapshot: &Value, text: &str) -> bool {
+    snapshot["latch"] == "" && snapshot["screen"].as_str().unwrap_or("").lines()
+        .rev().find_map(|line| line.trim_start().strip_prefix('›'))
+        .is_some_and(|line| line.trim() == text)
+}
+
+fn status_identifies(snapshot: &Value, id: &str) -> bool {
+    let screen = snapshot["screen"].as_str().unwrap_or("");
+    snapshot["latch"] == "" && !screen.contains("[ccmux] Codex attach exited")
+        && screen.rsplit_once("Session:").is_some_and(|(_, value)| {
+            value.chars().filter(|c| !c.is_whitespace() && *c != '│')
+                .take(100).collect::<String>().starts_with(id)
+        })
+}
+
 struct Harness<'a> {
     config: CodexConfig,
     client: CodexClient,
@@ -383,7 +567,10 @@ impl<'a> Harness<'a> {
 
     fn tmux(&self, args: &[&str]) -> Result<String> {
         let result = output(tmux_command(args))?;
-        ensure!(result.status.success(), "throwaway tmux command failed");
+        ensure!(result.status.success(), "throwaway tmux {} failed: {}", args[0],
+            self.wait(Duration::from_secs(1)).describe(&json!({
+                "exit_code":result.status.code(),"stderr":String::from_utf8_lossy(&result.stderr)
+            })));
         ensure!(!String::from_utf8_lossy(&result.stdout).contains(&self.client.prepared.token),
             "credential appeared in tmux output (withheld)");
         String::from_utf8(result.stdout).map_err(|_| anyhow::anyhow!("invalid tmux output"))
@@ -421,6 +608,7 @@ impl<'a> Harness<'a> {
         let transport = TcpConnector.connect(&self.client.prepared, deadline).map_err(live_error)?;
         let mut rpc = LiveRpc {
             transport, registry:self.registry.clone(), work:self.work.clone(), next_id:0, events:Vec::new(),
+            wait:Waiter::new(deadline, &self.client.prepared.token),
         };
         let info = rpc.request("initialize", json!({
             "clientInfo":{"name":"ccmux_probe","version":env!("CARGO_PKG_VERSION")},
@@ -460,22 +648,33 @@ impl<'a> Harness<'a> {
         self.tmux(&["capture-pane","-p","-t",pane])
     }
 
-    fn keys(&self, pane: &str, text: &str) -> Result<()> {
-        self.check_pane(pane)?;
-        self.tmux(&["send-keys","-t",pane,"-l",text])?;
-        // Allow slash command completion before Enter, as in the recorded probe.
-        thread::sleep(Duration::from_millis(200));
-        self.tmux(&["send-keys","-t",pane,"Enter"])?;
-        Ok(())
+    fn wait(&self, budget: Duration) -> Waiter<'a> {
+        Waiter::new(Deadline { clock:self.clock,
+            end:self.end.min(self.clock.now() + budget) }, &self.client.prepared.token)
     }
 
-    fn until(&self, budget: Duration, mut predicate: impl FnMut() -> Result<bool>) -> Result<()> {
-        let end = self.end.min(self.clock.now() + budget);
-        loop {
-            ensure!(self.clock.now() < end, "live condition timed out");
-            if predicate()? { return Ok(()); }
-            thread::sleep(Duration::from_millis(100));
-        }
+    fn snapshot(&self, pane: &str) -> Result<Value> {
+        let screen = self.screen(pane)?;
+        let latch = self.tmux(&["show-options","-pqv","-t",pane,"@ccmux_detached"])?;
+        Ok(json!({"pane":pane,"latch":latch.trim(),"screen":screen.trim_end()}))
+    }
+
+    fn keys(&self, pane: &str, text: &str) -> Result<()> {
+        let wait = self.wait(Duration::from_secs(30));
+        wait.until(&format!("Codex input prompt in pane {pane} before {text}"), || {
+            let snapshot = self.snapshot(pane)?;
+            ensure!(snapshot["latch"] != "1", "Codex TUI parked: {}", wait.describe(&snapshot));
+            Ok((composer_ready(&snapshot).then_some(()), snapshot))
+        })?;
+        self.tmux(&["send-keys","-t",pane,"-l",text])?;
+        // Sending bytes is not proof the TUI has rendered/accepted them.
+        // Send Enter once, only after the composer displays our command.
+        wait.scoped(Duration::from_secs(10)).until(&format!("{text} in pane {pane} composer"), || {
+            let snapshot = self.snapshot(pane)?;
+            Ok((command_visible(&snapshot, text).then_some(()), snapshot))
+        })?;
+        self.tmux(&["send-keys","-t",pane,"Enter"])?;
+        Ok(())
     }
 
     fn open(&mut self, id: &str) -> Result<String> {
@@ -484,13 +683,12 @@ impl<'a> Harness<'a> {
         let pane = self.tmux(&["new-window","-d","-t",&format!("={}:", self.run),
             "-P","-F","#{pane_id}","/bin/sh","-c",&command])?.trim().to_owned();
         self.remember_pane(&pane)?;
-        self.until(Duration::from_secs(20), || {
-            let screen = self.screen(&pane)?;
-            ensure!(!screen.contains("[ccmux] Codex attach exited"), "Codex TUI exited before readiness");
-            Ok(screen.contains("OpenAI Codex"))
-        })?;
+        self.check_pane(&pane)?;
+        // Detached new windows need not inherit new-session's dimensions.
+        self.tmux(&["set-option","-w","-t",&pane,"window-size","manual"])?;
+        self.tmux(&["resize-window","-t",&pane,"-x","180","-y","48"])?;
         self.keys(&pane, "/status")?;
-        self.until(Duration::from_secs(15), || Ok(self.screen(&pane)?.contains(id)))?;
+        self.attached(&pane, id)?;
         let root = self.tmux(&["display-message","-p","-t",&pane,"#{pane_pid}"])?;
         let clients = pane_clients(root.trim().parse()?)?;
         self.registry.borrow_mut().record(json!({"event":"clients","pane":pane,
@@ -499,47 +697,61 @@ impl<'a> Harness<'a> {
         Ok(pane)
     }
 
-    fn attached(&self, pane: &str, id: &str) -> Result<bool> {
-        let latch = self.tmux(&["show-options","-pqv","-t",pane,"@ccmux_detached"])?;
-        let screen = self.screen(pane)?;
-        Ok(latch.trim().is_empty() && screen.contains(id)
-            && !screen.contains("[ccmux] Codex attach exited"))
+    fn attached(&self, pane: &str, id: &str) -> Result<()> {
+        let wait = self.wait(Duration::from_secs(15));
+        wait.until(&format!("/status identifying thread {id} in pane {pane}"), || {
+            let snapshot = self.snapshot(pane)?;
+            ensure!(snapshot["latch"] != "1", "Codex TUI parked: {}", wait.describe(&snapshot));
+            Ok((status_identifies(&snapshot, id).then_some(()), snapshot))
+        })
     }
 
     fn quit(&self, pane: &str) -> Result<()> {
         self.keys(pane, "/quit")?;
-        self.until(Duration::from_secs(15), || {
-            let latch = self.tmux(&["show-options","-pqv","-t",pane,"@ccmux_detached"])?;
-            let screen = self.screen(pane)?;
-            Ok(latch.trim() == "1" && screen.contains("[ccmux] Codex attach exited (rc=0)")
-                && screen.contains("$(cat ") && clients_exited(&self.clients[pane])?)
+        self.wait(Duration::from_secs(15)).until(&format!("pane {pane} parked rc=0 and its clients exited"), || {
+            let mut snapshot = self.snapshot(pane)?;
+            snapshot["clients_exited"] = json!(clients_exited(&self.clients[pane])?);
+            let screen = snapshot["screen"].as_str().unwrap_or("");
+            let ready = snapshot["latch"] == "1" && screen.contains("[ccmux] Codex attach exited (rc=0)")
+                && screen.contains("$(cat ") && snapshot["clients_exited"] == true;
+            Ok((ready.then_some(()), snapshot))
         })
-
     }
 
     fn kill_pane(&mut self, pane: &str) -> Result<()> {
         self.check_pane(pane)?;
         self.tmux(&["kill-pane","-t",pane])?;
         self.panes.remove(pane);
-        if let Some(clients) = self.clients.get(pane) {
-            self.until(Duration::from_secs(10), || clients_exited(clients))?;
-        }
-        Ok(())
+        self.wait(Duration::from_secs(10)).until(&format!("pane {pane} and its clients gone after kill-pane"), || {
+            let panes = self.tmux(&["list-panes","-a","-F","#{pane_id}"])?;
+            let gone = !panes.lines().any(|id| id == pane);
+            let clients_gone = self.clients.get(pane).map(|c| clients_exited(c)).transpose()?.unwrap_or(true);
+            let snapshot = json!({"pane":pane,"pane_gone":gone,"clients_exited":clients_gone});
+            Ok(((gone && clients_gone).then_some(()), snapshot))
+        })
     }
 
     fn unloaded_fixture(&self, id: &str) -> Result<()> {
-        // This is NOT the natural idle timer. Restore an owned archived rollout
-        // and require it to be notLoaded before any resume/read-side-effect check.
-        let mut rpc = self.rpc(Duration::from_secs(15))?;
+        // Wait for each mutation separately; issuing unarchive while archive
+        // is still becoming visible can race the fixture's own setup.
+        let mut rpc = self.rpc(Duration::from_secs(60))?;
         rpc.request("thread/archive", json!({"threadId":id}))?;
+        rpc.history_ids(true, true, 100, &[id])?;
+        let wait = rpc.wait.scoped(Duration::from_secs(15));
+        wait.until(&format!("thread {id} absent from loaded list after archive"), || {
+            let loaded = rpc.loaded(100)?.0.contains(id);
+            Ok(((!loaded).then_some(()), json!({"id":id,"loaded":loaded})))
+        })?;
         rpc.request("thread/unarchive", json!({"threadId":id}))?;
-        ensure!(!rpc.loaded(100)?.0.contains(id), "archive/unarchive did not yield an unloaded fixture");
-        ensure!(rpc.read(id)?["status"]["type"] == "notLoaded", "unloaded fixture has wrong status");
+        rpc.history_ids(true, false, 100, &[id])?;
+        rpc.thread_state(id, "notLoaded", false)?;
         rpc.close()
     }
 
     fn cleanup(&mut self) -> Result<()> {
         let mut errors = Vec::new();
+        let cleanup_wait = |budget| Waiter::new(Deadline {
+            clock:self.clock, end:self.clock.now() + budget }, &self.client.prepared.token);
         if self.server_started {
             let stopped = (|| -> Result<()> {
                 let existing = output(tmux_command(&["list-sessions","-F","#{session_name}"]))?;
@@ -549,48 +761,49 @@ impl<'a> Harness<'a> {
                 let panes = self.tmux(&["list-panes","-a","-F","#{pane_id}"])?;
                 ensure!(panes.lines().all(|id| self.panes.contains(id)), "cleanup refuses an unregistered pane");
                 self.tmux(&["kill-server"])?;
-                let after = output(tmux_command(&["list-sessions"]))?;
-                ensure!(server_absent(after.status.code(), &after.stdout, &after.stderr),
-                    "throwaway tmux server remains");
-                Ok(())
+                cleanup_wait(Duration::from_secs(10)).until("throwaway tmux server exit after kill-server", || {
+                    let after = output(tmux_command(&["list-sessions"]))?;
+                    let gone = server_absent(after.status.code(), &after.stdout, &after.stderr);
+                    Ok((gone.then_some(()), json!({"exit_code":after.status.code(),
+                        "stdout":String::from_utf8_lossy(&after.stdout),"stderr":String::from_utf8_lossy(&after.stderr)})))
+                })
             })();
-            if stopped.is_err() { errors.push("throwaway tmux cleanup failed"); }
+            if let Err(error) = stopped { errors.push(error.to_string()); }
         }
-        let clients_gone = (|| -> Result<()> {
-            let end = Instant::now() + Duration::from_secs(10);
-            loop {
-                let mut all_exited = true;
-                for clients in self.clients.values() { all_exited &= clients_exited(clients)?; }
-                if all_exited { return Ok(()); }
-                ensure!(Instant::now() < end, "owned client process remains");
-                thread::sleep(Duration::from_millis(100));
+        let clients_gone = cleanup_wait(Duration::from_secs(10)).until("all owned client processes to exit", || {
+            let mut remaining = Vec::new();
+            for clients in self.clients.values() {
+                for stamp in clients {
+                    if !clients_exited(&[*stamp])? { remaining.push(stamp.pid); }
+                }
             }
-        })();
-        if clients_gone.is_err() { errors.push("owned client exit could not be verified"); }
+            Ok((remaining.is_empty().then_some(()), json!({"remaining_pids":remaining})))
+        });
+        if let Err(error) = clients_gone { errors.push(error.to_string()); }
         let ids: Vec<_> = self.registry.borrow().threads.keys().cloned().collect();
         let archive = cleanup_owned(&ids, |id| {
             // Cleanup has a fresh budget, even when the test used all of its own.
-            let mut rpc = self.rpc_until(self.clock.now() + Duration::from_secs(15))?;
+            let mut rpc = self.rpc_until(self.clock.now() + Duration::from_secs(30))?;
             let (already_archived, _) = rpc.history(true, true, 100)?;
             if !already_archived.contains_key(id) {
                 rpc.request("thread/archive", json!({"threadId":id}))?;
             }
-            let (archived, _) = rpc.history(true, true, 100)?;
-            ensure!(archived.contains_key(id), "archive not visible in DB-only history");
+            rpc.history_ids(true, true, 100, &[id])?;
             rpc.close()?;
             self.registry.borrow_mut().record(json!({"event":"archived","id":id}))
         });
-        if archive.is_err() { errors.push("registered thread archival failed (see registry)"); }
+        if let Err(error) = archive { errors.push(error.to_string()); }
         self.record(json!({"event":"cleanup","ids":ids,"ok":errors.is_empty()}))?;
         ensure!(errors.is_empty(), "{}", errors.join("; "));
         Ok(())
     }
+
 }
 
 fn cleanup_owned(ids: &[String], mut archive: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let mut failed = Vec::new();
     for id in ids {
-        if archive(id).is_err() { failed.push(id.clone()); }
+        if let Err(error) = archive(id) { failed.push(format!("{id}: {error}")); }
     }
     ensure!(failed.is_empty(), "cleanup failed for {}", failed.join(", "));
     Ok(())
@@ -604,7 +817,12 @@ fn with_cleanup<T>(
     let result = catch_unwind(AssertUnwindSafe(|| case(state)));
     // Preserve both failures; a successful body can never mask failed cleanup.
     if let Err(error) = cleanup(state) {
-        bail!("live cleanup FAILED: {error}; case succeeded: {}", matches!(result, Ok(Ok(()))));
+        let body = match &result {
+            Ok(Ok(())) => "succeeded".into(),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "panicked".into(),
+        };
+        bail!("live cleanup FAILED: {error}; case: {body}");
     }
     match result {
         Ok(result) => result,
@@ -622,7 +840,8 @@ fn run(case: impl FnOnce(&mut Harness<'_>) -> Result<()>) {
 
 fn unchanged(before: &Value, after: &Value) -> Result<()> {
     let before = before["updatedAt"].as_i64().ok_or_else(|| anyhow::anyhow!("updatedAt missing"))?;
-    ensure!(after["updatedAt"].as_i64() == Some(before), "read/attach advanced updatedAt");
+    ensure!(after["updatedAt"].as_i64() == Some(before),
+        "read/attach changed updatedAt: expected {before}, observed {:?}", after["updatedAt"].as_i64());
     Ok(())
 }
 
@@ -630,30 +849,28 @@ fn unchanged(before: &Value, after: &Value) -> Result<()> {
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_multi_attach_and_loaded_unloaded_resume() {
     run(|h| {
-        let mut creator = h.rpc(Duration::from_secs(90))?;
+        let mut creator = h.rpc(Duration::from_secs(120))?;
         let id = creator.materialize(&h.name("resume"))?;
         creator.close()?;
-        let before = h.rpc(Duration::from_secs(10))?.read(&id)?;
-        ensure!(before["status"]["type"] == "idle", "loaded resume fixture is not idle");
+        let before = h.rpc(Duration::from_secs(30))?.thread_state(&id, "idle", true)?;
         // Cross a timestamp second, so an accidental touch cannot compare equal.
         thread::sleep(Duration::from_millis(1100));
         let first = h.open(&id)?;
         let second = h.open(&id)?;
-        ensure!(h.attached(&first, &id)? && h.attached(&second, &id)?,
-            "two concurrent attachments were not maintained");
-        unchanged(&before, &h.rpc(Duration::from_secs(10))?.read(&id)?)?;
+        h.attached(&first, &id)?;
+        h.attached(&second, &id)?;
+        unchanged(&before, &h.rpc(Duration::from_secs(30))?.thread_state(&id, "idle", true)?)?;
         h.quit(&first)?;
-        ensure!(h.attached(&second, &id)?, "second attachment disappeared");
+        h.attached(&second, &id)?;
         h.quit(&second)?;
         h.kill_pane(&first)?;
         h.kill_pane(&second)?;
         h.unloaded_fixture(&id)?;
-        let before = h.rpc(Duration::from_secs(10))?.read(&id)?;
+        let before = h.rpc(Duration::from_secs(30))?.thread_state(&id, "notLoaded", false)?;
         thread::sleep(Duration::from_millis(1100));
         let pane = h.open(&id)?;
-        let mut observer = h.rpc(Duration::from_secs(10))?;
-        ensure!(observer.loaded(100)?.0.contains(&id), "resume did not load the thread");
-        unchanged(&before, &observer.read(&id)?)?;
+        let mut observer = h.rpc(Duration::from_secs(30))?;
+        unchanged(&before, &observer.thread_state(&id, "idle", true)?)?;
         observer.close()?;
         h.quit(&pane)?;
         h.record(json!({"event":"multi_attach_resume_pass","id":id}))
@@ -664,7 +881,7 @@ fn live_multi_attach_and_loaded_unloaded_resume() {
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_metadata_reads_do_not_load_or_subscribe() {
     run(|h| {
-        let mut creator = h.rpc(Duration::from_secs(90))?;
+        let mut creator = h.rpc(Duration::from_secs(120))?;
         let id = creator.materialize(&h.name("reads"))?;
         let mut creator = Some(creator);
         for unloaded in [false, true] {
@@ -673,11 +890,9 @@ fn live_metadata_reads_do_not_load_or_subscribe() {
                 h.unloaded_fixture(&id)?;
             }
             for method in ["thread/list","thread/loaded/list","thread/read"] {
-                // Baseline on a different connection, so only the method under
-                // test can acquire this observer's subscription.
-                let mut before = h.rpc(Duration::from_secs(10))?;
-                ensure!(before.loaded(100)?.0.contains(&id) != unloaded, "fixture load state changed");
-                let metadata = before.read(&id)?;
+                // Settle the setup mutation on a DIFFERENT connection first.
+                let mut before = h.rpc(Duration::from_secs(30))?;
+                let metadata = before.thread_state(&id, if unloaded { "notLoaded" } else { "idle" }, !unloaded)?;
                 before.close()?;
                 thread::sleep(Duration::from_millis(1100));
                 let mut rpc = h.rpc(Duration::from_secs(10))?;
@@ -687,12 +902,17 @@ fn live_metadata_reads_do_not_load_or_subscribe() {
                     _ => { rpc.read(&id)?; }
                 }
                 let status = rpc.request("thread/unsubscribe", json!({"threadId":id}))?;
+                // Do NOT retry this check: a retry could consume a subscription
+                // created by the read and turn a real regression into a pass.
                 ensure!(status["status"] == if unloaded { "notLoaded" } else { "notSubscribed" },
-                    "{method} loaded/subscribed to the owned thread");
+                    "{method} loaded/subscribed to {id}: {}", rpc.wait.describe(&status));
                 rpc.close()?;
                 let mut after = h.rpc(Duration::from_secs(10))?;
-                ensure!(after.loaded(100)?.0.contains(&id) != unloaded, "{method} changed loaded membership");
-                unchanged(&metadata, &after.read(&id)?)?;
+                let loaded = after.loaded(100)?.0.contains(&id);
+                let row = after.read(&id)?;
+                ensure!(loaded != unloaded, "{method} changed loaded membership: {}",
+                    after.wait.describe(&thread_snapshot(&id, &row, loaded)));
+                unchanged(&metadata, &row)?;
                 after.close()?;
             }
         }
@@ -700,76 +920,125 @@ fn live_metadata_reads_do_not_load_or_subscribe() {
     });
 }
 
+const METADATA_FIELDS: [&str; 7] = ["id","name","cwd","createdAt","updatedAt","ephemeral","source"];
+
+fn metadata_matches(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Value>, ids: &[&str]) -> bool {
+    ids.iter().all(|id| METADATA_FIELDS.iter().all(|field| {
+        left.get(*id).and_then(|row| row.get(*field))
+            .is_some_and(|value| right.get(*id).and_then(|row| row.get(*field)) == Some(value))
+    }))
+}
+
+fn owned_metadata(rows: &BTreeMap<String, Value>, ids: &[&str]) -> Value {
+    json!(ids.iter().map(|id| {
+        let fields: serde_json::Map<_, _> = METADATA_FIELDS.iter()
+            .map(|key| ((*key).into(), rows.get(*id).and_then(|row| row.get(*key)).cloned().unwrap_or(Value::Null)))
+            .collect();
+        json!({"id":id,"metadata":fields})
+    }).collect::<Vec<_>>())
+}
+
 #[test]
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_db_freshness_pagination_and_poll_cost() {
     run(|h| {
-        let mut creator = h.rpc(Duration::from_secs(120))?;
+        let mut creator = h.rpc(Duration::from_secs(150))?;
         let first = creator.materialize(&h.name("index-a"))?;
-        // DB-only must see the write BEFORE any scan-and-repair call.
-        ensure!(creator.history(true, false, 1)?.0.contains_key(&first), "DB-only index is stale");
+        creator.history_ids(true, false, 1, &[&first])?;
         let second = creator.materialize(&h.name("index-b"))?;
-        let (db, pages) = creator.history(true, false, 1)?;
-        ensure!(db.contains_key(&first) && db.contains_key(&second) && pages >= 2,
-            "history pagination did not cross the owned rows");
-        let (scan, _) = creator.history(false, false, 1)?;
-        let (again, _) = creator.history(true, false, 1)?;
-        for id in [&first, &second] {
-            for field in ["id","name","cwd","createdAt","updatedAt","ephemeral","source"] {
-                ensure!(db[id].get(field).is_some() && db[id][field] == scan[id][field]
-                    && db[id][field] == again[id][field], "DB-only and scan metadata differ");
-            }
-        }
-        let (loaded, loaded_pages) = creator.loaded(1)?;
-        ensure!(loaded.contains(&first) && loaded.contains(&second) && loaded_pages >= 2,
-            "loaded pagination did not cross the owned rows");
+        let ids = [first.as_str(), second.as_str()];
+        let expected = BTreeMap::from([
+            (first.clone(), creator.read(&first)?), (second.clone(), creator.read(&second)?),
+        ]);
+        // Wait for DB-only visibility BEFORE the first scan. Never let scan
+        // repair the index and then claim the original DB-only read was fresh.
+        let wait = creator.wait.scoped(Duration::from_secs(15));
+        let (db, pages) = wait.until("DB-only metadata and pagination before any scan-and-repair", || {
+            let (rows, pages) = creator.history(true, false, 1)?;
+            let ready = pages >= 2 && metadata_matches(&expected, &rows, &ids);
+            let snapshot = json!({"pages":pages,"expected":owned_metadata(&expected, &ids),
+                "db":owned_metadata(&rows, &ids)});
+            Ok((ready.then_some((rows, pages)), snapshot))
+        })?;
+        let wait = creator.wait.scoped(Duration::from_secs(15));
+        wait.until("scan and DB-only metadata matching the pre-scan sample", || {
+            let (scan, _) = creator.history(false, false, 1)?;
+            let (again, _) = creator.history(true, false, 1)?;
+            let ready = metadata_matches(&db, &scan, &ids) && metadata_matches(&db, &again, &ids);
+            Ok((ready.then_some(()), json!({"before":owned_metadata(&db, &ids),
+                "scan":owned_metadata(&scan, &ids),"after":owned_metadata(&again, &ids)})))
+        })?;
+        let (_, loaded_pages) = creator.loaded_ids(1, &ids)?;
+        ensure!(loaded_pages >= 2, "loaded pagination did not cross two pages: {loaded_pages}");
         creator.close()?;
+        let wait = h.wait(Duration::from_secs(15));
+        let mut warmup_attempts = 0;
+        wait.until("production poll complete with both materialized probe rows", || {
+            warmup_attempts += 1;
+            let observation = h.client.poll(chrono::Utc::now().timestamp_millis());
+            let present: Vec<_> = ids.iter().map(|id| observation.sessions.iter().any(|s| s.session_id == *id)).collect();
+            let ready = observation.complete && present.iter().all(|yes| *yes);
+            Ok((ready.then_some(()), json!({"complete":observation.complete,"present":present,
+                "diagnostic":observation.diagnostic.map(|d| d.message)})))
+        })?;
         let mut samples = Vec::new();
         for _ in 0..5 {
             let start = Instant::now();
             let observation = h.client.poll(chrono::Utc::now().timestamp_millis());
             samples.push(start.elapsed().as_millis());
-            ensure!(observation.complete, "production poll incomplete: {:?}", observation.diagnostic);
-            ensure!(observation.sessions.iter().any(|s| s.session_id == first)
-                && observation.sessions.iter().any(|s| s.session_id == second), "production poll lost owned rows");
+            ensure!(observation.complete, "measured production poll incomplete: {:?}",
+                observation.diagnostic);
+            ensure!(ids.iter().all(|id| observation.sessions.iter().any(|s| s.session_id == *id)),
+                "measured production poll lost settled probe rows");
         }
         samples.sort_unstable();
         h.record(json!({"event":"index_pagination_poll_pass","history_pages":pages,
-            "loaded_pages":loaded_pages,"poll_ms":samples,"p95_ms":samples[4],
-            "budget_ms":POLL_TIMEOUT.as_millis()}))
+            "loaded_pages":loaded_pages,"warmup_attempts":warmup_attempts,"poll_ms":samples,
+            "p95_ms":samples[4],"budget_ms":POLL_TIMEOUT.as_millis()}))
     });
 }
 
+fn active_completion_ready(row: &Value) -> bool {
+    row["status"] == "completed" && row["items"].as_array().is_some_and(|items| {
+        items.iter().any(|i| i["type"] == "commandExecution" && i["exitCode"] == 0
+            && i["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60")))
+        && items.iter().any(|i| i["type"] == "agentMessage"
+            && i["text"].as_str().is_some_and(|s| s.trim() == "done"))
+    })
+}
+
 fn active_exit(h: &mut Harness<'_>, graceful: bool) -> Result<()> {
-    let mut creator = h.rpc(Duration::from_secs(120))?;
-    let id = creator.create(&h.name(if graceful { "active-graceful" } else { "active-abrupt" }))?;
+    let mut creator = h.rpc(Duration::from_secs(180))?;
+    let id = creator.materialize(&h.name(if graceful { "active-graceful" } else { "active-abrupt" }))?;
+    // Attach BEFORE starting the active turn: TUI bootstrap should not spend
+    // the sleep interval that supplies our zero-client active witness.
+    let pane = h.open(&id)?;
     let turn = creator.start_turn(&id,
         "Run /usr/bin/sleep 60 with the shell execution tool in the foreground. Do not background it or shorten it. After it exits, reply exactly done. Do not run other commands or tools.")?;
-    loop {
-        if creator.events.iter().any(|e| e["params"]["threadId"] == id && e["params"]["turnId"] == turn
-            && e["params"]["item"]["type"] == "commandExecution"
-            && e["params"]["item"]["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60")))
-        { break; }
-        let event = creator.transport.receive().map_err(live_error)?;
-        creator.event(event);
-    }
-    let pane = h.open(&id)?;
+    let wait = creator.wait.scoped(Duration::from_secs(45));
+    wait.until(&format!("foreground sleep command in thread {id}, turn {turn}"), || {
+        let row = creator.turn_once(&id, &turn)?;
+        wait.turn_failure(&id, &turn, &row)?;
+        let started = creator.events.iter().any(|e| e["params"]["threadId"] == id
+            && e["params"]["turnId"] == turn && e["params"]["item"]["type"] == "commandExecution"
+            && e["params"]["item"]["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60")));
+        Ok(((started && row["status"] == "inProgress").then_some(()),
+            json!({"row":row,"command_started":started})))
+    })?;
     creator.close()?;
     if graceful { h.quit(&pane)?; } else { h.kill_pane(&pane)?; }
-    // New observers only read; none resumes or subscribes after the last TUI
-    // exits. Assert active first, so completion before exit cannot pass.
-    let mut observer = h.rpc(Duration::from_secs(100))?;
-    ensure!(observer.turn(&id, &turn)?["status"] == "inProgress", "turn was not active after client exit");
-    let completed = observer.completed(&id, &turn)?;
-    let items = completed["items"].as_array().ok_or_else(|| anyhow::anyhow!("completion items missing"))?;
-    ensure!(items.iter().any(|i| i["type"] == "commandExecution" && i["exitCode"] == 0
-        && i["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60"))),
-        "sleep completion evidence missing");
-    ensure!(items.iter().any(|i| i["type"] == "agentMessage"
-        && i["text"].as_str().is_some_and(|s| s.trim() == "done")), "final done response missing");
+    // Observers never resume/subscribe. Missing or partial rows may settle, but
+    // observing only completion cannot prove an ACTIVE turn survived exit.
+    let mut observer = h.rpc(Duration::from_secs(120))?;
+    let row = observer.turn(&id, &turn)?;
+    ensure!(row["status"] == "inProgress", "no active witness after last client exit: {}",
+        observer.wait.describe(&row));
+    h.record(json!({"event":"zero_client_active","id":id,"turn":turn,"graceful":graceful}))?;
+    observer.wait_turn(&id, &turn, "completed turn with successful sleep and final done",
+        Duration::from_secs(90), active_completion_ready)?;
     let subscription = observer.request("thread/unsubscribe", json!({"threadId":id}))?;
     ensure!(matches!(subscription["status"].as_str(), Some("notSubscribed" | "notLoaded")),
-        "completion observer subscribed");
+        "completion observer subscribed: {}", observer.wait.describe(&subscription));
     observer.close()?;
     h.record(json!({"event":"active_last_client_completion_pass","id":id,"turn":turn,"graceful":graceful}))
 }
@@ -916,6 +1185,7 @@ fn live_rpc_registers_before_mutation_and_never_replies_to_server_requests() {
     let id = "01a0a609-12a6-7000-8000-000000000001";
     let registry = Rc::new(RefCell::new(Registry::default()));
     let sent = Rc::new(RefCell::new(Vec::new()));
+    let clock = MonotonicClock(Instant::now());
     let mut rpc = LiveRpc {
         transport:Box::new(FakeLiveTransport { sent:sent.clone(), replies: [
             json!({"id":0,"method":"item/commandExecution/requestApproval","params":{}}),
@@ -924,6 +1194,7 @@ fn live_rpc_registers_before_mutation_and_never_replies_to_server_requests() {
             json!({"id":2,"error":{"code":-1,"message":"synthetic-secret"}}),
         ].into() }),
         registry:registry.clone(), work:"/probe".into(), next_id:0, events:Vec::new(),
+        wait:Waiter::new(Deadline::new(&clock), "synthetic-secret"),
     };
     assert!(rpc.request("thread/archive", json!({"threadId":"foreign"})).is_err());
     assert!(rpc.create("not-a-probe").is_err());
@@ -951,4 +1222,293 @@ fn live_process_identity_parsing_handles_parentheses_and_records_start_time() {
     fields[0] = "Z";
     assert!(parse_process_stamp(456, &format!("456 (codex) {}", fields.join(" "))).unwrap().zombie);
     assert!(parse_process_stamp(456, "456 (short) S 123").is_err());
+}
+
+const WAIT_ID: &str = "01a0a609-12a6-7000-8000-000000000001";
+const WAIT_OTHER: &str = "01a0a609-12a6-7000-8000-000000000002";
+const WAIT_SECRET: &str = "secret\"\\value";
+
+#[derive(Default)]
+struct WaitClock(std::cell::Cell<Duration>);
+
+impl Clock for WaitClock {
+    fn now(&self) -> Duration { self.0.get() }
+}
+
+impl WaitClock {
+    fn advance(&self, duration: Duration) { self.0.set(self.0.get() + duration); }
+}
+
+fn scripted_live_rpc<'a>(
+    clock: &'a WaitClock, pause: &'a dyn Fn(Duration), results: Vec<Value>, budget: Duration,
+) -> (LiveRpc<'a>, Rc<RefCell<Vec<Value>>>) {
+    let mut registry = Registry::default();
+    registry.created(WAIT_ID, "ccmux-probe-waits").unwrap();
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let replies = results.into_iter().enumerate()
+        .map(|(id, result)| json!({"id":id,"result":result})).collect();
+    (LiveRpc {
+        transport:Box::new(FakeLiveTransport { sent:sent.clone(), replies }),
+        registry:Rc::new(RefCell::new(registry)), work:"/probe".into(), next_id:0, events:Vec::new(),
+        wait:Waiter::with_pause(Deadline { clock, end:clock.now() + budget }, WAIT_SECRET, pause),
+    }, sent)
+}
+
+fn turn_page(row: Value) -> Value {
+    if row.is_null() { json!({"data":[]}) } else { json!({"data":[row]}) }
+}
+
+#[test]
+fn live_turn_waits_through_index_lag_partial_and_unknown_statuses() {
+    for completed in [false, true] {
+        let clock = WaitClock::default();
+        let pause = |d| clock.advance(d);
+        let target = if completed { "completed" } else { "inProgress" };
+        let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, vec![
+            json!({"turn":{"id":"new-turn"}}),
+            turn_page(Value::Null),
+            turn_page(json!({"id":"old-turn","status":"completed"})),
+            turn_page(json!({"id":"new-turn"})),
+            turn_page(json!({"id":"new-turn","status":"future-status"})),
+            turn_page(json!({"id":"new-turn","status":target})),
+        ], Duration::from_secs(5));
+        let turn = rpc.start_turn(WAIT_ID, "trivial").unwrap();
+        let row = if completed { rpc.completed(WAIT_ID, &turn) } else { rpc.turn(WAIT_ID, &turn) }.unwrap();
+        assert_eq!(row["id"], "new-turn");
+        assert_eq!(row["status"], target);
+        assert_eq!(clock.now(), Duration::from_secs(1));
+        let calls = sent.borrow();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[0]["method"], "turn/start");
+        assert!(calls[1..].iter().all(|v| v["method"] == "thread/turns/list"
+            && v["params"]["threadId"] == WAIT_ID));
+    }
+}
+
+#[test]
+fn live_explicit_turn_failure_reports_the_redacted_error_payload() {
+    for status in ["failed","interrupted"] {
+        let clock = WaitClock::default();
+        let pause = |d| clock.advance(d);
+        let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, vec![
+            turn_page(Value::Null),
+            turn_page(json!({"id":"turn","status":status,"error":{
+                "message":format!("model failed {WAIT_SECRET}"),"code":"model_error",
+                "details":{"authorization":"another private credential"}
+            }})),
+        ], Duration::from_secs(5));
+        let error = rpc.completed(WAIT_ID, "turn").unwrap_err().to_string();
+        assert!(error.contains(status) && error.contains("model_error") && error.contains("model failed"));
+        assert!(error.contains("error:") && error.contains("redacted"));
+        assert!(!error.contains(WAIT_SECRET) && !error.contains("another private credential"));
+        assert_eq!(sent.borrow().len(), 2);
+        assert_eq!(clock.now(), Duration::from_millis(250)); // explicit failure does not wait out the budget
+    }
+}
+
+#[test]
+fn live_missing_and_unknown_turn_status_timeout_with_last_observation() {
+    for row in [Value::Null, json!({"id":"turn"}), json!({"id":"turn","status":"queued"}),
+        json!({"id":"turn","status":17})]
+    {
+        let clock = WaitClock::default();
+        let pause = |d| clock.advance(d);
+        let (mut rpc, sent) = scripted_live_rpc(&clock, &pause,
+            vec![turn_page(row.clone()); 4], Duration::from_secs(1));
+        let error = rpc.completed(WAIT_ID, "turn").unwrap_err().to_string();
+        assert!(error.contains("timed out waiting for turn completion"));
+        assert!(error.contains(WAIT_ID) && error.contains("turn turn") && error.contains("last observed:"));
+        assert!(error.contains(&format!("\"row\":{row}")));
+        assert_eq!(clock.now(), Duration::from_secs(1));
+        assert_eq!(sent.borrow().len(), 4);
+    }
+}
+
+#[test]
+fn live_active_completion_waits_for_items_after_the_completed_status() {
+    let clock = WaitClock::default();
+    let pause = |d| clock.advance(d);
+    let command = json!({"type":"commandExecution","command":"/usr/bin/sleep 60","exitCode":0});
+    let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, vec![
+        turn_page(json!({"id":"turn","status":"inProgress"})),
+        turn_page(json!({"id":"turn","status":"completed"})),
+        turn_page(json!({"id":"turn","status":"completed","items":[command.clone()]})),
+        turn_page(json!({"id":"turn","status":"completed","items":[command,
+            {"type":"agentMessage","text":"done"}]})),
+    ], Duration::from_secs(5));
+    let row = rpc.wait_turn(WAIT_ID, "turn", "completion evidence",
+        Duration::from_secs(5), active_completion_ready).unwrap();
+    assert!(active_completion_ready(&row));
+    assert_eq!(sent.borrow().len(), 4);
+    assert_eq!(clock.now(), Duration::from_millis(750));
+    // A completed first observation is still NOT an inProgress witness.
+    assert!(turn_visible(&row));
+    assert_ne!(row["status"], "inProgress");
+}
+
+#[test]
+fn live_thread_state_waits_for_loaded_membership_and_metadata_to_converge() {
+    for (loaded, status) in [(false, "notLoaded"), (true, "idle")] {
+        let clock = WaitClock::default();
+        let pause = |d| clock.advance(d);
+        let ids = if loaded { json!([WAIT_ID]) } else { json!([]) };
+        let stale = if loaded { "notLoaded" } else { "idle" };
+        let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, vec![
+            json!({"data":if loaded { json!([]) } else { json!([WAIT_ID]) }}),
+            json!({"thread":{"id":WAIT_ID,"status":{"type":stale}}}),
+            json!({"data":ids}),
+            json!({"thread":{"id":WAIT_ID,"status":null}}),
+            json!({"data":ids}),
+            json!({"thread":{"id":WAIT_ID,"status":{"type":status}}}),
+        ], Duration::from_secs(5));
+        assert_eq!(rpc.thread_state(WAIT_ID, status, loaded).unwrap()["status"]["type"], status);
+        assert_eq!(sent.borrow().len(), 6);
+        assert!(sent.borrow().iter().all(|v| matches!(v["method"].as_str(),
+            Some("thread/loaded/list" | "thread/read"))));
+        assert_eq!(clock.now(), Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn live_history_and_loaded_waits_retry_a_whole_paginated_observation() {
+    for history in [false, true] {
+        let clock = WaitClock::default();
+        let pause = |d| clock.advance(d);
+        let row = |id: &str| if history { json!({"id":id}) } else { json!(id) };
+        let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, vec![
+            json!({"data":[]}),
+            json!({"data":[row(WAIT_ID)],"nextCursor":"next-page"}),
+            json!({"data":[row(WAIT_OTHER)],"nextCursor":null}),
+        ], Duration::from_secs(5));
+        let ids = [WAIT_ID, WAIT_OTHER];
+        let pages = if history { rpc.history_ids(true, true, 1, &ids).unwrap().1 }
+            else { rpc.loaded_ids(1, &ids).unwrap().1 };
+        assert_eq!(pages, 2);
+        let calls = sent.borrow();
+        assert!(calls[0]["params"]["cursor"].is_null());
+        assert!(calls[1]["params"]["cursor"].is_null()); // start a new walk after the pending sample
+        assert_eq!(calls[2]["params"]["cursor"], "next-page");
+        if history { assert!(calls.iter().all(|v| v["params"]["useStateDbOnly"] == true)); }
+        assert_eq!(clock.now(), Duration::from_millis(250));
+    }
+}
+
+#[test]
+fn live_wait_timeout_retains_last_value_and_redacts_before_escaping_or_truncation() {
+    let clock = WaitClock::default();
+    let pause = |d| clock.advance(d);
+    let wait = Waiter::with_pause(Deadline::new(&clock), WAIT_SECRET, &pause);
+    let mut attempts = 0;
+    let error = wait.until("archived index row", || {
+        attempts += 1;
+        if attempts == 2 {
+            clock.advance(Duration::from_secs(1));
+            return Err(live_error(CodexError::timeout()));
+        }
+        Ok((None::<()>, json!({"stage":"index pending","message":format!("\u{1b}[31m{WAIT_SECRET}"),
+            "nested":{"api_key":"provider-key"},"padding":"x".repeat(5000)})))
+    }).unwrap_err();
+    let error = format!("{error:?} {error}");
+    let escaped = serde_json::to_string(WAIT_SECRET).unwrap();
+    assert!(error.contains("archived index row") && error.contains("index pending"));
+    assert!(error.contains("redacted") && error.contains("truncated"));
+    assert!(!error.contains(WAIT_SECRET) && !error.contains(&escaped[1..escaped.len()-1]));
+    assert!(!error.contains("provider-key") && !error.contains('\u{1b}'));
+
+    let clock = WaitClock::default();
+    let pause = |d| clock.advance(d);
+    let wait = Waiter::with_pause(Deadline::new(&clock), WAIT_SECRET, &pause);
+    let error = wait.until("ready within deadline", || {
+        clock.advance(Duration::from_secs(1));
+        Ok((Some(()), json!({"ready":true})))
+    }).unwrap_err().to_string();
+    assert!(error.contains("timed out waiting for ready within deadline") && error.contains("\"ready\":true"));
+}
+
+#[test]
+fn live_tui_readiness_waits_for_input_echo_and_launch_identity_without_branding() {
+    let clock = WaitClock::default();
+    let pause = |d| clock.advance(d);
+    let wait = Waiter::with_pause(Deadline { clock:&clock, end:Duration::from_secs(5) }, WAIT_SECRET, &pause);
+    let mut snapshots = std::collections::VecDeque::from([
+        json!({"latch":"","screen":""}),
+        json!({"latch":"","screen":"model:     loading\nResuming session…\n› Ask Codex"}),
+        json!({"latch":"","screen":"Codex new banner\n› Ask Codex"}),
+    ]);
+    wait.until("TUI input prompt", || {
+        let snapshot = snapshots.pop_front().unwrap();
+        Ok((composer_ready(&snapshot).then_some(()), snapshot))
+    }).unwrap();
+    assert_eq!(clock.now(), Duration::from_millis(500));
+    assert!(!command_visible(&json!({"latch":"","screen":"› /stat"}), "/status"));
+    assert!(command_visible(&json!({"latch":"","screen":"› /status"}), "/status"));
+    assert!(!status_identifies(&json!({"latch":"","screen":format!(
+        "Resuming {WAIT_ID}\n│ Session: {WAIT_OTHER} │")}), WAIT_ID));
+    assert!(status_identifies(&json!({"latch":"","screen":format!(
+        "│ Session: {}\n│ {} │\n› Ask Codex", &WAIT_ID[..20], &WAIT_ID[20..])}), WAIT_ID));
+    let parked = json!({"latch":"1","screen":format!(
+        "│ Session: {WAIT_ID} │\n[ccmux] Codex attach exited (rc=0). resume: {WAIT_ID}")});
+    assert!(!status_identifies(&parked, WAIT_ID) && !composer_ready(&parked));
+    let error = wait.scoped(Duration::from_millis(500)).until::<()>("TUI /status for launch id", || {
+        Ok((None, json!({"pane":"%3","screen":format!("last frame {WAIT_SECRET}")})))
+    }).unwrap_err().to_string();
+    assert!(error.contains("TUI /status for launch id") && error.contains("last frame"));
+    assert!(!error.contains(WAIT_SECRET));
+}
+
+#[test]
+fn live_cleanup_failure_keeps_the_case_condition_and_cleanup_diagnostic() {
+    let error = with_cleanup(&mut (), |_| bail!("turn visibility: last row null"),
+        |_| bail!("archive visibility: last row idle")).unwrap_err().to_string();
+    assert!(error.contains("cleanup FAILED"));
+    assert!(error.contains("turn visibility: last row null") && error.contains("archive visibility: last row idle"));
+}
+
+struct WaitDeadlineWire<'a> { clock: &'a WaitClock, armed: Cell<Duration> }
+
+impl Read for WaitDeadlineWire<'_> {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        self.clock.advance(self.armed.get());
+        Err(io::ErrorKind::WouldBlock.into())
+    }
+}
+
+impl Write for WaitDeadlineWire<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { Ok(bytes.len()) }
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+impl SocketIo for WaitDeadlineWire<'_> {
+    fn read_timeout(&self, duration: Duration) -> io::Result<()> { self.armed.set(duration); Ok(()) }
+    fn write_timeout(&self, _duration: Duration) -> io::Result<()> { Ok(()) }
+}
+
+#[test]
+fn live_scoped_deadline_reaches_socket_reads_and_restores_the_connection_budget() {
+    let clock = WaitClock::default();
+    let deadline = Deadline::new(&clock);
+    let stream = TimedStream { deadline, inner:WaitDeadlineWire {
+        clock:&clock, armed:Cell::new(Duration::ZERO),
+    }};
+    let socket = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None);
+    let mut transport = WsTransport { socket, deadline };
+    transport.set_deadline(Duration::from_millis(250));
+    let error = transport.receive().unwrap_err();
+    assert_eq!(error.diagnostic.kind, CodexFailureKind::Timeout);
+    assert_eq!(clock.now(), Duration::from_millis(250)); // not the connection's original one second
+
+    let clock = WaitClock::default();
+    let pause = |d| clock.advance(d);
+    let wait = Waiter::with_pause(Deadline::new(&clock), WAIT_SECRET, &pause);
+    for panic in [false, true] {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            wait.scoped(Duration::from_millis(100)).until::<()>("scoped read", || {
+                assert_eq!(wait.io_end.get(), Duration::from_millis(100));
+                if panic { panic!("test callback"); }
+                bail!("test read failure")
+            })
+        }));
+        if panic { assert!(result.is_err()); } else { assert!(result.unwrap().is_err()); }
+        assert_eq!(wait.io_end.get(), Duration::from_secs(1));
+    }
 }

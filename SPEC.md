@@ -5032,9 +5032,29 @@ returned ID in the in-memory ownership set and durable `registry.jsonl`
 BEFORE naming or sending turns; the name must carry the prefix. Record the
 installed CLI version and server `initialize.userAgent` (the latter is the
 server's self-report, not proof from the installed binary). Keep registries
-and result summaries under `~/.local/tmp/`; no credentials, raw wire errors,
-turn content, or pane captures go into logs. Test-only mutation access remains
-separate from the production lister's read-only method enum.
+and result summaries under `~/.local/tmp/`; no credentials or raw wire
+payloads go into logs. On failure, include a bounded, redacted last observation
+(owned turn/status/error or pane snapshot). Redact before escaping/truncating;
+retain both ends of large fields so a TUI prompt is not lost behind its header.
+Test-only mutation access remains separate from the production lister's
+read-only method enum.
+
+Mutation responses do not prove their effects are already visible. Wait for
+each setup observation under a named monotonic deadline: turn visibility
+15 s, completion 90 s, thread state / history visibility 15 s, and foreground
+command start 45 s, all within the 240 s case budget. Missing turn rows and
+absent/unrecognized statuses remain pending. Only explicit `failed` or
+`interrupted` turn statuses fail immediately with the redacted `error`
+payload; timeouts identify the condition and last observation. Scope RPC I/O
+to the active wait deadline using a test-only transport hook; production
+polling keeps its fixed deadline.
+
+For TUI readiness, wait for the composer (30 s), the literal slash command
+echo (10 s), then send Enter once and wait for `/status` to identify the
+launch thread (15 s). Do not depend on branding/banner text or a fixed sleep
+before Enter. Set owned windows to 180x48 explicitly. Park/client-exit waits
+are bounded too. Cleanup gets fresh exit/archive observation budgets and
+preserves its diagnostic alongside any original case failure.
 
 The shipped cases are:
 
@@ -5052,20 +5072,30 @@ The shipped cases are:
   fresh connections against both loaded and unloaded owned threads.
   `thread/unsubscribe` must report `notSubscribed` or `notLoaded`,
   respectively; loaded membership and `updatedAt` must remain unchanged.
+  Settle the fixture first, then keep the side-effect assertions strict:
+  retrying `thread/unsubscribe` could consume a regression and hide it.
 - **DB-only freshness, pagination, and poll cost:** materialize two owned
   threads with trivial turns; DB-only must see each BEFORE scan-and-repair.
   Compare metadata before/after a scan restricted to the unique probe cwd.
   Follow loaded/history cursors with page size 1 across both owned IDs.
   Run five complete production observations over the real population,
   require both owned rows, and record durations/p95 against the 1,000 ms
-  production poll budget. Do not copy other threads' content into artifacts.
-- **Graceful last-client exit with active completion:** after an owned
-  foreground `sleep 60` starts, attach the real TUI, close its creating RPC
-  client, and `/quit`. Require the production park wrapper's rc=0/latch.
+  production poll budget. First allow a bounded warm-up for both rows to
+  become visible; record warm-up attempts separately from the five measured
+  polls. All measured polls must complete. DB-only convergence must precede
+  any scan, and comparisons retain that pre-scan sample so repair cannot mask
+  a stale index. Do not copy other threads' content into artifacts.
+- **Graceful last-client exit with active completion:** materialize an owned
+  thread with a trivial turn and attach the real TUI BEFORE starting its
+  foreground `sleep 60`, so bootstrap cannot consume the active interval.
+  Observe command start, close the creating RPC client, and `/quit`.
+  Require the production park wrapper's rc=0/latch.
 - **Abrupt last-client exit with active completion:** the same setup, but
   kill ONLY the registered pane. In BOTH exit cases, require the SAME turn
   to be active after client exit, then complete with successful command
-  exit and final `done`, using read-only observers with no reattach.
+  exit and final `done`, using read-only observers with no reattach. Wait for
+  completion items as well as status; a completion-only first observation
+  cannot count as the required active witness.
   Verify exit of the client descendants recorded under each owned pane
   (PID plus start time, no argv/environ reads). These cases cover `kill-pane`,
   not a separate native-client SIGKILL.
