@@ -4753,11 +4753,21 @@ refines the contract; it does not turn unrun experiments into live findings.
   `active-sigkill`, and `active-graceful-valid`. The initial `active-pane`
   attempt showed zero-client progress but completed AFTER reattach; it is not
   a fourth completion proof and has no RPC `completion_check`.
-  The later operator rerun recorded early materialization turns as
-  `interrupted` with `error:null` (PROBE-FINDINGS §9). An early close by
-  the sole subscriber BEFORE a command is underway is a separate, unmeasured
-  boundary: the retained run does not prove close-before-result ordering.
-  Do not infer that cause from error-path disconnect/archive cleanup.
+- Follow-up probes on the same CLI/server pair established that an immediate
+  post-ack `thread/turns/list` snapshot can transiently return
+  `interrupted, error:null, items:[]` for a healthy turn (PROBE-FINDINGS §9):
+  A hit this at +2 ms before any close, then completed after creator loss.
+  B closed at +43 ms with zero items and completed without a subscriber.
+  Early graceful creator-only close did NOT cause interruption in those
+  trials; it is no longer a suspected explanation for the harness failures.
+  D's close-plus-live-archive trial recorded a real abort at +13 ms.
+  Together with the old harness control flow, this supports the sequence:
+  false history status → failed case → creator drop → archive cleanup →
+  actual abort. A cleanup-file timestamp does not independently timestamp
+  socket close. D combines close/archive in one trial; no abrupt RST or TUI
+  was involved, C supplied no new late-close evidence, and one clean early
+  read cannot rule out the race. Keep creator terminal notifications as the
+  harness's completion signal and distinguish teardown aborts from results.
   v1 starts no turns; this does not change its attach contract.
 - The CLI's authenticated remote guard rejects non-loopback `ws://`.
   v1 therefore uses loopback only, with an operator-owned SSH tunnel for a
@@ -5149,6 +5159,14 @@ The shipped cases are:
 Always close the owned clients and archive ONLY registered thread IDs;
 never delete. Cleanup runs after case failure/panic as well as success,
 attempts every registered ID, and verifies archival in DB-only history.
+Cleanup deliberately does NOT wait indefinitely for terminal state: it may
+archive a live or unknown-state turn and thereby interrupt it. This is
+permitted ONLY for the registered disposable probe threads, so failed/hung
+experiments leave no running probe work behind. Preserve the case's original
+failure; an archive-induced abort is a teardown effect and must never count
+as evidence that disconnect interrupted a turn or that a survival case
+passed. The creator notification and pre-cleanup completion checks remain
+the evidence gates.
 Remove the throwaway server only after verifying its owned session/pane
 inventory. Any archive, verification, or tmux cleanup failure FAILS the case;
 a passing body never overrides failed cleanup. Offline harness tests cover

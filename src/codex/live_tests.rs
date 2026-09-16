@@ -923,6 +923,11 @@ impl<'a> Harness<'a> {
         });
         if let Err(error) = clients_gone { errors.push(error.to_string()); }
         let ids: Vec<_> = self.registry.borrow().threads.keys().cloned().collect();
+        // Registered probe threads are disposable. Cleanup deliberately may
+        // archive a live/unknown-state turn and interrupt it, so a failed or
+        // hung experiment leaves no running probe work behind. Do not wait
+        // indefinitely for terminal state. These teardown aborts are NEVER
+        // lifecycle evidence; with_cleanup preserves the original failure.
         let archive = cleanup_owned(&ids, |id| {
             // Cleanup has a fresh budget, even when the test used all of its own.
             let mut rpc = self.rpc_until(self.clock.now() + Duration::from_secs(30))?;

@@ -634,46 +634,104 @@ and turn cwd; the thread's own cwd remained the default described below.
   **Consequence:** remote attach and ccmux's pane-closing `x` pass the active-work
   survival requirement for the measured server.
 
-- **Early materialization failures are not established last-client probes.**
-  Operator rerun on **2026-09-16**, CLI **0.154.0** / server **0.153.4**,
-  at commit `b979baa`. Method: the opt-in command in SPEC §12.11,
+- **Immediate history reads can falsely report interruption; cleanup can
+  then cause a real abort.** Operator probes on **2026-09-16**, CLI
+  **0.154.0** / server **0.153.4**. All follow-up timestamps below are UTC.
+  The `b979baa` opt-in rerun used the SPEC §12.11 command,
   `cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1`,
-  with the test-only URL/token-file settings. The graceful active-exit case
-  passed; abrupt active-exit, index/pagination, read-side-effect, and resume
-  cases failed while materializing a trivial luna/low turn. The reported
-  `thread/turns/list` rows had `status:"interrupted", error:null`.
-  An operator's separate hand-run on one connected client reached
-  `completed` and final `ready`.
+  with test-only URL/token-file settings. Graceful active exit passed;
+  abrupt active exit, index/pagination, metadata reads, and resume failed
+  while materializing a trivial luna/low turn. Their first history failures
+  reported `status:"interrupted", error:null` on the still-open creator
+  connection, before the case returned into cleanup.
 
-  Retained registries under `~/.local/tmp/ccmux-probe-640429-*/` identify
-  the four interrupted turns' threads as
-  `01a0a7b8-9845-7441-a5ee-4aaac28d8eca` (abrupt),
-  `01a0a7b9-d695-71b3-9162-55f146552756` (index-b),
-  `01a0a7b9-d9b9-7340-a7f3-83b5ce9620f3` (reads), and
-  `01a0a7b9-dca0-7850-b1dd-c3a1acf266a4` (resume).
-  Read-only inspection of their archived rollouts found `task_started`
-  followed by `turn_aborted(reason:"interrupted")` about 60–120 ms later.
-  Each registry records successful archive-only cleanup. The index-a and
-  graceful threads also appear in those registries and were archived.
+  Retained `~/.local/tmp/ccmux-probe-640429-*/registry.jsonl` files belong
+  to this rerun. The earlier `445554-*` / `454338-*` runs were
+  `b300222`, not `b979baa`. The four failed turns' threads were:
 
-  **Causal limit:** the operator suggested an early close by the only
-  subscriber, before the turn was underway. Code inspection finds that
-  `b979baa` already uses the SAME `LiveRpc` through
-  `materialize -> start_turn -> completed`. A deadline does not close a
-  socket asynchronously. The first interrupted history result causes that
-  function to return, drop its connection, and run archive cleanup; the
-  retained artifacts do not establish a creator close BEFORE that result.
-  Early creator-only disconnect as the cause is therefore **UNMEASURED**,
-  not a new lifecycle fact. These interruptions must not be confused with
-  the established-command survival evidence above.
+  | Case | Thread.id | Rollout task_started → turn_aborted |
+  |---|---|---|
+  | abrupt | `01a0a7b8-9845-7441-a5ee-4aaac28d8eca` | 63 ms |
+  | index-b | `01a0a7b9-d695-71b3-9162-55f146552756` | 122 ms |
+  | reads | `01a0a7b9-d9b9-7340-a7f3-83b5ce9620f3` | 64 ms |
+  | resume | `01a0a7b9-dca0-7850-b1dd-c3a1acf266a4` | 66 ms |
 
-  **Consequence:** keep one creator through the terminal notification,
-  matching the original `probe.py::wait_turn` method; do not use an immediate
-  history snapshot as that creator's completion signal. The harness now
-  records start, terminal, command-underway, handoff, and explicit close
-  events to make lifecycle ordering reviewable. Deliberate mid-turn release
-  requires an owned in-progress command item and a verified attached TUI.
-  This is an evidence/harness correction; v1 never starts turns.
+  Each archive-only cleanup succeeded. The final registry writes' mtimes
+  fall 43.29–43.39 ms AFTER the rollout aborts; the next run-directory
+  timestamps corroborate the cleanup boundary for the first three cases.
+  Those clocks do NOT timestamp the creator's close or prove it followed
+  the rollout abort. Code establishes the order: the same `LiveRpc`
+  starts and reads the turn; the bad row makes the case return and drop
+  the creator; cleanup then archives. The filesystem abort and the earlier
+  erroneous history status are different events.
+
+  **Controlled follow-up:** retained log
+  `/home/qdu/.claude/jobs/4fd85d5a/tmp/turnprobe/probe.jsonl`,
+  methods `probe.py::variant_a/b/c/d`, and the owned archived rollouts.
+  Four turns used `gpt-5.6-luna` / low, a read-only sandbox, never-approve
+  policy, and the foreground command `/usr/bin/sleep 25`, followed by
+  `done`. Reads used `thread/turns/list(limit:5,sortDirection:"desc",
+  itemsView:"full")`; observers never resumed or subscribed.
+
+  - **A — transient history status before any close:**
+    `01a0a83f-59de-7411-a5fd-cab4c986b216`.
+    Turn/start ack and rollout `task_started`: 03:25:19.795.
+    The SAME open creator read `interrupted, error:null, items:[]`
+    at 03:25:19.797 (ack +2 ms), then closed at that same logged
+    millisecond. The rollout has NO `turn_aborted`; its sleep exited 0
+    and `task_complete` is 03:25:50.784, about 31 s after close.
+    A fresh read at 03:26:02.778 reported `completed`.
+    The saved script was edited after A; its current keep-open loop does
+    not describe this recorded close. The log and rollout establish the
+    actual sequence: the false status preceded close, and completion did
+    not require a subscriber.
+  - **B — early creator-only close did not interrupt:**
+    `01a0a841-e840-78e2-8f61-8c6d58a1450d`.
+    Ack 03:28:07.318; the pre-close read at 03:28:07.360 (+42 ms)
+    was `inProgress` with zero items. Close finished at 03:28:07.361
+    (+43 ms). A previously connected, unsubscribed observer saw
+    `inProgress` through 03:28:37.474, then `completed` at
+    03:28:39.481. The rollout's actual `task_complete` is
+    03:28:39.194; no abort occurred, and the sleep exited 0.
+  - **C — no additional late-close evidence:**
+    `01a0a843-9712-7210-8229-073e1c1f2ab6`.
+    Its +42 ms early read was `inProgress`. The notification pump never
+    observed the required `item/started`, so the late-close variant
+    aborted its scenario. The turn completed at 03:30:28.722 BEFORE
+    creator close at 03:30:57.648. This is another control-open result;
+    late-close survival still rests on the original supported probes above.
+  - **D — close plus live archive produced a real abort:**
+    `01a0a845-61a8-79d1-bc9e-9ec55bc5915a`.
+    Ack / `task_started` and creator close were logged at
+    03:31:54.999. The next operation archived the live thread;
+    its rollout recorded `turn_aborted(reason:"interrupted")` at
+    03:31:55.012 (+13 ms), and archive returned successfully at
+    03:31:55.045. Reads remained interrupted through 03:33:53.424;
+    no completion appears in the rollout.
+
+  **Measured conclusion and limits:** A demonstrates a transient derived
+  history status for a healthy turn; A/B refute early graceful creator-only
+  close as the explanation for the harness failures. D reproduces the real
+  abort under live-thread archive cleanup. Combined with `b979baa`'s
+  control flow, the supported reconstruction is: false history interruption
+  → case failure → creator drop → archive cleanup → actual rollout abort.
+  D is one combined close+archive trial, not an independently varied
+  archive-only experiment. A/B isolate close without archive at their
+  measured timings; they are not a guarantee for all timings or versions.
+  Closes used graceful WebSocket close/process exit, not abrupt RST; no TUI
+  was attached. The transient row occurred in one of three early reads
+  (+2 ms, versus the two clean +42 ms reads); a clean read does not rule
+  out the race. All four follow-up IDs were verified in
+  `~/.codex/archived_sessions` and absent from `~/.codex/sessions`.
+  The separate empty dry-run thread was not one of these four turns.
+
+  **Consequence:** retain `adfc677`'s creator terminal-notification wait,
+  matching the original `probe.py::wait_turn`; never treat an immediate
+  post-ack history snapshot as the creator's terminal signal. This addresses
+  the demonstrated trigger. Cleanup may intentionally interrupt unfinished
+  registered probe turns (§12.11); its aborts are teardown effects, never
+  evidence of client-loss behavior. v1 starts no turns, so its attach
+  contract is unchanged.
 
 - **Pending approval survives disconnect and is shown on reattach.**
   Method: on `approval-last-client`, use per-thread
