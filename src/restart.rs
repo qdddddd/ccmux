@@ -320,6 +320,7 @@ pub fn agent_verdict(s: &Session) -> Verdict {
     match s.group() {
         Group::Idle | Group::Completed => Verdict::Restart,
         Group::Working | Group::Blocked => Verdict::Busy,
+        Group::Codex => Verdict::NotRunning,
     }
 }
 

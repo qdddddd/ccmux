@@ -81,9 +81,11 @@ Only loopback `ws://` is supported: `localhost`, `127.0.0.0/8` or
 `ssh -N -L 8965:127.0.0.1:8965 host`, then use the local URL above.
 
 The list includes loaded threads and unloaded threads updated in the last
-seven days, limited to persistent, top-level threads. `> ` marks Codex rows;
-`◇` means unloaded and appears under Completed. It does not establish the
-last turn's outcome.
+seven days, limited to persistent, top-level threads. They share a final
+**Codex** group, with blocked threads first and unloaded threads last.
+Names have no provider prefix. `◇` means unloaded; it does not establish
+the last turn's outcome. `a` hides unloaded Codex rows along with the
+Claude Completed group.
 
 `Enter/o/s/t` open the official Codex TUI; `x` closes a pane while work
 stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
@@ -117,7 +119,7 @@ are listed above.
 | `L` | Show the session's logs |
 | `d` / `u` | Hide the row from the list / undo the last hide |
 | `/` | Filter by name, cwd or short id |
-| `a` | Show or hide the Completed group |
+| `a` | Show or hide Completed and unloaded Codex rows |
 | `r` | Refresh, and re-assert the layout |
 | `R` | Restart ccmux and idle agents after an upgrade |
 | `?` | Help |
@@ -136,7 +138,9 @@ Pasted text is never run as keys.
 Claude rows list only background sessions: those started with `claude --bg` or `n`.
 Interactive Claude sessions cannot be attached into a split, so they are left out.
 
-Groups run **Blocked**, **Working**, **Idle**, **Completed**.
+Groups run **Blocked**, **Working**, **Idle**, **Completed**, **Codex**.
+The first four contain Claude rows; every Codex state stays in Codex.
+Empty groups have no header.
 
 | Glyph | Meaning |
 |---|---|

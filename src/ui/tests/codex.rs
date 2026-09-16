@@ -19,15 +19,17 @@ fn codex_degraded(app: &mut App) {
 }
 
 #[test]
-fn codex_states_and_marker_preserve_existing_row_geometry() {
+fn codex_states_keep_their_glyphs_in_the_provider_group() {
     use crate::model::CodexStatus;
     let cases = [
-        (CodexStatus::NotLoaded, Status::Idle, Some(State::Unloaded), "◇", "unloaded", Group::Completed),
-        (CodexStatus::Idle, Status::Idle, None, "○", "idle", Group::Idle),
-        (CodexStatus::SystemError, Status::Unknown("systemError".into()), None, "?", "systemError", Group::Idle),
-        (CodexStatus::Active { flags: vec![] }, Status::Busy, Some(State::Working), "●", "working", Group::Working),
-        (CodexStatus::Active { flags: vec!["newFlag".into()] }, Status::Unknown("newFlag".into()), Some(State::Working), "?", "unknown", Group::Working),
-        (CodexStatus::Active { flags: vec!["newFlag".into(), "waitingOnApproval".into()] }, Status::Waiting, Some(State::Blocked), "▲", "blocked", Group::Blocked),
+        (CodexStatus::NotLoaded, Status::Idle, Some(State::Unloaded), "◇", "unloaded", Group::Codex),
+        (CodexStatus::Idle, Status::Idle, None, "○", "idle", Group::Codex),
+        (CodexStatus::SystemError, Status::Unknown("systemError".into()), None, "?", "systemError", Group::Codex),
+        (CodexStatus::Unknown("future".into()), Status::Unknown("future".into()), None, "?", "unknown", Group::Codex),
+        (CodexStatus::Active { flags: vec![] }, Status::Busy, Some(State::Working), "●", "working", Group::Codex),
+        (CodexStatus::Active { flags: vec!["newFlag".into()] }, Status::Unknown("newFlag".into()), Some(State::Working), "?", "unknown", Group::Codex),
+        (CodexStatus::Active { flags: vec!["newFlag".into(), "waitingOnApproval".into()] }, Status::Waiting, Some(State::Blocked), "▲", "blocked", Group::Codex),
+        (CodexStatus::Active { flags: vec!["waitingOnUserInput".into()] }, Status::Waiting, Some(State::Blocked), "▲", "blocked", Group::Codex),
     ];
     for (runtime, status, state, glyph, detail, group) in cases {
         let row = codex_row(runtime, status, state);
@@ -40,7 +42,7 @@ fn codex_states_and_marker_preserve_existing_row_geometry() {
             let line = session_line(&app, &row, true, w as usize, &p);
             assert_eq!(line_w(&line), w as usize);
             if w >= 6 {
-                assert!(line.spans.iter().any(|s| s.content == "> " && s.style.fg == Some(p.gray)));
+                assert!(!line.spans.iter().any(|s| s.content == "> "));
             }
         }
         let rendered = rows_at(&app, 60, 24).join("\n");
@@ -51,10 +53,32 @@ fn codex_states_and_marker_preserve_existing_row_geometry() {
     }
 }
 
+fn codex_fleet() -> Vec<Session> {
+    use crate::model::CodexStatus;
+    vec![
+        codex_row(CodexStatus::NotLoaded, Status::Idle, Some(State::Unloaded)),
+        codex_row(CodexStatus::Idle, Status::Idle, None),
+        codex_row(CodexStatus::SystemError, Status::Unknown("systemError".into()), None),
+        codex_row(CodexStatus::Unknown("future".into()), Status::Unknown("future".into()), None),
+        codex_row(CodexStatus::Active { flags: vec![] }, Status::Busy, Some(State::Working)),
+        codex_row(CodexStatus::Active { flags: vec!["newFlag".into()] },
+            Status::Unknown("newFlag".into()), Some(State::Working)),
+        codex_row(CodexStatus::Active { flags: vec!["newFlag".into(), "waitingOnApproval".into()] },
+            Status::Waiting, Some(State::Blocked)),
+        codex_row(CodexStatus::Active { flags: vec!["waitingOnUserInput".into()] },
+            Status::Waiting, Some(State::Blocked)),
+    ].into_iter().enumerate().map(|(i, mut s)| {
+        s.session_id = format!("01a00000-1111-7222-8333-{:012x}", i + 100);
+        s.id = Some(format!("{:08x}", i + 100));
+        s.name = format!("Codex task {i}");
+        s
+    }).collect()
+}
+
 #[test]
 fn mixed_provider_render_matrix_covers_standing_errors_flashes_and_drift() {
     let mut sessions = many(20);
-    sessions.push(codex_row(crate::model::CodexStatus::NotLoaded, Status::Idle, Some(State::Unloaded)));
+    sessions.extend(codex_fleet());
     for dark in [false, true] {
         let mut app = app_with(sessions.clone());
         app.dark = dark;
@@ -165,5 +189,120 @@ fn both_providers_cwd_render_without_controls_at_every_size() {
         assert!(rows_at(&app, 34, 24).join("\n").contains("/safe/ab"));
         assert_eq!(app.sessions[0].cwd, cwd, "render must not change the stored path");
         assert!(app.sessions[0].filter_haystack().contains(&cwd.to_lowercase()));
+    }
+}
+
+#[test]
+fn the_codex_group_reclaims_the_marker_columns_at_every_width() {
+    let mut row = codex_row(crate::model::CodexStatus::Idle, Status::Idle, None);
+    for name in ["abcdefghijklmnopqrstuvwxyz123456789", "> literal name", "汉字名字🙂长名字"] {
+        row.name = name.into();
+        let mut claude = row.clone();
+        claude.provider = Provider::Claude;
+        claude.codex = None;
+        for dark in [false, true] {
+            let mut app = app_with(vec![row.clone()]);
+            app.dark = dark;
+            let p = Palette::for_app(&app);
+            for selected in [false, true] {
+                for w in 0..=120 {
+                    assert_eq!(session_line(&app, &row, selected, w, &p),
+                        session_line(&app, &claude, selected, w, &p),
+                        "{w} columns, name {name:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_group_counts_only_visible_rows_and_preserves_state_contrast() {
+    for dark in [false, true] {
+        let mut app = app_with(codex_fleet());
+        app.dark = dark;
+        let p = Palette::for_app(&app);
+        assert_eq!(app.rows[0], Row::Header { group: Group::Codex, count: 8 });
+        let drawn = rows_at(&app, 34, 24);
+        assert_eq!(drawn[1].trim(), "── Codex                       8");
+        for s in &app.sessions {
+            let want = match s.state {
+                Some(State::Blocked | State::Working) => p.fg,
+                Some(State::Unloaded) => p.dim,
+                _ => p.gray,
+            };
+            assert_eq!(name_tier(s, &p), want);
+        }
+        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE));
+        assert_eq!(app.rows[0], Row::Header { group: Group::Codex, count: 7 });
+        let drawn = rows_at(&app, 34, 24);
+        assert_eq!(drawn[1].trim(), "── Codex                       7");
+        assert!(!drawn.join("\n").contains('◇'));
+        assert!(drawn.join("\n").contains('▲'));
+    }
+}
+
+#[test]
+fn every_codex_state_is_visible_when_selected_across_the_render_matrix() {
+    let mut sessions = many(7);
+    sessions.extend(codex_fleet());
+    for dark in [false, true] {
+        for &(w, h) in SIZES {
+            for idx in 7..sessions.len() {
+                let mut app = app_with(sessions.clone());
+                app.dark = dark;
+                app.codex.settings.url = "ws://localhost".into();
+                app.viewport = list_viewport_rows(h);
+                app.selected_key = Some(app.sessions[idx].session_id.clone());
+                app.reanchor_selection();
+                let drawn = rows_at(&app, w, h);
+                assert_eq!(app.sessions[idx].group(), Group::Codex);
+                if w > 0 && h >= 3 {
+                    let (glyph, _) = status_glyph(&app.sessions[idx], &Palette::for_app(&app));
+                    assert_eq!(app.rows[app.selected], Row::Session { idx });
+                    let y = 1 + app.selected - app.scroll;
+                    assert!(y <= app.viewport as usize, "{w}x{h}: selection is outside the viewport");
+                    let x = if w < 20 { 0 } else { 2 };
+                    assert_eq!(drawn[y].chars().nth(x).unwrap().to_string(), glyph,
+                        "{w}x{h}, {:?}: {drawn:?}", app.sessions[idx].state);
+                }
+                for line in drawn { assert_eq!(display_width(&line), w as usize); }
+            }
+        }
+    }
+}
+
+#[test]
+fn claude_only_list_matches_the_pre_codex_group_baseline() {
+    let mut app = app_with(many(7));
+    app.sessions.iter_mut().enumerate().for_each(|(i, s)| s.name = format!("Claude {i}"));
+    // Captured before the fifth-group change, including spaces and row order.
+    let expected = [
+        " ── Blocked                     2 ",
+        "▏ ▲ Claude 6                   1h ",
+        "  ▲ Claude 4                   1h ",
+        "                                  ",
+        " ── Working                     2 ",
+        "  ◐ Claude 1                   1h ",
+        "  ● Claude 0                   1h ",
+        "                                  ",
+        " ── Idle                        1 ",
+        "  ? Claude 3                   1h ",
+        "                                  ",
+        " ── Completed                   2 ",
+        "  ■ Claude 5                   1h ",
+        "  ✓ Claude 2                   1h ",
+        "                                  ",
+        "                                  ",
+        "                                  ",
+    ];
+    for dark in [false, true] {
+        app.dark = dark;
+        for codex_enabled in [false, true] {
+            app.codex.settings.url = if codex_enabled { "ws://localhost".into() } else { String::new() };
+            let drawn = rows_at(&app, 34, 24);
+            assert_eq!(&drawn[1..18], &expected);
+            assert!(!app.rows.iter().any(|r| matches!(r, Row::Header { group: Group::Codex, .. })));
+        }
     }
 }

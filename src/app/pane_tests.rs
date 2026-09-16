@@ -409,10 +409,11 @@ fn moving_from_a_claude_delete_window_to_codex_disarms_it() {
         claude.state = Some(State::Stopped);
         a.sessions.push(claude);
         a.rebuild_rows();
-        a.select_last();
+        a.select_first(); // Completed now precedes the final Codex group.
+        assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
         a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(a.stop_arm.is_some());
-        press(a, 'g');
+        press(a, 'G');
         assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
         assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
         assert!(server.borrow().calls.is_empty());

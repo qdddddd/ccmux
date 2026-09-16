@@ -226,24 +226,24 @@ fn name_fallback_and_control_stripping() {
 #[test]
 fn all_status_rows_and_flags_map_without_worker_inference() {
     let cases = [
-        (json!({"type":"notLoaded"}), Status::Idle, Some(State::Unloaded), Group::Completed, CodexStatus::NotLoaded),
-        (json!({"type":"idle"}), Status::Idle, None, Group::Idle, CodexStatus::Idle),
-        (json!({"type":"systemError"}), Status::Unknown("systemError".into()), None, Group::Idle, CodexStatus::SystemError),
-        (json!({"type":"active","activeFlags":[]}), Status::Busy, Some(State::Working), Group::Working,
+        (json!({"type":"notLoaded"}), Status::Idle, Some(State::Unloaded), Group::Codex, CodexStatus::NotLoaded),
+        (json!({"type":"idle"}), Status::Idle, None, Group::Codex, CodexStatus::Idle),
+        (json!({"type":"systemError"}), Status::Unknown("systemError".into()), None, Group::Codex, CodexStatus::SystemError),
+        (json!({"type":"active","activeFlags":[]}), Status::Busy, Some(State::Working), Group::Codex,
             CodexStatus::Active { flags: vec![] }),
         (json!({"type":"active","activeFlags":["waitingOnApproval"]}),
-            Status::Waiting, Some(State::Blocked), Group::Blocked,
+            Status::Waiting, Some(State::Blocked), Group::Codex,
             CodexStatus::Active { flags: vec!["waitingOnApproval".into()] }),
         (json!({"type":"active","activeFlags":["waitingOnUserInput"]}),
-            Status::Waiting, Some(State::Blocked), Group::Blocked,
+            Status::Waiting, Some(State::Blocked), Group::Codex,
             CodexStatus::Active { flags: vec!["waitingOnUserInput".into()] }),
         (json!({"type":"active","activeFlags":["zFuture","waitingOnApproval","aFuture","zFuture"]}),
-            Status::Waiting, Some(State::Blocked), Group::Blocked,
+            Status::Waiting, Some(State::Blocked), Group::Codex,
             CodexStatus::Active { flags: vec!["aFuture".into(), "waitingOnApproval".into(), "zFuture".into()] }),
         (json!({"type":"active","activeFlags":["zFuture","aFuture","zFuture"]}),
-            Status::Unknown("aFuture, zFuture".into()), Some(State::Working), Group::Working,
+            Status::Unknown("aFuture, zFuture".into()), Some(State::Working), Group::Codex,
             CodexStatus::Active { flags: vec!["aFuture".into(), "zFuture".into()] }),
-        (json!({"type":"future"}), Status::Unknown("future".into()), None, Group::Idle,
+        (json!({"type":"future"}), Status::Unknown("future".into()), None, Group::Codex,
             CodexStatus::Unknown("future".into())),
     ];
     for (runtime, status, state, group, expected) in cases {

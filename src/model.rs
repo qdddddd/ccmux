@@ -109,14 +109,15 @@ pub enum State {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
-    /// FIRST, above Working, and the discriminants say so: a blocked session is
-    /// the only kind that cannot advance one token until the operator answers
-    /// it, so it is the first thing on screen. `build_rows` walks `all()` in
-    /// this order and `Ord` is derived from it.
+    /// Claude's FIRST group, above Working: it cannot advance until the
+    /// operator answers. `build_rows` walks `all()` in this order and
+    /// `Ord` is derived from it.
     Blocked = 0,
     Working = 1,
     Idle = 2,
     Completed = 3,
+    /// All Codex states stay together, after the four Claude groups.
+    Codex = 4,
 }
 
 impl Group {
@@ -126,11 +127,12 @@ impl Group {
             Group::Working => "Working",
             Group::Idle => "Idle",
             Group::Completed => "Completed",
+            Group::Codex => "Codex",
         }
     }
 
-    pub fn all() -> [Group; 4] {
-        [Group::Blocked, Group::Working, Group::Idle, Group::Completed]
+    pub fn all() -> [Group; 5] {
+        [Group::Blocked, Group::Working, Group::Idle, Group::Completed, Group::Codex]
     }
 
     /// SPEC §3.1 surface. `App::cycle_group` walks `rows`' header positions
@@ -141,7 +143,8 @@ impl Group {
             Group::Blocked => Group::Working,
             Group::Working => Group::Idle,
             Group::Idle => Group::Completed,
-            Group::Completed => Group::Blocked,
+            Group::Completed => Group::Codex,
+            Group::Codex => Group::Blocked,
         }
     }
 
@@ -149,10 +152,11 @@ impl Group {
     #[allow(dead_code)]
     pub fn prev(self) -> Group {
         match self {
-            Group::Blocked => Group::Completed,
+            Group::Blocked => Group::Codex,
             Group::Working => Group::Blocked,
             Group::Idle => Group::Working,
             Group::Completed => Group::Idle,
+            Group::Codex => Group::Completed,
         }
     }
 }
@@ -220,7 +224,7 @@ impl Session {
         &self.session_id
     }
 
-    /// Grouping rule, mirroring the stock fleet view:
+    /// Codex always has its own group. Claude keeps the stock fleet rule:
     ///   Some(Done) | Some(Stopped) | Some(Unloaded) -> Group::Completed
     ///   Some(Blocked)                 -> Group::Blocked
     ///   status == Waiting             -> Group::Blocked
@@ -248,14 +252,14 @@ impl Session {
     /// but not first, and not what `Tab` lands on — which is the same burial
     /// this whole change exists to undo, one field over.
     ///
-    /// `ui::status_glyph` asks THIS function for the blocked verdict rather
-    /// than re-deriving it, so the mark on the row and the heading above it
+    /// For Claude, `ui::status_glyph` asks THIS function for the blocked
+    /// verdict rather than re-deriving it, so the mark and heading
     /// cannot disagree. `the_blocked_glyph_and_the_blocked_group_never_disagree`
     /// pins that across the whole state x status matrix.
     pub fn group(&self) -> Group {
+        if self.provider == Provider::Codex { return Group::Codex; }
         match &self.state {
-            // Completed wins. Unloaded is a server-loading fact, not a verdict
-            // on the last turn, but it shares this reviewable group (§12.3).
+            // Claude's terminal states still outrank a stale waiting status.
             Some(State::Done) | Some(State::Stopped) | Some(State::Unloaded) => Group::Completed,
             Some(State::Blocked) => Group::Blocked,
             // Either axis, at every state that is still running.
@@ -265,6 +269,18 @@ impl Session {
                 Status::Busy => Group::Working,
                 _ => Group::Idle,
             },
+        }
+    }
+
+    /// Codex's normalized state orders its own group (§12.3). Unknown-only
+    /// active flags still carry Working; systemError has no known state.
+    fn codex_state_rank(&self) -> u8 {
+        match self.state {
+            Some(State::Blocked) => 0,
+            Some(State::Working) => 1,
+            Some(State::Unloaded) => 4,
+            None if self.status == Status::Idle => 2,
+            _ => 3,
         }
     }
 
@@ -477,12 +493,12 @@ pub enum Row {
 }
 
 /// Build the flat render list: for each group in Blocked, Working, Idle,
-/// Completed order, emit a `Header` (only if the group has >=1 matching session) followed
+/// Completed, Codex order, emit a `Header` (only if it has matching sessions) followed
 /// by its `Session` rows. Groups after the first are preceded by a `Spacer`.
 ///
 /// Filtering: case-insensitive substring of `filter` against
 /// `Session::filter_haystack()`. An empty `filter` matches everything.
-/// `show_completed == false` omits the Completed group entirely.
+/// `show_completed == false` omits Completed and Codex's Unloaded rows.
 /// `hidden` holds `session_id`s dismissed with `d`; they are omitted too.
 ///
 /// All three filters live here, in the one pure function, so they cannot
@@ -492,7 +508,8 @@ pub enum Row {
 /// `sessions`: the full poll stays intact, so `total` still counts the
 /// dismissed session and reconciliation can still see that it is alive.
 ///
-/// Within a group, sessions sort by `started_at` DESCENDING (newest first),
+/// Codex sorts by state rank first; Claude keeps its existing order.
+/// Within each rank/group, sort by `started_at` DESCENDING (newest first),
 /// tie-broken by `session_id` ASCENDING so the order is total and stable.
 pub fn build_rows(
     sessions: &[Session],
@@ -504,10 +521,12 @@ pub fn build_rows(
     let matching: Vec<usize> = (0..sessions.len())
         .filter(|&i| !hidden.iter().any(|h| h == &sessions[i].session_id))
         .filter(|&i| needle.is_empty() || sessions[i].filter_haystack().contains(&needle))
+        .filter(|&i| show_completed || sessions[i].provider != Provider::Codex
+            || sessions[i].state != Some(State::Unloaded))
         .collect();
 
-    // 4 headers + 3 spacers in the worst case.
-    let mut rows = Vec::with_capacity(matching.len() + 7);
+    // 5 headers + 4 spacers in the worst case.
+    let mut rows = Vec::with_capacity(matching.len() + 9);
     for group in Group::all() {
         if group == Group::Completed && !show_completed {
             continue;
@@ -521,9 +540,12 @@ pub fn build_rows(
             continue;
         }
         in_group.sort_by(|&a, &b| {
-            sessions[b]
-                .started_at
-                .cmp(&sessions[a].started_at)
+            let rank = if group == Group::Codex {
+                sessions[a].codex_state_rank().cmp(&sessions[b].codex_state_rank())
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            rank.then_with(|| sessions[b].started_at.cmp(&sessions[a].started_at))
                 .then_with(|| sessions[a].session_id.cmp(&sessions[b].session_id))
         });
         if !rows.is_empty() {
@@ -1074,17 +1096,21 @@ mod tests {
         assert_eq!(Group::Working.title(), "Working");
         assert_eq!(Group::Idle.title(), "Idle");
         assert_eq!(Group::Completed.title(), "Completed");
+        assert_eq!(Group::Codex.title(), "Codex");
         assert_eq!(
             Group::all(),
-            [Group::Blocked, Group::Working, Group::Idle, Group::Completed]
+            [Group::Blocked, Group::Working, Group::Idle, Group::Completed, Group::Codex]
         );
         assert_eq!(Group::Blocked.next(), Group::Working);
         assert_eq!(Group::Working.next(), Group::Idle);
-        assert_eq!(Group::Completed.next(), Group::Blocked);
-        assert_eq!(Group::Blocked.prev(), Group::Completed);
+        assert_eq!(Group::Completed.next(), Group::Codex);
+        assert_eq!(Group::Codex.next(), Group::Blocked);
+        assert_eq!(Group::Blocked.prev(), Group::Codex);
+        assert_eq!(Group::Codex.prev(), Group::Completed);
         assert_eq!(Group::Working.prev(), Group::Blocked);
         assert!(Group::Blocked < Group::Working);
         assert!(Group::Working < Group::Idle && Group::Idle < Group::Completed);
+        assert!(Group::Completed < Group::Codex);
     }
 
     /// `all()` is the ONE order `build_rows` walks, `next`/`prev` are a second
@@ -1490,12 +1516,12 @@ mod tests {
     }
 
     #[test]
-    fn unloaded_is_completed_but_codex_never_has_a_claude_worker() {
+    fn unloaded_stays_in_codex_and_never_has_a_claude_worker() {
         for status in [Status::Idle, Status::Busy, Status::Waiting, Status::Unknown("new".into())] {
             let mut row = sess(Some("12345678"), status, Some(State::Unloaded));
             row.provider = Provider::Codex;
             row.codex = Some(CodexMeta { updated_at: 42, runtime: CodexStatus::NotLoaded });
-            assert_eq!(row.group(), Group::Completed);
+            assert_eq!(row.group(), Group::Codex);
             for pid in [None, Some(42)] {
                 row.pid = pid;
                 assert!(!row.has_worker(), "even a corrupt Codex pid is not worker evidence");
@@ -1505,6 +1531,89 @@ mod tests {
         assert!(!claude.has_worker());
         claude.pid = Some(42);
         assert!(claude.has_worker());
+    }
+
+    #[test]
+    fn codex_group_precedes_every_state_and_status_rule() {
+        for state in [None, Some(State::Working), Some(State::Blocked),
+            Some(State::Done), Some(State::Stopped), Some(State::Unloaded),
+            Some(State::Unknown("future".into()))]
+        {
+            for status in [Status::Busy, Status::Idle, Status::Waiting, Status::Unknown("future".into())] {
+                let mut row = sess(Some("12345678"), status, state.clone());
+                row.provider = Provider::Codex;
+                assert_eq!(row.group(), Group::Codex, "{:?} {:?}", row.state, row.status);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_rows_sort_by_state_then_creation_time_then_full_id() {
+        let states = [
+            ("blocked", Status::Waiting, Some(State::Blocked)),
+            ("working", Status::Busy, Some(State::Working)),
+            ("idle", Status::Idle, None),
+            ("unknown", Status::Unknown("systemError".into()), None),
+            ("unloaded", Status::Idle, Some(State::Unloaded)),
+        ];
+        let mut rows = vec![sess(Some("claude"), Status::Idle, Some(State::Done))];
+        rows[0].session_id = "claude".into();
+        let mut expected = Vec::new();
+        for (rank, (label, status, state)) in states.into_iter().enumerate() {
+            // Lower-priority states are newer, so age alone gives the WRONG order.
+            for (suffix, time) in [("c", 1), ("b", 2), ("a", 2)] {
+                let mut row = sess(Some("12345678"), status.clone(), state.clone());
+                row.provider = Provider::Codex;
+                row.session_id = format!("{label}-{suffix}");
+                row.started_at = rank as i64 * 100 + time;
+                // Unrecognized active flags retain the Working rank.
+                if label == "working" && suffix == "a" { row.status = Status::Unknown("newFlag".into()); }
+                // systemError and unknown tags share one rank.
+                if label == "unknown" && suffix == "b" { row.status = Status::Unknown("future".into()); }
+                rows.push(row);
+            }
+            expected.extend(["a", "b", "c"].map(|suffix| format!("{label}-{suffix}")));
+        }
+        expected.insert(0, "claude".into());
+        for _ in 0..rows.len() {
+            rows.rotate_left(1);
+            let view = build_rows(&rows, "", true, &[]);
+            let headers: Vec<_> = view.iter().filter_map(|r| match r {
+                Row::Header { group, count } => Some((*group, *count)), _ => None,
+            }).collect();
+            assert_eq!(headers, [(Group::Completed, 1), (Group::Codex, 15)]);
+            let ids: Vec<_> = view.iter().filter_map(|r| match r {
+                Row::Session { idx } => Some(rows[*idx].session_id.clone()), _ => None,
+            }).collect();
+            assert_eq!(ids, expected);
+        }
+    }
+
+    #[test]
+    fn hiding_finished_work_filters_codex_unloaded_before_counting() {
+        let mut done = sess(Some("done"), Status::Idle, Some(State::Done));
+        done.session_id = "done".into();
+        let mut unloaded = sess(Some("unloaded"), Status::Idle, Some(State::Unloaded));
+        unloaded.provider = Provider::Codex;
+        unloaded.session_id = "unloaded".into();
+        let mut idle = sess(Some("idle"), Status::Idle, None);
+        idle.provider = Provider::Codex;
+        idle.session_id = "idle".into();
+        let rows = [done, unloaded, idle];
+        assert_eq!(build_rows(&rows, "", false, &[]), [
+            Row::Header { group: Group::Codex, count: 1 }, Row::Session { idx: 2 },
+        ]);
+        assert!(build_rows(&rows, "", false, &["idle".into()]).is_empty());
+        assert!(build_rows(&rows, "unloaded", false, &[]).is_empty());
+        assert_eq!(build_rows(&rows, "unloaded", true, &[]), [
+            Row::Header { group: Group::Codex, count: 1 }, Row::Session { idx: 1 },
+        ]);
+        let view = build_rows(&rows, "", true, &[]);
+        assert_eq!(view, [
+            Row::Header { group: Group::Completed, count: 1 }, Row::Session { idx: 0 },
+            Row::Spacer, Row::Header { group: Group::Codex, count: 2 },
+            Row::Session { idx: 2 }, Row::Session { idx: 1 },
+        ]);
     }
 
     #[test]

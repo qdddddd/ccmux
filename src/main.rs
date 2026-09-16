@@ -1238,7 +1238,7 @@ mod tests {
         // The other direction, for the two values that shipped unmodelled: the
         // spec must NAME them, because the glyph table and the state list are
         // where the next implementer looks before touching `model::State`.
-        for needle in ["[Group; 4]", "Blocked = 0", "Blocked", "Stopped", "Waiting"] {
+        for needle in ["[Group; 5]", "Codex = 4", "Blocked = 0", "Blocked", "Stopped", "Waiting"] {
             assert!(
                 SPEC.contains(needle),
                 "SPEC.md does not declare {needle:?}, which the crate has"

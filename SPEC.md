@@ -374,7 +374,9 @@ Signatures below are authoritative. Bodies are the owner's business.
 
 ### 3.1 `src/model.rs` — owner: Scaffold
 
-**AMENDED BY §12.3:** provider identity, Codex metadata, and the Unloaded state.
+**AMENDED BY §12.3:** provider identity, Codex metadata, Unloaded, and the
+five-variant Group surface. Codex grouping and state-rank sorting supersede
+the four-group signatures/rules below for Codex rows; Claude rules remain.
 
 Pure data + parsing + grouping + formatting. No IO, no process spawning, no
 tmux, no ratatui. Fully unit-testable.
@@ -1823,6 +1825,10 @@ result in `App::viewport`; `app.rs` reads that field and never recomputes it.
 
 ### 6.3 Group headers
 
+**AMENDED BY §§12.3, 12.6:** a fifth, last Codex group with a visible-row
+count and an aqua chip. Blocked Codex rows stay there; the four groups and
+the sample below describe Claude rows.
+
 Rendered only for non-empty groups. The title starts on column 5 — the same
 column the session names start on, so it reads as a column heading — and the
 count's last cell sits on the rail at column W-1. At W=34:
@@ -1851,7 +1857,10 @@ coloured `Blocked 2` alone, truncated to W. Header rows are never selectable;
 
 ### 6.4 Session rows — one line each
 
-**AMENDED BY §§12.3, 12.6:** Codex labels, status mapping, and the Unloaded glyph.
+**AMENDED BY §§12.3, 12.6:** Codex's own group, state glyphs, and Unloaded.
+Codex rows use the full name budget without a provider prefix; their glyphs
+and name contrast follow state rather than the provider heading. The
+glyph/group agreement rule below remains authoritative for Claude.
 
 Fixed-width row, left to right:
 
@@ -2129,6 +2138,9 @@ agent and return immediately`).
 Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 
 ### 8.1 Normal mode
+
+**AMENDED BY §§12.6, 12.8:** Tab/Shift-Tab include the fifth Codex group,
+skipping empty groups; `a` hides Completed and Codex Unloaded rows.
 
 | Key | Action | Destructive? |
 |---|---|---|
@@ -3444,7 +3456,9 @@ the CLI omits `id`, so a **listed** row can reach it.
 
 ### 10.1 Unit tests (no tmux, no `claude`; run in CI)
 
-**AMENDED BY §12.11:** add parser, mapping, union, compatibility, and verb-routing fixtures.
+**AMENDED BY §12.11:** add parser, mapping, union, compatibility, verb-routing,
+and five-group fixtures. The glyph/group equivalence below applies to Claude;
+blocked Codex rows keep `▲` inside their own provider group.
 
 **model.rs (Scaffold)**
 - `parse_sessions` on the exact 4-element payload in PROBE-FINDINGS §1 yields 4
@@ -3996,6 +4010,21 @@ pub struct CodexMeta {
 // pub codex: Option<CodexMeta>,
 // State gains:
 // Unloaded,
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    Blocked = 0,
+    Working = 1,
+    Idle = 2,
+    Completed = 3,
+    Codex = 4,
+}
+impl Group {
+    pub fn title(self) -> &'static str; // adds "Codex"
+    pub fn all() -> [Group; 5];        // Blocked, Working, Idle, Completed, Codex
+    pub fn next(self) -> Group;        // same order, Codex wraps to Blocked
+    pub fn prev(self) -> Group;        // reverse, Blocked wraps to Codex
+}
 ```
 
 Every Claude parser result has `provider=Claude, codex=None`. Every Codex
@@ -4019,11 +4048,23 @@ as its full key. A same-key/different-provider conflict is refused and reported,
 never overwritten or routed to Claude. This adds routing checks, not a new
 composite key throughout app.rs.
 
+**Provider grouping precedes every state/status rule.**
+`Session::group()` returns `Group::Codex` for `provider == Codex`,
+including blocked, unloaded, unknown, and systemError rows. Claude retains
+§3.1's resolution order. Walk the groups as Blocked, Working, Idle, Completed,
+Codex. Empty groups emit no header or spacer, so a Claude-only list is
+unchanged. A blocked Codex thread stays in Codex; it is never hoisted into
+the Claude Blocked group.
+
+Within Codex, sort by the state rank below ASCENDING, then `started_at`
+DESCENDING, then full `session_id` ASCENDING. This puts requests for the
+operator first and unloaded rows last without splitting the provider section.
+Claude keeps its existing creation-time/id ordering.
 Codex normally uses `started_at = Thread.createdAt * 1000`; §12.5's
 step-3-only display anchor is the exception for read-time fallback metadata.
-Group sorting and displayed age remain creation-based (§3.1), not last-turn
-age. The seven-day window uses fresh `Thread.updatedAt * 1000` separately,
-with checked integer conversion.
+Displayed age and the within-rank time ordering are creation-based, not
+last-turn age. The seven-day window uses fresh `Thread.updatedAt * 1000`
+separately, with checked integer conversion.
 Display `Thread.cwd` exactly through the existing path shortener. Do not
 substitute the pane cwd, launch thread's cwd, or the last turn's cwd.
 Use nonblank `Thread.name`, else the first nonblank line of `Thread.preview`,
@@ -4033,28 +4074,29 @@ State mapping is resolved in this order. Flag arrays are sorted/deduplicated
 for stable equality/fingerprints, while every unknown value remains available
 to drift reporting.
 
-| Codex runtime value | Shared status / state | Group | Glyph / meaning |
-|---|---|---|---|
-| `notLoaded` | Idle / Unloaded | Completed | `◇`, unloaded; resume via TUI |
-| `idle` | Idle / None | Idle | `○`, ready for input |
-| `systemError` | Unknown("systemError") / None | Idle | `?`, runtime error |
-| `active` with either known blocking flag | Waiting / Blocked | Blocked | `▲`, needs the operator |
-| `active` with an empty flag array | Busy / Working | Working | `●`, working |
-| `active` with only unknown flags | Unknown(raw flags) / Working | Working | `?` in `p.purple`, unrecognized active refinement |
-| unrecognized status tag | Unknown(raw tag) / None | Idle | `?`, unrecognized state |
+| Codex runtime value | Shared status / state | Group | Rank | Glyph / meaning |
+|---|---|---|---|---|
+| `notLoaded` | Idle / Unloaded | Codex | 4 | `◇`, unloaded; resume via TUI |
+| `idle` | Idle / None | Codex | 2 | `○`, ready for input |
+| `systemError` | Unknown("systemError") / None | Codex | 3 | `?`, runtime error |
+| `active` with either known blocking flag | Waiting / Blocked | Codex | 0 | `▲`, needs the operator |
+| `active` with an empty flag array | Busy / Working | Codex | 1 | `●`, working |
+| `active` with only unknown flags | Unknown(raw flags) / Working | Codex | 1 | `?` in `p.purple`, unrecognized active refinement |
+| unrecognized status tag | Unknown(raw tag) / None | Codex | 3 | `?`, unrecognized state |
 
 Known blocking flags are exactly `waitingOnApproval` and
 `waitingOnUserInput`. **A known blocking flag wins even when unknown flags
-are also present.** The row stays Blocked/`▲`; report the unknown flags
-separately through `note_drift`. Unknown-only flags must not become Blocked;
-the known `active` tag keeps the Working group. Pin the representation to
+are also present.** The row keeps state Blocked/`▲` and rank 0 inside
+Codex; report the unknown flags separately through `note_drift`.
+Unknown-only flags must not become Blocked; the known `active` tag keeps
+the Working rank (1) inside Codex. Pin the representation to
 `Status::Unknown(raw flags)` plus `Some(State::Working)`, so drift labels it
 as status, not state. Blocked still wins before the glyph's `?` fallback.
 A missing/malformed status object or malformed active flag array is a dropped
 row, not `idle`; extra unrelated JSON fields are ignored.
 
-`State::Unloaded` joins Done/Stopped in `group()`'s first Completed branch,
-but keeps its own glyph and text. It asserts only “not loaded in this server”.
+`State::Unloaded` stays in Codex, last by state rank, with its own glyph
+and text. It asserts only “not loaded in this server”.
 It says nothing about the last turn's success or a writer in another runtime.
 `systemError` keeps a visible `?` and a provider-labelled warning; it is a
 valid row, not a failed poll and not a stopped thread.
@@ -4202,7 +4244,7 @@ pinning width, and flushing tab state still run when neither provider is due.
 by full `Thread.id`, then hash provider, full ID, parsed name, cwd, shared
 status/state, and normalized `CodexStatus` (including sorted unknown flags).
 Leave out `started_at`, `CodexMeta.updated_at`, cutoff, age text, metadata
-provenance, and the display-only provider marker. Apply every returned row
+provenance, and display-only group/row ordering. Apply every returned row
 even when the fingerprint is unchanged: this hash controls only the ladder.
 A timestamp-only change does not reset it; a row/name/cwd/status/flag change
 does. Claude retains its existing fingerprint.
@@ -4319,34 +4361,48 @@ Detectable inconsistent results become incomplete; no claim is made that
 undetectable concurrent changes cannot transiently alter membership. There is
 no destructive action based on such an absence in Codex v1.
 
-### 12.6 Rows, detail text, and errors (§§6.4–6.8, 9)
+### 12.6 Rows, detail text, and errors (§§6.3–6.8, 9)
 
-Keep the four-column gutter and every existing width threshold. A Codex row
-uses `> ` (two ASCII cells) at the beginning of the EXISTING name budget,
-with `>` in `p.gray` and the name retaining its normal style. This marker
-does not collide with the status glyph set or move the glyph/age rails.
-It is DISPLAY ONLY: never add it to `Session.name`, `PaneEntry.name`,
-captured/flash labels, or the idle fingerprint. Claude names remain unchanged.
-Use ordinary truncation at narrow widths. Two cells keep more of the task
-name visible in a narrow sidebar.
+Keep the four-column gutter and every existing width threshold. When any
+Codex rows are visible, the last group is titled `Codex`, using §6.3's
+header geometry with
+`p.aqua` for its two-cell chip. Title/count styles remain `p.gray` BOLD
+and `p.dim`. Its count is the number of visible Codex rows after `/`,
+`d`, and `a` filtering. No header is emitted when none remain.
+
+Remove the former two-cell `> ` provider marker: the group identifies the
+provider, and those two columns return to the name at every width that draws
+one. Gutter/glyph/age rails and ordinary truncation remain unchanged.
+`Session.name`, `PaneEntry.name`, captured/flash labels, and fingerprints
+are untouched; a literal `>` in a name is still ordinary name content.
+Unselected Codex names keep state contrast: Blocked/Working use `p.fg`,
+Idle/unknown/systemError use `p.gray`, and Unloaded uses `p.dim`.
+Selection still promotes every name to bold `p.fg` (§6.4).
 
 Codex's filter haystack contains `codex`, name, `Thread.cwd`, tail-eight
 display ID, and full `Thread.id`; Claude keeps its existing haystack.
 Filtering must not require a unique short-ID suffix.
 
 `Unloaded` uses the one-cell hollow diamond `◇` (U+25C7), `p.gray`,
-before the generic Completed glyph rule. It never uses `■` or `✓`.
+inside the Codex group. It never uses `■` or `✓`.
 The selected row's middle detail line is
 `id      <tail-eight> codex unloaded`; other Codex states replace the last
 word with `idle`, `working`, `blocked`, `systemError`, or `unknown`.
-Active with unknown-only flags uses `unknown` here but remains in Working
-with a purple `?`. The name and cwd occupy the existing other two detail
-lines. Preserve full unknown status/flag values in the provider-labelled
-drift warning. The `a` key includes/excludes Unloaded with Completed.
+Active with unknown-only flags uses `unknown` here but retains Working
+rank inside Codex with a purple `?`. The name and cwd occupy the existing
+other two detail lines. Preserve full unknown status/flag values in the
+provider-labelled drift warning.
+
+`a` keeps the finished-work visibility toggle: when `show_completed` is
+false, omit the entire Claude Completed group AND only the Unloaded rows
+inside Codex. Leave all other Codex rows visible, including idle/error rows.
+Apply this before header counts and navigation; a now-empty Codex group has
+no header or spacer. This filter does not assert the unloaded turn's outcome.
 
 Show Codex-specific help additions only when Codex is enabled. Explain the
-`>` provider marker, unloaded as “not loaded in this server; Enter resumes;
-last-turn outcome unknown”, and the launch-target map limitation (§12.7).
+last Codex group with blocked rows first, `a` also toggling `◇` rows,
+unloaded as “not loaded in this server; Enter resumes; last-turn outcome
+unknown”, and the launch-target map limitation (§12.7).
 Say “n creates a Claude session; create Codex threads in the Codex TUI”.
 
 Each enabled provider starts `NotYetObserved` in a fresh process: neither
@@ -4562,8 +4618,15 @@ and every Claude call. `n` and `R` remain global verbs.
 | `L` | Warn: `Codex logs unavailable in v1 — use the Codex TUI`; no log overlay or history RPC |
 | `n` | open the ordinary Claude new-background prompt (§8.6), capturing `Provider::Claude` and the sidebar's local cwd; no Codex RPC |
 | `R` | global ccmux/Claude restart under the rules below; never a Codex restart |
-| navigation, `/`, `a`, `?`, `q/Esc` | existing behavior, including Codex rows and provider-specific help |
+| navigation, `/`, `?`, `q/Esc` | existing behavior, including Codex rows and provider-specific help |
+| `Tab` / `Shift-Tab` | cycle non-empty groups in Blocked, Working, Idle, Completed, Codex order, forward/reverse, wrapping |
+| `a` | toggle Completed and Codex Unloaded visibility (§12.6); other Codex rows stay |
 | `c`, `S`, other unbound keys | remain unbound; no new aliases |
+
+Navigation walks the visible header/row list, never a fixed four-element
+array. Tab lands on the first visible Codex row (blocked first if present).
+Filter/dismiss/`a` can empty that group; both directions skip it as they
+already skip any other empty group. Claude-only navigation is unchanged.
 
 `n` always creates a Claude session, whatever the selection. With a Codex
 selection or no selection, prefill from the sidebar's local working directory
@@ -4571,7 +4634,7 @@ selection or no selection, prefill from the sidebar's local working directory
 field fallback on failure. Do not use `Thread.cwd` or seed mkdir-arming from
 it. A Claude selection keeps its existing cwd prefill. The prompt captures
 `Provider::Claude`; cursor changes cannot change that provider. No Codex
-ID or display marker reaches dispatch. There is no provider toggle.
+ID or provider decoration reaches dispatch. There is no provider toggle.
 
 `u` uses the hidden winner's provider, never the currently selected row's.
 Moving from a Claude row to a Codex row disarms any pending Claude `Ctrl-x`
@@ -4843,8 +4906,8 @@ refines the contract; it does not turn unrun experiments into live findings.
 
 The one-line standing-error layout, guarded diagnostic delivery, 30-second
 per-provider automatic cooldown, per-thread runtime-warning episodes, and
-two-cell provider marker are UI contracts to verify with fixtures/render tests,
-not new live measurements. Fresh providers are `NotYetObserved`; their first
+provider group/state ordering are UI contracts to verify with fixtures/render
+tests, not new live measurements. Fresh providers are `NotYetObserved`; their first
 failure queues a diagnostic behind any restart summary. Reason categories
 bound deduplication even when stderr varies; explicit `r` bypasses only the
 cooldown. Both footer changes apply to Claude-only users too.
@@ -4862,9 +4925,21 @@ have these tests; existing Claude tests remain authoritative except for
   extra fields; every status row in §12.3. Test both blocking flags, mixed
   known/unknown flags, unknown-only flags, duplicates, and malformed arrays.
   Unknown-only active flags produce `Status::Unknown(raw flags)` plus
-  `State::Working`, Working/`?`, detail `unknown`; a known blocking flag
-  still gives Blocked/`▲`. Unloaded uses only its `◇` branch. No synthetic
-  Codex pid or `has_worker` inference.
+  `State::Working`, Codex group/rank 1/`?`, detail `unknown`; a known
+  blocking flag still gives state Blocked/rank 0/`▲` inside Codex.
+  Unloaded uses only its `◇` branch. No synthetic Codex pid or
+  `has_worker` inference.
+- **Provider grouping and navigation:** all Codex states, including unknown
+  and systemError, return Codex before state/status rules. All five group
+  variants agree across `all()`, Ord, `next()` and `prev()`.
+  Within Codex, assert blocked-first and Unloaded-last even with opposing
+  ages, then newest-first and full-ID ascending ties in every rank; input
+  order must not affect the result. Test Tab/Shift-Tab through five groups,
+  wrapping and skipping groups emptied by filters, dismissals, or `a`.
+  `a` removes Completed and Codex Unloaded only, with visible-row header
+  counts; toggling restores them. An empty Codex group adds no header/spacer.
+  Keep a pre-change Claude-only list snapshot byte-identical, with Codex
+  either OFF or enabled with no eligible rows.
 - **Source branches:** exercise all five eligible strings and current
   subAgent subtypes, including `memory_consolidation`, `other`, and
   `thread_spawn`. ANY sole-key subAgent object is deliberately excluded:
@@ -4905,7 +4980,7 @@ have these tests; existing Claude tests remain authoritative except for
   metadata from `H`/the cutoff page updates that anchor. Timestamp-only
   changes are still applied. Row/name/cwd/status/flag changes reset the
   ladder; status becoming active on the anchored row does too. Permuting
-  row/flag order and adding the display marker do not change the fingerprint.
+  row/flag order and display-only group ordering do not change the fingerprint.
 - **Protocol and deadline:** fake transport/clock exercise initialize/
   initialized order, exact method/parameter allowlist, ID zero/string
   dispatch, unrelated notifications, auth/upgrade/method errors, and one
@@ -4976,7 +5051,7 @@ have these tests; existing Claude tests remain authoritative except for
   refusal and absence of RPC/subprocess/modal side effects. Test provider
   routing in the lower-level façade too. With ONLY Codex rows visible,
   `n` opens a Claude prompt using the sidebar's local cwd; submitting it
-  sends no Codex ID, display marker, or Codex-derived cwd to dispatch.
+  sends no Codex ID, provider decoration, or Codex-derived cwd to dispatch.
   `Enter/o/s/t/x` retain ownership/focus rules and the seeded-map ordering.
   Snapshot the remote wrapper with hostile path/name inputs, literal command
   substitution, no token bytes, validated latch target, parked retry to the
@@ -5010,10 +5085,13 @@ have these tests; existing Claude tests remain authoritative except for
   records its posting time, and wins over pending automatic candidates.
   A post-verb/wake-up failure has no cooldown exemption. Same-tick coalescing
   must not include a provider still in cooldown. Error text stays bounded.
-- **Rendering and provider errors:** retain the existing width/height matrix.
-  At widths 34 and 20, the two-cell `> ` stays inside the name budget and
-  leaves the gutter/age rails fixed; stored names, map names, and flash
-  labels have no marker. With unchanged standing Codex error and no flash,
+- **Rendering and provider errors:** retain the existing width/height matrix
+  and both palettes, with a populated Codex group covering all state glyphs.
+  Select each Codex state at every size so the viewport actually renders it.
+  Assert visible header counts and state contrast, unchanged gutter/age
+  rails, and the full name budget after removing `> `, including widths
+  34 and 20. Preserve literal name content and the unchanged detail line.
+  With unchanged standing Codex error and no flash,
   34x40 still draws name/id/state/cwd detail; 34x8 clears no list row and
   keeps the selected row visible. Repeat with Claude-only and combined
   standing errors. A Claude `Ctrl-x` arm and transient error still wrap at

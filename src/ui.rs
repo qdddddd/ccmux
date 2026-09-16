@@ -489,10 +489,9 @@ fn margin(w: usize) -> usize {
     if w >= MARGIN_MIN { 1 } else { 0 }
 }
 
-/// Group -> name weight. The ladder `palette_contrast_is_readable` already
-/// guarantees (fg > gray > dim), spent on the one axis the list is sorted by,
-/// so the weight still names the group when its header has scrolled off the
-/// top.
+/// Name weight follows Claude groups and Codex states. The ladder
+/// `palette_contrast_is_readable` guarantees (fg > gray > dim), so activity
+/// stays legible even when a group header has scrolled off the top.
 fn name_tier(sess: &Session, p: &Palette) -> Color {
     match sess.group() {
         // Blocked shares the top rung with Working. There is nothing above
@@ -501,6 +500,11 @@ fn name_tier(sess: &Session, p: &Palette) -> Color {
         Group::Blocked | Group::Working => p.fg,
         Group::Idle => p.gray,
         Group::Completed => p.dim,
+        Group::Codex => match sess.state {
+            Some(State::Blocked | State::Working) => p.fg,
+            Some(State::Unloaded) => p.dim,
+            _ => p.gray,
+        },
     }
 }
 
@@ -514,6 +518,7 @@ fn group_accent(g: Group, p: &Palette) -> Color {
         Group::Working => p.orange,
         Group::Idle => p.blue,
         Group::Completed => p.gray,
+        Group::Codex => p.aqua,
     }
 }
 
@@ -592,8 +597,8 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
     }
     let unknown_status = matches!(sess.status, Status::Unknown(_));
     let unknown_state = matches!(sess.state, Some(State::Unknown(_)));
-    // ONE match, in precedence order, and the blocked verdict is ASKED OF
-    // `group()` rather than re-derived from `state`/`status` here.
+    // Claude's blocked verdict is ASKED OF `group()` rather than re-derived.
+    // Codex has a provider group; its normalized state supplies the verdict.
     //
     // It was re-derived once, and the two rules promptly disagreed: this arm
     // read `state == Blocked || status == Waiting` while `Session::group` only
@@ -606,13 +611,15 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
         // Before the `?` fallback, deliberately: a row this build cannot fully
         // name but that `group()` has placed in Blocked is still a row waiting
         // on a human, and purple `?` is not what that should look like.
+        Group::Codex if sess.state == Some(State::Blocked) => ("▲", p.yellow),
         Group::Blocked => ("▲", p.yellow),
         _ if unknown_status || unknown_state => ("?", p.purple),
         Group::Working => match sess.status {
             Status::Busy => ("●", p.orange),
             _ => ("◐", p.blue),
         },
-        Group::Idle => ("○", p.gray),
+        Group::Codex if sess.state == Some(State::Working) => ("●", p.orange),
+        Group::Idle | Group::Codex => ("○", p.gray),
         // Unreachable in practice — `group()` returns Completed only for
         // `Done`/`Stopped`, and both returned above — but kept as a real arm
         // rather than an `unreachable!`, because `draw` must never panic.
@@ -634,10 +641,6 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
 /// is the row's LEFT edge, so a badge that grew would push this row's glyph
 /// and name right while its neighbours stayed put, and the eye reads a broken
 /// left edge as broken far more readily than a short name.
-fn provider_marker(sess: &Session, budget: usize) -> String {
-    if sess.provider == Provider::Codex { truncate_end("> ", budget) } else { String::new() }
-}
-
 fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette) -> Line<'static> {
     if w == 0 {
         return Line::from(Vec::<Span>::new());
@@ -669,10 +672,8 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
             Span::styled(glyph.to_string(), base.fg(glyph_color)),
             Span::styled(" ".to_string(), base),
         ];
-        let marker = provider_marker(sess, w.saturating_sub(2));
-        let name = truncate_end(&sess.name, w.saturating_sub(2 + display_width(&marker)));
-        let used = 2 + display_width(&marker) + display_width(&name);
-        if !marker.is_empty() { spans.push(Span::styled(marker, base.fg(p.gray))); }
+        let name = truncate_end(&sess.name, w.saturating_sub(2));
+        let used = 2 + display_width(&name);
         spans.push(Span::styled(name, name_style));
         pad_to(&mut spans, used, w, base);
         return Line::from(spans);
@@ -697,8 +698,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     };
     let right = if age.is_some() { GAP + field } else { 0 };
     let name_budget = w.saturating_sub(GUTTER + right + m);
-    let marker = provider_marker(sess, name_budget);
-    let name = truncate_end(&sess.name, name_budget.saturating_sub(display_width(&marker)));
+    let name = truncate_end(&sess.name, name_budget);
 
     // The gutter's ONE ink, shared by both its columns. `badge.is_some()` is
     // already the "not in the tab you are looking at" test — it is what makes
@@ -738,8 +738,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     }
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
     spans.push(Span::styled(" ".to_string(), base));
-    let mut used = GUTTER + display_width(&marker) + display_width(&name);
-    if !marker.is_empty() { spans.push(Span::styled(marker, base.fg(p.gray))); }
+    let mut used = GUTTER + display_width(&name);
     spans.push(Span::styled(name, name_style));
 
     // Pad out to the rail's lead so the age lands flush on column W-1.
@@ -855,7 +854,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
             Some(crate::model::CodexStatus::NotLoaded) => "unloaded",
             Some(crate::model::CodexStatus::Idle) => "idle",
             Some(crate::model::CodexStatus::SystemError) => "systemError",
-            Some(crate::model::CodexStatus::Active { .. }) if sess.group() == Group::Blocked => "blocked",
+            Some(crate::model::CodexStatus::Active { .. }) if sess.state == Some(State::Blocked) => "blocked",
             Some(crate::model::CodexStatus::Active { .. }) if !matches!(sess.status, Status::Unknown(_)) => "working",
             _ => "unknown",
         }.to_string()
@@ -1186,7 +1185,8 @@ const KEYS: &[(&str, &str)] = &[
 /// `App::help_lines` each frame so `app.rs` can clamp `help_scroll` against the
 /// real content without importing `ui` (the DAG stays acyclic).
 const CODEX_KEYS: &[(&str, &str)] = &[
-    (">", "Codex session"),
+    ("Codex", "last group; ▲ first"),
+    ("a", "also toggles ◇ rows"),
     ("◇", "not loaded in server"),
     ("", "last outcome unknown"),
     ("Enter", "open/jump Codex TUI"),

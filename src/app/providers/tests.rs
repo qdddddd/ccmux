@@ -266,7 +266,7 @@ fn provider_rows_replace_only_on_their_own_complete_observation() {
     poll(&mut a, vec![one.clone(), two.clone()], true);
     poll(&mut a, vec![row(1, CodexStatus::Active { flags: vec![] })], false);
     assert_eq!(a.sessions.len(), 3);
-    assert_eq!(a.codex.rows[&one.session_id].group(), model::Group::Working);
+    assert_eq!(a.codex.rows[&one.session_id].group(), model::Group::Codex);
     assert!(a.codex.rows.contains_key(&two.session_id));
     assert_eq!(a.fail_streak, 0);
     a.apply_poll(Ok(payload(vec![])));
@@ -846,4 +846,59 @@ fn runtime_delivery_settles_before_a_pending_drift_warning_takes_the_slot() {
     a.msg_deadline = None;
     assert!(!a.announce_warnings(now + MSG_TTL + MSG_TTL));
     assert!(a.drift_pending.is_empty() && a.message.is_none());
+}
+
+#[test]
+fn tab_and_backtab_cycle_five_groups_and_skip_hidden_empty_groups() {
+    let mut a = configured();
+    a.sessions = [Some(State::Blocked), Some(State::Working), None, Some(State::Done)]
+        .into_iter().enumerate().map(|(i, state)| Session {
+            session_id: format!("claude-{i}"), state, ..claude()
+        }).collect();
+    let unloaded = row(2, CodexStatus::NotLoaded);
+    let mut blocked = row(1, CodexStatus::Active { flags: vec!["waitingOnApproval".into()] });
+    blocked.status = Status::Waiting;
+    blocked.state = Some(State::Blocked);
+    a.sessions.extend([unloaded.clone(), blocked.clone()]);
+    a.rebuild_rows();
+    a.select_first();
+    assert_eq!(a.selected_session().unwrap().group(), model::Group::Blocked);
+    for target in ["claude-1", "claude-2", "claude-3", &blocked.session_id, "claude-0"] {
+        key(&mut a, KeyCode::Tab);
+        assert_eq!(a.selected_session().unwrap().session_id, target);
+    }
+    for target in [&blocked.session_id, "claude-3", "claude-2", "claude-1", "claude-0"] {
+        key(&mut a, KeyCode::BackTab);
+        assert_eq!(a.selected_session().unwrap().session_id, target);
+    }
+    key(&mut a, KeyCode::Char('a'));
+    for target in ["claude-1", "claude-2", &blocked.session_id, "claude-0"] {
+        key(&mut a, KeyCode::Tab);
+        assert_eq!(a.selected_session().unwrap().session_id, target);
+    }
+    key(&mut a, KeyCode::BackTab);
+    assert_eq!(a.selected_session().unwrap().session_id, blocked.session_id);
+    assert!(a.rows.iter().any(|r| matches!(r, model::Row::Header { group: model::Group::Codex, count: 1 })));
+    key(&mut a, KeyCode::Char('d')); // Only an unloaded Codex row remains, hidden by a.
+    assert!(!a.rows.iter().any(|r| matches!(r, model::Row::Header { group: model::Group::Codex, .. })));
+    a.select_first();
+    key(&mut a, KeyCode::BackTab);
+    assert_eq!(a.selected_session().unwrap().session_id, "claude-2");
+    key(&mut a, KeyCode::Char('u'));
+    a.select_first();
+    key(&mut a, KeyCode::BackTab);
+    assert_eq!(a.selected_session().unwrap().session_id, blocked.session_id);
+    key(&mut a, KeyCode::Char('a'));
+    assert!(a.rows.iter().any(|r| matches!(r, model::Row::Header { group: model::Group::Codex, count: 2 })));
+    a.filter = unloaded.session_id;
+    a.rebuild_rows();
+    for code in [KeyCode::Tab, KeyCode::BackTab] {
+        key(&mut a, code);
+        assert_eq!(a.selected_session().unwrap().state, Some(State::Unloaded));
+    }
+    key(&mut a, KeyCode::Char('a'));
+    assert!(a.rows.is_empty());
+    for code in [KeyCode::Tab, KeyCode::BackTab] { key(&mut a, code); }
+    assert!(a.selected_session().is_none());
+    assert!(calls().is_empty(), "navigation must not poll or prepare");
 }
