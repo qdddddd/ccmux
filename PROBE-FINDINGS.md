@@ -634,6 +634,47 @@ and turn cwd; the thread's own cwd remained the default described below.
   **Consequence:** remote attach and ccmux's pane-closing `x` pass the active-work
   survival requirement for the measured server.
 
+- **Early materialization failures are not established last-client probes.**
+  Operator rerun on **2026-09-16**, CLI **0.154.0** / server **0.153.4**,
+  at commit `b979baa`. Method: the opt-in command in SPEC §12.11,
+  `cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1`,
+  with the test-only URL/token-file settings. The graceful active-exit case
+  passed; abrupt active-exit, index/pagination, read-side-effect, and resume
+  cases failed while materializing a trivial luna/low turn. The reported
+  `thread/turns/list` rows had `status:"interrupted", error:null`.
+  An operator's separate hand-run on one connected client reached
+  `completed` and final `ready`.
+
+  Retained registries under `~/.local/tmp/ccmux-probe-640429-*/` identify
+  the four interrupted turns' threads as
+  `01a0a7b8-9845-7441-a5ee-4aaac28d8eca` (abrupt),
+  `01a0a7b9-d695-71b3-9162-55f146552756` (index-b),
+  `01a0a7b9-d9b9-7340-a7f3-83b5ce9620f3` (reads), and
+  `01a0a7b9-dca0-7850-b1dd-c3a1acf266a4` (resume).
+  Read-only inspection of their archived rollouts found `task_started`
+  followed by `turn_aborted(reason:"interrupted")` about 60–120 ms later.
+  Each registry records successful archive-only cleanup. The index-a and
+  graceful threads also appear in those registries and were archived.
+
+  **Causal limit:** the operator suggested an early close by the only
+  subscriber, before the turn was underway. Code inspection finds that
+  `b979baa` already uses the SAME `LiveRpc` through
+  `materialize -> start_turn -> completed`. A deadline does not close a
+  socket asynchronously. The first interrupted history result causes that
+  function to return, drop its connection, and run archive cleanup; the
+  retained artifacts do not establish a creator close BEFORE that result.
+  Early creator-only disconnect as the cause is therefore **UNMEASURED**,
+  not a new lifecycle fact. These interruptions must not be confused with
+  the established-command survival evidence above.
+
+  **Consequence:** keep one creator through the terminal notification,
+  matching the original `probe.py::wait_turn` method; do not use an immediate
+  history snapshot as that creator's completion signal. The harness now
+  records start, terminal, command-underway, handoff, and explicit close
+  events to make lifecycle ordering reviewable. Deliberate mid-turn release
+  requires an owned in-progress command item and a verified attached TUI.
+  This is an evidence/harness correction; v1 never starts turns.
+
 - **Pending approval survives disconnect and is shown on reattach.**
   Method: on `approval-last-client`, use per-thread
   `approvalPolicy:"untrusted"`, `approvalsReviewer:"user"`, and read-only

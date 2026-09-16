@@ -4753,6 +4753,12 @@ refines the contract; it does not turn unrun experiments into live findings.
   `active-sigkill`, and `active-graceful-valid`. The initial `active-pane`
   attempt showed zero-client progress but completed AFTER reattach; it is not
   a fourth completion proof and has no RPC `completion_check`.
+  The later operator rerun recorded early materialization turns as
+  `interrupted` with `error:null` (PROBE-FINDINGS §9). An early close by
+  the sole subscriber BEFORE a command is underway is a separate, unmeasured
+  boundary: the retained run does not prove close-before-result ordering.
+  Do not infer that cause from error-path disconnect/archive cleanup.
+  v1 starts no turns; this does not change its attach contract.
 - The CLI's authenticated remote guard rejects non-loopback `ws://`.
   v1 therefore uses loopback only, with an operator-owned SSH tunnel for a
   remote server (§12.2). TLS/`wss://` operation and a live SSH-tunnel path
@@ -5039,15 +5045,36 @@ retain both ends of large fields so a TUI prompt is not lost behind its header.
 Test-only mutation access remains separate from the production lister's
 read-only method enum.
 
-Mutation responses do not prove their effects are already visible. Wait for
-each setup observation under a named monotonic deadline: turn visibility
-15 s, completion 90 s, thread state / history visibility 15 s, and foreground
-command start 45 s, all within the 240 s case budget. Missing turn rows and
-absent/unrecognized statuses remain pending. Only explicit `failed` or
-`interrupted` turn statuses fail immediately with the redacted `error`
-payload; timeouts identify the condition and last observation. Scope RPC I/O
-to the active wait deadline using a test-only transport hook; production
-polling keeps its fixed deadline.
+Mutation responses do not prove their effects are already visible. Open ONE
+creator connection for the case's creation work and keep it through each
+turn/start, progress observation, and terminal notification. Its connection
+budget is the case budget, not an observer's short RPC budget. Give each
+luna/low turn a 120 s monotonic lifecycle deadline starting BEFORE turn/start;
+waiting for completion does not renew it. The overall case budget is 360 s
+to accommodate two such turns plus setup/index observations. Short-lived
+observers cannot create threads or start turns.
+
+On the subscribed creator, wait for the matching `turn/completed`
+notification BEFORE checking history/index visibility; an immediate history
+snapshot is not its lifecycle signal. Check notifications already received
+during the start response too. Ordinary close refuses a pending creator
+turn. Deliberate handoff is the only successful mid-turn close path and needs
+the owned in-progress command plus a matching verified TUI. Record creator
+start, terminal, command-underway, handoff, and explicit close events without
+raw wire content. Failures/timeouts still drop clients and run archive cleanup;
+they never count as survival evidence.
+
+For fresh read-only observers after handoff, turn visibility is bounded by
+15 s and completion by 90 s. Thread state / history visibility waits use 15 s;
+foreground command start uses 45 s, capped by its creator turn's deadline.
+Missing rows and absent/unrecognized statuses remain pending. Explicit
+`failed` or `interrupted` in a creator's terminal notification or an observer's
+turn row fails immediately with the redacted `error` payload. Timeouts name
+the condition and last observation. Scope RPC I/O to the active wait deadline
+using a test-only transport hook; production polling keeps its fixed deadline.
+Offline fixtures must prove one creator transport survives through terminal,
+buffered/mismatched notifications do not misroute, pending close is refused,
+observer mutations are refused, and handoff requires both witnesses.
 
 For TUI readiness, wait for the composer (30 s), the literal slash command
 echo (10 s), then send Enter once and wait for `/status` to identify the
@@ -5088,8 +5115,12 @@ The shipped cases are:
 - **Graceful last-client exit with active completion:** materialize an owned
   thread with a trivial turn and attach the real TUI BEFORE starting its
   foreground `sleep 60`, so bootstrap cannot consume the active interval.
-  Observe command start, close the creating RPC client, and `/quit`.
-  Require the production park wrapper's rc=0/latch.
+  Require an owned `item/started` notification for this turn's
+  `commandExecution` with `status:inProgress` and the requested sleep command;
+  a turn/start acknowledgement alone is not proof that work is underway.
+  Recheck the already-identified TUI's owned pane, clear detached latch, and
+  live recorded client descendants, close the creator explicitly, and
+  `/quit`. Require the production park wrapper's rc=0/latch.
 - **Abrupt last-client exit with active completion:** the same setup, but
   kill ONLY the registered pane. In BOTH exit cases, require the SAME turn
   to be active after client exit, then complete with successful command

@@ -24,7 +24,8 @@ fn live_error(error: CodexError) -> anyhow::Error {
 
 const SOCKET: &str = "ccmux-probe";
 const MODEL: &str = "gpt-5.6-luna";
-const CASE_TIMEOUT: Duration = Duration::from_secs(240);
+const CASE_TIMEOUT: Duration = Duration::from_secs(360);
+const TURN_TIMEOUT: Duration = Duration::from_secs(120);
 static SERIAL: Mutex<()> = Mutex::new(());
 
 // All post-mutation observations share a monotonic deadline. The snapshot is
@@ -250,27 +251,48 @@ impl Registry {
     }
 }
 
+struct CreatedTurn {
+    end: Duration,
+    command_underway: bool,
+}
+
+// Issued only after /status verified this launch and the owned TUI remains
+// alive. An ordinary close is forbidden while a creator has a pending turn.
+struct AttachedTui { pane: String, thread: String }
+
 /// Separate from the production Method/Rpc: no mutation method is added to
 /// the lister. Every request other than the private creation path is guarded.
 struct LiveRpc<'a> {
-    transport: Box<dyn Transport + 'a>,
+    transport: Option<Box<dyn Transport + 'a>>,
     registry: Rc<RefCell<Registry>>,
     work: PathBuf,
     next_id: u64,
     events: Vec<Value>,
+    creator: bool,
+    turns: BTreeMap<(String, String), CreatedTurn>,
     wait: Waiter<'a>,
 }
 
 impl LiveRpc<'_> {
+    fn send(&mut self, value: Value) -> Result<(), CodexError> {
+        let transport = self.transport.as_mut().ok_or_else(CodexError::protocol)?;
+        transport.set_deadline(self.wait.io_end.get());
+        transport.send(value)
+    }
+
+    fn receive(&mut self) -> Result<Value, CodexError> {
+        let transport = self.transport.as_mut().ok_or_else(CodexError::protocol)?;
+        transport.set_deadline(self.wait.io_end.get());
+        transport.receive()
+    }
+
     fn exchange(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        self.transport.set_deadline(self.wait.io_end.get());
-        self.transport.send(json!({"id":id,"method":method,"params":params}))
+        self.send(json!({"id":id,"method":method,"params":params}))
             .map_err(|error| live_error(error).context(format!("sending live RPC {method}")))?;
         loop {
-            self.transport.set_deadline(self.wait.io_end.get());
-            let value = self.transport.receive()
+            let value = self.receive()
                 .map_err(|error| live_error(error).context(format!("receiving live RPC {method}")))?;
             if value.get("method").is_some() {
                 self.event(value);
@@ -284,6 +306,7 @@ impl LiveRpc<'_> {
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        ensure!(method != "turn/start" || self.creator, "observer cannot start turns");
         self.registry.borrow().authorize(method, &params, &self.work)?;
         self.exchange(method, params)
     }
@@ -300,6 +323,7 @@ impl LiveRpc<'_> {
     }
 
     fn create(&mut self, name: &str) -> Result<String> {
+        ensure!(self.creator, "observer cannot create threads");
         ensure!(name.starts_with("ccmux-probe-"), "probe name guard");
         let result = self.exchange("thread/start", json!({
             "cwd":self.work, "model":MODEL, "ephemeral":false,
@@ -315,10 +339,71 @@ impl LiveRpc<'_> {
     }
 
     fn start_turn(&mut self, id: &str, prompt: &str) -> Result<String> {
-        let value = self.request("turn/start", json!({
-            "threadId":id, "input":[{"type":"text","text":prompt}], "model":MODEL, "effort":"low"
-        }))?;
-        Ok(value["turn"]["id"].as_str().ok_or_else(|| anyhow::anyhow!("missing turn id"))?.into())
+        ensure!(self.creator && self.turns.is_empty(), "turn needs an idle creator connection");
+        let wait = self.wait.scoped(TURN_TIMEOUT);
+        let value = wait.until(&format!("turn/start acknowledgement for thread {id}"), || {
+            let value = self.request("turn/start", json!({
+                "threadId":id, "input":[{"type":"text","text":prompt}], "model":MODEL, "effort":"low"
+            }))?;
+            Ok((Some(value), json!({"thread":id})))
+        })?;
+        let turn = value["turn"]["id"].as_str().ok_or_else(|| anyhow::anyhow!("missing turn id"))?.to_owned();
+        self.turns.insert((id.into(), turn.clone()), CreatedTurn {
+            end:wait.deadline.end, command_underway:false,
+        });
+        self.registry.borrow_mut().record(json!({"event":"creator_turn_started","id":id,"turn":turn}))?;
+        Ok(turn)
+    }
+
+    fn created_progress(&mut self, id: &str, turn: &str, command: bool) -> Result<Value> {
+        let key = (id.to_owned(), turn.to_owned());
+        let owned = self.turns.get(&key).ok_or_else(|| anyhow::anyhow!("turn not owned by this connection"))?;
+        let mut wait = self.wait.scoped(if command { Duration::from_secs(45) } else { TURN_TIMEOUT });
+        wait.deadline.end = wait.deadline.end.min(owned.end);
+        // receive() already blocks. Do not sleep between notification frames.
+        let no_pause = |_| {};
+        let wait = Waiter { pause:&no_pause, ..wait };
+        let condition = if command { "in-progress sleep command notification" } else { "creator turn/completed notification" };
+        let mut receive = false;
+        wait.until(&format!("{condition} (thread {id}, turn {turn})"), || {
+            if receive {
+                let event = self.receive().map_err(live_error)?;
+                ensure!(event.get("method").is_some(), "unexpected response while awaiting creator notification");
+                self.event(event);
+            }
+            receive = true;
+            let terminal = self.events.iter().rev().find(|e| e["method"] == "turn/completed"
+                && e["params"]["threadId"] == id && e["params"]["turn"]["id"] == turn)
+                .map(|e| e["params"]["turn"].clone()).unwrap_or(Value::Null);
+            if matches!(terminal["status"].as_str(), Some("completed" | "failed" | "interrupted")) {
+                self.turns.remove(&key);
+                self.registry.borrow_mut().record(json!({"event":"creator_turn_terminal",
+                    "id":id,"turn":turn,"status":terminal["status"]}))?;
+                wait.turn_failure(id, turn, &terminal)?;
+                ensure!(!command, "turn completed before creator handoff (thread {id}, turn {turn})");
+                return Ok((Some(terminal.clone()), json!({"terminal":terminal})));
+            }
+            let underway = self.events.iter().rev().find(|e| sleep_underway(e, id, turn)).cloned();
+            if command && let Some(event) = &underway {
+                self.turns.get_mut(&key).unwrap().command_underway = true;
+                self.registry.borrow_mut().record(json!({"event":"creator_command_underway",
+                    "id":id,"turn":turn,"item":event["params"]["item"]["id"],"status":"inProgress"}))?;
+                return Ok((Some(event.clone()), json!({"command":event})));
+            }
+            Ok((None, json!({"thread":id,"turn":turn,"terminal_notification":terminal,
+                "command_underway":underway.is_some(),"creator_connected":true})))
+        })
+    }
+
+    fn handoff(&mut self, id: &str, turn: &str, tui: &AttachedTui) -> Result<()> {
+        let key = (id.to_owned(), turn.to_owned());
+        ensure!(tui.thread == id && self.turns.len() == 1
+            && self.turns.get(&key).is_some_and(|t| t.command_underway),
+            "creator handoff requires its in-progress command and matching attached TUI");
+        self.registry.borrow_mut().record(json!({"event":"creator_handoff",
+            "id":id,"turn":turn,"pane":tui.pane,"command_status":"inProgress"}))?;
+        self.turns.remove(&key);
+        self.close()
     }
 
     fn read(&mut self, id: &str) -> Result<Value> {
@@ -394,7 +479,10 @@ impl LiveRpc<'_> {
     fn materialize(&mut self, name: &str) -> Result<String> {
         let id = self.create(name)?;
         let turn = self.start_turn(&id, "Reply exactly indexed. Do not use tools.")?;
-        self.completed(&id, &turn)?;
+        // Keep this SAME subscribed connection until an authoritative terminal
+        // notification. Read history only afterwards; an immediate rollout
+        // snapshot is not our creator's lifecycle signal.
+        self.created_progress(&id, &turn, false)?;
         self.thread_state(&id, "idle", true)?;
         self.history_ids(true, false, 100, &[&id])?;
         Ok(id)
@@ -441,11 +529,24 @@ impl LiveRpc<'_> {
         }
     }
 
-    fn close(mut self) -> Result<()> {
-        self.transport.set_deadline(self.wait.io_end.get());
-        self.transport.close().map_err(|error| live_error(error).context("closing live RPC client"))?;
+    fn close(&mut self) -> Result<()> {
+        ensure!(self.turns.is_empty(), "creator still owns a pending turn; wait for terminal or explicit handoff");
+        let mut transport = self.transport.take().ok_or_else(|| anyhow::anyhow!("live RPC already closed"))?;
+        transport.set_deadline(self.wait.io_end.get());
+        let result = transport.close();
+        drop(transport); // close frame AND socket gone before last-client observation
+        result.map_err(|error| live_error(error).context("closing live RPC client"))?;
+        self.registry.borrow_mut().record(json!({"event":"rpc_closed","creator":self.creator}))?;
         Ok(())
     }
+}
+
+fn sleep_underway(event: &Value, id: &str, turn: &str) -> bool {
+    event.get("id").is_none() && event["method"] == "item/started"
+        && event["params"]["threadId"] == id && event["params"]["turnId"] == turn
+        && event["params"]["item"]["type"] == "commandExecution"
+        && event["params"]["item"]["status"] == "inProgress"
+        && event["params"]["item"]["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60"))
 }
 
 #[derive(Clone, Copy)]
@@ -533,6 +634,7 @@ struct Harness<'a> {
     registry: Rc<RefCell<Registry>>,
     panes: BTreeSet<String>,
     clients: BTreeMap<String, Vec<ProcessStamp>>,
+    launches: BTreeMap<String, String>,
     server_started: bool,
     _lock: RunLock,
 }
@@ -561,7 +663,8 @@ impl<'a> Harness<'a> {
         Ok(Self {
             config, client, clock, end:clock.now() + CASE_TIMEOUT, work, run,
             registry:Rc::new(RefCell::new(Registry { journal:Some(journal), ..Registry::default() })),
-            panes:BTreeSet::new(), clients:BTreeMap::new(), server_started:false, _lock:guard,
+            panes:BTreeSet::new(), clients:BTreeMap::new(), launches:BTreeMap::new(),
+            server_started:false, _lock:guard,
         })
     }
 
@@ -607,8 +710,8 @@ impl<'a> Harness<'a> {
         let deadline = Deadline { clock:self.clock, end };
         let transport = TcpConnector.connect(&self.client.prepared, deadline).map_err(live_error)?;
         let mut rpc = LiveRpc {
-            transport, registry:self.registry.clone(), work:self.work.clone(), next_id:0, events:Vec::new(),
-            wait:Waiter::new(deadline, &self.client.prepared.token),
+            transport:Some(transport), registry:self.registry.clone(), work:self.work.clone(), next_id:0, events:Vec::new(),
+            creator:false, turns:BTreeMap::new(), wait:Waiter::new(deadline, &self.client.prepared.token),
         };
         let info = rpc.request("initialize", json!({
             "clientInfo":{"name":"ccmux_probe","version":env!("CARGO_PKG_VERSION")},
@@ -618,12 +721,20 @@ impl<'a> Harness<'a> {
         self.registry.borrow_mut().record(json!({
             "event":"server_version","value":self.client.redact(identity)
         }))?;
-        rpc.transport.send(json!({"method":"initialized","params":{}})).map_err(live_error)?;
+        rpc.send(json!({"method":"initialized","params":{}})).map_err(live_error)?;
         Ok(rpc)
     }
 
     fn rpc(&self, budget: Duration) -> Result<LiveRpc<'a>> {
         self.rpc_until(self.end.min(self.clock.now() + budget))
+    }
+
+    fn creator(&self) -> Result<LiveRpc<'a>> {
+        // One connection for the case's creation work; each turn gets its own
+        // full lifecycle deadline, including start and notification delivery.
+        let mut rpc = self.rpc_until(self.end)?;
+        rpc.creator = true;
+        Ok(rpc)
     }
 
     fn name(&self, label: &str) -> String { format!("{}-{label}", self.run) }
@@ -694,6 +805,7 @@ impl<'a> Harness<'a> {
         self.registry.borrow_mut().record(json!({"event":"clients","pane":pane,
             "processes":clients.iter().map(|p| json!({"pid":p.pid,"started":p.started})).collect::<Vec<_>>()}))?;
         self.clients.insert(pane.clone(), clients);
+        self.launches.insert(pane.clone(), id.into());
         Ok(pane)
     }
 
@@ -704,6 +816,18 @@ impl<'a> Harness<'a> {
             ensure!(snapshot["latch"] != "1", "Codex TUI parked: {}", wait.describe(&snapshot));
             Ok((status_identifies(&snapshot, id).then_some(()), snapshot))
         })
+    }
+
+    fn handoff_target(&self, pane: &str, id: &str) -> Result<AttachedTui> {
+        // open() already proved /status identity before turn/start. The sleep
+        // task sends no identity-changing TUI command. Recheck its pane,
+        // detached latch and recorded native descendants just before handoff.
+        ensure!(self.launches.get(pane).is_some_and(|launch| launch == id),
+            "handoff TUI launch identity was not verified");
+        let snapshot = self.snapshot(pane)?;
+        ensure!(snapshot["latch"] == "" && !clients_exited(&self.clients[pane])?,
+            "handoff TUI exited: {}", self.wait(Duration::from_secs(1)).describe(&snapshot));
+        Ok(AttachedTui { pane:pane.into(), thread:id.into() })
     }
 
     fn quit(&self, pane: &str) -> Result<()> {
@@ -849,7 +973,7 @@ fn unchanged(before: &Value, after: &Value) -> Result<()> {
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_multi_attach_and_loaded_unloaded_resume() {
     run(|h| {
-        let mut creator = h.rpc(Duration::from_secs(120))?;
+        let mut creator = h.creator()?;
         let id = creator.materialize(&h.name("resume"))?;
         creator.close()?;
         let before = h.rpc(Duration::from_secs(30))?.thread_state(&id, "idle", true)?;
@@ -881,7 +1005,7 @@ fn live_multi_attach_and_loaded_unloaded_resume() {
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_metadata_reads_do_not_load_or_subscribe() {
     run(|h| {
-        let mut creator = h.rpc(Duration::from_secs(120))?;
+        let mut creator = h.creator()?;
         let id = creator.materialize(&h.name("reads"))?;
         let mut creator = Some(creator);
         for unloaded in [false, true] {
@@ -942,7 +1066,7 @@ fn owned_metadata(rows: &BTreeMap<String, Value>, ids: &[&str]) -> Value {
 #[ignore = "opt-in owned Codex threads and tmux -L ccmux-probe; see SPEC §12.11"]
 fn live_db_freshness_pagination_and_poll_cost() {
     run(|h| {
-        let mut creator = h.rpc(Duration::from_secs(150))?;
+        let mut creator = h.creator()?;
         let first = creator.materialize(&h.name("index-a"))?;
         creator.history_ids(true, false, 1, &[&first])?;
         let second = creator.materialize(&h.name("index-b"))?;
@@ -1008,24 +1132,18 @@ fn active_completion_ready(row: &Value) -> bool {
 }
 
 fn active_exit(h: &mut Harness<'_>, graceful: bool) -> Result<()> {
-    let mut creator = h.rpc(Duration::from_secs(180))?;
+    let mut creator = h.creator()?;
     let id = creator.materialize(&h.name(if graceful { "active-graceful" } else { "active-abrupt" }))?;
     // Attach BEFORE starting the active turn: TUI bootstrap should not spend
     // the sleep interval that supplies our zero-client active witness.
     let pane = h.open(&id)?;
     let turn = creator.start_turn(&id,
         "Run /usr/bin/sleep 60 with the shell execution tool in the foreground. Do not background it or shorten it. After it exits, reply exactly done. Do not run other commands or tools.")?;
-    let wait = creator.wait.scoped(Duration::from_secs(45));
-    wait.until(&format!("foreground sleep command in thread {id}, turn {turn}"), || {
-        let row = creator.turn_once(&id, &turn)?;
-        wait.turn_failure(&id, &turn, &row)?;
-        let started = creator.events.iter().any(|e| e["params"]["threadId"] == id
-            && e["params"]["turnId"] == turn && e["params"]["item"]["type"] == "commandExecution"
-            && e["params"]["item"]["command"].as_str().is_some_and(|s| s.contains("/usr/bin/sleep 60")));
-        Ok(((started && row["status"] == "inProgress").then_some(()),
-            json!({"row":row,"command_started":started})))
-    })?;
-    creator.close()?;
+    // The owned item/started must identify this turn's foreground sleep
+    // command AND status inProgress. A turn/start ack alone is not underway.
+    creator.created_progress(&id, &turn, true)?;
+    let tui = h.handoff_target(&pane, &id)?;
+    creator.handoff(&id, &turn, &tui)?;
     if graceful { h.quit(&pane)?; } else { h.kill_pane(&pane)?; }
     // Observers never resume/subscribe. Missing or partial rows may settle, but
     // observing only completion cannot prove an ACTIVE turn survived exit.
@@ -1187,14 +1305,14 @@ fn live_rpc_registers_before_mutation_and_never_replies_to_server_requests() {
     let sent = Rc::new(RefCell::new(Vec::new()));
     let clock = MonotonicClock(Instant::now());
     let mut rpc = LiveRpc {
-        transport:Box::new(FakeLiveTransport { sent:sent.clone(), replies: [
+        transport:Some(Box::new(FakeLiveTransport { sent:sent.clone(), replies: [
             json!({"id":0,"method":"item/commandExecution/requestApproval","params":{}}),
             json!({"id":0,"result":{"thread":{"id":id}}}),
             json!({"id":1,"result":{}}),
             json!({"id":2,"error":{"code":-1,"message":"synthetic-secret"}}),
-        ].into() }),
+        ].into() })),
         registry:registry.clone(), work:"/probe".into(), next_id:0, events:Vec::new(),
-        wait:Waiter::new(Deadline::new(&clock), "synthetic-secret"),
+        creator:true, turns:BTreeMap::new(), wait:Waiter::new(Deadline::new(&clock), "synthetic-secret"),
     };
     assert!(rpc.request("thread/archive", json!({"threadId":"foreign"})).is_err());
     assert!(rpc.create("not-a-probe").is_err());
@@ -1248,9 +1366,9 @@ fn scripted_live_rpc<'a>(
     let replies = results.into_iter().enumerate()
         .map(|(id, result)| json!({"id":id,"result":result})).collect();
     (LiveRpc {
-        transport:Box::new(FakeLiveTransport { sent:sent.clone(), replies }),
+        transport:Some(Box::new(FakeLiveTransport { sent:sent.clone(), replies })),
         registry:Rc::new(RefCell::new(registry)), work:"/probe".into(), next_id:0, events:Vec::new(),
-        wait:Waiter::with_pause(Deadline { clock, end:clock.now() + budget }, WAIT_SECRET, pause),
+        creator:true, turns:BTreeMap::new(), wait:Waiter::with_pause(Deadline { clock, end:clock.now() + budget }, WAIT_SECRET, pause),
     }, sent)
 }
 
@@ -1511,4 +1629,244 @@ fn live_scoped_deadline_reaches_socket_reads_and_restores_the_connection_budget(
         if panic { assert!(result.is_err()); } else { assert!(result.unwrap().is_err()); }
         assert_eq!(wait.io_end.get(), Duration::from_secs(1));
     }
+}
+
+// This transport is one physical connection for the entire creator lifecycle.
+// Running out of scripted frames simulates a blocked read until its deadline.
+#[derive(Default)]
+struct LifecycleTrace {
+    methods: Vec<String>,
+    timeline: Vec<String>,
+    deadlines: Vec<Duration>,
+    closes: usize,
+    drops: usize,
+    terminal_received: bool,
+}
+
+struct LifecycleTransport<'a> {
+    clock: &'a WaitClock,
+    end: Duration,
+    trace: Rc<RefCell<LifecycleTrace>>,
+    frames: std::collections::VecDeque<(Duration, Value)>,
+}
+
+impl Drop for LifecycleTransport<'_> {
+    fn drop(&mut self) { self.trace.borrow_mut().drops += 1; }
+}
+
+impl Transport for LifecycleTransport<'_> {
+    fn send(&mut self, value: Value) -> Result<(), CodexError> {
+        let mut trace = self.trace.borrow_mut();
+        assert_eq!(trace.closes, 0);
+        assert_eq!(trace.drops, 0);
+        let method = value["method"].as_str().unwrap();
+        trace.methods.push(method.into());
+        trace.timeline.push(method.into());
+        Ok(())
+    }
+    fn receive(&mut self) -> Result<Value, CodexError> {
+        let (delay, value) = self.frames.pop_front().unwrap_or((self.end.saturating_sub(self.clock.now()), Value::Null));
+        self.clock.advance(delay);
+        if self.clock.now() >= self.end { return Err(CodexError::timeout()); }
+        if value["method"] == "turn/completed" {
+            let mut trace = self.trace.borrow_mut();
+            trace.terminal_received = true;
+            trace.timeline.push(format!("terminal:{}:{}:{}", value["params"]["threadId"],
+                value["params"]["turn"]["id"], value["params"]["turn"]["status"]));
+        }
+        Ok(value)
+    }
+    fn close(&mut self) -> Result<(), CodexError> {
+        self.trace.borrow_mut().closes += 1;
+        Ok(())
+    }
+    fn set_deadline(&mut self, end: Duration) {
+        self.end = end;
+        self.trace.borrow_mut().deadlines.push(end);
+    }
+}
+
+fn lifecycle_rpc<'a>(clock: &'a WaitClock, frames: Vec<Value>)
+    -> (LiveRpc<'a>, Rc<RefCell<LifecycleTrace>>)
+{
+    let mut registry = Registry::default();
+    registry.created(WAIT_ID, "ccmux-probe-lifecycle").unwrap();
+    let trace = Rc::new(RefCell::new(LifecycleTrace::default()));
+    let end = clock.now() + CASE_TIMEOUT;
+    (LiveRpc {
+        transport:Some(Box::new(LifecycleTransport { clock, end, trace:trace.clone(),
+            frames:frames.into_iter().map(|v| (Duration::ZERO, v)).collect() })),
+        registry:Rc::new(RefCell::new(registry)), work:"/probe".into(), next_id:0, events:Vec::new(),
+        creator:true, turns:BTreeMap::new(), wait:Waiter::new(Deadline { clock, end }, WAIT_SECRET),
+    }, trace)
+}
+
+fn terminal_event(id: &str, turn: &str, status: Value) -> Value {
+    json!({"method":"turn/completed","params":{"threadId":id,
+        "turn":{"id":turn,"status":status,"error":null,"items":[]}}})
+}
+
+fn command_event(id: &str, turn: &str) -> Value {
+    json!({"method":"item/started","params":{"threadId":id,"turnId":turn,
+        "item":{"id":"command","type":"commandExecution","command":"/bin/zsh -c '/usr/bin/sleep 60'",
+            "status":"inProgress"}}})
+}
+
+#[test]
+fn live_materialization_keeps_one_creator_until_terminal_then_reads_history() {
+    let clock = WaitClock::default();
+    let (mut rpc, trace) = lifecycle_rpc(&clock, vec![
+        json!({"id":0,"result":{"thread":{"id":WAIT_ID}}}),
+        json!({"id":1,"result":{}}),
+        json!({"id":2,"result":{"turn":{"id":"materialize","status":"inProgress"}}}),
+        json!({"method":"turn/started","params":{"threadId":WAIT_ID,"turn":{"id":"materialize"}}}),
+        json!({"id":0,"method":"item/commandExecution/requestApproval","params":{"threadId":WAIT_ID}}),
+        terminal_event(WAIT_OTHER, "materialize", json!("interrupted")),
+        terminal_event(WAIT_ID, "older-turn", json!("interrupted")),
+        terminal_event(WAIT_ID, "materialize", json!("completed")),
+        json!({"id":3,"result":{"data":[WAIT_ID]}}),
+        json!({"id":4,"result":{"thread":{"id":WAIT_ID,"status":{"type":"idle"}}}}),
+        json!({"id":5,"result":{"data":[{"id":WAIT_ID}]}}),
+    ]);
+    rpc.registry.borrow_mut().threads.clear(); // materialize must register its own returned ID
+    assert_eq!(rpc.materialize("ccmux-probe-lifecycle").unwrap(), WAIT_ID);
+    assert!(rpc.turns.is_empty());
+    let expected = ["thread/start","thread/name/set","turn/start",
+        "thread/loaded/list","thread/read","thread/list"];
+    assert_eq!(trace.borrow().methods, expected);
+    assert!(trace.borrow().terminal_received);
+    let terminal = format!("terminal:\"{WAIT_ID}\":\"materialize\":\"completed\"");
+    let timeline = trace.borrow().timeline.clone();
+    assert!(timeline.iter().position(|v| v == &terminal).unwrap()
+        < timeline.iter().position(|v| v == "thread/loaded/list").unwrap());
+    assert_eq!((trace.borrow().closes, trace.borrow().drops), (0,0));
+    rpc.close().unwrap();
+    assert_eq!((trace.borrow().closes, trace.borrow().drops), (1,1));
+    drop(rpc);
+    assert_eq!(trace.borrow().drops, 1);
+}
+
+#[test]
+fn live_creator_accepts_terminal_notification_before_start_response_on_same_socket() {
+    let clock = WaitClock::default();
+    let (mut rpc, trace) = lifecycle_rpc(&clock, vec![
+        terminal_event(WAIT_ID, "turn", json!("completed")),
+        json!({"id":0,"result":{"turn":{"id":"turn"}}}),
+    ]);
+    let turn = rpc.start_turn(WAIT_ID, "trivial").unwrap();
+    let row = rpc.created_progress(WAIT_ID, &turn, false).unwrap();
+    assert_eq!(row["status"], "completed");
+    assert_eq!(trace.borrow().methods, ["turn/start"]);
+    rpc.close().unwrap();
+}
+
+#[test]
+fn live_creator_waits_for_matching_terminal_and_redacts_actual_terminal_failures() {
+    for status in ["failed","interrupted"] {
+        let clock = WaitClock::default();
+        let mut terminal = terminal_event(WAIT_ID, "turn", json!(status));
+        terminal["params"]["turn"]["error"] = json!({"message":format!("test {WAIT_SECRET}"),
+            "code":"test_error","authorization":"private"});
+        let (mut rpc, trace) = lifecycle_rpc(&clock, vec![
+            json!({"id":0,"result":{"turn":{"id":"turn"}}}),
+            terminal_event(WAIT_OTHER, "turn", json!("failed")),
+            terminal_event(WAIT_ID, "turn", Value::Null),
+            terminal_event(WAIT_ID, "turn", json!("future-status")),
+            terminal,
+        ]);
+        rpc.start_turn(WAIT_ID, "trivial").unwrap();
+        let error = rpc.created_progress(WAIT_ID, "turn", false).unwrap_err();
+        let text = format!("{error:?} {error}");
+        assert!(text.contains(status) && text.contains("test_error") && text.contains("redacted"));
+        assert!(!text.contains(WAIT_SECRET) && !text.contains("private"));
+        assert!(rpc.turns.is_empty()); // terminal error is known; cleanup can close
+        assert_eq!(trace.borrow().methods, ["turn/start"]);
+        rpc.close().unwrap();
+    }
+}
+
+#[test]
+fn live_creator_uses_one_turn_deadline_and_timeout_keeps_last_notification() {
+    for status in [Value::Null, json!("future-status")] {
+        let clock = WaitClock::default();
+        let (mut rpc, trace) = lifecycle_rpc(&clock, vec![
+            json!({"id":0,"result":{"turn":{"id":"turn"}}}),
+            terminal_event(WAIT_ID, "turn", status.clone()),
+        ]);
+        rpc.start_turn(WAIT_ID, "trivial").unwrap();
+        // The deadline covers the whole lifecycle, not a fresh budget at each
+        // step, and not the short budget used by ordinary read-only observers.
+        clock.advance(Duration::from_secs(100));
+        let error = rpc.created_progress(WAIT_ID, "turn", false).unwrap_err().to_string();
+        assert!(error.contains("timed out waiting for creator turn/completed notification"));
+        assert!(error.contains("creator_connected") && error.contains("terminal_notification"));
+        assert!(error.contains(&format!("\"status\":{status}")));
+        assert_eq!(clock.now(), TURN_TIMEOUT);
+        assert!(trace.borrow().deadlines.iter().all(|end| *end == TURN_TIMEOUT));
+        assert_eq!((trace.borrow().closes, trace.borrow().drops), (0,0));
+    }
+}
+
+#[test]
+fn live_pending_creator_cannot_close_or_handoff_without_both_witnesses() {
+    let clock = WaitClock::default();
+    let (mut rpc, trace) = lifecycle_rpc(&clock, vec![
+        json!({"id":0,"result":{"turn":{"id":"turn"}}}),
+        command_event(WAIT_ID, "turn"),
+    ]);
+    let turn = rpc.start_turn(WAIT_ID, "sleep").unwrap();
+    let tui = AttachedTui { pane:"%1".into(), thread:WAIT_ID.into() };
+    assert!(rpc.close().unwrap_err().to_string().contains("pending turn"));
+    assert!(rpc.handoff(WAIT_ID, &turn, &tui).is_err());
+    assert_eq!(trace.borrow().closes, 0);
+    rpc.created_progress(WAIT_ID, &turn, true).unwrap();
+    let wrong = AttachedTui { pane:"%2".into(), thread:WAIT_OTHER.into() };
+    assert!(rpc.handoff(WAIT_ID, &turn, &wrong).is_err());
+    assert!(rpc.close().is_err()); // underway alone is not a normal terminal
+    assert_eq!(trace.borrow().closes, 0);
+    rpc.handoff(WAIT_ID, &turn, &tui).unwrap();
+    assert_eq!((trace.borrow().closes, trace.borrow().drops), (1,1));
+    assert_eq!(trace.borrow().methods, ["turn/start"]); // no polling reconnects or mutations
+}
+
+#[test]
+fn live_sleep_witness_requires_owned_turn_and_in_progress_command_item() {
+    let event = command_event(WAIT_ID, "turn");
+    assert!(sleep_underway(&event, WAIT_ID, "turn"));
+    assert!(!sleep_underway(&event, WAIT_OTHER, "turn"));
+    assert!(!sleep_underway(&event, WAIT_ID, "other"));
+    for (path, value) in [
+        ("/id", json!(0)),
+        ("/method", json!("item/completed")),
+        ("/params/item/type", json!("agentMessage")),
+        ("/params/item/status", json!("completed")),
+        ("/params/item/status", Value::Null),
+        ("/params/item/command", json!("/usr/bin/true")),
+    ] {
+        let mut invalid = event.clone();
+        if path == "/id" { invalid["id"] = value; }
+        else { *invalid.pointer_mut(path).unwrap() = value; }
+        assert!(!sleep_underway(&invalid, WAIT_ID, "turn"), "{path}");
+    }
+    let clock = WaitClock::default();
+    let (mut rpc, trace) = lifecycle_rpc(&clock, vec![
+        json!({"id":0,"result":{"turn":{"id":"turn"}}}),
+        terminal_event(WAIT_ID, "turn", json!("completed")),
+    ]);
+    rpc.start_turn(WAIT_ID, "sleep").unwrap();
+    let error = rpc.created_progress(WAIT_ID, "turn", true).unwrap_err().to_string();
+    assert!(error.contains("completed before creator handoff"));
+    assert_eq!(trace.borrow().closes, 0);
+}
+
+#[test]
+fn live_short_observers_cannot_create_threads_or_start_turns() {
+    let clock = WaitClock::default();
+    let (mut rpc, trace) = lifecycle_rpc(&clock, Vec::new());
+    rpc.creator = false;
+    assert!(rpc.create("ccmux-probe-observer").is_err());
+    assert!(rpc.start_turn(WAIT_ID, "trivial").is_err());
+    assert!(rpc.request("turn/start", json!({"threadId":WAIT_ID})).is_err());
+    assert!(trace.borrow().methods.is_empty());
+    assert_eq!(trace.borrow().closes, 0);
 }
