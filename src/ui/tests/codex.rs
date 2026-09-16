@@ -21,35 +21,46 @@ fn codex_degraded(app: &mut App) {
 #[test]
 fn codex_states_keep_their_glyphs_in_the_provider_group() {
     use crate::model::CodexStatus;
+    #[derive(Clone, Copy, Debug)]
+    enum Ink { Gray, Purple, Orange, Yellow }
     let cases = [
-        (CodexStatus::NotLoaded, Status::Idle, Some(State::Unloaded), "◇", "unloaded", Group::Codex),
-        (CodexStatus::Idle, Status::Idle, None, "○", "idle", Group::Codex),
-        (CodexStatus::SystemError, Status::Unknown("systemError".into()), None, "?", "systemError", Group::Codex),
-        (CodexStatus::Unknown("future".into()), Status::Unknown("future".into()), None, "?", "unknown", Group::Codex),
-        (CodexStatus::Active { flags: vec![] }, Status::Busy, Some(State::Working), "●", "working", Group::Codex),
-        (CodexStatus::Active { flags: vec!["newFlag".into()] }, Status::Unknown("newFlag".into()), Some(State::Working), "?", "unknown", Group::Codex),
-        (CodexStatus::Active { flags: vec!["newFlag".into(), "waitingOnApproval".into()] }, Status::Waiting, Some(State::Blocked), "▲", "blocked", Group::Codex),
-        (CodexStatus::Active { flags: vec!["waitingOnUserInput".into()] }, Status::Waiting, Some(State::Blocked), "▲", "blocked", Group::Codex),
+        (CodexStatus::NotLoaded, Status::Idle, Some(State::Unloaded), "◇", Ink::Gray, "unloaded", Group::Codex),
+        (CodexStatus::Idle, Status::Idle, None, "○", Ink::Gray, "idle", Group::Codex),
+        (CodexStatus::SystemError, Status::Unknown("systemError".into()), None, "?", Ink::Purple, "systemError", Group::Codex),
+        (CodexStatus::Unknown("future".into()), Status::Unknown("future".into()), None, "?", Ink::Purple, "unknown", Group::Codex),
+        (CodexStatus::Active { flags: vec![] }, Status::Busy, Some(State::Working), "●", Ink::Orange, "working", Group::Codex),
+        (CodexStatus::Active { flags: vec!["newFlag".into()] }, Status::Unknown("newFlag".into()), Some(State::Working), "?", Ink::Purple, "unknown", Group::Codex),
+        (CodexStatus::Active { flags: vec!["newFlag".into(), "waitingOnApproval".into()] }, Status::Waiting, Some(State::Blocked), "▲", Ink::Yellow, "blocked", Group::Codex),
+        (CodexStatus::Active { flags: vec!["waitingOnUserInput".into()] }, Status::Waiting, Some(State::Blocked), "▲", Ink::Yellow, "blocked", Group::Codex),
     ];
-    for (runtime, status, state, glyph, detail, group) in cases {
+    for (runtime, status, state, glyph, ink, detail, group) in cases {
         let row = codex_row(runtime, status, state);
         let mut app = app_with(vec![row.clone()]);
         app.codex.settings.url = "ws://localhost".into();
-        let p = Palette::for_app(&app);
-        assert_eq!(status_glyph(&row, &p).0, glyph);
         assert_eq!(row.group(), group);
-        for &(w, _) in SIZES {
-            let line = session_line(&app, &row, true, w as usize, &p);
-            assert_eq!(line_w(&line), w as usize);
-            if w >= 6 {
-                assert!(!line.spans.iter().any(|s| s.content == "> "));
+        for dark in [false, true] {
+            app.dark = dark;
+            let p = Palette::for_app(&app);
+            let color = match ink {
+                Ink::Gray => p.gray,
+                Ink::Purple => p.purple,
+                Ink::Orange => p.orange,
+                Ink::Yellow => p.yellow,
+            };
+            assert_eq!(status_glyph(&row, &p), (glyph, color));
+            for &(w, _) in SIZES {
+                let line = session_line(&app, &row, true, w as usize, &p);
+                assert_eq!(line_w(&line), w as usize);
+                if w >= 6 {
+                    assert!(!line.spans.iter().any(|s| s.content == "> "));
+                }
             }
+            let rendered = rows_at(&app, 60, 24).join("\n");
+            assert!(rendered.contains(&format!("00000011 codex {detail}")), "{rendered}");
+            all_modes(&mut app);
         }
-        let rendered = rows_at(&app, 60, 24).join("\n");
-        assert!(rendered.contains(&format!("00000011 codex {detail}")), "{rendered}");
         assert!(!row.name.starts_with("> "));
         assert!(row.filter_haystack().contains(&row.session_id));
-        all_modes(&mut app);
     }
 }
 

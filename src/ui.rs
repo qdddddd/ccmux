@@ -3192,6 +3192,16 @@ mod tests {
             let on_sel = ratio(g, p.sel_bg);
             assert!(on_bg >= 4.0, "{name}: blocked accent is {on_bg:.2}:1 on the ground");
             assert!(on_sel >= 4.0, "{name}: blocked accent is {on_sel:.2}:1 on sel_bg");
+            let mut codex = sess(1, Kind::Background, Status::Waiting, Some(State::Blocked));
+            codex.provider = Provider::Codex;
+            let codex_g = status_glyph(&codex, &p).1;
+            assert_eq!(codex_g, p.yellow);
+            let codex_on_bg = ratio(codex_g, bg);
+            let codex_on_sel = ratio(codex_g, p.sel_bg);
+            assert!(codex_on_bg >= 4.0,
+                "{name}: Codex blocked glyph is {codex_on_bg:.2}:1 on the ground");
+            assert!(codex_on_sel >= 4.0,
+                "{name}: Codex blocked glyph is {codex_on_sel:.2}:1 on sel_bg");
             // Distinct from every accent the list already spends.
             for (other, c) in [
                 ("working", p.orange),
@@ -3763,4 +3773,3 @@ mod tests {
     }
 
 }
-
