@@ -63,7 +63,10 @@ variable. `CCMUX_CLAUDE_BIN` overrides the `claude` binary, and
 
 ## Codex sessions
 
-Codex is opt-in. Point ccmux at an existing Codex app-server:
+Codex is on by default when `~/.config/agents/codex-serve.token` exists;
+disable it with `--codex-url ''`. If `$XDG_CONFIG_HOME` is set and non-empty,
+ccmux uses `$XDG_CONFIG_HOME/agents/codex-serve.token` instead. Override the
+defaults when pointing ccmux at another existing Codex app-server:
 
 ```sh
 ccmux --codex-url ws://127.0.0.1:8965 \
@@ -74,7 +77,8 @@ The environment equivalents are `CCMUX_CODEX_URL` and
 `CCMUX_CODEX_TOKEN_FILE`; flags take precedence. `CCMUX_CODEX_BIN`
 selects the Codex executable. Settings follow new tabs and `R` restarts.
 The token is read inside each attach pane, never placed in tmux options or
-command arguments. No URL means no Codex connections.
+command arguments. An empty URL disables Codex; an absent URL uses the
+loopback default above.
 
 Only loopback `ws://` is supported: `localhost`, `127.0.0.0/8` or
 `[::1]`. For a remote server, open your own SSH tunnel, for example

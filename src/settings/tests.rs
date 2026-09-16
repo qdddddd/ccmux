@@ -5,6 +5,7 @@ fn env(key: &str) -> Option<String> {
         "CCMUX_CODEX_URL" => Some("ws://localhost:8965".into()),
         "CCMUX_CODEX_TOKEN_FILE" => Some("secrets/token file".into()),
         "CCMUX_CODEX_BIN" => Some("/opt/codex custom".into()),
+        "HOME" => Some("/home/fixture".into()),
         _ => None,
     }
 }
@@ -12,26 +13,114 @@ fn env(key: &str) -> Option<String> {
 #[test]
 fn explicit_settings_win_and_relative_paths_resolve_once() {
     let cwd = Path::new("/workspace");
-    let s = CodexSettings::resolve(None, None, env, Some(cwd));
+    let s = CodexSettings::resolve(None, None, env, Some(cwd),
+        |_| panic!("explicit environment settings must not probe defaults"));
     assert_eq!(s.url, "ws://localhost:8965");
     assert_eq!(s.token_file, Path::new("/workspace/secrets/token file"));
     assert_eq!(s.bin, "/opt/codex custom");
     let explicit = CodexSettings::resolve(Some("ws://127.0.0.2:42".into()),
-        Some("/other/token".into()), env, Some(cwd));
+        Some("/other/token".into()), env, Some(cwd),
+        |_| panic!("explicit settings must not probe defaults"));
     assert_eq!(explicit.url, "ws://127.0.0.2:42");
     assert_eq!(explicit.token_file, Path::new("/other/token"));
     assert!(explicit.config().is_ok());
-    assert!(!CodexSettings::resolve(Some(String::new()), None, env, Some(cwd)).enabled());
-    assert!(!CodexSettings::resolve(None, None, |_| None, None).enabled());
 }
 
 #[test]
-fn absent_and_unresolvable_token_paths_never_get_an_implicit_default() {
-    let missing = CodexSettings::resolve(Some("ws://localhost".into()), None, |_| None, None);
-    assert!(missing.token_file.as_os_str().is_empty());
-    let relative = CodexSettings::resolve(None, None, env, None);
-    let error = relative.config().err().expect("unresolvable relative path");
-    assert_eq!(error.kind, CodexFailureKind::Configuration);
+fn absent_options_resolve_the_home_or_xdg_defaults_independently() {
+    let home = |key: &str| match key {
+        "HOME" => Some("/home/fixture".into()),
+        _ => None,
+    };
+    let s = CodexSettings::resolve(None, None, home, None, |path| {
+        assert_eq!(path, Path::new("/home/fixture/.config/agents/codex-serve.token"));
+        true
+    });
+    assert_eq!(s.url, DEFAULT_CODEX_URL);
+    assert_eq!(s.token_file, Path::new("/home/fixture/.config/agents/codex-serve.token"));
+
+    let xdg = |key: &str| match key {
+        "XDG_CONFIG_HOME" => Some("/xdg/config".into()),
+        "HOME" => Some("/ignored/home".into()),
+        _ => None,
+    };
+    let s = CodexSettings::resolve(None, None, xdg, None, |path| {
+        assert_eq!(path, Path::new("/xdg/config/agents/codex-serve.token"));
+        true
+    });
+    assert_eq!(s.url, DEFAULT_CODEX_URL);
+    assert_eq!(s.token_file, Path::new("/xdg/config/agents/codex-serve.token"));
+
+    let empty_xdg = |key: &str| match key {
+        "XDG_CONFIG_HOME" => Some(String::new()),
+        "HOME" => Some("/fallback/home".into()),
+        _ => None,
+    };
+    let s = CodexSettings::resolve(None, None, empty_xdg, None, |_| true);
+    assert_eq!(s.token_file, Path::new("/fallback/home/.config/agents/codex-serve.token"));
+}
+
+#[test]
+fn missing_fully_defaulted_token_is_quiet_off_but_explicit_values_are_loud() {
+    use std::cell::RefCell;
+    let home = |key: &str| match key {
+        "HOME" => Some("/home/fixture".into()),
+        _ => None,
+    };
+    let probed = RefCell::new(Vec::new());
+    let quiet = CodexSettings::resolve(None, None, home, None, |path| {
+        probed.borrow_mut().push(path.to_path_buf());
+        false
+    });
+    assert_eq!(quiet, CodexSettings::default());
+    assert_eq!(&*probed.borrow(), &[PathBuf::from(
+        "/home/fixture/.config/agents/codex-serve.token")]);
+
+    let explicit_url = CodexSettings::resolve(Some("ws://localhost:8965".into()), None,
+        home, None, |_| panic!("an explicit URL must stay loud without a default probe"));
+    assert!(explicit_url.enabled());
+    assert_eq!(explicit_url.token_file,
+        Path::new("/home/fixture/.config/agents/codex-serve.token"));
+
+    let explicit_token = CodexSettings::resolve(None, Some("/missing/explicit-token".into()),
+        home, None, |_| panic!("an explicit token must stay loud without a default probe"));
+    assert!(explicit_token.enabled());
+    assert_eq!(explicit_token.url, DEFAULT_CODEX_URL);
+
+    let no_root = |key: &str| match key {
+        "HOME" | "XDG_CONFIG_HOME" => Some(String::new()),
+        _ => None,
+    };
+    let quiet = CodexSettings::resolve(None, None, no_root, None,
+        |_| panic!("no default token path means there is nothing to probe"));
+    assert_eq!(quiet, CodexSettings::default());
+}
+
+#[test]
+fn empty_flag_or_environment_url_is_off_before_any_existence_probe() {
+    use std::cell::Cell;
+    let probes = Cell::new(0);
+    let explicit = CodexSettings::resolve(Some(String::new()), None, env,
+        Some(Path::new("/workspace")), |_: &Path| {
+            probes.set(probes.get() + 1);
+            true
+        });
+    assert_eq!(explicit, CodexSettings {
+        url: String::new(), token_file: PathBuf::new(), bin: "/opt/codex custom".into(),
+    });
+    assert_eq!(probes.get(), 0);
+
+    let empty_env = |key: &str| match key {
+        "CCMUX_CODEX_URL" => Some(String::new()),
+        "HOME" => Some("/home/fixture".into()),
+        _ => None,
+    };
+    let inherited = CodexSettings::resolve(None, None, empty_env, None, |_: &Path| {
+        probes.set(probes.get() + 1);
+        true
+    });
+    assert_eq!(inherited, CodexSettings::default());
+    assert_eq!(probes.get(), 0, "set-but-empty URL must perform no filesystem probe");
 }
 
 #[test]

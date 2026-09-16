@@ -68,11 +68,13 @@ pub struct Cli {
     #[arg(short = 'L', long, global = true, value_parser = validate_socket_name)]
     pub socket: Option<String>,
 
-    /// Optional loopback ws:// Codex app-server URL (CCMUX_CODEX_URL)
+    /// Loopback ws:// Codex app-server URL; empty disables
+    /// (default ws://127.0.0.1:8965; CCMUX_CODEX_URL)
     #[arg(long, global = true)]
     pub codex_url: Option<String>,
 
-    /// Codex bearer-token file path (CCMUX_CODEX_TOKEN_FILE); never a token
+    /// Codex bearer-token file path (default under XDG_CONFIG_HOME/HOME);
+    /// CCMUX_CODEX_TOKEN_FILE; never a token
     #[arg(long, global = true)]
     pub codex_token_file: Option<String>,
 }
@@ -151,6 +153,7 @@ fn main() -> anyhow::Result<()> {
     let codex = settings::CodexSettings::resolve(
         cli.codex_url.clone(), cli.codex_token_file.clone(),
         |key| std::env::var(key).ok(), cwd.as_deref(),
+        std::path::Path::exists,
     );
     match cli.cmd {
         Some(Cmd::Sidebar { interval }) => run_sidebar(&cli, interval, &codex),
@@ -882,6 +885,41 @@ mod tests {
     }
 
     #[test]
+    fn default_codex_gate_propagates_on_and_off_to_launch_and_exec() {
+        use std::ffi::OsStr;
+        let env = |key: &str| match key {
+            "HOME" => Some("/home/fixture".into()),
+            _ => None,
+        };
+        let cli = Cli::try_parse_from(["ccmux", "--socket", "ccmux-smoke"]).unwrap();
+        let pending = restart::Pending { exe: "/new/ccmux".into() };
+
+        let on = settings::CodexSettings::resolve(None, None, env, None, |path| {
+            assert_eq!(path, std::path::Path::new(
+                "/home/fixture/.config/agents/codex-serve.token"));
+            true
+        });
+        let launch = sidebar_command(&cli, 34, &on).unwrap();
+        assert!(launch.ends_with("--codex-url=ws://127.0.0.1:8965 --codex-token-file=/home/fixture/.config/agents/codex-serve.token"));
+        let command = exec_command(&pending, &on);
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.ends_with(&[
+            OsStr::new("--codex-url=ws://127.0.0.1:8965"),
+            OsStr::new("--codex-token-file=/home/fixture/.config/agents/codex-serve.token"),
+        ]));
+
+        let off = settings::CodexSettings::resolve(None, None, env, None, |_| false);
+        assert_eq!(off, settings::CodexSettings::default());
+        let launch = sidebar_command(&cli, 34, &off).unwrap();
+        assert!(launch.ends_with("--codex-url= --codex-token-file="));
+        let command = exec_command(&pending, &off);
+        let args: Vec<_> = command.get_args().collect();
+        assert!(args.ends_with(&[
+            OsStr::new("--codex-url="), OsStr::new("--codex-token-file="),
+        ]));
+    }
+
+    #[test]
     fn width_clamp_bounds_match_the_spec() {
         assert_eq!(1u16.clamp(WIDTH_MIN, WIDTH_MAX), 20);
         assert_eq!(34u16.clamp(WIDTH_MIN, WIDTH_MAX), 34);
@@ -1410,7 +1448,11 @@ mod tests {
         {
             // Resolve from the environment, so the original URL is never argv.
             let settings = settings::CodexSettings::resolve(None, Some("/fixture/token".into()),
-                |key| if key == "CCMUX_CODEX_URL" { Some(url.into()) } else { None }, None);
+                |key| match key {
+                    "CCMUX_CODEX_URL" => Some(url.into()),
+                    "HOME" => Some("/home/fixture".into()),
+                    _ => None,
+                }, None, |_| panic!("explicit settings must not probe defaults"));
             let launch = sidebar_command(&cli, 34, &settings).unwrap();
             let pending = restart::Pending { exe: "/new/ccmux".into() };
             let peer = restart::sidebar_command(&pending.exe, &settings).unwrap();
@@ -1422,7 +1464,9 @@ mod tests {
                     && !text.contains("token="), "{text}");
             }
             let cli = Cli::try_parse_from(settings.args(["ccmux", "sidebar"].map(Into::into))).unwrap();
-            let child = settings::CodexSettings::resolve(cli.codex_url, cli.codex_token_file, |_| None, None);
+            let child = settings::CodexSettings::resolve(cli.codex_url, cli.codex_token_file,
+                |key| if key == "HOME" { Some("/home/fixture".into()) } else { None },
+                None, |_| panic!("propagated settings must not probe defaults"));
             assert!(child.enabled());
             assert_eq!(child.config().err().unwrap().message, settings.config().err().unwrap().message);
         }

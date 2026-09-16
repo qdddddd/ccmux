@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{codex::{CodexConfig, CodexDiagnostic, CodexFailureKind}, tmux};
 
+pub const DEFAULT_CODEX_URL: &str = "ws://127.0.0.1:8965";
+const DEFAULT_TOKEN_NAME: &str = "agents/codex-serve.token";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexSettings {
     pub url: String,
@@ -19,24 +22,52 @@ impl Default for CodexSettings {
 }
 
 impl CodexSettings {
-    /// Resolution reads no credentials and does no DNS. Empty CLI values
-    /// override the environment, especially the explicit OFF passed to tmux.
+    /// Resolution reads no credentials and does no DNS. It only probes whether
+    /// the fully defaulted token path exists, so a machine without codex-serve
+    /// stays quietly OFF. Empty CLI/environment URL values are explicit OFF
+    /// and return before that probe.
     pub fn resolve(
         url: Option<String>, token: Option<String>,
         env: impl Fn(&str) -> Option<String>, cwd: Option<&Path>,
+        exists: impl Fn(&Path) -> bool,
     ) -> Self {
-        let url = url.or_else(|| env("CCMUX_CODEX_URL")).unwrap_or_default();
-        let token = token.or_else(|| env("CCMUX_CODEX_TOKEN_FILE")).unwrap_or_default();
-        let mut token_file = PathBuf::from(token);
+        let bin = env("CCMUX_CODEX_BIN").filter(|s| !s.is_empty()).unwrap_or_else(|| "codex".into());
+        let (url, url_defaulted) = match url {
+            Some(url) => (url, false),
+            None => match env("CCMUX_CODEX_URL") {
+                Some(url) => (url, false),
+                None => (DEFAULT_CODEX_URL.into(), true),
+            },
+        };
+        if url.is_empty() {
+            return Self { url, token_file: PathBuf::new(), bin };
+        }
+
+        let (token_file, token_defaulted) = match token {
+            Some(token) => (PathBuf::from(token), false),
+            None => match env("CCMUX_CODEX_TOKEN_FILE") {
+                Some(token) => (PathBuf::from(token), false),
+                None => {
+                    let root = env("XDG_CONFIG_HOME").filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(|| env("HOME").filter(|s| !s.is_empty())
+                            .map(|home| PathBuf::from(home).join(".config")));
+                    (root.map(|root| root.join(DEFAULT_TOKEN_NAME)).unwrap_or_default(), true)
+                }
+            },
+        };
+        let mut token_file = token_file;
         if !token_file.as_os_str().is_empty() && token_file.is_relative()
             && let Some(cwd) = cwd
         {
             token_file = cwd.join(token_file);
         }
-        Self {
-            url, token_file,
-            bin: env("CCMUX_CODEX_BIN").filter(|s| !s.is_empty()).unwrap_or_else(|| "codex".into()),
+        if url_defaulted && token_defaulted
+            && (token_file.as_os_str().is_empty() || !exists(&token_file))
+        {
+            return Self { url: String::new(), token_file: PathBuf::new(), bin };
         }
+        Self { url, token_file, bin }
     }
 
     pub fn enabled(&self) -> bool { !self.url.is_empty() }

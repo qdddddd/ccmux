@@ -3812,7 +3812,9 @@ claim that the implementation already exists.
 
 ### 12.1 Scope and ownership (§§2, 3.3, 8, 10.3)
 
-Codex is opt-in, with ONE configured app-server endpoint per ccmux workspace.
+Codex uses ONE configured app-server endpoint per ccmux workspace. Local
+defaults enable it when the default token file exists (§12.2); an explicit
+empty URL disables it.
 v1 adds listing, grouping, filtering, navigation, `a`, `d/u`, `r`,
 `Enter/o/s/t` remote attach, and `x`. The official Codex TUI owns every
 conversation mutation. The sidebar owns its pane and dismissal records.
@@ -3839,25 +3841,44 @@ Add these global CLI options, accepted by the launcher and `sidebar`:
 
 | Option | Environment fallback | Default / precedence |
 |---|---|---|
-| `--codex-url <URL>` | `CCMUX_CODEX_URL` | disabled; explicit flag wins |
-| `--codex-token-file <PATH>` | `CCMUX_CODEX_TOKEN_FILE` | no implicit path; explicit flag wins |
+| `--codex-url <URL>` | `CCMUX_CODEX_URL` | `ws://127.0.0.1:8965`; flag, environment, default |
+| `--codex-token-file <PATH>` | `CCMUX_CODEX_TOKEN_FILE` | `$XDG_CONFIG_HOME/agents/codex-serve.token`, else `$HOME/.config/agents/codex-serve.token`; flag, environment, default |
 | no new binary flag | `CCMUX_CODEX_BIN` | `codex`; one executable, not shell text |
 
-An absent or empty effective URL means OFF. Do not read a token, resolve a
-hostname, inspect Codex state, prepare a client, connect, or show a Codex error
-in this case, even if a token-file variable is present. Claude-only windows
-keep byte-identical v1 maps (§12.9). Two §12.6 changes ALSO apply to
-Claude-only users: standing poll errors occupy one truncated footer line,
-and first failure/recovery-to-failure/category changes queue guarded,
-rate-limited diagnostic flashes, with failed explicit `r` exempt from the
-cooldown. Other Claude polling, row-retention, and verb behavior remains.
+Resolve URL and token path independently. A PRESENT flag wins over a PRESENT
+environment value, including an empty string; only an absent value falls
+through to its default. An empty effective URL means OFF. Return canonical
+OFF before constructing or probing a default token path: do not read a token,
+resolve a hostname, inspect Codex state, prepare a client, connect, or show a
+Codex error, even if a token-file variable is present.
+
+The default token root is a non-empty `XDG_CONFIG_HOME`, then a non-empty
+`HOME` plus `.config`. With neither root, fully defaulted settings resolve to
+OFF without an existence probe. When BOTH URL and token path came from their
+defaults, probe only whether that token path exists. A missing path resolves
+to the same canonical OFF: no preparation, DNS, credential read, diagnostic,
+Codex help, or Codex polling. This existence probe is not a credential read.
+If either option was explicit, do not apply the quiet gate: an explicit URL
+with a missing default token, or an explicit token with the default URL,
+remains enabled and reports the normal configuration/credential failure.
+A present default token also enables Codex, so a down server remains loud.
+
+Run this gate once when `main` resolves settings. Propagated child settings
+are explicit and do not re-probe or re-decide the defaults. A default token
+created after resolution takes effect in a newly launched process, not by an
+automatic poll in the existing process. Claude-only windows keep byte-identical
+v1 maps (§12.9). Two §12.6 changes ALSO apply to Claude-only users: standing
+poll errors occupy one truncated footer line, and first
+failure/recovery-to-failure/category changes queue guarded, rate-limited
+diagnostic flashes, with failed explicit `r` exempt from the cooldown. Other
+Claude polling, row-retention, and verb behavior remains.
 
 **v1 accepts only loopback `ws://`.** URL syntax validation requires a host
 that is either `localhost` (case-insensitive, NO trailing dot), an IPv4
 literal in `127.0.0.0/8`, or IPv6 `[::1]`. Reject other hostnames even if
 they resolve to loopback: the official CLI rejects their authenticated
 `ws://` attach too. Reject userinfo, query, and fragment. No `wss://`, TLS
-stack, implicit endpoint, or discovery fallback is added in v1.
+stack, server discovery, or alternate endpoint fallback is added in v1.
 
 An invalid URL is a Codex configuration error BEFORE DNS, credential-file IO,
 a connection, or an attach command. Its diagnostic is
@@ -3874,11 +3895,14 @@ disagree and expose the sidebar's bearer. For a remote server, the operator
 can run `ssh -N -L 8965:127.0.0.1:8965 host` and configure ccmux with
 `ws://127.0.0.1:8965`. ccmux does not start or manage the tunnel.
 
-The token-file path is required, made absolute against the launching process's
-cwd once, and carried as a path. During preparation, reject a non-regular or
-unreadable file, or an empty credential, as a Codex failure. Remove trailing LF
-as shell command substitution does; reject any remaining CR/LF. No credential
-bytes may enter Debug/Display, errors, argv, tmux options, logs, or fixtures.
+The token-file path defaults as above and is otherwise required for an enabled
+configuration. Thus `--codex-url X` without a token flag or environment value
+uses the default token path. Make the path absolute against the launching
+process's cwd once and carry it as a path. During preparation, reject a
+non-regular or unreadable file, or an empty credential, as a Codex failure.
+Remove trailing LF as shell command substitution does; reject any remaining
+CR/LF. No credential bytes may enter Debug/Display, errors, argv, tmux options,
+logs, or fixtures.
 
 The non-secret configuration surface is authoritative:
 
@@ -3961,6 +3985,9 @@ otherwise mistakes executable paths containing `=` for assignments.
 OFF is explicit: `--codex-url=` overrides a stale URL in tmux's environment.
 `R` probes support for these flags before exec (§8.11), so pre-Codex binaries
 are refused even when OFF; dropping the flags would lose that override.
+Defaults which pass the quiet gate propagate as explicit URL/token flags;
+quietly gated OFF propagates the explicit empty URL and token path. A child
+therefore never re-evaluates the parent process's default-file decision.
 No token value is forwarded. Existing width/theme/socket/interval and restart
 handoff rules remain. Self-exec canonicalizes these Codex options instead of
 relying on the original argv having contained environment-derived settings.
@@ -4703,8 +4730,8 @@ pub struct PaneMap {
    field order/default fields. The empty value remains `EMPTY_MAP_JSON` v1.
    With at least one Codex entry, write v2 with `provider:"claude"` or
    `provider:"codex"` REQUIRED on every entry. Removing the last Codex
-   entry returns the owning window to v1 on its next write. Opt-in alone
-   does not select v2; an existing Codex entry keeps v2 even with Codex OFF.
+   entry returns the owning window to v1 on its next write. Enabled settings
+   alone do not select v2; an existing Codex entry keeps v2 even with Codex OFF.
 3. The legacy `@ccmux_map` ownership marker stays empty v1. `t`'s uncached
    pre-write follows the same content rule: empty/Claude-only is v1; a map
    seeded with a Codex entry is v2 BEFORE the sidebar starts. Never put a
@@ -4992,10 +5019,21 @@ have these tests; existing Claude tests remain authoritative except for
   completeness from the ignored requests alone. Request floods expire
   within the same budget. Expiry starts no request and does not wait on
   close. Errors/logs/command text contain no test secret.
-- **URL/configuration:** OFF makes zero preparation/connection calls.
+- **URL/configuration:** absent options resolve independently to the loopback
+  URL and XDG-then-HOME token path. Fixture every environment value and the
+  existence probe: no test may depend on the host's HOME or token file.
+  A present-but-empty URL flag or environment value means OFF and performs
+  zero existence probes, preparation, or connection calls. Fully defaulted
+  settings with no token root perform no probe and resolve OFF; a missing
+  default token path is probed once and resolves OFF without DNS, credential
+  reads, diagnostics, or Codex UI. A present default token enables Codex.
+  An explicit URL plus a missing default token, and an explicit token plus
+  the default URL, stay enabled/loud and do not use the quiet gate.
   Explicit options beat environment; paths become absolute; launcher/heal/
   `t`/self-exec/other-sidebar restart preserve enabled AND disabled settings
-  and binary overrides despite a conflicting tmux environment. Accept
+  and binary overrides despite a conflicting tmux environment. Assert both
+  sidebar launch and self-exec receive resolved defaults when enabled and
+  explicit OFF after the quiet gate; children do not probe defaults. Accept
   `ws://localhost:8965`, `ws://LOCALHOST:8965`,
   `ws://127.0.0.2:8965`, and `ws://[::1]:8965`; reject non-loopback
   literals, LAN/Tailscale/other hostnames, `localhost.`, `wss://`,
