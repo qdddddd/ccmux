@@ -2295,6 +2295,10 @@ impl App {
                 .is_some_and(|arm| arm.provider == Provider::Codex);
             if codex || self.codex_closed_until.is_some_and(|end| now < end) {
                 self.disarm_ctrl_x();
+                // This press stamped the guard at `now`; the next press inside
+                // CX_MIN_GAP is refused because of it, so the wording must last
+                // exactly as long, not merely to the original window's end.
+                self.extend_codex_closed(now + CX_MIN_GAP);
                 self.flash(CODEX_CLOSED, MsgLevel::Warn);
                 return Action::Redraw;
             }
@@ -2410,6 +2414,9 @@ impl App {
     fn archive_and_arm(&mut self, session: &Session) {
         if let Some(reason) = self.codex_archive_refusal(session) {
             self.flash(reason, MsgLevel::Warn);
+            // A double tap on a refused row is a burst against this press's
+            // stamp; it must not say "press Ctrl+X again" (§12.8).
+            self.extend_codex_closed(Instant::now() + CX_MIN_GAP);
             return;
         }
         let label = session_label(session);
@@ -2499,12 +2506,17 @@ impl App {
                 format!("{label} left the list — nothing deleted")
             };
             self.flash(msg, MsgLevel::Warn);
+            if arm.provider == Provider::Codex { self.end_codex_window_unarchived(&arm); }
             return;
         }
         if arm.provider == Provider::Codex {
-            let Some(selected) = selected.as_ref() else { return; };
+            let Some(selected) = selected.as_ref() else {
+                self.end_codex_window_unarchived(&arm);
+                return;
+            };
             if let Some(reason) = self.codex_archive_refusal(selected) {
                 self.flash(reason, MsgLevel::Warn);
+                self.end_codex_window_unarchived(&arm);
                 return;
             }
         }
@@ -2604,7 +2616,7 @@ impl App {
             && session.session_id == arm.session_id).cloned();
         let Some(target) = target else {
             self.flash(format!("{label} left the list — not archived"), MsgLevel::Warn);
-            self.stamp_ctrl_x(Instant::now());
+            self.end_codex_window_unarchived(&arm);
             return;
         };
         // FRESH INVENTORY, for `act_enter`'s reason: the tab maps are as old
@@ -2614,15 +2626,15 @@ impl App {
         self.refresh_panes();
         if let Some(reason) = self.codex_archive_refusal(&target) {
             self.flash(reason, MsgLevel::Warn);
-            self.stamp_ctrl_x(Instant::now());
+            self.end_codex_window_unarchived(&arm);
             return;
         }
         let config = match self.codex.settings.config() {
             Ok(config) => config,
             Err(error) => {
                 self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
+                self.end_codex_window_unarchived(&arm);
                 self.act_force_refresh();
-                self.stamp_ctrl_x(Instant::now());
                 return;
             }
         };
@@ -2638,12 +2650,17 @@ impl App {
                 self.flash(format!("archived {label}"), MsgLevel::Info);
                 self.act_force_refresh();
             }
+            // Neither ending archived anything, and the forced poll below may
+            // drop the row and put the cursor on a Claude neighbour: protect
+            // the rest of the window before that poll runs.
             Ok(ArchiveOutcome::StateChanged) => {
                 self.flash("state changed — not archived", MsgLevel::Warn);
+                self.end_codex_window_unarchived(&arm);
                 self.act_force_refresh();
             }
             Err(error) => {
                 self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
+                self.end_codex_window_unarchived(&arm);
                 self.act_force_refresh();
             }
         }
@@ -2672,7 +2689,38 @@ impl App {
         let Some(end) = arm.at.checked_add(CX_WINDOW) else { return; };
         if end <= Instant::now() { return; }
         self.stamp_ctrl_x(end.checked_sub(CX_MIN_GAP).unwrap_or(end));
-        self.codex_closed_until = Some(end);
+        self.extend_codex_closed(end);
+    }
+
+    /// EVERY ending of a Codex window that archived nothing — a refused
+    /// second press, a settle refusal, a configuration error, StateChanged,
+    /// an RPC failure, a row that left — ends here. Any of them can leave the
+    /// cursor on a Claude neighbour (the forced poll may drop the row), so each
+    /// protects the rest of the original two seconds and keeps the
+    /// non-inviting wording for as long as the guard stamped now refuses. A
+    /// slow RPC can outlast the window itself; the `now + CX_MIN_GAP` half
+    /// covers a press buffered during it.
+    fn end_codex_window_unarchived(&mut self, arm: &StopArm) {
+        self.protect_after_codex_disarm(arm);
+        let now = Instant::now();
+        self.stamp_ctrl_x(now);
+        self.extend_codex_closed(now + CX_MIN_GAP);
+    }
+
+    /// `codex_closed_until` only chooses wording, and only ever moves later.
+    fn extend_codex_closed(&mut self, until: Instant) {
+        self.codex_closed_until = Some(self.codex_closed_until.map_or(until, |end| end.max(until)));
+    }
+
+    /// A tick that blocked long enough to buffer a keystroke must not let that
+    /// keystroke read as a second, deliberate press into an open Codex window:
+    /// the guard measures keystrokes, and a tap typed during the tick was
+    /// typed before it ended. Claude keeps `SLOW_TICK`'s drain unchanged.
+    pub fn note_blocking_tick(&mut self, ended: Instant) {
+        let open = self.stop_arm.as_ref().or_else(||
+            self.pending_delete.as_ref().map(|pending| &pending.target))
+            .is_some_and(|arm| arm.provider == Provider::Codex);
+        if open { self.stamp_ctrl_x(ended); }
     }
 
     /// The first Codex press flashes its invitation for `MSG_TTL`, twice the

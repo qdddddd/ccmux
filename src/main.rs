@@ -669,7 +669,9 @@ fn timed_tick(
 ) -> anyhow::Result<()> {
     let started = now();
     app.tick();
-    if now().saturating_duration_since(started) >= SLOW_TICK { drain()?; }
+    let ended = now();
+    if ended.saturating_duration_since(started) >= SLOW_KEY { app.note_blocking_tick(ended); }
+    if ended.saturating_duration_since(started) >= SLOW_TICK { drain()?; }
     Ok(())
 }
 
@@ -1519,6 +1521,52 @@ mod tests {
             }).unwrap();
             KEYS.with(|k| assert!(k.borrow().is_empty(), "{launch}: buffered input survived"));
             EVENTS.with(|e| assert_eq!(*e.borrow(), ["frame", "claude poll", "prepare", "drain"]));
+        }
+    }
+
+    #[test]
+    fn a_blocking_tick_under_slow_tick_re_dates_an_open_codex_window() {
+        use std::cell::Cell;
+        use std::time::Instant;
+        thread_local! {
+            static CLOCK: Cell<Instant> = Cell::new(Instant::now());
+            static STEP: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+            static DRAINS: Cell<u32> = const { Cell::new(0) };
+        }
+        // (tick length, Codex window open, guard expected at the tick's end)
+        for (step, open, stamped) in [(900, true, true), (200, true, false), (900, false, false)] {
+            STEP.with(|s| s.set(Duration::from_millis(step)));
+            DRAINS.with(|d| d.set(0));
+            let mut app = app::App::new("ccmux-test".into(), 34, Duration::from_millis(2500), true);
+            app.degraded = true; // tick must not access tmux
+            app.agents_poll = || {
+                CLOCK.with(|c| c.set(c.get() + STEP.with(Cell::get)));
+                Ok(model::Payload::default())
+            };
+            if open {
+                // The armed row must still be listed after the tick, or the
+                // tick's rebuild disarms the window before the hook can see it.
+                let id = "019c0000-0000-7000-8000-000000000001";
+                app.sessions.push(model::Session {
+                    provider: model::Provider::Codex,
+                    codex: Some(model::CodexMeta { runtime: model::CodexStatus::Idle, updated_at: 20 }),
+                    session_id: id.into(), id: Some("00000001".into()), name: "task".into(),
+                    cwd: "/remote".into(), kind: model::Kind::Background, pid: None, started_at: 10,
+                    status: model::Status::Idle, state: None,
+                });
+                app.stop_arm = Some(app::StopArm {
+                    provider: model::Provider::Codex, session_id: id.into(),
+                    short_id: "00000001".into(), name: "task".into(), at: CLOCK.with(Cell::get),
+                });
+            }
+            timed_tick(&mut app, || CLOCK.with(Cell::get), || {
+                DRAINS.with(|d| d.set(d.get() + 1));
+                Ok(())
+            }).unwrap();
+            let end = CLOCK.with(Cell::get);
+            assert_eq!(DRAINS.with(Cell::get), 0, "{step} ms is under SLOW_TICK");
+            assert_eq!(app.cx_last_press == Some(end), stamped,
+                "{step} ms, open={open}: a tap typed during the tick must read as a burst");
         }
     }
 

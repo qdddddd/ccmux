@@ -1240,7 +1240,9 @@ fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
         assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
         ctrl_x(&mut a);
         assert!(agents::test_spawn::joined().is_empty(), "{refusal}: a double-tapped refusal stopped a neighbour");
-        assert_eq!(a.message.as_ref().unwrap().0, "too fast — press Ctrl+X again");
+        // Never "press Ctrl+X again": obeying that once the row had left is
+        // what stopped the neighbour.
+        assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED, "{refusal}");
     }
 }
 
@@ -1555,4 +1557,186 @@ fn only_a_confirmed_archive_hides_a_thread() {
             assert_eq!(codex_names(&a), ["task 1"], "{outcome:?} hid a thread that was not archived");
         }
     }
+}
+
+// ── Every Codex window ending that archived nothing protects the neighbour ──
+//
+// A second review of the fixes found the same class again: the window could
+// also end through a refused second press, a settle-time StateChanged or
+// failure, or a row that left — and each of those left the rest of the two
+// seconds unguarded, so a paced retry after the forced poll dropped the row
+// stopped the Claude neighbour. Real sleeps; every press is >= CX_MIN_GAP
+// after the last deliberate one and inside the original window.
+
+fn message(a: &App) -> String { a.message.as_ref().map(|m| m.0.clone()).unwrap_or_default() }
+
+fn press_inside_the_window(a: &mut App, armed_at: Instant, offset_ms: u64) {
+    sleep_until(armed_at + Duration::from_millis(offset_ms));
+    ctrl_x(a);
+    assert!(armed_at.elapsed() < CX_WINDOW, "the press left the original window");
+}
+
+#[test]
+fn a_refused_second_press_protects_the_rest_of_the_codex_window() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    poll(&mut a, vec![row(1, CodexStatus::Active { flags: vec![] })], true);
+    a.rebuild_rows();
+    assert!(a.stop_arm.is_some(), "a row that stays visible does not disarm");
+    press_inside_the_window(&mut a, armed_at, 800);
+    assert_eq!(message(&a), "running — not archived");
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
+    vanish(&mut a);
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    press_inside_the_window(&mut a, armed_at, 1600);
+    assert!(agents::test_spawn::joined().is_empty(), "stopped {:?}", agents::test_spawn::joined());
+    assert!(!calls().contains(&"archive"));
+}
+
+#[test]
+fn a_settle_that_archives_nothing_protects_the_rest_of_the_codex_window() {
+    for outcome in ["state-changed", "timeout", "protocol"] {
+        let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+        SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(match outcome {
+            "state-changed" => Ok(codex::ArchiveOutcome::StateChanged),
+            "timeout" => Err(error(CodexFailureKind::Timeout)),
+            _ => Err(error(CodexFailureKind::Protocol)),
+        }));
+        ctrl_x(&mut a);
+        let armed_at = a.stop_arm.as_ref().unwrap().at;
+        press_inside_the_window(&mut a, armed_at, 780);
+        assert!(a.pending_delete.is_some(), "{outcome}");
+        sleep_until(armed_at + Duration::from_millis(780) + CX_SETTLE + Duration::from_millis(5));
+        assert!(with_inventory(|_| Ok(String::new()), || a.tick_stop_arm()));
+        assert!(message(&a).contains("not archived") || message(&a).starts_with("archive failed: "),
+            "{outcome}: {}", message(&a));
+        vanish(&mut a);
+        assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+        press_inside_the_window(&mut a, armed_at, 1780);
+        assert!(agents::test_spawn::joined().is_empty(),
+            "{outcome}: a retry inside the window stopped {:?}", agents::test_spawn::joined());
+        assert!(!message(&a).contains("press Ctrl+X again"), "{outcome}: {}", message(&a));
+    }
+}
+
+#[test]
+fn a_state_change_then_a_hidden_unload_stops_nothing() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    key(&mut a, KeyCode::Char('a'));
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
+    SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(Ok(codex::ArchiveOutcome::StateChanged)));
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    press_inside_the_window(&mut a, armed_at, 800);
+    settle_ctrl_x(&mut a);
+    assert_eq!(message(&a), "state changed — not archived");
+    // The thread unloaded; `a` hides it and the cursor falls to Claude.
+    poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
+    a.rebuild_rows();
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    press_inside_the_window(&mut a, armed_at, 1700);
+    assert!(agents::test_spawn::joined().is_empty(), "stopped {:?}", agents::test_spawn::joined());
+}
+
+#[test]
+fn a_double_tapped_codex_refusal_never_invites_another_press() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Active { flags: vec![] }));
+    ctrl_x(&mut a);
+    let t0 = Instant::now();
+    assert_eq!(message(&a), "running — not archived");
+    sleep_until(t0 + Duration::from_millis(200));
+    ctrl_x(&mut a);
+    assert_eq!(message(&a), CODEX_CLOSED);
+    vanish(&mut a);
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    assert!(!screen(&a).contains("press Ctrl+X again"));
+    assert!(agents::test_spawn::joined().is_empty());
+}
+
+#[test]
+fn the_closed_wording_lasts_as_long_as_the_guard_a_refused_press_set() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    vanish(&mut a);
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    press_inside_the_window(&mut a, armed_at, 1900);
+    assert_eq!(message(&a), CODEX_CLOSED);
+    // Past the original window, but inside the guard that 1.9 s press set.
+    sleep_until(armed_at + Duration::from_millis(2500));
+    ctrl_x(&mut a);
+    assert_eq!(message(&a), CODEX_CLOSED);
+    assert!(!screen(&a).contains("press Ctrl+X again"));
+    assert!(agents::test_spawn::joined().is_empty());
+}
+
+#[test]
+fn a_slow_failed_archive_keeps_a_buffered_press_uninvited() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    SCRIPT.with(|s| {
+        let mut s = s.borrow_mut();
+        s.archive_results.push_back(Err(error(CodexFailureKind::Timeout)));
+        s.archive_delay = Duration::from_millis(1000);
+    });
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    press_inside_the_window(&mut a, armed_at, 800);
+    settle_ctrl_x(&mut a);
+    assert!(armed_at.elapsed() >= Duration::from_millis(1800), "the RPC ate most of the window");
+    vanish(&mut a);
+    sleep_until(armed_at + CX_WINDOW + Duration::from_millis(50));
+    ctrl_x(&mut a); // typed during the RPC, read just after the window ended
+    assert_eq!(message(&a), CODEX_CLOSED);
+    assert!(agents::test_spawn::joined().is_empty());
+}
+
+#[test]
+fn a_tap_buffered_behind_a_blocking_tick_is_not_a_second_press() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    // A 900 ms tick: under SLOW_TICK, so nothing drains, but long enough that
+    // a double tap's second half typed at +50 ms is dequeued >= CX_MIN_GAP on.
+    std::thread::sleep(Duration::from_millis(900));
+    a.note_blocking_tick(Instant::now());
+    ctrl_x(&mut a);
+    assert!(a.pending_delete.is_none(), "a double tap scheduled the archive");
+    sleep_until(armed_at + Duration::from_millis(900) + CX_SETTLE + Duration::from_millis(5));
+    with_inventory(|_| Ok(String::new()), || a.tick_stop_arm());
+    assert!(!calls().contains(&"archive"));
+    assert_eq!(message(&a), CODEX_CLOSED);
+}
+
+#[test]
+fn a_blocking_tick_without_a_codex_window_stamps_nothing() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    assert!(a.cx_last_press.is_none());
+    a.note_blocking_tick(Instant::now());
+    assert!(a.cx_last_press.is_none(), "Claude timing must not change");
+}
+
+#[test]
+fn a_lagging_loaded_read_with_a_new_updated_at_is_not_a_rediscovery() {
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    archive_selected(&mut a);
+    let mut lagging = row(1, CodexStatus::NotLoaded);
+    lagging.codex.as_mut().unwrap().updated_at = 99;
+    // Plain `poll`: the row is not in the archived:false history.
+    poll(&mut a, vec![lagging.clone()], false);
+    assert!(codex_names(&a).is_empty(), "an incomplete lagging read resurrected the row");
+    poll(&mut a, vec![lagging.clone()], true);
+    assert!(codex_names(&a).is_empty(), "a complete lagging read resurrected the row");
+    poll(&mut a, vec![lagging], true);
+    assert!(codex_names(&a).is_empty());
+}
+
+#[test]
+fn an_archived_polled_row_stays_gone_after_an_incomplete_poll() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    archive_selected(&mut a);
+    assert!(codex_names(&a).is_empty());
+    poll(&mut a, vec![], false);
+    assert!(codex_names(&a).is_empty(), "the cached row came back after an incomplete poll");
 }

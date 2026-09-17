@@ -1583,13 +1583,13 @@ fn live_rpc_declines_only_the_owned_turn_approval_once() {
         assert!(sent.borrow().is_empty());
 
         // A held request for an unstarted turn, a held user-input request, a
-        // request never held, and one without an id all go unanswered.
+        // request never held all go unanswered (a held null id: its own test).
         let held_other_turn = rpc.server_requests.iter()
             .find(|held| held["params"]["turnId"] == "other-turn").cloned().unwrap();
         let held_input = rpc.server_requests.iter()
             .find(|held| held["method"] != APPROVAL_REQUEST).cloned().unwrap();
         for refused in [foreign.clone(), held_other_turn, held_input,
-            approval(json!(10), WAIT_ID, "turn"), approval(Value::Null, WAIT_ID, "turn")]
+            approval(json!(10), WAIT_ID, "turn")]
         {
             assert!(rpc.decline_approval(&refused).is_err(), "{refused}");
         }
@@ -2247,4 +2247,20 @@ fn live_short_observers_cannot_create_threads_or_start_turns() {
     assert!(rpc.request("turn/start", json!({"threadId":WAIT_ID})).is_err());
     assert!(trace.borrow().methods.is_empty());
     assert_eq!(trace.borrow().closes, 0);
+}
+
+#[test]
+fn live_rpc_never_answers_a_held_null_id_approval() {
+    let clock = WaitClock::default();
+    let pause = |_| {};
+    let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, Vec::new(), CASE_TIMEOUT);
+    rpc.turns.insert((WAIT_ID.into(), "turn".into()), CreatedTurn { end:CASE_TIMEOUT, command_underway:false });
+    let owned = json!({"id":Value::Null,"method":APPROVAL_REQUEST,
+        "params":{"threadId":WAIT_ID,"turnId":"turn","itemId":"command"}});
+    rpc.transport = Some(Box::new(FakeLiveTransport { sent:sent.clone(), replies:[owned.clone()].into() }));
+    // Held through the real receive path, so only the id guard can refuse it.
+    assert_eq!(rpc.wait_approval(WAIT_ID, "turn").unwrap(), owned);
+    assert!(rpc.server_requests.contains(&owned));
+    assert!(rpc.decline_approval(&owned).is_err());
+    assert!(sent.borrow().is_empty());
 }

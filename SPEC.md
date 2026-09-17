@@ -4769,9 +4769,21 @@ A later Claude selection can never inherit a Codex arm or pending action.
 
 A disarm other than expiry protects the rest of the original two-second
 window: the repeat guard is dated so that every press before the window's end
-reads as a burst, and no press ever moves the guard backwards. A burst, and
-every press refused inside that remainder, warns
-`archive window closed — nothing archived` and never invites another press.
+reads as a burst, and no press ever moves the guard backwards. The same holds
+for EVERY ending that archives nothing, not only a disarm: a refused second
+press, a settle-time refusal or configuration error, `StateChanged`, an RPC
+failure or timeout, and a row that left before the settle. Each can leave the
+cursor on a Claude neighbour once the forced poll drops the row. A burst, a
+refused first press, and every press refused inside that remainder, warn
+`archive window closed — nothing archived` and never invite another press;
+that wording lasts as long as the guard the refused press itself set
+(`CX_MIN_GAP` past it), so it never lapses into Claude's inviting
+`too fast — press Ctrl+X again` while that press's guard still refuses. A
+successful archive keeps Claude's post-delete behavior. A tick that blocks for
+at least `SLOW_KEY` while a Codex window is open re-dates the guard to the
+tick's end, so a double tap typed during a tick shorter than `SLOW_TICK` (which
+drains nothing) reads as a burst and closes the window rather than as the
+second, confirming press.
 When any Codex window closes without archiving, a footer message still
 showing its `Ctrl-x again to archive <label>` invitation is replaced by that
 same line, so the invitation cannot outlive the window. Claude's burst
