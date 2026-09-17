@@ -538,7 +538,8 @@ pub struct App {
     pub codex: CodexPoll,
     /// Seam for the only Codex mutation. Production opens a fresh guarded RPC
     /// transaction; hermetic tests must install an explicit recorder.
-    pub codex_archive: fn(&CodexConfig, &str) -> Result<ArchiveOutcome, CodexDiagnostic>,
+    pub codex_archive: fn(&CodexConfig, &str, &model::CodexStatus)
+        -> Result<ArchiveOutcome, CodexDiagnostic>,
     pub diagnostics: Diagnostics,
     pub fail_streak: u32,
     pub last_poll: Instant,
@@ -2423,6 +2424,11 @@ impl App {
     }
 
     fn codex_archive_refusal(&self, session: &Session) -> Option<&'static str> {
+        // §9.5's wording: outside tmux no pane map was ever read, so "no
+        // mapped pane" below would be a guess.
+        if self.degraded {
+            return Some("not inside tmux — archive unavailable");
+        }
         let settings = &self.codex.settings;
         if !settings.enabled() || settings.config().is_err()
             || !settings.token_file.is_absolute() || settings.bin.is_empty()
@@ -2441,6 +2447,12 @@ impl App {
             || !matches!(runtime, Some(model::CodexStatus::Idle | model::CodexStatus::NotLoaded))
         {
             return Some("state unknown — not archived");
+        }
+        // Fail closed on the inventory, as `R` does: an unread `list-panes`
+        // or `list-windows` leaves the maps stale or, in a fresh image,
+        // empty, and an empty map is not evidence that no pane is attached.
+        if !self.panes_fresh || !self.tabs_fresh {
+            return Some("pane map unavailable — not archived");
         }
         if self.has_mapped_pane(Provider::Codex, &session.session_id) {
             return Some("close its pane first (x) — not archived");
@@ -2595,6 +2607,11 @@ impl App {
             self.stamp_ctrl_x(Instant::now());
             return;
         };
+        // FRESH INVENTORY, for `act_enter`'s reason: the tab maps are as old
+        // as the last tick, and another tab's sidebar may have opened this
+        // thread since. A failed read clears a fresh flag, which the refusal
+        // below turns into a refusal.
+        self.refresh_panes();
         if let Some(reason) = self.codex_archive_refusal(&target) {
             self.flash(reason, MsgLevel::Warn);
             self.stamp_ctrl_x(Instant::now());
@@ -2609,9 +2626,12 @@ impl App {
                 return;
             }
         };
-        match (self.codex_archive)(&config, &arm.session_id) {
-            Ok(ArchiveOutcome::Archived) => {
-                self.codex.archived(&arm.session_id);
+        // The row's runtime as re-checked just now; the fresh read must agree.
+        let expected = target.codex.as_ref().map(|meta| meta.runtime.clone())
+            .unwrap_or(model::CodexStatus::Unknown(String::new()));
+        match (self.codex_archive)(&config, &arm.session_id, &expected) {
+            Ok(ArchiveOutcome::Archived { updated_at }) => {
+                self.codex.archived(&arm.session_id, updated_at);
                 self.sessions.retain(|session| session.provider != Provider::Codex
                     || session.session_id != arm.session_id);
                 self.rebuild_rows();
@@ -5093,7 +5113,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
-            codex_archive: |_, _| panic!("unit test reached codex archive RPC"),
+            codex_archive: |_, _, _| panic!("unit test reached codex archive RPC"),
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),

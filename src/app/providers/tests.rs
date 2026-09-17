@@ -9,6 +9,8 @@ use std::rc::Rc;
 struct Script {
     calls: Vec<&'static str>,
     archive_ids: Vec<String>,
+    archive_expected: Vec<CodexStatus>,
+    archive_delay: Duration,
     archive_results: VecDeque<Result<codex::ArchiveOutcome, CodexDiagnostic>>,
     observations: VecDeque<CodexObservation>,
     prepare_error: Option<CodexDiagnostic>,
@@ -47,15 +49,19 @@ fn fake_prepare(_: &CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic>
     })
 }
 
-fn fake_archive(_: &CodexConfig, id: &str)
+fn fake_archive(_: &CodexConfig, id: &str, expected: &CodexStatus)
     -> Result<codex::ArchiveOutcome, CodexDiagnostic>
 {
-    SCRIPT.with(|state| {
+    let delay = SCRIPT.with(|state| {
         let mut script = state.borrow_mut();
         script.calls.push("archive");
         script.archive_ids.push(id.into());
-        script.archive_results.pop_front().unwrap_or(Ok(codex::ArchiveOutcome::Archived))
-    })
+        script.archive_expected.push(expected.clone());
+        script.archive_delay
+    });
+    std::thread::sleep(delay); // a real block, like the RPC it stands in for
+    SCRIPT.with(|state| state.borrow_mut().archive_results.pop_front()
+        .unwrap_or(Ok(codex::ArchiveOutcome::Archived { updated_at: 20 })))
 }
 
 fn configured() -> App {
@@ -137,7 +143,21 @@ fn settle_ctrl_x(a: &mut App) {
     if let Some(pending) = &mut a.pending_delete {
         pending.at = pending.at.checked_sub(CX_SETTLE).unwrap_or(pending.at);
     }
-    assert!(a.tick_stop_arm());
+    assert!(with_inventory(|_| Ok(String::new()), || a.tick_stop_arm()));
+}
+
+/// The settle re-reads the pane inventory. `answer` gets the verb and is
+/// the whole session as far as the refresh can tell; anything else is a bug.
+fn with_inventory<T>(answer: fn(&str) -> Result<String, crate::tmux::TmuxError>,
+    test: impl FnOnce() -> T) -> T
+{
+    crate::tmux::test_commands::with(move |argv| {
+        let args = if argv.first().is_some_and(|a| a == "-L") { &argv[2..] } else { argv };
+        match args[0].as_str() {
+            verb @ ("list-panes" | "list-windows") => answer(verb),
+            other => panic!("unscripted tmux command {other}"),
+        }
+    }, test)
 }
 
 fn show(a: &mut App, rows: Vec<Session>) {
@@ -425,6 +445,8 @@ fn codex_archive_needs_two_presses_then_removes_and_suppresses_the_row() {
     assert!(a.sessions.is_empty());
     poll(&mut a, vec![target.clone()], true);
     assert!(a.sessions.is_empty());
+    poll(&mut a, vec![target.clone()], true);
+    assert!(a.sessions.is_empty(), "a second lagging complete poll resurrected the archive");
     poll(&mut a, vec![], true);
     poll(&mut a, vec![target], true);
     assert_eq!(a.sessions.len(), 1);
@@ -1197,16 +1219,19 @@ fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
     let mut blocked = row(1, CodexStatus::Active { flags: vec!["waitingOnApproval".into()] });
     blocked.status = Status::Waiting;
     blocked.state = Some(State::Blocked);
-    let cases = [
-        (row(1, CodexStatus::Active { flags: vec![] }), false, "running — not archived"),
-        (blocked, false, "running — not archived"),
-        (row(1, CodexStatus::SystemError), false, "state unknown — not archived"),
-        (row(1, CodexStatus::Unknown("future".into())), false, "state unknown — not archived"),
-        (row(1, CodexStatus::Idle), true, "close its pane first (x) — not archived"),
+    type Setup = fn(&mut App, &Session);
+    let cases: [(Session, Setup, &str); 7] = [
+        (row(1, CodexStatus::Active { flags: vec![] }), |_, _| {}, "running — not archived"),
+        (blocked, |_, _| {}, "running — not archived"),
+        (row(1, CodexStatus::SystemError), |_, _| {}, "state unknown — not archived"),
+        (row(1, CodexStatus::Unknown("future".into())), |_, _| {}, "state unknown — not archived"),
+        (row(1, CodexStatus::Idle), mapped_in_another_tab, "close its pane first (x) — not archived"),
+        (row(1, CodexStatus::Idle), |a, _| a.degraded = true, "not inside tmux — archive unavailable"),
+        (row(1, CodexStatus::NotLoaded), |a, _| a.tabs_fresh = false, "pane map unavailable — not archived"),
     ];
-    for (target, mapped, refusal) in cases {
+    for (target, setup, refusal) in cases {
         let mut a = beside_working_claude(target.clone());
-        if mapped { mapped_in_another_tab(&mut a, &target); }
+        setup(&mut a, &target);
         ctrl_x(&mut a);
         assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)), Some((refusal, MsgLevel::Warn)));
         assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "{refusal}");
@@ -1254,6 +1279,11 @@ fn a_refused_press_cannot_shorten_a_vanished_codex_window() {
 #[test]
 fn a_vanished_codex_window_refuses_a_paced_press_without_an_earlier_one() {
     closed_window_refuses_paced_presses(vanish, &[1600]);
+}
+
+#[test]
+fn a_codex_window_closed_by_a_burst_protects_the_neighbour_after_its_row_vanishes() {
+    closed_window_refuses_paced_presses(|a| { ctrl_x(a); vanish(a); }, &[800, 1600]);
 }
 
 #[test]
@@ -1307,4 +1337,222 @@ fn a_repeat_burst_closes_a_codex_window_for_its_remainder() {
         assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
     }
     assert!(!calls().contains(&"archive") && agents::test_spawn::joined().is_empty());
+}
+
+fn history(sessions: Vec<Session>, complete: bool) -> CodexObservation {
+    let mut observation = observation(sessions, complete);
+    observation.history_metadata_ids = observation.sessions.iter()
+        .map(|row| row.session_id.clone()).collect();
+    observation
+}
+
+fn poll_history(a: &mut App, rows: Vec<Session>, complete: bool) {
+    queue(history(rows, complete));
+    a.codex.force = true;
+    assert!(a.poll_codex());
+}
+
+fn archive_selected(a: &mut App) {
+    ctrl_x(a);
+    age_ctrl_x(a);
+    ctrl_x(a);
+    settle_ctrl_x(a);
+    assert!(a.message.as_ref().unwrap().0.starts_with("archived "), "{:?}", a.message);
+}
+
+fn unarchived(n: u64) -> Session {
+    let mut row = row(n, CodexStatus::NotLoaded);
+    row.codex.as_mut().unwrap().updated_at = 99;
+    row
+}
+
+fn codex_names(a: &App) -> Vec<String> {
+    a.sessions.iter().filter(|s| s.provider == Provider::Codex).map(|s| s.name.clone()).collect()
+}
+
+#[test]
+fn codex_archive_fails_closed_without_a_readable_pane_inventory() {
+    type Break = fn(&mut App);
+    let cases: [(Break, &str); 3] = [
+        (|a| a.degraded = true, "not inside tmux — archive unavailable"),
+        (|a| a.panes_fresh = false, "pane map unavailable — not archived"),
+        (|a| a.tabs_fresh = false, "pane map unavailable — not archived"),
+    ];
+    for (broken, refusal) in cases {
+        // First press.
+        let mut a = configured();
+        show(&mut a, vec![row(1, CodexStatus::Idle)]);
+        broken(&mut a);
+        ctrl_x(&mut a);
+        assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)), Some((refusal, MsgLevel::Warn)));
+        assert!(a.stop_arm.is_none());
+
+        // Second press.
+        let mut a = configured();
+        show(&mut a, vec![row(1, CodexStatus::Idle)]);
+        ctrl_x(&mut a);
+        assert!(a.stop_arm.is_some());
+        broken(&mut a);
+        age_ctrl_x(&mut a);
+        ctrl_x(&mut a);
+        assert_eq!(a.message.as_ref().unwrap().0, refusal);
+        assert!(a.pending_delete.is_none());
+        assert!(!calls().contains(&"archive"), "{refusal}");
+    }
+
+    // Settle: outside tmux the refresh reads nothing at all.
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    a.degraded = true;
+    settle_ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().unwrap().0, "not inside tmux — archive unavailable");
+    assert!(!calls().contains(&"archive"));
+}
+
+#[test]
+fn a_failed_settle_inventory_refresh_refuses_the_archive() {
+    type Answer = fn(&str) -> Result<String, crate::tmux::TmuxError>;
+    let failures: [Answer; 2] = [
+        |_| Err(crate::tmux::TmuxError::NotFound("list-panes failed".into())),
+        |verb| if verb == "list-windows" {
+            Err(crate::tmux::TmuxError::NotFound("list-windows failed".into()))
+        } else { Ok(String::new()) },
+    ];
+    for answer in failures {
+        let mut a = configured();
+        show(&mut a, vec![row(1, CodexStatus::Idle)]);
+        ctrl_x(&mut a);
+        age_ctrl_x(&mut a);
+        ctrl_x(&mut a);
+        assert!(a.pending_delete.is_some());
+        a.pending_delete.as_mut().unwrap().at -= CX_SETTLE;
+        assert!(with_inventory(answer, || a.tick_stop_arm()));
+        assert_eq!(a.message.as_ref().unwrap().0, "pane map unavailable — not archived");
+        assert!(!calls().contains(&"archive"));
+        assert_eq!(a.sessions.len(), 1);
+    }
+}
+
+#[test]
+fn the_archive_seam_receives_the_runtime_of_the_row_rechecked_at_settle() {
+    for (armed, settled) in [
+        (CodexStatus::NotLoaded, CodexStatus::NotLoaded),
+        (CodexStatus::Idle, CodexStatus::Idle),
+        // A poll between the press and the settle: the fresh read must match
+        // the row as it is now, not as it was confirmed.
+        (CodexStatus::Idle, CodexStatus::NotLoaded),
+    ] {
+        let mut a = configured();
+        show(&mut a, vec![row(1, armed.clone())]);
+        ctrl_x(&mut a);
+        age_ctrl_x(&mut a);
+        ctrl_x(&mut a);
+        show(&mut a, vec![row(1, settled.clone())]);
+        settle_ctrl_x(&mut a);
+        assert_eq!(SCRIPT.with(|s| s.borrow().archive_expected.clone()), vec![settled]);
+    }
+}
+
+#[test]
+fn the_settle_rechecks_the_row_before_the_rpc() {
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert!(a.pending_delete.is_some());
+    show(&mut a, vec![row(1, CodexStatus::Active { flags: vec![] })]);
+    settle_ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().unwrap().0, "running — not archived");
+    assert!(!calls().contains(&"archive"));
+    assert_eq!(a.sessions.len(), 1);
+}
+
+#[test]
+fn a_press_buffered_during_a_slow_archive_reads_as_a_burst() {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    SCRIPT.with(|s| s.borrow_mut().archive_delay = Duration::from_millis(900));
+    ctrl_x(&mut a);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    settle_ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().unwrap().0, "archived task 1");
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    // The press the operator made at the frozen screen.
+    ctrl_x(&mut a);
+    assert!(agents::test_spawn::joined().is_empty(), "a press buffered during the RPC stopped Claude");
+    assert_eq!(a.message.as_ref().unwrap().0, "too fast — press Ctrl+X again");
+}
+
+#[test]
+fn an_unarchive_after_an_incomplete_forced_poll_is_rediscovered() {
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    archive_selected(&mut a);
+    poll(&mut a, vec![], false);
+    poll_history(&mut a, vec![unarchived(1)], true);
+    assert_eq!(codex_names(&a), ["task 1"]);
+    poll_history(&mut a, vec![unarchived(1)], true);
+    assert_eq!(codex_names(&a), ["task 1"]);
+}
+
+#[test]
+fn a_persistently_incomplete_fleet_still_rediscovers_an_unarchived_thread() {
+    let mut a = configured();
+    let other = row(2, CodexStatus::Idle);
+    show(&mut a, vec![row(1, CodexStatus::Idle), other.clone()]);
+    archive_selected(&mut a);
+    assert_eq!(codex_names(&a), ["task 2"]);
+    for _ in 0..3 { poll_history(&mut a, vec![other.clone()], false); }
+    poll_history(&mut a, vec![other.clone(), unarchived(1)], false);
+    assert_eq!(codex_names(&a), ["task 1", "task 2"]);
+    for _ in 0..2 { poll_history(&mut a, vec![other.clone(), unarchived(1)], false); }
+    assert_eq!(codex_names(&a), ["task 1", "task 2"]);
+}
+
+#[test]
+fn a_lagging_copy_of_an_archived_thread_stays_hidden() {
+    let mut a = configured();
+    let target = row(1, CodexStatus::Idle);
+    show(&mut a, vec![target.clone()]);
+    archive_selected(&mut a);
+    // The loaded-list/read path, and even a history row, still carrying the
+    // archived `updatedAt`.
+    poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
+    poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
+    poll_history(&mut a, vec![target.clone()], true);
+    poll_history(&mut a, vec![target.clone()], false);
+    assert!(a.sessions.is_empty());
+    // Only a COMPLETE union may retire the tombstone by omission.
+    poll(&mut a, vec![], false);
+    poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
+    assert!(a.sessions.is_empty(), "an incomplete poll's omission retired the tombstone");
+    poll(&mut a, vec![], true);
+    poll(&mut a, vec![target], true);
+    assert_eq!(a.sessions.len(), 1, "a complete omission did not retire the tombstone");
+}
+
+#[test]
+fn only_a_confirmed_archive_hides_a_thread() {
+    for outcome in [
+        Ok(codex::ArchiveOutcome::StateChanged),
+        Err(error(CodexFailureKind::Timeout)),
+        Err(error(CodexFailureKind::Protocol)),
+    ] {
+        let mut a = configured();
+        show(&mut a, vec![row(1, CodexStatus::Idle)]);
+        SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(outcome.clone()));
+        ctrl_x(&mut a);
+        age_ctrl_x(&mut a);
+        ctrl_x(&mut a);
+        settle_ctrl_x(&mut a);
+        assert_eq!(SCRIPT.with(|s| s.borrow().archive_ids.len()), 1);
+        for _ in 0..2 {
+            poll(&mut a, vec![row(1, CodexStatus::Active { flags: vec![] })], true);
+            assert_eq!(codex_names(&a), ["task 1"], "{outcome:?} hid a thread that was not archived");
+        }
+    }
 }

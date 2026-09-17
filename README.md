@@ -104,9 +104,12 @@ stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
 as usual; `r` also reloads credentials and DNS. On an idle (`○`) or unloaded
 (`◇`) Codex row, press `Ctrl-x` twice within 2 s to archive it. The first
 press sends no RPC. ccmux refuses running, blocked, error/unknown, or mapped
-pane rows; the second press re-reads server status before archiving. `L`
-still refuses. `n` always creates a Claude session, using the sidebar's local
-cwd when Codex is selected. `R` skips Codex panes.
+pane rows, and refuses when it cannot read the tmux pane maps. The second
+press re-reads the pane maps and the server status. It archives only if the
+server still reports the state the row shows: an unloaded row that the
+server now reports idle has been opened by some other client, and is refused.
+`L` still refuses. `n` always creates a Claude session, using the sidebar's
+local cwd when Codex is selected. `R` skips Codex panes.
 
 After `/quit` in the Codex TUI, the pane parks: Enter resumes, `s` opens a
 shell, `q` closes it. The pane map records the **launch target**.
@@ -119,8 +122,9 @@ Archive is a soft delete: turns stay intact and the official client can undo
 it. Either run
 `codex unarchive <id> --remote ws://127.0.0.1:8965 --remote-auth-token-env CODEX_REMOTE_TOKEN`
 with that environment variable set, or resume the archived ID and choose
-**Unarchive and resume**. Codex Desktop's **Delete all archived** action
-permanently deletes archived threads. ccmux has no unarchive key.
+**Unarchive and resume**. The thread reappears in the sidebar on a later poll.
+Codex Desktop's **Delete all archived** action permanently deletes archived
+threads. ccmux has no unarchive key.
 
 The fresh read and archive are separate RPCs. Another client can start a turn
 between them, and that turn would be aborted. ccmux cannot detect an idle TUI
@@ -310,8 +314,8 @@ while polling is paused.
 ## Degraded mode
 
 `ccmux sidebar` also runs outside tmux. The list, filtering, `n`, `L`,
-`Ctrl-x`, `d` and `u` work. `Enter`, `o`, `s`, `t`, `x` and `R` refuse
-with a message.
+`d` and `u` work, and so does `Ctrl-x` on Claude rows. `Enter`, `o`, `s`, `t`,
+`x`, `R` and `Ctrl-x` on Codex rows refuse with a message.
 
 ## Development
 

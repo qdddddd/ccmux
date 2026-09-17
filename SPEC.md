@@ -3394,6 +3394,9 @@ Unavoidable: the poll is up to 2.5 s stale.
 
 ### 9.5 tmux is not running / ccmux is running outside tmux
 
+**AMENDED BY §12.8:** degraded `Ctrl-x` works on Claude rows only; a Codex row
+refuses `not inside tmux — archive unavailable`.
+
 - **Launcher, `tmux` binary absent** → `eprintln!("ccmux: tmux not found on
   PATH")`, exit 1.
 - **Launcher, tmux present but no server** → `has_session` exits non-zero, which
@@ -4201,15 +4204,28 @@ unknown-method error is deliberately NOT sent.
 
 The archive transaction opens a fresh connection and performs, in order:
 `initialize`, `initialized`, `thread/read(includeTurns:false)`, and only when
-the returned status tag is exactly `idle` or `notLoaded`, one
-`thread/archive`. `active` with any flags, `systemError`, an unknown/malformed
-status, a mismatched thread identity, or any error reaches no archive request.
+the returned thread has the captured ID and a status tag that still matches the
+row re-checked at settle — exactly `idle` for an Idle row, exactly `notLoaded`
+for an Unloaded row — one `thread/archive`. `notLoaded` -> `idle` is the only
+visible sign that a client attached outside ccmux since the last poll, and an
+attached TUI breaks silently on archive. The reverse, an Idle row whose fresh
+read is `notLoaded` after the idle unload, is refused too; the operator retries
+after the next poll. `active` with any flags, `systemError`, an
+unknown/malformed status, a status that does not match the row, or a
+mismatched thread identity is a state change and reaches no archive request.
+A matching read without a valid `updatedAt`, or any error, also reaches none.
 Do not parse RPC error message text and never retry `thread/archive`
 automatically. Ignore broadcast notifications and server requests exactly as
 the poll connection does. A successful archive response removes the row from
-the local provider cache immediately. Suppress a lagging loaded/read result
-for that ID until a complete authoritative union omits it; clear its immutable
-exclusion/read-order bookkeeping so cached metadata cannot resurrect it.
+the local provider cache immediately and tombstones the ID with the fresh
+read's `updatedAt`; clear its immutable exclusion/read-order bookkeeping so
+cached metadata cannot resurrect it. Archive leaves `updatedAt` unchanged,
+drops the ID from `thread/list archived:false` at once, and unarchive bumps
+`updatedAt` (PROBE-FINDINGS §10). The tombstone therefore suppresses every
+row for that ID, including a lagging loaded/read result, until a complete
+authoritative union omits the ID, or until any observation, complete or not,
+lists the ID in the `archived:false` history with a different `updatedAt`,
+which is a rediscovery. Only a confirmed `{}` creates a tombstone.
 
 Require the server identity/version supplied by `initialize` to be a string,
 but production v1 does not retain or display it. The opt-in live harness records
@@ -4493,8 +4509,11 @@ The first eligible press is Warn `Ctrl-x again to archive <label>` and opens
 the shared two-second destructive window without RPC. Local refusals are Warn:
 `running — not archived`, `state unknown — not archived`,
 `close its pane first (x) — not archived`, or the provider's configuration
-refusal. A window that closes without archiving, and any press refused for
-the rest of its two seconds, is Warn `archive window closed — nothing archived`.
+refusal; outside tmux `not inside tmux — archive unavailable`, and with an
+unread pane inventory `pane map unavailable — not archived`.
+A window that closes without archiving, and any press refused for
+the rest of its two seconds, is Warn `archive window closed — nothing archived`;
+`Esc` keeps its own Info `archive window closed`.
 A fresh-read rejection is Warn `state changed — not archived`.
 RPC/timeout failure is Warn `archive failed: <bounded redacted diagnostic>`.
 Success is Info `archived <label>` after the row has already been removed.
@@ -4735,10 +4754,14 @@ ID or provider decoration reaches dispatch. There is no provider toggle.
 Codex `Ctrl-x` reuses §8.2's one destructive-window state machine and its
 750 ms repeat guard, two-second window, settle delay, and mode/quit disarms.
 The first press stamps the repeat guard before any return and sends no RPC.
-It refuses, as Warn, an unconfigured provider, Working/Blocked row
-(`running — not archived`), unknown/systemError row
-(`state unknown — not archived`), or any ccmux PaneMap record for that full
-Thread.id in any window (`close its pane first (x) — not archived`). Otherwise
+It refuses, as Warn, tmux-degraded mode (`not inside tmux — archive
+unavailable`, ahead of every other refusal), an unconfigured provider,
+Working/Blocked row (`running — not archived`), unknown/systemError row
+(`state unknown — not archived`), a pane inventory whose last `list-panes` or
+`list-windows` read failed (`pane map unavailable — not archived`; an unread
+map is not evidence that no pane is attached), or any ccmux PaneMap record for
+that full Thread.id in any window (`close its pane first (x) — not archived`).
+Otherwise
 it captures provider plus full Thread.id and warns
 `Ctrl-x again to archive <label>`. Moving to another row, crossing providers,
 the row vanishing, leaving Normal mode, expiry, or a repeat burst disarms it.
@@ -4755,16 +4778,22 @@ same line, so the invitation cannot outlive the window. Claude's burst
 behavior, including its surviving arm, is unchanged.
 
 The second qualified press must still select that exact provider/full ID and
-reapply every local refusal to the current row. After the settle guard it runs
-§12.4's fresh read-before-archive transaction on the captured ID. Fresh
-`active` (including empty/known/unknown flags), `systemError`, unknown or
-malformed status, identity mismatch, or a row that is no longer locally
-eligible sends no archive and warns `state changed — not archived`. Success
+reapply every local refusal to the current row. After the settle guard it
+re-reads the pane and tab inventory, exactly as `Enter` does, and applies every
+local refusal again to the row as it is now; a failed inventory read refuses
+through the inventory refusal above. A row that is no longer locally eligible
+at either point repeats that local refusal and sends nothing. Otherwise it runs
+§12.4's fresh read-before-archive transaction on the captured ID with the
+settle-time row's runtime as the expected status. Fresh `active` (including
+empty/known/unknown flags), `systemError`, unknown or malformed status, a
+status that no longer matches the row, or identity mismatch sends no archive
+and warns `state changed — not archived`. Success
 removes the row before flashing `archived <label>` and forces a poll. Error or
 timeout warns `archive failed: <bounded redacted diagnostic>` and forces a
-poll; it never infers success. A successful local archive tombstone suppresses
-lagging loaded/read metadata until a complete `archived:false` union omits the
-ID, after which a later unarchive can be rediscovered.
+poll; it never infers success. The §12.4 tombstone keeps lagging copies of the
+archived thread hidden; a later unarchive is rediscovered from the
+`archived:false` history by its new `updatedAt`, even while polls stay
+incomplete.
 
 Open/tab refusals in tmux-degraded mode remain exactly
 `not inside tmux — open unavailable`,
@@ -5223,26 +5252,40 @@ have these tests; existing Claude tests remain authoritative except for
   launch ID, rc propagation, and explicit-only shell handoff. `R` plans no
   Codex pane/agent action and counts skips once.
 - **Guarded archive:** every first-press local refusal sends no RPC and opens no
-  destructive window: unconfigured, Working, Blocked, systemError/unknown,
-  and a matching mapped pane in any window. An eligible first press only arms
-  the full Thread.id. The same second press within two seconds sends exactly
-  one fresh `thread/read`, then exactly one `thread/archive` only for exact
-  `idle`/`notLoaded`. Exercise active with empty, approval, input, and unknown
-  flags; systemError; unknown/malformed status; mismatched identity; RPC error;
-  timeout; unexpected server requests; and broadcast notifications. None may
-  archive or report success. Expiry, navigation, mode change, disappearance,
-  cross-provider movement, and held/repeated input disarm; a neighbouring
-  Claude row cannot inherit stop/delete. With real sleeps, presses paced past
-  750 ms but inside the original two seconds after a disappearance, crossing,
-  or burst reach neither `claude stop` nor archive, with and without an
-  earlier refused press, and no closed window leaves
-  `again to archive` on screen. Each first-press refusal kind, double-tapped
-  onto a Working Claude neighbour after the Codex row vanishes, stops nothing.
-  The footer pair reads `C-x archive` only on a Codex row. Recheck row and pane state on the
-  second press. Success removes the row immediately, clears only that ID's
-  exclusion/read-order cache, forces a poll, and remains absent through a
-  lagging read until a complete `archived:false` union omits it. A later
-  unarchive is discoverable. Keep a Claude-only Ctrl-x baseline unchanged.
+  destructive window: tmux-degraded, unconfigured, Working, Blocked,
+  systemError/unknown, a failed pane or tab inventory read, and a matching
+  mapped pane in any window; degraded and inventory refusals also apply on the
+  second press and at settle. An eligible first press only arms the full
+  Thread.id. The same second press within two seconds sends exactly
+  one fresh `thread/read`, then exactly one `thread/archive` only when the
+  fresh `idle`/`notLoaded` matches the row's Idle/Unloaded runtime at settle.
+  Exercise active with empty, approval, input, and unknown flags; systemError;
+  unknown/malformed status; each mismatched status pairing; mismatched
+  identity (`state changed`); a read without `updatedAt`; RPC error; timeout;
+  a read and archive that each fit the 1,000 ms budget but not together; a slow
+  connect or read that uses it up; unexpected server requests; and broadcast
+  notifications. None may archive or report success. Re-read the inventory at
+  settle: a thread opened in another tab after the second press refuses, and a
+  failed `list-panes` or `list-windows` refuses. A row that turns Working
+  between the second press and the settle refuses at settle. A `Ctrl-x`
+  buffered during a slow archive RPC reads as a burst. Expiry, navigation,
+  mode change, disappearance, cross-provider movement, and held/repeated input
+  disarm; a neighbouring Claude row cannot inherit stop/delete. With real
+  sleeps, presses paced past 750 ms but inside the original two seconds after
+  a disappearance, crossing, or burst reach neither `claude stop` nor
+  archive, with and without an earlier refused press, and no closed window
+  leaves `again to archive` on screen. Each first-press refusal kind,
+  double-tapped onto a Working Claude neighbour after the Codex row vanishes,
+  stops nothing.
+  The footer pair reads `C-x archive` only on a Codex row. Recheck row and
+  pane state on the second press. Success removes the row immediately, clears
+  only that ID's exclusion/read-order cache, forces a poll, and remains absent
+  through two complete lagging loaded/read polls, a history row with the
+  archived `updatedAt`, and an incomplete poll that omits it, until a complete
+  `archived:false` union omits it. An unarchive with a new `updatedAt` is
+  rediscovered after an incomplete forced poll and under persistently
+  incomplete polls. StateChanged, timeout, and RPC error never hide the row.
+  Keep a Claude-only Ctrl-x baseline unchanged.
 - **Runtime warning episodes:** two full IDs in `systemError` have distinct
   delivery keys, even with equal tail IDs. Repeated unchanged polls cannot
   refresh a warning timer. Cover/overwrite leaves it pending; a full

@@ -1579,7 +1579,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
-            codex_archive: |_, _| panic!("render test reached codex archive RPC"),
+            codex_archive: |_, _, _| panic!("render test reached codex archive RPC"),
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: std::collections::BTreeSet::new(),

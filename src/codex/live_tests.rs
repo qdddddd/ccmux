@@ -1075,7 +1075,8 @@ fn live_archive_idle_loaded_thread() {
         let id = creator.materialize(&h.name("archive-idle"))?;
         creator.thread_state(&id, "idle", true)?;
         creator.close()?;
-        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::Archived,
+        ensure!(matches!(h.client.archive(&id, &CodexStatus::Idle).map_err(live_error)?,
+            ArchiveOutcome::Archived { .. }),
             "idle archive did not report success");
         archived_everywhere(h, &id)?;
         h.record(json!({"event":"archive_idle_pass","id":id}))
@@ -1090,7 +1091,8 @@ fn live_archive_not_loaded_thread() {
         let id = creator.materialize(&h.name("archive-unloaded"))?;
         creator.close()?;
         h.unloaded_fixture(&id)?;
-        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::Archived,
+        ensure!(matches!(h.client.archive(&id, &CodexStatus::NotLoaded).map_err(live_error)?,
+            ArchiveOutcome::Archived { .. }),
             "notLoaded archive did not report success");
         archived_everywhere(h, &id)?;
         h.record(json!({"event":"archive_unloaded_pass","id":id}))
@@ -1108,8 +1110,8 @@ fn live_archive_gate_refuses_active_turn_until_it_completes() {
         let mut observer = h.rpc(Duration::from_secs(30))?;
         observer.thread_state(&id, "active", true)?;
         observer.close()?;
-        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::StateChanged,
-            "active thread passed the archive gate");
+        ensure!(h.client.archive(&id, &CodexStatus::Idle).map_err(live_error)?
+            == ArchiveOutcome::StateChanged, "active thread passed the archive gate");
         creator.created_progress(&id, &turn, false)?;
         creator.close()?;
         let mut observer = h.rpc(Duration::from_secs(30))?;
@@ -1132,8 +1134,8 @@ fn live_archive_gate_preserves_pending_approval_until_declined() {
         let mut observer = h.rpc(Duration::from_secs(30))?;
         waiting_approval(&mut observer, &id)?;
         observer.close()?;
-        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::StateChanged,
-            "waiting approval passed the archive gate");
+        ensure!(h.client.archive(&id, &CodexStatus::Idle).map_err(live_error)?
+            == ArchiveOutcome::StateChanged, "waiting approval passed the archive gate");
         let mut observer = h.rpc(Duration::from_secs(30))?;
         waiting_approval(&mut observer, &id)?;
         observer.close()?;

@@ -377,6 +377,10 @@ fn degraded_tmux_refusals_win_over_codex_configuration_errors() {
             key(a, code);
             assert_eq!(a.message.as_ref().unwrap().0, format!("not inside tmux — {verb} unavailable"));
         }
+        a.codex_archive = |_, _, _| panic!("degraded archive reached the RPC");
+        a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(a.message.as_ref().unwrap().0, "not inside tmux — archive unavailable");
+        assert!(a.stop_arm.is_none());
         assert!(server.borrow().calls.is_empty());
     });
 }
@@ -402,6 +406,40 @@ fn codex_archive_arm_and_unbound_keys_have_no_external_effects() {
         assert_eq!(a.mode, Mode::Normal);
         assert!(server.borrow().calls.is_empty() && agents::test_spawn::calls().is_empty());
     });
+}
+
+static ARCHIVES: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn archive_rereads_every_tab_before_the_rpc() {
+    with_sidebar(|a, server| {
+        ARCHIVES.store(0, Ordering::SeqCst);
+        a.codex_archive = |_, _, _| {
+            ARCHIVES.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::codex::ArchiveOutcome::Archived { updated_at: 1 })
+        };
+        let row = a.sessions[0].clone();
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        a.on_key(ctrl_x);
+        assert!(a.stop_arm.is_some(), "{:?}", a.message);
+        // Another tab's sidebar opens the thread; this one has not ticked.
+        map_in_tab_without_refresh(server, 2, &row);
+        a.cx_last_press = a.cx_last_press.and_then(|t| t.checked_sub(Duration::from_secs(1)));
+        a.on_key(ctrl_x);
+        a.pending_delete.as_mut().expect("the stale inventory let the second press through").at -= CX_SETTLE;
+        assert!(a.tick_stop_arm());
+        assert_eq!(ARCHIVES.load(Ordering::SeqCst), 0, "archived under a TUI attached in tab 2");
+        assert_eq!(a.message.as_ref().unwrap().0, "close its pane first (x) — not archived");
+        assert!(server.borrow().calls("list-windows").len() == 1);
+    });
+}
+
+fn map_in_tab_without_refresh(server: &Rc<RefCell<Server>>, window: u32, row: &Session) {
+    let mut s = server.borrow_mut();
+    s.tabs.insert(window, TabInfo { window: wid(window), index: window, sidebar: None,
+        map: PaneMap::new(), hidden: HiddenLog::new() });
+    let pane = s.add_pane(window);
+    s.tabs.get_mut(&window).unwrap().map.insert(&pid(&pane), record(row));
 }
 
 #[test]

@@ -106,7 +106,9 @@ pub struct CodexObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveOutcome {
-    Archived,
+    /// `updated_at` is the fresh read's `updatedAt`: the value the local
+    /// tombstone recognizes a lagging copy of the archived thread by.
+    Archived { updated_at: i64 },
     StateChanged,
 }
 
@@ -814,9 +816,9 @@ impl CodexClient {
         self.poll_with(now_ms, &clock, &mut TcpConnector)
     }
 
-    pub fn archive(&mut self, id: &str) -> Result<ArchiveOutcome, CodexError> {
+    pub fn archive(&mut self, id: &str, expected: &CodexStatus) -> Result<ArchiveOutcome, CodexError> {
         let clock = MonotonicClock(Instant::now());
-        let result = self.archive_with(id, &clock, &mut TcpConnector);
+        let result = self.archive_with(id, expected, &clock, &mut TcpConnector);
         result.map_err(|mut error| {
             if error.diagnostic.kind == CodexFailureKind::Timeout {
                 error.diagnostic.message = "codex archive timed out after 1000 ms".into();
@@ -825,8 +827,12 @@ impl CodexClient {
         })
     }
 
+    /// `expected` is the runtime of the row as re-checked at settle. Only
+    /// `idle` for an Idle row or `notLoaded` for an Unloaded one passes:
+    /// `notLoaded` -> `idle` is the one visible sign that a client outside
+    /// ccmux attached since the poll, and an attached TUI breaks silently.
     fn archive_with(
-        &mut self, id: &str, clock: &dyn Clock, connector: &mut impl Connector,
+        &mut self, id: &str, expected: &CodexStatus, clock: &dyn Clock, connector: &mut impl Connector,
     ) -> Result<ArchiveOutcome, CodexError> {
         if !valid_codex_id(id) { return Err(CodexError::protocol()); }
         let deadline = Deadline::new(clock);
@@ -837,16 +843,17 @@ impl CodexClient {
             .ok_or_else(CodexError::protocol)?;
         rpc.initialized()?;
         let value = rpc.request(Method::Read(id))?;
-        let row = value.get("thread").filter(|row| thread_id(row) == Some(id))
-            .ok_or_else(CodexError::protocol)?;
-        let eligible = matches!(row.get("status").and_then(|status| status.get("type"))
-            .and_then(Value::as_str), Some("idle" | "notLoaded"));
+        let row = value.get("thread").ok_or_else(CodexError::protocol)?;
+        let tag = row.get("status").and_then(|status| status.get("type")).and_then(Value::as_str);
+        let eligible = thread_id(row) == Some(id) && matches!((expected, tag),
+            (CodexStatus::Idle, Some("idle")) | (CodexStatus::NotLoaded, Some("notLoaded")));
         let outcome = if eligible {
+            let updated_at = timestamp(row, "updatedAt").ok_or_else(CodexError::protocol)?;
             let result = rpc.request(Method::Archive(id))?;
             if !result.as_object().is_some_and(serde_json::Map::is_empty) {
                 return Err(CodexError::protocol());
             }
-            ArchiveOutcome::Archived
+            ArchiveOutcome::Archived { updated_at }
         } else {
             ArchiveOutcome::StateChanged
         };
@@ -976,9 +983,11 @@ impl CodexClient {
 /// Prepare a fresh client, then perform the read-before-archive transaction.
 /// Preparation may do DNS and credential IO; the connection, initialize,
 /// fresh read, optional archive, and close share one 1000 ms deadline.
-pub fn archive(config: &CodexConfig, id: &str) -> Result<ArchiveOutcome, CodexDiagnostic> {
+pub fn archive(config: &CodexConfig, id: &str, expected: &CodexStatus)
+    -> Result<ArchiveOutcome, CodexDiagnostic>
+{
     let mut client = prepare(config).map_err(|error| error.diagnostic().clone())?;
-    client.archive(id).map_err(|error| error.diagnostic().clone())
+    client.archive(id, expected).map_err(|error| error.diagnostic().clone())
 }
 
 #[cfg(test)]

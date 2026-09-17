@@ -184,12 +184,12 @@ fn poll(script: Script) -> (CodexObservation, Rc<RefCell<Script>>) {
     (result, connector.script)
 }
 
-fn archive(script: Script, thread_id: &str)
+fn archive(script: Script, thread_id: &str, expected: &CodexStatus)
     -> (Result<ArchiveOutcome, CodexError>, Rc<RefCell<Script>>)
 {
     let clock = FakeClock::default();
     let mut connector = FakeConnector::new(&clock, script);
-    let result = client().archive_with(thread_id, &clock, &mut connector);
+    let result = client().archive_with(thread_id, expected, &clock, &mut connector);
     (result, connector.script)
 }
 
@@ -709,13 +709,15 @@ fn initialize_order_and_exact_read_only_method_parameters() {
 
 #[test]
 fn archive_uses_one_fresh_read_and_exactly_one_mutation() {
-    for status in [json!({"type":"idle"}), json!({"type":"notLoaded"})] {
+    for (status, expected) in [(json!({"type":"idle"}), CodexStatus::Idle),
+        (json!({"type":"notLoaded"}), CodexStatus::NotLoaded)]
+    {
         let mut row = thread(1);
         row["status"] = status;
         let mut script = Script::default();
         script.reads.insert(id(1), row);
-        let (result, script) = archive(script, &id(1));
-        assert_eq!(result.unwrap(), ArchiveOutcome::Archived);
+        let (result, script) = archive(script, &id(1), &expected);
+        assert_eq!(result.unwrap(), ArchiveOutcome::Archived { updated_at: NOW / 1000 * 1000 });
         let script = script.borrow();
         assert_eq!(script.archive_ids, vec![id(1)]);
         assert_eq!(script.closes, 1);
@@ -743,14 +745,16 @@ fn every_non_idle_fresh_status_refuses_before_archive() {
         json!({"type":"future"}),
         json!({}),
     ] {
-        let mut row = thread(1);
-        row["status"] = status.clone();
-        let mut script = Script::default();
-        script.reads.insert(id(1), row);
-        let (result, script) = archive(script, &id(1));
-        assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged, "{status}");
-        assert!(script.borrow().archive_ids.is_empty(), "{status}");
-        assert_eq!(script.borrow().closes, 1);
+        for expected in [CodexStatus::Idle, CodexStatus::NotLoaded] {
+            let mut row = thread(1);
+            row["status"] = status.clone();
+            let mut script = Script::default();
+            script.reads.insert(id(1), row);
+            let (result, script) = archive(script, &id(1), &expected);
+            assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged, "{status}");
+            assert!(script.borrow().archive_ids.is_empty(), "{status}");
+            assert_eq!(script.borrow().closes, 1);
+        }
     }
 }
 
@@ -759,21 +763,21 @@ fn archive_errors_timeouts_and_invalid_success_are_never_success() {
     let mut rpc_error = Script::default();
     rpc_error.reads.insert(id(1), thread(1));
     rpc_error.rpc_errors.insert("thread/archive".into());
-    let (result, script) = archive(rpc_error, &id(1));
+    let (result, script) = archive(rpc_error, &id(1), &CodexStatus::Idle);
     assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Protocol);
     assert_eq!(script.borrow().archive_ids, vec![id(1)]);
 
     let mut timeout = Script::default();
     timeout.reads.insert(id(1), thread(1));
     timeout.archive_cost = POLL_TIMEOUT;
-    let (result, script) = archive(timeout, &id(1));
+    let (result, script) = archive(timeout, &id(1), &CodexStatus::Idle);
     assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
     assert_eq!(script.borrow().archive_ids, vec![id(1)]);
 
     let mut malformed = Script::default();
     malformed.reads.insert(id(1), thread(1));
     malformed.archive_result = json!({"unexpected":true});
-    assert_eq!(archive(malformed, &id(1)).0.unwrap_err().diagnostic.kind,
+    assert_eq!(archive(malformed, &id(1), &CodexStatus::Idle).0.unwrap_err().diagnostic.kind,
         CodexFailureKind::Protocol);
 }
 
@@ -788,8 +792,8 @@ fn archive_connection_ignores_requests_and_broadcast_notifications() {
         json!({"method":"thread/status/changed","params":{"threadId":id(1),
             "status":{"type":"notLoaded"}}}),
     ];
-    let (result, script) = archive(script, &id(1));
-    assert_eq!(result.unwrap(), ArchiveOutcome::Archived);
+    let (result, script) = archive(script, &id(1), &CodexStatus::Idle);
+    assert!(matches!(result.unwrap(), ArchiveOutcome::Archived { .. }));
     let sent = &script.borrow().sent;
     assert_eq!(sent.len(), 4);
     assert!(sent.iter().all(|value| value.get("method").is_some()));
@@ -797,10 +801,73 @@ fn archive_connection_ignores_requests_and_broadcast_notifications() {
 }
 
 #[test]
+fn archive_requires_the_fresh_status_to_match_the_row() {
+    // notLoaded -> idle is a client attaching outside ccmux since the poll;
+    // idle -> notLoaded is the server's idle unload. Both refuse.
+    for (fresh, row_showed) in [("idle", CodexStatus::NotLoaded), ("notLoaded", CodexStatus::Idle)] {
+        let mut row = thread(1);
+        row["status"] = json!({"type":fresh});
+        let mut script = Script::default();
+        script.reads.insert(id(1), row);
+        let (result, script) = archive(script, &id(1), &row_showed);
+        assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged, "{fresh}");
+        let script = script.borrow();
+        assert_eq!(script.read_ids, vec![id(1)]);
+        assert!(script.archive_ids.is_empty(), "{fresh}: archive sent against a changed row");
+        assert_eq!(script.closes, 1);
+    }
+}
+
+#[test]
+fn a_fresh_read_of_another_thread_is_a_state_change_not_an_archive() {
+    let mut script = Script::default();
+    script.reads.insert(id(1), thread(2));
+    let (result, script) = archive(script, &id(1), &CodexStatus::Idle);
+    assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged);
+    assert!(script.borrow().archive_ids.is_empty());
+}
+
+#[test]
+fn a_fresh_read_without_updated_at_is_never_archived() {
+    let mut row = thread(1);
+    row.as_object_mut().unwrap().remove("updatedAt");
+    let mut script = Script::default();
+    script.reads.insert(id(1), row);
+    let (result, script) = archive(script, &id(1), &CodexStatus::Idle);
+    assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Protocol);
+    assert!(script.borrow().archive_ids.is_empty());
+}
+
+#[test]
+fn the_fresh_read_and_the_archive_share_one_deadline() {
+    // Each half fits a fresh 1000 ms budget; together they do not.
+    let mut split = Script::default();
+    split.reads.insert(id(1), thread(1));
+    split.read_cost = Duration::from_millis(600);
+    split.archive_cost = Duration::from_millis(600);
+    let (result, script) = archive(split, &id(1), &CodexStatus::Idle);
+    assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
+    assert_eq!(script.borrow().archive_ids, vec![id(1)], "the late answer is never success");
+
+    // A read that uses the budget up, or a slow connect plus a read that
+    // fits alone, never sends the archive.
+    for (connect, read) in [(0, 1000), (500, 600)] {
+        let mut slow = Script::default();
+        slow.reads.insert(id(1), thread(1));
+        slow.connect_cost = Duration::from_millis(connect);
+        slow.read_cost = Duration::from_millis(read);
+        let (result, script) = archive(slow, &id(1), &CodexStatus::Idle);
+        assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
+        assert!(script.borrow().archive_ids.is_empty(), "archive sent after the deadline");
+    }
+}
+
+#[test]
 fn archive_rejects_invalid_addresses_without_connecting() {
     let clock = FakeClock::default();
     let mut connector = FakeConnector::new(&clock, Script::default());
-    let error = client().archive_with("not-a-thread", &clock, &mut connector).unwrap_err();
+    let error = client().archive_with("not-a-thread", &CodexStatus::Idle, &clock, &mut connector)
+        .unwrap_err();
     assert_eq!(error.diagnostic.kind, CodexFailureKind::Protocol);
     assert!(connector.script.borrow().sent.is_empty());
 }
