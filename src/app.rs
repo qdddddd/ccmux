@@ -130,6 +130,10 @@ const CX_SETTLE: Duration = Duration::from_millis(180);
 /// than schedules. Retuning either constant past the other would silently
 /// reopen that overlap.
 const _: () = assert!(CX_SETTLE.as_millis() < CX_MIN_GAP.as_millis());
+/// The first eligible Codex press's flash and footer hint, followed by a label.
+const CODEX_INVITATION: &str = "Ctrl-x again to archive ";
+/// A Codex window that closed without archiving. It invites no further press.
+const CODEX_CLOSED: &str = "archive window closed — nothing archived";
 /// Names stored in `@ccmux_map`, truncated. tmux rejects a `set-option` value
 /// over ~16 KB (measured: ok at 16323 bytes, "command too long" at 16324), and
 /// `name` is the only unbounded field in a `PaneEntry`.
@@ -518,6 +522,10 @@ pub struct App {
     pub cx_last_press: Option<Instant>,
     /// A qualifying second press, waiting out `CX_SETTLE`; see the constant.
     pub pending_delete: Option<PendingDelete>,
+    /// The end of a Codex window that closed without archiving. Until then
+    /// the repeat guard refuses every press (`protect_after_codex_disarm`),
+    /// and this selects wording that does not invite another one.
+    pub codex_closed_until: Option<Instant>,
     /// `n`'s cursor intent, waiting for the dispatched session to be listed.
     /// See `PendingJump`. `None` is the normal state — at most one is ever
     /// live, and a second `n` replaces the first (the newest dispatch is the
@@ -734,6 +742,7 @@ impl App {
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
+            codex_closed_until: None,
             pending_jump: None,
 
             message: None,
@@ -2269,19 +2278,30 @@ impl App {
             .cx_last_press
             .map(|t| now.saturating_duration_since(t))
             .unwrap_or(CX_MIN_GAP);
-        self.cx_last_press = Some(now);
+        // Never BACKWARDS: a closed Codex window future-dates the guard to
+        // cover its remainder, and a press refused inside that remainder must
+        // not pull the guard back to `now` and shorten it.
+        self.stamp_ctrl_x(now);
 
         if gap < CX_MIN_GAP {
+            // A Codex window does not survive a burst (§12.8): it closes, the
+            // guard covers the rest of its two seconds, and the flash invites
+            // no further press. Inside that remainder every press lands here
+            // and says the same thing — "press Ctrl+X again" would be followed
+            // by a Claude stop once the cursor had fallen to a neighbour.
+            let codex = self.stop_arm.as_ref().or_else(||
+                self.pending_delete.as_ref().map(|pending| &pending.target))
+                .is_some_and(|arm| arm.provider == Provider::Codex);
+            if codex || self.codex_closed_until.is_some_and(|end| now < end) {
+                self.disarm_ctrl_x();
+                self.flash(CODEX_CLOSED, MsgLevel::Warn);
+                return Action::Redraw;
+            }
             // Buffered burst, or auto-repeat. It acts on nothing, and it
             // CANCELS a settling delete: a second chord this soon after the one
             // that scheduled it is a repeat stream, not a human pressing twice.
             // The arm itself survives, so a human who merely tapped too fast
             // still has their window.
-            if let Some(arm) = self.pending_delete.as_ref().map(|pending| pending.target.clone())
-                && arm.provider == Provider::Codex
-            {
-                self.protect_after_codex_disarm(&arm);
-            }
             self.pending_delete = None;
             // Say so. Silence here is indistinguishable from a wedged sidebar:
             // the press acts on nothing and — before this — asked for no redraw
@@ -2317,8 +2337,13 @@ impl App {
         // session and its worktree. Re-stamping here restarts the clock when
         // the UI became responsive again, so anything the tty buffered while
         // it was frozen reads as the burst it is.
-        self.cx_last_press = Some(Instant::now());
+        self.stamp_ctrl_x(Instant::now());
         Action::Redraw
+    }
+
+    /// Move the repeat guard forward to `at`, never back.
+    fn stamp_ctrl_x(&mut self, at: Instant) {
+        self.cx_last_press = Some(self.cx_last_press.map_or(at, |last| last.max(at)));
     }
 
     /// First press: dispatch to the provider's one shared destructive window.
@@ -2394,7 +2419,7 @@ impl App {
             name: session.name.clone(),
             at: Instant::now(),
         });
-        self.flash(format!("Ctrl-x again to archive {label}"), MsgLevel::Warn);
+        self.flash(format!("{CODEX_INVITATION}{label}"), MsgLevel::Warn);
     }
 
     fn codex_archive_refusal(&self, session: &Session) -> Option<&'static str> {
@@ -2486,12 +2511,10 @@ impl App {
     /// a window that has closed even when no key is ever pressed again.
     pub fn tick_stop_arm(&mut self) -> bool {
         let mut redraw = false;
-        if self
-            .stop_arm
-            .as_ref()
-            .is_some_and(|a| a.at.elapsed() > CX_WINDOW)
-        {
-            self.stop_arm = None;
+        if let Some(arm) = self.stop_arm.take_if(|a| a.at.elapsed() > CX_WINDOW) {
+            if arm.provider == Provider::Codex {
+                self.close_codex_invitation();
+            }
             redraw = true;
         }
         if self
@@ -2560,7 +2583,7 @@ impl App {
         // Without it a `Ctrl+X` buffered during the freeze dequeues with a
         // stale gap, reads as a fresh FIRST press, and stops whatever row the
         // cursor fell to when the deleted session left the list.
-        self.cx_last_press = Some(Instant::now());
+        self.stamp_ctrl_x(Instant::now());
     }
 
     fn run_codex_archive(&mut self, arm: StopArm) {
@@ -2569,12 +2592,12 @@ impl App {
             && session.session_id == arm.session_id).cloned();
         let Some(target) = target else {
             self.flash(format!("{label} left the list — not archived"), MsgLevel::Warn);
-            self.cx_last_press = Some(Instant::now());
+            self.stamp_ctrl_x(Instant::now());
             return;
         };
         if let Some(reason) = self.codex_archive_refusal(&target) {
             self.flash(reason, MsgLevel::Warn);
-            self.cx_last_press = Some(Instant::now());
+            self.stamp_ctrl_x(Instant::now());
             return;
         }
         let config = match self.codex.settings.config() {
@@ -2582,7 +2605,7 @@ impl App {
             Err(error) => {
                 self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
                 self.act_force_refresh();
-                self.cx_last_press = Some(Instant::now());
+                self.stamp_ctrl_x(Instant::now());
                 return;
             }
         };
@@ -2604,7 +2627,7 @@ impl App {
                 self.act_force_refresh();
             }
         }
-        self.cx_last_press = Some(Instant::now());
+        self.stamp_ctrl_x(Instant::now());
     }
 
     /// Close the delete/archive window and drop anything settling in it.
@@ -2614,6 +2637,7 @@ impl App {
             self.pending_delete.as_ref().map(|pending| &pending.target)).cloned();
         if let Some(arm) = arm.filter(|arm| arm.provider == Provider::Codex) {
             self.protect_after_codex_disarm(&arm);
+            self.close_codex_invitation();
         }
         self.stop_arm = None;
         self.pending_delete = None;
@@ -2621,17 +2645,24 @@ impl App {
 
     /// A disarmed Codex confirmation must not turn the operator's intended
     /// second press into a first Claude stop after the cursor falls to a
-    /// neighbour. Reuse the repeat timestamp to cover the unexpired portion
-    /// of the original two-second window; no second action state is created.
+    /// neighbour. Every press before the original window's end reads as a
+    /// burst from this stamp, and `stamp_ctrl_x` never moves it back.
+    /// `codex_closed_until` only chooses the burst's wording.
     fn protect_after_codex_disarm(&mut self, arm: &StopArm) {
-        let now = Instant::now();
-        let remaining = CX_WINDOW.saturating_sub(now.saturating_duration_since(arm.at));
-        if remaining.is_zero() { return; }
-        self.cx_last_press = if remaining >= CX_MIN_GAP {
-            now.checked_add(remaining - CX_MIN_GAP)
-        } else {
-            now.checked_sub(CX_MIN_GAP - remaining)
-        }.or(Some(now));
+        let Some(end) = arm.at.checked_add(CX_WINDOW) else { return; };
+        if end <= Instant::now() { return; }
+        self.stamp_ctrl_x(end.checked_sub(CX_MIN_GAP).unwrap_or(end));
+        self.codex_closed_until = Some(end);
+    }
+
+    /// The first Codex press flashes its invitation for `MSG_TTL`, twice the
+    /// window. When the window closes without archiving, the footer falls
+    /// back to that flash while the cursor may already sit on a Claude row,
+    /// so the invitation is replaced by a line that invites nothing.
+    fn close_codex_invitation(&mut self) {
+        if self.message.as_ref().is_some_and(|(text, _)| text.starts_with(CODEX_INVITATION)) {
+            self.flash(CODEX_CLOSED, MsgLevel::Warn);
+        }
     }
 
     /// The footer line while the window is open — `None` when it is not.
@@ -2643,7 +2674,7 @@ impl App {
         let arm = self.stop_arm.as_ref()?;
         let label = model::truncate_end(&arm.name, LABEL_MAX);
         if arm.provider == Provider::Codex {
-            Some(format!("Ctrl-x again to archive {label}"))
+            Some(format!("{CODEX_INVITATION}{label}"))
         } else {
             Some(format!(
                 "Ctrl+X again: delete {label} and its worktree — cannot be undone"
@@ -5056,6 +5087,7 @@ mod tests {
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
+            codex_closed_until: None,
             pending_jump: None,
             message: None,
             msg_deadline: None,

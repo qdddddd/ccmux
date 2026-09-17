@@ -145,6 +145,46 @@ fn show(a: &mut App, rows: Vec<Session>) {
     a.rebuild_rows();
 }
 
+/// A launch record for `target` in some other tab's stored map.
+fn mapped_in_another_tab(a: &mut App, target: &Session) {
+    let mut remote = PaneMap::new();
+    remote.insert(&PaneId::parse("%9").unwrap(), PaneEntry {
+        provider:Provider::Codex, session_id:target.session_id.clone(),
+        short_id:target.id.clone().unwrap(), name:target.name.clone(), opened_at:1,
+    });
+    a.tabs.push(TabInfo { window:WindowId::parse("@9").unwrap(), index:9,
+        sidebar:None, map:remote, hidden:HiddenLog::new() });
+}
+
+/// A Working Claude row above `codex`, with the cursor on `codex`.
+fn beside_working_claude(codex: Session) -> App {
+    let mut a = configured();
+    let mut working = claude();
+    working.status = Status::Busy;
+    working.state = Some(State::Working);
+    a.apply_poll(Ok(payload(vec![working])));
+    poll(&mut a, vec![codex], true);
+    a.rebuild_rows();
+    key(&mut a, KeyCode::Char('G'));
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
+    agents::test_spawn::reset();
+    a
+}
+
+/// Everything drawn, at a width where no flash has to wrap.
+fn screen(a: &App) -> String {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::ui::draw(f, a)).unwrap();
+    let buf = term.backend().buffer();
+    (0..24).map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>().join("\n")
+}
+
+fn sleep_until(at: Instant) {
+    std::thread::sleep(at.saturating_duration_since(Instant::now()));
+}
+
 fn claude_error(a: &mut App, stderr: &str) {
     a.apply_poll(Err(AgentsError::Cmd { code: 1, stderr: stderr.into() }));
 }
@@ -345,13 +385,7 @@ fn codex_archive_local_refusals_never_arm_or_call_rpc() {
 
     let mut a = configured();
     let target = row(1, CodexStatus::Idle);
-    let mut remote = PaneMap::new();
-    remote.insert(&PaneId::parse("%9").unwrap(), PaneEntry {
-        provider:Provider::Codex, session_id:target.session_id.clone(),
-        short_id:target.id.clone().unwrap(), name:target.name.clone(), opened_at:1,
-    });
-    a.tabs.push(TabInfo { window:WindowId::parse("@9").unwrap(), index:9,
-        sidebar:None, map:remote, hidden:HiddenLog::new() });
+    mapped_in_another_tab(&mut a, &target);
     show(&mut a, vec![target]);
     ctrl_x(&mut a);
     assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
@@ -985,7 +1019,7 @@ fn a_codex_arm_stamps_the_burst_guard_before_its_row_disappears() {
     a.rebuild_rows();
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
     for _ in 0..3 { a.on_key(ctrl_x); }
-    assert_eq!(a.message.as_ref().unwrap().0, "too fast — press Ctrl+X again");
+    assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
     assert!(agents::test_spawn::joined().is_empty(), "a buffered refusal stopped a neighbour");
     assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
 }
@@ -1156,4 +1190,121 @@ fn tab_and_backtab_cycle_five_groups_and_skip_hidden_empty_groups() {
     for code in [KeyCode::Tab, KeyCode::BackTab] { key(&mut a, code); }
     assert!(a.selected_session().is_none());
     assert!(calls().is_empty(), "navigation must not poll or prepare");
+}
+
+#[test]
+fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
+    let mut blocked = row(1, CodexStatus::Active { flags: vec!["waitingOnApproval".into()] });
+    blocked.status = Status::Waiting;
+    blocked.state = Some(State::Blocked);
+    let cases = [
+        (row(1, CodexStatus::Active { flags: vec![] }), false, "running — not archived"),
+        (blocked, false, "running — not archived"),
+        (row(1, CodexStatus::SystemError), false, "state unknown — not archived"),
+        (row(1, CodexStatus::Unknown("future".into())), false, "state unknown — not archived"),
+        (row(1, CodexStatus::Idle), true, "close its pane first (x) — not archived"),
+    ];
+    for (target, mapped, refusal) in cases {
+        let mut a = beside_working_claude(target.clone());
+        if mapped { mapped_in_another_tab(&mut a, &target); }
+        ctrl_x(&mut a);
+        assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)), Some((refusal, MsgLevel::Warn)));
+        assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "{refusal}");
+        poll(&mut a, vec![], true);
+        a.rebuild_rows();
+        assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+        ctrl_x(&mut a);
+        assert!(agents::test_spawn::joined().is_empty(), "{refusal}: a double-tapped refusal stopped a neighbour");
+        assert_eq!(a.message.as_ref().unwrap().0, "too fast — press Ctrl+X again");
+    }
+}
+
+/// The confirming press and the retry both land inside the original two
+/// seconds, CX_MIN_GAP apart, after the window closed under the cursor.
+fn closed_window_refuses_paced_presses(close: fn(&mut App), presses: &[u64]) {
+    let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    assert!(screen(&a).contains("again to archive"));
+    close(&mut a);
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
+    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    assert!(!screen(&a).contains("again to archive"), "{}", screen(&a));
+    for &offset in presses {
+        sleep_until(armed_at + Duration::from_millis(offset));
+        ctrl_x(&mut a);
+        assert!(armed_at.elapsed() < CX_WINDOW, "the press at {offset} ms left the window");
+        assert!(agents::test_spawn::joined().is_empty(), "the press at {offset} ms stopped Claude");
+        assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
+        assert!(!screen(&a).contains("again to archive"));
+    }
+    assert!(!calls().contains(&"archive"));
+}
+
+fn vanish(a: &mut App) {
+    poll(a, vec![], true);
+    a.rebuild_rows();
+}
+
+#[test]
+fn a_refused_press_cannot_shorten_a_vanished_codex_window() {
+    closed_window_refuses_paced_presses(vanish, &[800, 1600]);
+}
+
+#[test]
+fn a_vanished_codex_window_refuses_a_paced_press_without_an_earlier_one() {
+    closed_window_refuses_paced_presses(vanish, &[1600]);
+}
+
+#[test]
+fn a_refused_press_cannot_shorten_a_codex_window_closed_by_crossing() {
+    closed_window_refuses_paced_presses(|a| key(a, KeyCode::Char('k')), &[800, 1600]);
+}
+
+#[test]
+fn no_closed_codex_window_leaves_its_invitation_on_screen() {
+    let expire = |a: &mut App| {
+        a.stop_arm.as_mut().unwrap().at -= CX_WINDOW + Duration::from_millis(1);
+        assert!(a.tick_stop_arm());
+    };
+    type Close = fn(&mut App);
+    let closes: [(&str, Close); 5] = [
+        ("crossing", |a| key(a, KeyCode::Char('k'))),
+        ("vanish", vanish),
+        ("expiry", expire),
+        ("burst", ctrl_x),
+        ("mode change", |a| { key(a, KeyCode::Char('/')); key(a, KeyCode::Esc); }),
+    ];
+    for (name, close) in closes {
+        let mut a = beside_working_claude(row(1, CodexStatus::Idle));
+        ctrl_x(&mut a);
+        assert!(screen(&a).contains("Ctrl-x again to archive task 1"), "{name}");
+        close(&mut a);
+        assert_eq!(a.mode, Mode::Normal, "{name}");
+        assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "{name}");
+        let drawn = screen(&a);
+        assert!(!drawn.contains("again to archive"), "{name}: {drawn}");
+        assert!(drawn.contains(CODEX_CLOSED), "{name}: {drawn}");
+        assert!(agents::test_spawn::joined().is_empty() && !calls().contains(&"archive"), "{name}");
+    }
+}
+
+#[test]
+fn a_repeat_burst_closes_a_codex_window_for_its_remainder() {
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    let armed_at = a.stop_arm.as_ref().unwrap().at;
+    ctrl_x(&mut a);
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "a burst kept the archive window");
+    assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
+    for offset in [800, 1600] {
+        sleep_until(armed_at + Duration::from_millis(offset));
+        ctrl_x(&mut a);
+        assert!(armed_at.elapsed() < CX_WINDOW, "the press at {offset} ms left the window");
+        assert!(a.stop_arm.is_none() && a.pending_delete.is_none(),
+            "the press at {offset} ms after a burst reopened or confirmed the archive");
+        assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
+    }
+    assert!(!calls().contains(&"archive") && agents::test_spawn::joined().is_empty());
 }

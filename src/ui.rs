@@ -1086,7 +1086,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     // at all; below that the pinned help key is the whole footer.
     if w >= MARGIN_MIN {
         let budget = w - m - hw - 1; // the rail, plus at least one blank column
-        for (key, text) in HINTS {
+        // `C-x` archives on a Codex row (§12.8). Only the label changes, so a
+        // Claude row, and a Claude-only list, keeps its footer byte for byte;
+        // the longer label fits or drops as a whole pair like any other.
+        let codex = app.selected_session().is_some_and(|s| s.provider == Provider::Codex);
+        for &(key, text) in HINTS {
+            let text = if codex && key == "C-x" { "archive" } else { text };
             let pair = display_width(key) + 1 + display_width(text);
             let want = if used == 0 { pair } else { used + 2 + pair };
             if want > budget {
@@ -1095,7 +1100,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
             if used > 0 {
                 spans.push(Span::styled("  ".to_string(), Style::default()));
             }
-            spans.push(Span::styled((*key).to_string(), Style::default().fg(p.gray)));
+            spans.push(Span::styled(key.to_string(), Style::default().fg(p.gray)));
             spans.push(Span::styled(format!(" {text}"), Style::default().fg(p.dim)));
             used = want;
         }
@@ -1568,6 +1573,7 @@ mod tests {
             stop_arm: None,
             cx_last_press: None,
             pending_delete: None,
+            codex_closed_until: None,
             pending_jump: None,
             message: None,
             msg_deadline: None,

@@ -4483,15 +4483,19 @@ last Codex group with blocked rows first, `a` also toggling `◇` rows,
 unloaded as “not loaded in this server; Enter resumes; last-turn outcome
 unknown”, and the launch-target map limitation (§12.7).
 Say “n creates a Claude session; create Codex threads in the Codex TUI”.
-Add `C-x ×2  archive ○/◇ thread`; keep the ordinary footer's `C-x stop`
-byte-identical because that compact hint describes Claude.
+Add `C-x ×2  archive ○/◇ thread`. The ordinary footer's pair reads
+`C-x archive` while a Codex row is selected; it fits or drops as a whole pair
+under the existing width rules. With a Claude row selected, or no Codex row
+listed, the footer stays byte-identical with `C-x stop`.
 
 Codex archive messages use the existing transient slot and wrapping rules.
 The first eligible press is Warn `Ctrl-x again to archive <label>` and opens
 the shared two-second destructive window without RPC. Local refusals are Warn:
 `running — not archived`, `state unknown — not archived`,
 `close its pane first (x) — not archived`, or the provider's configuration
-refusal. A fresh-read rejection is Warn `state changed — not archived`.
+refusal. A window that closes without archiving, and any press refused for
+the rest of its two seconds, is Warn `archive window closed — nothing archived`.
+A fresh-read rejection is Warn `state changed — not archived`.
 RPC/timeout failure is Warn `archive failed: <bounded redacted diagnostic>`.
 Success is Info `archived <label>` after the row has already been removed.
 
@@ -4739,6 +4743,16 @@ it captures provider plus full Thread.id and warns
 `Ctrl-x again to archive <label>`. Moving to another row, crossing providers,
 the row vanishing, leaving Normal mode, expiry, or a repeat burst disarms it.
 A later Claude selection can never inherit a Codex arm or pending action.
+
+A disarm other than expiry protects the rest of the original two-second
+window: the repeat guard is dated so that every press before the window's end
+reads as a burst, and no press ever moves the guard backwards. A burst, and
+every press refused inside that remainder, warns
+`archive window closed — nothing archived` and never invites another press.
+When any Codex window closes without archiving, a footer message still
+showing its `Ctrl-x again to archive <label>` invitation is replaced by that
+same line, so the invitation cannot outlive the window. Claude's burst
+behavior, including its surviving arm, is unchanged.
 
 The second qualified press must still select that exact provider/full ID and
 reapply every local refusal to the current row. After the settle guard it runs
@@ -5218,7 +5232,13 @@ have these tests; existing Claude tests remain authoritative except for
   timeout; unexpected server requests; and broadcast notifications. None may
   archive or report success. Expiry, navigation, mode change, disappearance,
   cross-provider movement, and held/repeated input disarm; a neighbouring
-  Claude row cannot inherit stop/delete. Recheck row and pane state on the
+  Claude row cannot inherit stop/delete. With real sleeps, presses paced past
+  750 ms but inside the original two seconds after a disappearance, crossing,
+  or burst reach neither `claude stop` nor archive, with and without an
+  earlier refused press, and no closed window leaves
+  `again to archive` on screen. Each first-press refusal kind, double-tapped
+  onto a Working Claude neighbour after the Codex row vanishes, stops nothing.
+  The footer pair reads `C-x archive` only on a Codex row. Recheck row and pane state on the
   second press. Success removes the row immediately, clears only that ID's
   exclusion/read-order cache, forces a poll, and remains absent through a
   lagging read until a complete `archived:false` union omits it. A later

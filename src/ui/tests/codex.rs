@@ -318,3 +318,33 @@ fn claude_only_list_matches_the_pre_codex_group_baseline() {
         }
     }
 }
+
+#[test]
+fn the_footer_says_archive_only_while_a_codex_row_is_selected() {
+    let claude = sess(1, Kind::Background, Status::Busy, Some(State::Working));
+    let codex = codex_row(crate::model::CodexStatus::Idle, Status::Idle, None);
+    let only = app_with(vec![claude.clone()]);
+    let on_claude = app_with(vec![claude.clone(), codex.clone()]);
+    let mut on_codex = app_with(vec![claude, codex]);
+    on_codex.selected = on_codex.rows.iter().position(|row| matches!(row,
+        Row::Session { idx } if on_codex.sessions[*idx].provider == Provider::Codex)).unwrap();
+    assert_eq!(only.selected_session().unwrap().provider, Provider::Claude);
+    assert_eq!(on_claude.selected_session().unwrap().provider, Provider::Claude);
+    assert_eq!(on_codex.selected_session().unwrap().provider, Provider::Codex);
+
+    let pairs = "⏎ open  o/s split  x close  t tab  d/u hide  C-x stop  n new  L logs  / filter  R restart";
+    assert!(rows_at(&only, 120, 24)[23].starts_with(pairs));
+    assert!(rows_at(&on_codex, 120, 24)[23].starts_with(&pairs.replace("C-x stop", "C-x archive")));
+    for w in 0..=120u16 {
+        let claude_footer = rows_at(&only, w, 24)[23].clone();
+        assert_eq!(rows_at(&on_claude, w, 24)[23], claude_footer, "w={w}");
+        let codex_footer = rows_at(&on_codex, w, 24)[23].clone();
+        assert!(!codex_footer.contains("stop"), "w={w}: {codex_footer:?}");
+        // Whole pairs only: the longer label drops out with everything after it.
+        if !codex_footer.contains("C-x archive") {
+            assert!(!codex_footer.contains("n new"), "w={w}: {codex_footer:?}");
+            let before = claude_footer.split("  C-x stop").next().unwrap().trim_end();
+            assert!(codex_footer.starts_with(before) || !claude_footer.contains("C-x"), "w={w}");
+        }
+    }
+}
