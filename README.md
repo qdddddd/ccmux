@@ -118,13 +118,14 @@ changing that record: sidebar Enter/`x` still refer to the original launch,
 and a parked retry returns to it. The Codex TUI owns every other thread
 mutation.
 
-Archive is a soft delete: turns stay intact and the official client can undo
-it. Either run
+Archive is a soft delete: turns stay intact, and while the archived thread
+still exists the official client can undo it. Either run
 `codex unarchive <id> --remote ws://127.0.0.1:8965 --remote-auth-token-env CODEX_REMOTE_TOKEN`
 with that environment variable set, or resume the archived ID and choose
 **Unarchive and resume**. The thread reappears in the sidebar on a later poll.
-Codex Desktop's **Delete all archived** action permanently deletes archived
-threads. ccmux has no unarchive key.
+Recovery is not guaranteed: Codex Desktop's **Delete all archived** action
+permanently deletes archived threads, and how long Codex keeps them otherwise
+has not been measured. ccmux has no unarchive key.
 
 The fresh read and archive are separate RPCs. Another client can start a turn
 between them, and that turn would be aborted. ccmux cannot detect an idle TUI

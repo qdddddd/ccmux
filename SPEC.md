@@ -5008,9 +5008,15 @@ refines the contract; it does not turn unrun experiments into live findings.
   Do not create a turn to make a row resumable or use timestamps as identity.
 - Attach did not advance `updatedAt` for loaded or unloaded persisted threads.
   On server 0.153.4, unsubscribed idle threads unloaded after about **30
-  minutes**. Server 0.154.0 unloaded five or more probes after approximately
-  **60 seconds** (60.006–60.014 s; §10). Both versions require the
+  minutes**. Server 0.154.0 unloaded them after approximately **60 seconds**:
+  60.009–60.014 s in the state probe (n=3) and 60.006/60.012 s in the
+  attached-TUI probe (n=2; PROBE-FINDINGS §10). Both versions require the
   recent-history half of the union.
+- On server 0.154.0, `thread/read` and DB-only `thread/list` return `cwd` as
+  the symlink-resolved real path, while scan-mode `thread/list` returns it as
+  given; a `cwd` filter given the unresolved path still matched
+  (PROBE-FINDINGS §10). Compare a live `cwd` only after canonicalizing both
+  sides, and never treat lexical cwd as identity.
 - `thread/archive` has no expected-status, idle-only, or force precondition.
   Archiving active/waiting threads aborts their turn; a fresh status read is
   therefore the only available client-side guard. A different client can
@@ -5021,7 +5027,8 @@ refines the contract; it does not turn unrun experiments into live findings.
   attached outside ccmux. Archiving such an idle thread leaves the TUI silent;
   its next message fails `thread not found`. A standalone non-remote Codex
   writer is also outside this endpoint: mid-turn it appears `notLoaded` but
-  archive was refused by the server's active-writer lock in 4/4 trials.
+  archive was refused by the server's active-writer lock in 4/4 attempts on
+  3 threads, only one of which (2 attempts) was mid-command.
   A standalone process between turns is invisible and archivable; that exact
   case is **UNMEASURED**. Archive under an externally attached TUI mid-turn is
   also **UNMEASURED**.
@@ -5031,10 +5038,13 @@ refines the contract; it does not turn unrun experiments into live findings.
   --remote-auth-token-env CODEX_REMOTE_TOKEN` command, or run
   `codex --remote ws://127.0.0.1:8965 --remote-auth-token-env
   CODEX_REMOTE_TOKEN resume <id>` and choose “Unarchive and resume”.
-  Codex does not automatically purge archived threads. Codex Desktop's
-  “Delete all archived” action sends `thread/delete`/filesystem removal and
-  destroys them permanently; that measured bulk-delete behavior is why
-  `thread/archive` is the sidebar's authority ceiling.
+  Recovery works only while the archived thread still exists. Codex Desktop's
+  “Delete all archived” UI path sends `thread/delete` plus filesystem removal
+  and destroys archived threads permanently. Earlier archived probe threads
+  are gone and a Desktop delete burst was logged; that the burst removed them
+  is inferred, and its trigger is unknown. No automatic purge path was found,
+  but retention beyond a few minutes is **UNMEASURED**. That permanent delete
+  path is why `thread/archive` is the sidebar's authority ceiling.
 - `/resume`, `/fork`, and `/new` invalidate a pane's launch identity
   without changing its argv. The map deliberately remains a launch record.
   `/new` takes default thread settings/cwd. The materialization turn's cwd
@@ -5350,11 +5360,16 @@ default-socket command, service restart/configuration change, or mutation
 of a pre-existing thread is permitted.
 
 Create only persistent `ccmux-probe-` threads in a unique probe cwd, with
-luna/low and per-thread read-only sandbox / never-approve policy. Record every
-returned ID in the in-memory ownership set and durable `registry.jsonl`
-BEFORE naming or sending turns; the name must carry the prefix. Record the
-installed CLI version and server `initialize.userAgent` (the latter is the
-server's self-report, not proof from the installed binary). Keep registries
+luna/low and per-thread read-only sandbox / never-approve policy. The one
+exception is the archive approval refusal case, whose thread uses
+`approvalPolicy:"untrusted"` so that a command approval can be held. The
+harness answers no other server request. It replies to that approval only
+through the registry's ownership check, only for an owned thread and a turn
+its creator connection started, at most once, and always with `decline`.
+Record every returned ID in the in-memory ownership set and durable
+`registry.jsonl` BEFORE naming or sending turns; the name must carry the
+prefix. Record the installed CLI version and server `initialize.userAgent`
+(the latter is the server's self-report, not proof from the installed binary). Keep registries
 and result summaries under `~/.local/tmp/`; no credentials or raw wire
 payloads go into logs. On failure, include a bounded, redacted last observation
 (owned turn/status/error or pane snapshot). Redact before escaping/truncating;
@@ -5437,6 +5452,8 @@ The shipped cases are:
 - **DB-only freshness, pagination, and poll cost:** materialize two owned
   threads with trivial turns; DB-only must see each BEFORE scan-and-repair.
   Compare metadata before/after a scan restricted to the unique probe cwd.
+  Every field must be equal, except that `cwd` is compared after
+  canonicalizing both sides (§12.10).
   Follow loaded/history cursors with page size 1 across both owned IDs.
   Run five complete production observations over the real population,
   require both owned rows, and record durations/p95 against the 1,000 ms
@@ -5474,7 +5491,7 @@ The shipped cases are:
   `active` status, and require production archive to return `StateChanged`.
   The same owned turn must subsequently complete and the thread return idle;
   cleanup cannot supply that evidence.
-- **Archive approval refusal:** create an owned restrictive-policy thread,
+- **Archive approval refusal:** create an owned `untrusted`-policy thread,
   require fresh `waitingOnApproval`, and require production archive to return
   `StateChanged`. Require the same approval still pending, then decline that
   owned request through the creator and prove its marker command did not run.
@@ -5493,7 +5510,8 @@ the evidence gates.
 Remove the throwaway server only after verifying its owned session/pane
 inventory. Any archive, verification, or tmux cleanup failure FAILS the case;
 a passing body never overrides failed cleanup. Offline harness tests cover
-opt-in isolation, fixed socket/environment removal, mutation ownership,
+opt-in isolation, fixed socket/environment removal, mutation ownership, the
+owned decline-only approval reply, symlink-aware `cwd` metadata comparison,
 and continued cleanup after an individual archive failure.
 
 Run only these ignored cases, not the older unrelated ignored tests:

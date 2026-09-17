@@ -210,6 +210,9 @@ impl Drop for RunLock {
     fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
 }
 
+/// The one server request the harness answers, and only with `decline`.
+const APPROVAL_REQUEST: &str = "item/commandExecution/requestApproval";
+
 #[derive(Default)]
 struct Registry {
     threads: BTreeMap<String, String>,
@@ -244,8 +247,10 @@ impl Registry {
                 ensure!(params["cwd"].as_str() == work.to_str(), "listing must use the probe cwd");
                 Ok(())
             }
+            // APPROVAL_REQUEST authorizes the reply to that server request,
+            // never a client request (`LiveRpc::request` refuses it).
             "thread/read" | "thread/turns/list" | "thread/name/set" | "turn/start"
-            | "thread/unsubscribe" | "thread/archive" | "thread/unarchive" => {
+            | "thread/unsubscribe" | "thread/archive" | "thread/unarchive" | APPROVAL_REQUEST => {
                 let id = params["threadId"].as_str().unwrap_or("");
                 ensure!(self.threads.contains_key(id), "probe thread ownership guard");
                 if method == "thread/name/set" {
@@ -270,7 +275,8 @@ struct AttachedTui { pane: String, thread: String }
 
 /// Separate from production Method/Rpc: this harness has the broader mutation
 /// set needed for owned fixtures. Production exposes only guarded archive.
-/// Every request other than the private creation path is ownership-checked.
+/// Every request other than the private creation path, and the one reply
+/// (declining an owned approval), is ownership-checked by the registry.
 struct LiveRpc<'a> {
     transport: Option<Box<dyn Transport + 'a>>,
     registry: Rc<RefCell<Registry>>,
@@ -317,12 +323,14 @@ impl LiveRpc<'_> {
 
     fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         ensure!(method != "turn/start" || self.creator, "observer cannot start turns");
+        ensure!(method != APPROVAL_REQUEST, "server request methods are answered, never sent");
         self.registry.borrow().authorize(method, &params, &self.work)?;
         self.exchange(method, params)
     }
 
     fn event(&mut self, value: Value) {
-        // Requests receive NO reply: even an error can deny an approval.
+        // Requests receive NO reply here: even an error can deny an approval.
+        // Only `decline_approval` answers, and only an owned command approval.
         let params = &value["params"];
         if value.get("id").is_some() {
             if params["threadId"].as_str()
@@ -359,7 +367,10 @@ impl LiveRpc<'_> {
         Ok(id.into())
     }
 
+    /// Waits for the command approval of a turn this connection started on an
+    /// owned thread. Requests for any other thread or turn never match.
     fn wait_approval(&mut self, id: &str, turn: &str) -> Result<Value> {
+        self.owned_approval(&json!({"threadId":id,"turnId":turn}))?;
         let wait = self.wait.scoped(Duration::from_secs(30));
         let no_pause = |_| {};
         let wait = Waiter { pause:&no_pause, ..wait };
@@ -372,7 +383,7 @@ impl LiveRpc<'_> {
             }
             receive = true;
             let request = self.server_requests.iter().find(|request|
-                request["method"] == "item/commandExecution/requestApproval"
+                request["method"] == APPROVAL_REQUEST
                     && request["params"]["threadId"] == id
                     && request["params"]["turnId"] == turn).cloned();
             Ok((request, json!({"thread":id,"turn":turn,
@@ -383,12 +394,26 @@ impl LiveRpc<'_> {
         })
     }
 
+    /// Registry ownership of the thread, plus a turn this connection started.
+    fn owned_approval(&self, params: &Value) -> Result<()> {
+        self.registry.borrow().authorize(APPROVAL_REQUEST, params, &self.work)?;
+        let turn = (params["threadId"].as_str().unwrap_or("").to_owned(),
+            params["turnId"].as_str().unwrap_or("").to_owned());
+        ensure!(self.turns.contains_key(&turn), "approval turn was not started by this connection");
+        Ok(())
+    }
+
+    /// The harness's only reply to a server request. The decision is always
+    /// `decline`, sent at most once, and only for a held approval of an owned
+    /// thread's turn that this connection started.
     fn decline_approval(&mut self, request: &Value) -> Result<()> {
+        ensure!(request["method"] == APPROVAL_REQUEST, "only command approvals are answered");
         let id = request.get("id").filter(|id| !id.is_null())
             .ok_or_else(|| anyhow::anyhow!("approval request missing id"))?;
-        let thread = request["params"]["threadId"].as_str().unwrap_or("");
-        ensure!(self.registry.borrow().threads.contains_key(thread),
-            "approval response ownership guard");
+        self.owned_approval(&request["params"])?;
+        let held = self.server_requests.iter().position(|held| held == request)
+            .ok_or_else(|| anyhow::anyhow!("approval request is not held or was already answered"))?;
+        self.server_requests.remove(held);
         self.send(json!({"id":id,"result":{"decision":"decline"}})).map_err(live_error)
     }
 
@@ -1227,9 +1252,21 @@ const METADATA_FIELDS: [&str; 7] = ["id","name","cwd","createdAt","updatedAt","e
 
 fn metadata_matches(left: &BTreeMap<String, Value>, right: &BTreeMap<String, Value>, ids: &[&str]) -> bool {
     ids.iter().all(|id| METADATA_FIELDS.iter().all(|field| {
-        left.get(*id).and_then(|row| row.get(*field))
-            .is_some_and(|value| right.get(*id).and_then(|row| row.get(*field)) == Some(value))
+        left.get(*id).and_then(|row| row.get(*field)).is_some_and(|value|
+            right.get(*id).and_then(|row| row.get(*field)).is_some_and(|other| field_matches(field, value, other)))
     }))
+}
+
+/// Server 0.154.0 returns `cwd` symlink-resolved from DB-only list/read but as
+/// given from scan mode (PROBE-FINDINGS §10), so `cwd` compares after
+/// canonicalization. Every other field, and any cwd that cannot be resolved,
+/// must match exactly.
+fn field_matches(field: &str, left: &Value, right: &Value) -> bool {
+    left == right || field == "cwd" && match (left.as_str(), right.as_str()) {
+        (Some(left), Some(right)) => matches!((fs::canonicalize(left), fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right),
+        _ => false,
+    }
 }
 
 fn owned_metadata(rows: &BTreeMap<String, Value>, ids: &[&str]) -> Value {
@@ -1404,7 +1441,9 @@ fn live_registry_rejects_unowned_mutations_and_deletion_even_when_owned() {
     let mut registry = Registry::default();
     assert!(registry.created(id, "operator-thread").is_err());
     registry.created(id, "ccmux-probe-owned").unwrap();
-    for method in ["thread/name/set","turn/start","thread/unsubscribe","thread/archive","thread/unarchive"] {
+    for method in ["thread/name/set","turn/start","thread/unsubscribe","thread/archive","thread/unarchive",
+        APPROVAL_REQUEST]
+    {
         assert!(registry.authorize(method, &json!({"threadId":"foreign"}), Path::new("/probe")).is_err());
         assert!(registry.authorize(method, &json!({"threadId":id,"name":"ccmux-probe-owned"}),
             Path::new("/probe")).is_ok());
@@ -1480,7 +1519,7 @@ impl Transport for FakeLiveTransport {
 }
 
 #[test]
-fn live_rpc_registers_before_mutation_and_never_replies_to_server_requests() {
+fn live_rpc_registers_before_mutation_and_leaves_unattributed_server_requests_unanswered() {
     let id = "01a0a609-12a6-7000-8000-000000000001";
     let registry = Rc::new(RefCell::new(Registry::default()));
     let sent = Rc::new(RefCell::new(Vec::new()));
@@ -1498,16 +1537,102 @@ fn live_rpc_registers_before_mutation_and_never_replies_to_server_requests() {
     };
     assert!(rpc.request("thread/archive", json!({"threadId":"foreign"})).is_err());
     assert!(rpc.create("not-a-probe").is_err());
+    registry.borrow_mut().threads.insert(id.into(), "ccmux-probe-owned".into());
+    assert!(rpc.request(APPROVAL_REQUEST, json!({"threadId":id})).is_err()); // a reply, never a request
+    registry.borrow_mut().threads.clear();
     assert!(sent.borrow().is_empty());
     assert_eq!(rpc.create("ccmux-probe-owned").unwrap(), id);
     assert_eq!(registry.borrow().threads[id], "ccmux-probe-owned");
     assert_eq!(sent.borrow().len(), 2); // no reply to the approval
+    assert!(rpc.server_requests.is_empty());
     assert_eq!(sent.borrow()[0]["method"], "thread/start");
     assert_eq!(sent.borrow()[1]["method"], "thread/name/set");
     let error = rpc.request("thread/archive", json!({"threadId":id})).unwrap_err();
     assert!(!format!("{error:?} {error}").contains("synthetic-secret"));
     assert!(rpc.request("thread/delete", json!({"threadId":id})).is_err());
     assert_eq!(sent.borrow().len(), 3);
+}
+
+#[test]
+fn live_rpc_declines_only_the_owned_turn_approval_once() {
+    let approval = |id: Value, thread: &str, turn: &str| json!({"id":id,"method":APPROVAL_REQUEST,
+        "params":{"threadId":thread,"turnId":turn,"itemId":"command"}});
+    let started = |rpc: &mut LiveRpc<'_>, thread: &str| rpc.turns.insert((thread.into(), "turn".into()),
+        CreatedTurn { end:CASE_TIMEOUT, command_underway:false });
+    let foreign = approval(json!(7), WAIT_OTHER, "turn");
+    for request_id in [json!(0), json!("approval-0")] {
+        let clock = WaitClock::default();
+        let pause = |_| {};
+        let (mut rpc, sent) = scripted_live_rpc(&clock, &pause, Vec::new(), CASE_TIMEOUT);
+        started(&mut rpc, WAIT_ID);
+        let owned = approval(request_id.clone(), WAIT_ID, "turn");
+        let frames = [
+            foreign.clone(),
+            approval(json!(8), WAIT_ID, "other-turn"),
+            json!({"id":9,"method":"item/tool/requestUserInput","params":{"threadId":WAIT_ID,"turnId":"turn"}}),
+            owned.clone(),
+        ];
+        rpc.transport = Some(Box::new(FakeLiveTransport { sent:sent.clone(), replies:frames.into() }));
+
+        // Only the owned thread's started turn can be awaited, and only its
+        // command approval matches. A foreign request is never even held.
+        assert!(rpc.wait_approval(WAIT_OTHER, "turn").is_err());
+        assert!(rpc.wait_approval(WAIT_ID, "other-turn").is_err());
+        assert_eq!(rpc.wait_approval(WAIT_ID, "turn").unwrap(), owned);
+        assert!(!rpc.server_requests.contains(&foreign));
+        assert!(sent.borrow().is_empty());
+
+        // A held request for an unstarted turn, a held user-input request, a
+        // request never held, and one without an id all go unanswered.
+        let held_other_turn = rpc.server_requests.iter()
+            .find(|held| held["params"]["turnId"] == "other-turn").cloned().unwrap();
+        let held_input = rpc.server_requests.iter()
+            .find(|held| held["method"] != APPROVAL_REQUEST).cloned().unwrap();
+        for refused in [foreign.clone(), held_other_turn, held_input,
+            approval(json!(10), WAIT_ID, "turn"), approval(Value::Null, WAIT_ID, "turn")]
+        {
+            assert!(rpc.decline_approval(&refused).is_err(), "{refused}");
+        }
+
+        // The registry alone still refuses a foreign thread that somehow has
+        // a turn record and a held request on this connection.
+        started(&mut rpc, WAIT_OTHER);
+        rpc.server_requests.push(foreign.clone());
+        assert!(rpc.wait_approval(WAIT_OTHER, "turn").is_err());
+        assert!(rpc.decline_approval(&foreign).is_err());
+        assert!(sent.borrow().is_empty());
+
+        rpc.decline_approval(&owned).unwrap();
+        assert_eq!(*sent.borrow(), [json!({"id":request_id,"result":{"decision":"decline"}})]);
+        assert!(rpc.decline_approval(&owned).is_err()); // answered at most once
+        assert_eq!(sent.borrow().len(), 1);
+    }
+}
+
+#[test]
+fn live_metadata_compares_cwd_through_symlinks_and_everything_else_exactly() {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let root = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/tmp").join(format!(
+        "ccmux-live-cwd-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    fs::create_dir_all(root.join("work")).unwrap();
+    fs::create_dir(root.join("other")).unwrap();
+    std::os::unix::fs::symlink(root.join("work"), root.join("link")).unwrap();
+    let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
+    let real = fs::canonicalize(root.join("work")).unwrap().to_str().unwrap().to_owned();
+    let row = |cwd: &str, updated: i64| BTreeMap::from([(WAIT_ID.to_owned(), json!({
+        "id":WAIT_ID,"name":"ccmux-probe-cwd","cwd":cwd,"createdAt":1,"updatedAt":updated,
+        "ephemeral":false,"source":"appServer"}))]);
+    let ids = [WAIT_ID];
+
+    assert!(metadata_matches(&row(&path("link"), 2), &row(&real, 2), &ids));
+    assert!(metadata_matches(&row(&real, 2), &row(&path("link"), 2), &ids));
+    assert!(!metadata_matches(&row(&path("link"), 2), &row(&path("other"), 2), &ids));
+    assert!(!metadata_matches(&row(&path("link"), 2), &row(&real, 3), &ids));
+    assert!(metadata_matches(&row("/absent/cwd", 2), &row("/absent/cwd", 2), &ids));
+    assert!(!metadata_matches(&row("/absent/cwd", 2), &row("/absent/other", 2), &ids));
+    assert!(!field_matches("name", &json!(path("link")), &json!(real)));
+    assert!(!metadata_matches(&row(&real, 2), &BTreeMap::new(), &ids));
+    fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

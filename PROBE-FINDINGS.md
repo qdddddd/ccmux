@@ -1048,13 +1048,20 @@ the same Codex home. Token bytes were not placed in argv or retained evidence.
   atomic.
 
 - **Archive aborts active and blocked work.** Method: archive one owned active
-  turn, two owned `active{waitingOnApproval}` turns, and one owned
-  `active{waitingOnUserInput}` turn. Active abort followed the archive by
-  27 ms (n=1). All three pending requests resolved, their commands did not run,
-  and the rollout described the previous turn as deliberately interrupted by
-  the user. None was refused by `thread/archive`.
-  **Consequence:** ccmux must refuse every `active` value, whatever its flags;
-  approval/input flags do not make archive safer.
+  turn, two owned `active{waitingOnApproval}` turns (one with its owning
+  connection open, one with no client connected), and one owned
+  `active{waitingOnUserInput}` turn, n=1 per condition. Active abort followed
+  the archive by 27 ms (n=1). Each rollout recorded `turn_aborted` with reason
+  `interrupted`; the connected approval case's rollout also gained a message
+  describing the turn as deliberately interrupted by the user. Where the
+  owning connection stayed open, it received `serverRequest/resolved` for the
+  held approval and for the held user-input request; the approval's marker
+  command never ran, and the user-input request had no command. The approval
+  with no connected client could not observe that notification: its resolution
+  is INFERRED from the same status sequence and its absent marker file. None
+  was refused by `thread/archive`. **Consequence:** ccmux must refuse every
+  `active` value, whatever its flags; approval/input flags do not make archive
+  safer.
 
 - **Loaded status is fresh enough to gate.** Method: while owned threads were
   active, compare `thread/read(includeTurns:false)` with their DB-only
@@ -1064,12 +1071,14 @@ the same Codex home. Token bytes were not placed in argv or retained evidence.
 
 - **The guarded transaction fits one second on this population.** Method: on
   one fresh connection, run connect, initialize, `thread/read`, local status
-  check, eligible `thread/archive`, and close. Loaded-idle trials measured
-  p50 99 ms and maximum 104 ms; notLoaded trials measured p50 44 ms and
-  maximum 59 ms. The read response to archive request gap was below 1 ms.
-  **Consequence:** the existing 1,000 ms whole-operation deadline has measured
-  headroom, but the sub-millisecond gap is still a real race with another
-  client starting a turn.
+  check, eligible `thread/archive`, and close. Loaded-idle trials (n=5)
+  measured p50 99.17 ms and maximum 102.61 ms to the archive response, or p50
+  100.91 ms and maximum 103.74 ms including close. notLoaded trials (n=5)
+  measured p50 44.30 ms and maximum 59.15 ms total; the report does not say
+  whether close is included. The read response to archive request gap was
+  below 1 ms in both series. **Consequence:** the existing 1,000 ms
+  whole-operation deadline has measured headroom, but the sub-millisecond gap
+  is still a real race with another client starting a turn.
 
 ### Archive effects and visibility
 
@@ -1108,48 +1117,78 @@ the same Codex home. Token bytes were not placed in argv or retained evidence.
 ### Other clients, unloading, and retention
 
 - **A standalone active writer is invisible to status but protected by its
-  writer lock.** Method: start four owned standalone `codex exec` turns, query
-  them from app-server, and attempt archive mid-turn. They appeared
-  `notLoaded`, were absent from `thread/loaded/list`, and their turn rows could
-  transiently say `interrupted`; all 4/4 archive calls were refused with
-  -32600 `thread <id> already has an active writer`. The lock released when
-  the turn ended, before process exit. **Consequence:** do not parse this error
-  text or treat notLoaded as global idleness. A standalone TUI between turns
-  is invisible and appears archivable, but that exact archive is UNMEASURED.
+  writer lock.** Method: start three owned standalone `codex exec` turns,
+  query them from app-server, and attempt archive while each turn was live.
+  They appeared `notLoaded`, were absent from `thread/loaded/list`, and their
+  turn rows could transiently say `interrupted`; all 4 archive attempts on the
+  3 threads were refused with -32600 `thread <id> already has an active
+  writer`. Only one thread was mid-command (2 attempts, during its `sleep`).
+  One attempt came before the command started, while the model was still
+  reasoning; the other came while the process was stuck in a network retry
+  loop. The lock released when the turn ended, before process exit (n=2).
+  **Consequence:** do not parse this error text or treat notLoaded as global
+  idleness. A standalone TUI between turns is invisible and appears
+  archivable, but that exact archive is UNMEASURED.
 
 - **An externally attached idle remote TUI is not protected.** Method: attach
   an official remote TUI to an owned idle thread, archive it from another
   connection, then submit text in the TUI (n=2). Archive succeeded; the TUI
   displayed no archive notice, and its next submission failed
   `turn/start failed: thread not found`. Resuming the archived ID offered
-  “Unarchive and resume” or cancel; the official `codex unarchive <id>
+  “Unarchive and resume” or cancel; in a separate probe the official `codex unarchive <id>
   --remote ws://127.0.0.1:8965 --remote-auth-token-env CODEX_REMOTE_TOKEN`
-  command exited 0. **Consequence:** ccmux must refuse every thread represented
-  in its own pane maps. It cannot detect an external TUI, so that risk remains.
+  command exited 0 (n=1). **Consequence:** ccmux must refuse every thread
+  represented in its own pane maps. It cannot detect an external TUI, so that
+  risk remains.
 
-- **Idle unload changed in app-server 0.154.0.** Method: leave five or more
-  owned idle, unsubscribed threads without a TUI and sample loaded membership.
-  They unloaded after 60.006, 60.009, 60.012, 60.013, and 60.014 seconds,
-  replacing §9's approximately 30-minute 0.153.4 result. `Thread.cwd` returned
-  the symlink-resolved real path. **Consequence:** recent archived:false
-  history remains necessary, and neither loaded membership nor lexical cwd is
-  a stable ownership signal.
+- **Idle unload changed in app-server 0.154.0.** Method: leave owned idle
+  threads unsubscribed and sample loaded membership. The state probe, which
+  used no TUI, measured unloads 60.009, 60.013, and 60.014 seconds after
+  unsubscribe (n=3); the attached-TUI probe separately recorded 60.006 and
+  60.012 seconds (n=2). This replaces §9's approximately 30-minute 0.153.4
+  result. **Consequence:** recent archived:false history remains necessary,
+  and loaded membership is not a stable ownership signal.
 
-- **Codex does not purge archived threads automatically.** Method: inspect the
-  previously archived probe population and app-server/desktop activity. About
-  65 archived probes from 2026-09-15/16 remained until Codex Desktop issued a
-  burst of `thread/delete` plus filesystem removal from its “Delete all
-  archived” UI. No other caller was found. **Consequence:** ccmux archive is a
-  reversible soft delete, but a later Desktop bulk delete destroys archived
-  threads permanently. This is why ccmux never calls `thread/delete`.
+- **`Thread.cwd` depends on the read path.** Method: run owned probes in
+  scratch directories reached through a symlink, then compare the `cwd`
+  returned by `thread/start`, `thread/read`, DB-only `thread/list`, and
+  scan-mode `thread/list` (three probes). `thread/start` echoed the path as
+  given (approval probe). `thread/read` and DB-only `thread/list` returned the
+  symlink-resolved real path (approval and standalone probes; the state probe
+  also saw the resolved path). Scan-mode `thread/list` returned the path as
+  given (standalone probe, 3 threads). A `thread/list` `cwd` filter given the
+  unresolved path still matched in all three probes, and in both modes in the
+  standalone probe. The ignored DB-freshness live case later timed out on this host
+  because it compared scan-mode and DB-only `cwd` byte for byte.
+  **Consequence:** lexical cwd is not a stable identity signal; the harness
+  compares `cwd` only after canonicalizing both sides.
+
+- **No archive purge path found; long-term retention UNMEASURED.** Method:
+  search the CLI binary and the Codex Desktop bundle for purge or retention
+  paths, read Desktop's app-server log, and re-list owned archived canaries.
+  No purge or retention path was found in the CLI binary or the Desktop bundle
+  strings searched; not every `retention` hit in the bundle was read. Two
+  owned archived canaries survived about 2 minutes, and an earlier probe saw
+  no purge within about 8 minutes. The 2026-09-15/16 archived probe threads
+  are gone. Codex Desktop's own stdio app-server logged a burst of
+  `thread/delete` requests, each followed by filesystem removal, at 2026-09-17
+  02:59:28–32Z. The count of surviving delete request rows (65 at one sample,
+  58 at the next) is a lower bound on the burst, not a count of probe threads,
+  and the log records request IDs, not thread IDs. That the probe threads were
+  among those deletes is INFERRED. The trigger is unknown: the only caller
+  found is Desktop's “Delete all archived” UI path. **Consequence:** ccmux
+  archive is a soft delete that official clients can undo while the thread
+  still exists. Desktop's bulk delete destroys archived threads permanently,
+  and how long Codex otherwise keeps them is unmeasured. This is why ccmux
+  never calls `thread/delete`.
 
 ### Evidence limits
 
 **UNMEASURED:** archiving a standalone Codex TUI between turns; archive under
 an externally attached TUI while its turn is active; pending file-change,
 permission, or MCP requests beyond the approval/user-input cases above; and
-retention over longer periods than the observed minutes/days. The standalone
-writer result is four mid-turn `codex exec` trials, not proof for every native
-runtime. The attached-idle TUI result is n=2 and cannot supply process
-discovery. These limits prohibit stronger claims; they do not justify broader
-mutation authority.
+retention beyond the observed minutes. The standalone writer result is 4
+refused attempts on 3 `codex exec` threads, only one of them (2 attempts)
+mid-command, not proof for every native runtime. The attached-idle TUI result
+is n=2 and cannot supply process discovery. These limits prohibit stronger
+claims; they do not justify broader mutation authority.
