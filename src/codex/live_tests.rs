@@ -268,14 +268,16 @@ struct CreatedTurn {
 // alive. An ordinary close is forbidden while a creator has a pending turn.
 struct AttachedTui { pane: String, thread: String }
 
-/// Separate from the production Method/Rpc: no mutation method is added to
-/// the lister. Every request other than the private creation path is guarded.
+/// Separate from production Method/Rpc: this harness has the broader mutation
+/// set needed for owned fixtures. Production exposes only guarded archive.
+/// Every request other than the private creation path is ownership-checked.
 struct LiveRpc<'a> {
     transport: Option<Box<dyn Transport + 'a>>,
     registry: Rc<RefCell<Registry>>,
     work: PathBuf,
     next_id: u64,
     events: Vec<Value>,
+    server_requests: Vec<Value>,
     creator: bool,
     turns: BTreeMap<(String, String), CreatedTurn>,
     wait: Waiter<'a>,
@@ -321,8 +323,15 @@ impl LiveRpc<'_> {
 
     fn event(&mut self, value: Value) {
         // Requests receive NO reply: even an error can deny an approval.
-        if value.get("id").is_some() { return; }
         let params = &value["params"];
+        if value.get("id").is_some() {
+            if params["threadId"].as_str()
+                .is_some_and(|id| self.registry.borrow().threads.contains_key(id))
+            {
+                self.server_requests.push(value);
+            }
+            return;
+        }
         if params["threadId"].as_str().is_some_and(|id| self.registry.borrow().threads.contains_key(id))
             && matches!(value["method"].as_str(), Some("item/started" | "turn/completed"))
         {
@@ -331,11 +340,15 @@ impl LiveRpc<'_> {
     }
 
     fn create(&mut self, name: &str) -> Result<String> {
+        self.create_with(name, "never")
+    }
+
+    fn create_with(&mut self, name: &str, approval_policy: &str) -> Result<String> {
         ensure!(self.creator, "observer cannot create threads");
         ensure!(name.starts_with("ccmux-probe-"), "probe name guard");
         let result = self.exchange("thread/start", json!({
             "cwd":self.work, "model":MODEL, "ephemeral":false,
-            "approvalPolicy":"never", "approvalsReviewer":"user", "sandbox":"read-only",
+            "approvalPolicy":approval_policy, "approvalsReviewer":"user", "sandbox":"read-only",
             "config":{"model_reasoning_effort":"low"},
             "developerInstructions":"Isolated ccmux lifecycle test. Do only the exact task. Never inspect files, credentials, environment, networks, MCP tools, or other sessions. Never spawn agents. Keep replies short."
         }))?;
@@ -344,6 +357,39 @@ impl LiveRpc<'_> {
         self.registry.borrow_mut().created(id, name)?;
         self.request("thread/name/set", json!({"threadId":id,"name":name}))?;
         Ok(id.into())
+    }
+
+    fn wait_approval(&mut self, id: &str, turn: &str) -> Result<Value> {
+        let wait = self.wait.scoped(Duration::from_secs(30));
+        let no_pause = |_| {};
+        let wait = Waiter { pause:&no_pause, ..wait };
+        let mut receive = false;
+        wait.until(&format!("pending command approval (thread {id}, turn {turn})"), || {
+            if receive {
+                let event = self.receive().map_err(live_error)?;
+                ensure!(event.get("method").is_some(), "unexpected response while awaiting approval");
+                self.event(event);
+            }
+            receive = true;
+            let request = self.server_requests.iter().find(|request|
+                request["method"] == "item/commandExecution/requestApproval"
+                    && request["params"]["threadId"] == id
+                    && request["params"]["turnId"] == turn).cloned();
+            Ok((request, json!({"thread":id,"turn":turn,
+                "server_requests":self.server_requests.iter().map(|request|
+                    json!({"id":request.get("id"),"method":request.get("method"),
+                        "threadId":request["params"].get("threadId"),
+                        "turnId":request["params"].get("turnId")})).collect::<Vec<_>>()})))
+        })
+    }
+
+    fn decline_approval(&mut self, request: &Value) -> Result<()> {
+        let id = request.get("id").filter(|id| !id.is_null())
+            .ok_or_else(|| anyhow::anyhow!("approval request missing id"))?;
+        let thread = request["params"]["threadId"].as_str().unwrap_or("");
+        ensure!(self.registry.borrow().threads.contains_key(thread),
+            "approval response ownership guard");
+        self.send(json!({"id":id,"result":{"decision":"decline"}})).map_err(live_error)
     }
 
     fn start_turn(&mut self, id: &str, prompt: &str) -> Result<String> {
@@ -728,7 +774,8 @@ impl<'a> Harness<'a> {
         let deadline = Deadline { clock:self.clock, end };
         let transport = TcpConnector.connect(&self.client.prepared, deadline).map_err(live_error)?;
         let mut rpc = LiveRpc {
-            transport:Some(transport), registry:self.registry.clone(), work:self.work.clone(), next_id:0, events:Vec::new(),
+            transport:Some(transport), registry:self.registry.clone(), work:self.work.clone(), next_id:0,
+            events:Vec::new(), server_requests:Vec::new(),
             creator:false, turns:BTreeMap::new(), wait:Waiter::new(deadline, &self.client.prepared.token),
         };
         let info = rpc.request("initialize", json!({
@@ -990,6 +1037,113 @@ fn unchanged(before: &Value, after: &Value) -> Result<()> {
     ensure!(after["updatedAt"].as_i64() == Some(before),
         "read/attach changed updatedAt: expected {before}, observed {:?}", after["updatedAt"].as_i64());
     Ok(())
+}
+
+fn archived_everywhere(h: &Harness<'_>, id: &str) -> Result<()> {
+    let mut rpc = h.rpc(Duration::from_secs(30))?;
+    let wait = rpc.wait.scoped(Duration::from_secs(15));
+    wait.until(&format!("thread {id} archived, absent from active history, and unloaded"), || {
+        let (archived, _) = rpc.history(true, true, 100)?;
+        let (active, _) = rpc.history(true, false, 100)?;
+        let loaded = rpc.loaded(100)?.0.contains(id);
+        let row = rpc.read(id)?;
+        let snapshot = json!({"id":id,"archived":archived.contains_key(id),
+            "active":active.contains_key(id),"loaded":loaded,"status":row.get("status")});
+        let ready = archived.contains_key(id) && !active.contains_key(id) && !loaded
+            && row["status"]["type"] == "notLoaded";
+        Ok((ready.then_some(()), snapshot))
+    })?;
+    rpc.close()
+}
+
+fn waiting_approval(rpc: &mut LiveRpc<'_>, id: &str) -> Result<Value> {
+    let wait = rpc.wait.scoped(Duration::from_secs(30));
+    wait.until(&format!("thread {id} waitingOnApproval"), || {
+        let row = rpc.read(id)?;
+        let flags = row["status"]["activeFlags"].as_array();
+        let ready = row["status"]["type"] == "active"
+            && flags.is_some_and(|flags| flags.iter().any(|flag| flag == "waitingOnApproval"));
+        Ok((ready.then_some(row.clone()), json!({"id":id,"status":row.get("status")})))
+    })
+}
+
+#[test]
+#[ignore = "opt-in owned Codex threads; see SPEC §12.11"]
+fn live_archive_idle_loaded_thread() {
+    run(CASE_TIMEOUT, |h| {
+        let mut creator = h.creator()?;
+        let id = creator.materialize(&h.name("archive-idle"))?;
+        creator.thread_state(&id, "idle", true)?;
+        creator.close()?;
+        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::Archived,
+            "idle archive did not report success");
+        archived_everywhere(h, &id)?;
+        h.record(json!({"event":"archive_idle_pass","id":id}))
+    });
+}
+
+#[test]
+#[ignore = "opt-in owned Codex threads; see SPEC §12.11"]
+fn live_archive_not_loaded_thread() {
+    run(CASE_TIMEOUT, |h| {
+        let mut creator = h.creator()?;
+        let id = creator.materialize(&h.name("archive-unloaded"))?;
+        creator.close()?;
+        h.unloaded_fixture(&id)?;
+        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::Archived,
+            "notLoaded archive did not report success");
+        archived_everywhere(h, &id)?;
+        h.record(json!({"event":"archive_unloaded_pass","id":id}))
+    });
+}
+
+#[test]
+#[ignore = "opt-in owned Codex threads; see SPEC §12.11"]
+fn live_archive_gate_refuses_active_turn_until_it_completes() {
+    run(CASE_TIMEOUT, |h| {
+        let mut creator = h.creator()?;
+        let id = creator.materialize(&h.name("archive-active"))?;
+        let turn = creator.start_turn(&id,
+            "Run /usr/bin/sleep 5 with the shell execution tool, then reply exactly done.")?;
+        let mut observer = h.rpc(Duration::from_secs(30))?;
+        observer.thread_state(&id, "active", true)?;
+        observer.close()?;
+        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::StateChanged,
+            "active thread passed the archive gate");
+        creator.created_progress(&id, &turn, false)?;
+        creator.close()?;
+        let mut observer = h.rpc(Duration::from_secs(30))?;
+        observer.thread_state(&id, "idle", true)?;
+        observer.close()?;
+        h.record(json!({"event":"archive_active_refusal_pass","id":id,"turn":turn}))
+    });
+}
+
+#[test]
+#[ignore = "opt-in owned Codex approval and archive gate; see SPEC §12.11"]
+fn live_archive_gate_preserves_pending_approval_until_declined() {
+    run(CASE_TIMEOUT, |h| {
+        let mut creator = h.creator()?;
+        let id = creator.create_with(&h.name("archive-approval"), "untrusted")?;
+        let marker = h.work.join("approval-must-not-run");
+        let turn = creator.start_turn(&id, &format!(
+            "Use the shell execution tool to run /usr/bin/touch {}. Do nothing else.",
+            marker.display()))?;
+        let mut observer = h.rpc(Duration::from_secs(30))?;
+        waiting_approval(&mut observer, &id)?;
+        observer.close()?;
+        ensure!(h.client.archive(&id).map_err(live_error)? == ArchiveOutcome::StateChanged,
+            "waiting approval passed the archive gate");
+        let mut observer = h.rpc(Duration::from_secs(30))?;
+        waiting_approval(&mut observer, &id)?;
+        observer.close()?;
+        let request = creator.wait_approval(&id, &turn)?;
+        creator.decline_approval(&request)?;
+        creator.created_progress(&id, &turn, false)?;
+        creator.close()?;
+        ensure!(!marker.exists(), "declined approval command unexpectedly ran");
+        h.record(json!({"event":"archive_approval_refusal_pass","id":id,"turn":turn}))
+    });
 }
 
 #[test]
@@ -1337,6 +1491,7 @@ fn live_rpc_registers_before_mutation_and_never_replies_to_server_requests() {
             json!({"id":2,"error":{"code":-1,"message":"synthetic-secret"}}),
         ].into() })),
         registry:registry.clone(), work:"/probe".into(), next_id:0, events:Vec::new(),
+        server_requests:Vec::new(),
         creator:true, turns:BTreeMap::new(), wait:Waiter::new(Deadline::new(&clock), "synthetic-secret"),
     };
     assert!(rpc.request("thread/archive", json!({"threadId":"foreign"})).is_err());
@@ -1393,6 +1548,7 @@ fn scripted_live_rpc<'a>(
     (LiveRpc {
         transport:Some(Box::new(FakeLiveTransport { sent:sent.clone(), replies })),
         registry:Rc::new(RefCell::new(registry)), work:"/probe".into(), next_id:0, events:Vec::new(),
+        server_requests:Vec::new(),
         creator:true, turns:BTreeMap::new(), wait:Waiter::with_pause(Deadline { clock, end:clock.now() + budget }, WAIT_SECRET, pause),
     }, sent)
 }
@@ -1791,6 +1947,7 @@ fn lifecycle_rpc<'a>(clock: &'a WaitClock, frames: Vec<Value>)
         transport:Some(Box::new(LifecycleTransport { clock, end, trace:trace.clone(),
             frames:frames.into_iter().map(|v| (Duration::ZERO, v)).collect() })),
         registry:Rc::new(RefCell::new(registry)), work:"/probe".into(), next_id:0, events:Vec::new(),
+        server_requests:Vec::new(),
         creator:true, turns:BTreeMap::new(), wait:Waiter::new(Deadline { clock, end }, WAIT_SECRET),
     }, trace)
 }

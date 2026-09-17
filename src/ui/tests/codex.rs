@@ -174,6 +174,7 @@ fn codex_help_is_opt_in_and_matches_scroll_geometry() {
     assert!(enabled.contains("Codex panes skipped"));
     assert!(enabled.contains("change TUI, not map"));
     assert!(enabled.contains("parked: resume launch"));
+    assert!(CODEX_KEYS.contains(&("C-x ×2", "archive ○/◇ thread")));
     assert!(!enabled.contains("pane actions unavailable"));
     assert_eq!(help_line_count(true), help_line_count(false) + CODEX_KEYS.len());
 }

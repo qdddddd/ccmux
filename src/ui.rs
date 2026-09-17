@@ -1197,7 +1197,8 @@ const CODEX_KEYS: &[(&str, &str)] = &[
     ("", "/resume /new /fork"),
     ("", "change TUI, not map"),
     ("enter", "parked: resume launch"),
-    ("C-x/L", "stop/logs: Codex TUI"),
+    ("C-x ×2", "archive ○/◇ thread"),
+    ("L", "logs: Codex TUI"),
 ];
 
 /// Number of lines the `?` overlay renders. `main.rs` copies it into
@@ -1572,6 +1573,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
+            codex_archive: |_, _| panic!("render test reached codex archive RPC"),
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: std::collections::BTreeSet::new(),
@@ -2011,6 +2013,7 @@ mod tests {
     fn the_open_delete_window_owns_the_footer_and_says_what_it_takes() {
         let mut app = app_with(many(3));
         app.stop_arm = Some(crate::app::StopArm {
+            provider: Provider::Claude,
             session_id: "uuid-0001".into(),
             short_id: "1c45d64f".into(),
             name: "bt/reg-update".into(),
@@ -2042,6 +2045,7 @@ mod tests {
     fn the_armed_warning_survives_a_sidebar_too_short_for_a_detail_block() {
         let mut app = app_with(many(3));
         app.stop_arm = Some(crate::app::StopArm {
+            provider: Provider::Claude,
             session_id: "uuid-0001".into(),
             short_id: "1c45d64f".into(),
             name: "bt/reg-update".into(),

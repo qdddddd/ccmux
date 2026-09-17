@@ -17,6 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agents::{self, AgentsError};
+use crate::codex::{ArchiveOutcome, CodexConfig, CodexDiagnostic};
 use crate::model::{self, Group, ParseError, Provider, Row, Session};
 use crate::restart::{self, Role};
 use crate::tmux::{
@@ -159,11 +160,11 @@ pub enum MsgLevel {
 /// The session the FIRST `Ctrl+X` press acted on, and when the window opened.
 ///
 /// Every field is CAPTURED at that first press. The second press hands
-/// `short_id` to `claude rm` and never re-reads the cursor, so a poll that
-/// re-sorts the list — or a row that slides under the cursor — cannot change
-/// what gets deleted.
+/// Claude hands `short_id` to `claude rm`; Codex addresses `session_id` in its
+/// guarded archive transaction. Neither provider can retarget from the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopArm {
+    pub provider: Provider,
     pub session_id: String,
     pub short_id: String,
     pub name: String,
@@ -172,8 +173,8 @@ pub struct StopArm {
     pub at: Instant,
 }
 
-/// A delete that qualified and is waiting out `CX_SETTLE`. Holds its own copy
-/// of the capture: once scheduled it is answerable to nothing on screen.
+/// A destructive second press waiting out `CX_SETTLE`. Holds its own copy of
+/// the capture: once scheduled it can only act on that provider and full id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDelete {
     pub target: StopArm,
@@ -527,6 +528,9 @@ pub struct App {
     pub msg_deadline: Option<Instant>,
     pub poll_error: Option<String>,
     pub codex: CodexPoll,
+    /// Seam for the only Codex mutation. Production opens a fresh guarded RPC
+    /// transaction; hermetic tests must install an explicit recorder.
+    pub codex_archive: fn(&CodexConfig, &str) -> Result<ArchiveOutcome, CodexDiagnostic>,
     pub diagnostics: Diagnostics,
     pub fail_streak: u32,
     pub last_poll: Instant,
@@ -736,6 +740,7 @@ impl App {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
+            codex_archive: crate::codex::archive,
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
@@ -1374,11 +1379,18 @@ impl App {
         // that leaves Normal — `/`, `n`, `?`, `L` — or quits closes it, because
         // the footer that carries the warning is no longer the thing on screen
         // and the operator's attention has moved with it. One place, so no
-        // handler can forget. A Codex selection also closes a Claude arm:
-        // stop/delete is not a verb of that provider (§12.8).
-        if self.mode != Mode::Normal || self.should_quit
-            || self.selected_session().is_some_and(|s| s.provider == Provider::Codex)
-        {
+        // handler can forget. Provider crossings close either provider's arm;
+        // a Codex arm also closes as soon as navigation leaves its captured
+        // row. Claude keeps its long-standing second-press refusal semantics.
+        let selected = self.selected_session();
+        let crossed = self.stop_arm.as_ref().or_else(||
+            self.pending_delete.as_ref().map(|pending| &pending.target))
+            .is_some_and(|arm| {
+                selected.is_some_and(|row| row.provider != arm.provider)
+                    || (arm.provider == Provider::Codex
+                        && selected.is_none_or(|row| row.session_id != arm.session_id))
+            });
+        if self.mode != Mode::Normal || self.should_quit || crossed {
             self.disarm_ctrl_x();
         }
         action
@@ -1456,6 +1468,16 @@ impl App {
     /// that created it, and the operator would have to go find it and `exit`.
     pub fn pane_of_any(&self, provider: Provider, session_id: &str) -> Option<PaneId> {
         self.open.get(session_id).filter(|o| o.provider == provider).map(|o| o.pane.clone())
+    }
+
+    /// Any persisted launch record, live inventory or not. Archive refuses on
+    /// the record itself because an attached Codex TUI receives no archive
+    /// notice and otherwise fails only when the operator next submits text.
+    fn has_mapped_pane(&self, provider: Provider, session_id: &str) -> bool {
+        self.open.get(session_id).is_some_and(|open| open.provider == provider)
+            || !self.map.panes_for_session(provider, session_id).is_empty()
+            || self.tabs.iter().any(|tab|
+                !tab.map.panes_for_session(provider, session_id).is_empty())
     }
 
     /// A provider disagreement is not an invitation to create another pane.
@@ -2232,10 +2254,10 @@ impl App {
         out
     }
 
-    // ── `Ctrl+X` — stop, and again inside the window to delete (§8.2) ───────
+    // ── `Ctrl+X` — Claude stop/delete; Codex guarded archive (§8.2/§12) ────
 
-    /// THE `Ctrl+X` entry point. First press stops the selected session with no
-    /// modal; a second press inside `CX_WINDOW` deletes it and its worktree.
+    /// THE `Ctrl+X` entry point. Claude stops then deletes; Codex locally arms
+    /// then runs the guarded archive transaction. Both share one repeat guard.
     ///
     /// Every press stamps `cx_last_press` before anything else can return, so
     /// the burst / auto-repeat guard can never be skipped by an early exit —
@@ -2249,17 +2271,17 @@ impl App {
             .unwrap_or(CX_MIN_GAP);
         self.cx_last_press = Some(now);
 
-        if self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
-            self.disarm_ctrl_x();
-            self.flash("Codex stop/delete unavailable in v1 — use the Codex TUI", MsgLevel::Warn);
-            return Action::Redraw;
-        }
         if gap < CX_MIN_GAP {
             // Buffered burst, or auto-repeat. It acts on nothing, and it
             // CANCELS a settling delete: a second chord this soon after the one
             // that scheduled it is a repeat stream, not a human pressing twice.
             // The arm itself survives, so a human who merely tapped too fast
             // still has their window.
+            if let Some(arm) = self.pending_delete.as_ref().map(|pending| pending.target.clone())
+                && arm.provider == Provider::Codex
+            {
+                self.protect_after_codex_disarm(&arm);
+            }
             self.pending_delete = None;
             // Say so. Silence here is indistinguishable from a wedged sidebar:
             // the press acts on nothing and — before this — asked for no redraw
@@ -2299,12 +2321,16 @@ impl App {
         Action::Redraw
     }
 
-    /// First press: stop the selection and open the delete window.
+    /// First press: dispatch to the provider's one shared destructive window.
     fn stop_and_arm(&mut self) {
-        let Some(sel) = self.selected_session() else {
+        let Some(sel) = self.selected_session().cloned() else {
             self.flash("no session selected", MsgLevel::Warn);
             return;
         };
+        if sel.provider == Provider::Codex {
+            self.archive_and_arm(&sel);
+            return;
+        }
         if !sel.is_attachable() {
             // §9.7's wording, unchanged by the move off `S`.
             self.flash("no short id — cannot stop this session", MsgLevel::Warn);
@@ -2313,7 +2339,7 @@ impl App {
         let session_id = sel.session_id.clone();
         let short_id = sel.id.clone().unwrap_or_default();
         let name = sel.name.clone();
-        let label = session_label(sel);
+        let label = session_label(&sel);
         let done = sel.group() == Group::Completed;
 
         if done {
@@ -2323,6 +2349,7 @@ impl App {
             // sessions (PROBE-FINDINGS §2); this is the press that offers it.
             self.flash(format!("{label} is already stopped"), MsgLevel::Info);
             self.stop_arm = Some(StopArm {
+                provider: Provider::Claude,
                 session_id,
                 short_id,
                 name,
@@ -2331,13 +2358,14 @@ impl App {
             return;
         }
 
-        match agents::stop(sel) {
+        match agents::stop(&sel) {
             Ok(()) => {
                 self.act_force_refresh();
                 // Stamped AFTER the shell-out: the window the footer promises
                 // must be two seconds of the operator's time, not two seconds
                 // minus however long `claude stop` took.
                 self.stop_arm = Some(StopArm {
+                    provider: Provider::Claude,
                     session_id,
                     short_id,
                     name,
@@ -2352,7 +2380,51 @@ impl App {
         }
     }
 
-    /// Second press inside the window. Schedules the delete; it does not run it.
+    /// Codex first press: local safety checks, then an in-memory arm only.
+    fn archive_and_arm(&mut self, session: &Session) {
+        if let Some(reason) = self.codex_archive_refusal(session) {
+            self.flash(reason, MsgLevel::Warn);
+            return;
+        }
+        let label = session_label(session);
+        self.stop_arm = Some(StopArm {
+            provider: Provider::Codex,
+            session_id: session.session_id.clone(),
+            short_id: session.id.clone().unwrap_or_default(),
+            name: session.name.clone(),
+            at: Instant::now(),
+        });
+        self.flash(format!("Ctrl-x again to archive {label}"), MsgLevel::Warn);
+    }
+
+    fn codex_archive_refusal(&self, session: &Session) -> Option<&'static str> {
+        let settings = &self.codex.settings;
+        if !settings.enabled() || settings.config().is_err()
+            || !settings.token_file.is_absolute() || settings.bin.is_empty()
+        {
+            return Some("codex not configured — archive unavailable");
+        }
+        if self.codex.open_rejected {
+            return Some("codex localhost resolved outside loopback — archive unavailable");
+        }
+        if matches!(session.state, Some(model::State::Working | model::State::Blocked)) {
+            return Some("running — not archived");
+        }
+        let runtime = session.codex.as_ref().map(|meta| &meta.runtime);
+        if matches!(session.status, model::Status::Unknown(_))
+            || matches!(runtime, Some(model::CodexStatus::SystemError | model::CodexStatus::Unknown(_)))
+            || !matches!(runtime, Some(model::CodexStatus::Idle | model::CodexStatus::NotLoaded))
+        {
+            return Some("state unknown — not archived");
+        }
+        if self.has_mapped_pane(Provider::Codex, &session.session_id) {
+            return Some("close its pane first (x) — not archived");
+        }
+        None
+    }
+
+    /// Second press inside the window. Schedules the provider action; it does
+    /// not run it until the repeat-settle interval has elapsed.
     fn arm_second_press(&mut self, arm: StopArm) {
         // The cursor must still be on the row the first press stopped. It is
         // the only check that reads the live selection at all — and it reads it
@@ -2364,9 +2436,9 @@ impl App {
         // the just-stopped session moved into Completed and `a` had that group
         // hidden. Two deliberate presses would then stop an innocent agent.
         // Cancelling costs one keypress and can stop nothing.
-        let same = self
-            .selected_session()
-            .is_some_and(|s| s.provider == Provider::Claude && s.session_id == arm.session_id);
+        let selected = self.selected_session().cloned();
+        let same = selected.as_ref()
+            .is_some_and(|s| s.provider == arm.provider && s.session_id == arm.session_id);
         if !same {
             let label = model::truncate_end(&arm.name, LABEL_MAX);
             // Two different things bring us here and the operator can only act
@@ -2379,13 +2451,25 @@ impl App {
             // the list did, and hides the recovery, which is to clear the
             // filter (or press `a`) and press `Ctrl+X` twice on the stopped
             // row — a first press there arms without stopping anything.
+            let consequence = if arm.provider == Provider::Codex {
+                "nothing archived"
+            } else { "nothing deleted" };
             let msg = if self.is_visible(&arm.session_id) {
-                format!("moved off {label} — nothing deleted")
+                format!("moved off {label} — {consequence}")
+            } else if arm.provider == Provider::Codex {
+                format!("{label} left the list — not archived")
             } else {
                 format!("{label} left the list — nothing deleted")
             };
             self.flash(msg, MsgLevel::Warn);
             return;
+        }
+        if arm.provider == Provider::Codex {
+            let Some(selected) = selected.as_ref() else { return; };
+            if let Some(reason) = self.codex_archive_refusal(selected) {
+                self.flash(reason, MsgLevel::Warn);
+                return;
+            }
         }
         self.pending_delete = Some(PendingDelete {
             target: arm,
@@ -2428,6 +2512,10 @@ impl App {
         // Nothing settled may fire into a mode that is not the one it was
         // scheduled from, or into a process on its way out.
         if self.mode != Mode::Normal || self.should_quit {
+            return;
+        }
+        if arm.provider == Provider::Codex {
+            self.run_codex_archive(arm);
             return;
         }
         let label = model::truncate_end(&arm.name, LABEL_MAX);
@@ -2475,24 +2563,92 @@ impl App {
         self.cx_last_press = Some(Instant::now());
     }
 
-    /// Close the delete window and drop anything settling in it. Called on
-    /// every departure from Normal mode, on `q`, and on `Esc`.
+    fn run_codex_archive(&mut self, arm: StopArm) {
+        let label = model::truncate_end(&arm.name, LABEL_MAX);
+        let target = self.sessions.iter().find(|session| session.provider == Provider::Codex
+            && session.session_id == arm.session_id).cloned();
+        let Some(target) = target else {
+            self.flash(format!("{label} left the list — not archived"), MsgLevel::Warn);
+            self.cx_last_press = Some(Instant::now());
+            return;
+        };
+        if let Some(reason) = self.codex_archive_refusal(&target) {
+            self.flash(reason, MsgLevel::Warn);
+            self.cx_last_press = Some(Instant::now());
+            return;
+        }
+        let config = match self.codex.settings.config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
+                self.act_force_refresh();
+                self.cx_last_press = Some(Instant::now());
+                return;
+            }
+        };
+        match (self.codex_archive)(&config, &arm.session_id) {
+            Ok(ArchiveOutcome::Archived) => {
+                self.codex.archived(&arm.session_id);
+                self.sessions.retain(|session| session.provider != Provider::Codex
+                    || session.session_id != arm.session_id);
+                self.rebuild_rows();
+                self.flash(format!("archived {label}"), MsgLevel::Info);
+                self.act_force_refresh();
+            }
+            Ok(ArchiveOutcome::StateChanged) => {
+                self.flash("state changed — not archived", MsgLevel::Warn);
+                self.act_force_refresh();
+            }
+            Err(error) => {
+                self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
+                self.act_force_refresh();
+            }
+        }
+        self.cx_last_press = Some(Instant::now());
+    }
+
+    /// Close the delete/archive window and drop anything settling in it.
+    /// Called on every departure from Normal mode, on `q`, and on `Esc`.
     pub fn disarm_ctrl_x(&mut self) {
+        let arm = self.stop_arm.as_ref().or_else(||
+            self.pending_delete.as_ref().map(|pending| &pending.target)).cloned();
+        if let Some(arm) = arm.filter(|arm| arm.provider == Provider::Codex) {
+            self.protect_after_codex_disarm(&arm);
+        }
         self.stop_arm = None;
         self.pending_delete = None;
     }
 
+    /// A disarmed Codex confirmation must not turn the operator's intended
+    /// second press into a first Claude stop after the cursor falls to a
+    /// neighbour. Reuse the repeat timestamp to cover the unexpired portion
+    /// of the original two-second window; no second action state is created.
+    fn protect_after_codex_disarm(&mut self, arm: &StopArm) {
+        let now = Instant::now();
+        let remaining = CX_WINDOW.saturating_sub(now.saturating_duration_since(arm.at));
+        if remaining.is_zero() { return; }
+        self.cx_last_press = if remaining >= CX_MIN_GAP {
+            now.checked_add(remaining - CX_MIN_GAP)
+        } else {
+            now.checked_sub(CX_MIN_GAP - remaining)
+        }.or(Some(now));
+    }
+
     /// The footer line while the window is open — `None` when it is not.
     ///
-    /// It names the session because the cursor is free to move while the window
-    /// is open, and it says what delete TAKES because nothing undoes it: `u`
-    /// undoes a dismissal, never this.
+    /// It names the session because the cursor may otherwise move while the
+    /// window is open. Claude describes irreversible worktree deletion; Codex
+    /// describes its reversible server archive.
     pub fn arm_hint(&self) -> Option<String> {
         let arm = self.stop_arm.as_ref()?;
         let label = model::truncate_end(&arm.name, LABEL_MAX);
-        Some(format!(
-            "Ctrl+X again: delete {label} and its worktree — cannot be undone"
-        ))
+        if arm.provider == Provider::Codex {
+            Some(format!("Ctrl-x again to archive {label}"))
+        } else {
+            Some(format!(
+                "Ctrl+X again: delete {label} and its worktree — cannot be undone"
+            ))
+        }
     }
 
     /// `d` — dismiss the selected session FROM THE LIST.
@@ -3471,6 +3627,11 @@ impl App {
             self.hidden.ids(),
         );
         self.reanchor_selection();
+        let lost_codex_target = self.stop_arm.as_ref().or_else(||
+            self.pending_delete.as_ref().map(|pending| &pending.target))
+            .is_some_and(|arm| arm.provider == Provider::Codex
+                && !self.is_visible(&arm.session_id));
+        if lost_codex_target { self.disarm_ctrl_x(); }
     }
 
     /// SPEC §5.3 steps 1-5, also run after every ccmux-issued split/kill so the
@@ -4370,8 +4531,12 @@ impl App {
                 // an open delete window. It takes precedence over the filter:
                 // one is a view, the other is a loaded verb.
                 if self.stop_arm.is_some() || self.pending_delete.is_some() {
+                    let codex = self.stop_arm.as_ref().or_else(||
+                        self.pending_delete.as_ref().map(|pending| &pending.target))
+                        .is_some_and(|arm| arm.provider == Provider::Codex);
                     self.disarm_ctrl_x();
-                    self.flash("delete window closed", MsgLevel::Info);
+                    self.flash(if codex { "archive window closed" } else { "delete window closed" },
+                        MsgLevel::Info);
                 } else if self.filter.is_empty() {
                     self.flash("press q to quit", MsgLevel::Info);
                 } else {
@@ -4896,6 +5061,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
+            codex_archive: |_, _| panic!("unit test reached codex archive RPC"),
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),

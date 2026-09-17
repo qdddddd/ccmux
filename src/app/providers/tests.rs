@@ -8,6 +8,8 @@ use std::rc::Rc;
 #[derive(Default)]
 struct Script {
     calls: Vec<&'static str>,
+    archive_ids: Vec<String>,
+    archive_results: VecDeque<Result<codex::ArchiveOutcome, CodexDiagnostic>>,
     observations: VecDeque<CodexObservation>,
     prepare_error: Option<CodexDiagnostic>,
     reload_error: Option<CodexDiagnostic>,
@@ -29,6 +31,9 @@ impl PollClient for Fake {
         script.calls.push("reload");
         script.reload_error.clone().map_or(Ok(()), Err)
     }
+    fn forget(&mut self, _: &str) {
+        self.0.borrow_mut().calls.push("forget");
+    }
 }
 
 fn fake_prepare(_: &CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic> {
@@ -42,12 +47,24 @@ fn fake_prepare(_: &CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic>
     })
 }
 
+fn fake_archive(_: &CodexConfig, id: &str)
+    -> Result<codex::ArchiveOutcome, CodexDiagnostic>
+{
+    SCRIPT.with(|state| {
+        let mut script = state.borrow_mut();
+        script.calls.push("archive");
+        script.archive_ids.push(id.into());
+        script.archive_results.pop_front().unwrap_or(Ok(codex::ArchiveOutcome::Archived))
+    })
+}
+
 fn configured() -> App {
     SCRIPT.with(|s| *s.borrow_mut() = Script::default());
     let mut a = app();
     a.codex.settings.url = "ws://127.0.0.1:8965".into();
     a.codex.settings.token_file = "/never-read-test-token".into();
     a.codex.prepare = fake_prepare;
+    a.codex_archive = fake_archive;
     a.agents_poll = || {
         SCRIPT.with(|s| s.borrow_mut().calls.push("claude poll"));
         Ok(payload(vec![claude()]))
@@ -106,6 +123,26 @@ fn poll(a: &mut App, rows: Vec<Session>, complete: bool) {
 
 fn key(a: &mut App, code: KeyCode) {
     a.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+fn ctrl_x(a: &mut App) {
+    a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+}
+
+fn age_ctrl_x(a: &mut App) {
+    a.cx_last_press = a.cx_last_press.and_then(|at| at.checked_sub(Duration::from_secs(1)));
+}
+
+fn settle_ctrl_x(a: &mut App) {
+    if let Some(pending) = &mut a.pending_delete {
+        pending.at = pending.at.checked_sub(CX_SETTLE).unwrap_or(pending.at);
+    }
+    assert!(a.tick_stop_arm());
+}
+
+fn show(a: &mut App, rows: Vec<Session>) {
+    a.sessions = rows;
+    a.rebuild_rows();
 }
 
 fn claude_error(a: &mut App, stderr: &str) {
@@ -280,6 +317,223 @@ fn provider_rows_replace_only_on_their_own_complete_observation() {
 }
 
 #[test]
+fn codex_archive_local_refusals_never_arm_or_call_rpc() {
+    let mut cases = Vec::new();
+    cases.push((row(1, CodexStatus::Active { flags: vec![] }), "running — not archived"));
+    let mut blocked = row(1, CodexStatus::Active { flags: vec!["waitingOnApproval".into()] });
+    blocked.status = Status::Waiting;
+    blocked.state = Some(State::Blocked);
+    cases.push((blocked, "running — not archived"));
+    cases.push((row(1, CodexStatus::SystemError), "state unknown — not archived"));
+    cases.push((row(1, CodexStatus::Unknown("future".into())), "state unknown — not archived"));
+    for (row, message) in cases {
+        let mut a = configured();
+        show(&mut a, vec![row]);
+        ctrl_x(&mut a);
+        assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
+        assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)), Some((message, MsgLevel::Warn)));
+        assert!(!calls().contains(&"archive"));
+    }
+
+    let mut a = configured();
+    a.codex.settings.url.clear();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
+        Some(("codex not configured — archive unavailable", MsgLevel::Warn)));
+    assert!(a.stop_arm.is_none() && !calls().contains(&"archive"));
+
+    let mut a = configured();
+    let target = row(1, CodexStatus::Idle);
+    let mut remote = PaneMap::new();
+    remote.insert(&PaneId::parse("%9").unwrap(), PaneEntry {
+        provider:Provider::Codex, session_id:target.session_id.clone(),
+        short_id:target.id.clone().unwrap(), name:target.name.clone(), opened_at:1,
+    });
+    a.tabs.push(TabInfo { window:WindowId::parse("@9").unwrap(), index:9,
+        sidebar:None, map:remote, hidden:HiddenLog::new() });
+    show(&mut a, vec![target]);
+    ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
+        Some(("close its pane first (x) — not archived", MsgLevel::Warn)));
+    assert!(a.stop_arm.is_none() && !calls().contains(&"archive"));
+}
+
+#[test]
+fn codex_archive_needs_two_presses_then_removes_and_suppresses_the_row() {
+    let mut a = configured();
+    let target = row(1, CodexStatus::Idle);
+    let id = target.session_id.clone();
+    show(&mut a, vec![target.clone()]);
+    assert_eq!(a.selected_session().map(|s| s.provider), Some(Provider::Codex));
+
+    ctrl_x(&mut a);
+    assert_eq!(a.stop_arm.as_ref().map(|arm| (arm.provider, arm.session_id.as_str())),
+        Some((Provider::Codex, id.as_str())), "message: {:?}", a.message);
+    assert!(!calls().contains(&"archive"));
+    assert_eq!(a.arm_hint().as_deref(), Some("Ctrl-x again to archive task 1"));
+
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_some());
+    assert!(!calls().contains(&"archive"));
+    settle_ctrl_x(&mut a);
+    assert_eq!(SCRIPT.with(|s| s.borrow().archive_ids.clone()), vec![id.clone()]);
+    assert!(a.sessions.is_empty() && a.rows.is_empty());
+    assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
+        Some(("archived task 1", MsgLevel::Info)));
+    assert!(a.codex.force);
+
+    // A lagging loaded/read path may still return the archived Thread. The
+    // local tombstone keeps it out until a complete authoritative union omits
+    // it, after which a later unarchive can be rediscovered.
+    poll(&mut a, vec![target.clone()], false);
+    assert!(a.sessions.is_empty());
+    poll(&mut a, vec![target.clone()], true);
+    assert!(a.sessions.is_empty());
+    poll(&mut a, vec![], true);
+    poll(&mut a, vec![target], true);
+    assert_eq!(a.sessions.len(), 1);
+}
+
+#[test]
+fn successful_archive_forgets_metadata_in_the_prepared_poll_client() {
+    let mut a = configured();
+    let target = row(1, CodexStatus::Idle);
+    poll(&mut a, vec![target], true);
+    a.rebuild_rows();
+
+    ctrl_x(&mut a);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    settle_ctrl_x(&mut a);
+
+    assert_eq!(calls(), ["prepare", "codex poll", "archive", "forget"]);
+}
+
+#[test]
+fn codex_archive_revalidates_and_reports_failure_without_success() {
+    for outcome in [
+        Ok(codex::ArchiveOutcome::StateChanged),
+        Err(CodexDiagnostic { kind:CodexFailureKind::Timeout,
+            message:"codex archive timed out after 1000 ms".into() }),
+    ] {
+        let mut a = configured();
+        let target = row(1, CodexStatus::NotLoaded);
+        show(&mut a, vec![target]);
+        SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(outcome.clone()));
+        ctrl_x(&mut a);
+        age_ctrl_x(&mut a);
+        ctrl_x(&mut a);
+        settle_ctrl_x(&mut a);
+        assert_eq!(SCRIPT.with(|s| s.borrow().archive_ids.len()), 1);
+        assert_eq!(a.sessions.len(), 1);
+        let (message, level) = a.message.clone().unwrap();
+        assert_eq!(level, MsgLevel::Warn);
+        match outcome {
+            Ok(_) => assert_eq!(message, "state changed — not archived"),
+            Err(_) => assert_eq!(message, "archive failed: codex archive timed out after 1000 ms"),
+        }
+        assert!(a.codex.force);
+    }
+}
+
+#[test]
+fn codex_archive_window_disarms_on_retarget_modes_and_repeat_bursts() {
+    // Row disappearance followed by a Claude neighbour must never reach stop.
+    agents::test_spawn::reset();
+    let mut a = configured();
+    let codex = row(1, CodexStatus::Idle);
+    let claude = claude();
+    show(&mut a, vec![claude.clone(), codex]);
+    while a.selected_session().is_some_and(|s| s.provider != Provider::Codex) {
+        key(&mut a, KeyCode::Char('j'));
+    }
+    ctrl_x(&mut a);
+    a.sessions.retain(|s| s.provider == Provider::Claude);
+    a.rebuild_rows();
+    assert!(a.stop_arm.is_none(), "a vanished Codex row disarms immediately");
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
+    assert!(agents::test_spawn::calls().is_empty());
+    assert!(!calls().contains(&"archive"));
+
+    // Mode departure uses the shared disarm path.
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    key(&mut a, KeyCode::Char('/'));
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
+
+    // A held/repeated third event cancels the settling operation.
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert!(a.pending_delete.is_none());
+    assert!(!calls().contains(&"archive"));
+
+    // Vanishing during the settle interval cancels before the RPC seam.
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert!(a.pending_delete.is_some());
+    a.sessions.clear();
+    a.rebuild_rows();
+    assert!(a.pending_delete.is_none());
+    assert!(!a.tick_stop_arm());
+    assert!(!calls().contains(&"archive"));
+}
+
+#[test]
+fn codex_archive_window_expires_and_rechecks_row_and_pane_state() {
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle), row(2, CodexStatus::NotLoaded)]);
+    ctrl_x(&mut a);
+    key(&mut a, KeyCode::Char('j'));
+    assert!(a.stop_arm.is_none(), "moving to another Codex row disarms");
+    assert!(!calls().contains(&"archive"));
+
+    let mut a = configured();
+    show(&mut a, vec![row(1, CodexStatus::Idle)]);
+    ctrl_x(&mut a);
+    a.stop_arm.as_mut().unwrap().at -= CX_WINDOW + Duration::from_millis(1);
+    assert!(a.tick_stop_arm());
+    assert!(a.stop_arm.is_none() && !calls().contains(&"archive"));
+
+    let mut a = configured();
+    let mut target = row(1, CodexStatus::Idle);
+    show(&mut a, vec![target.clone()]);
+    ctrl_x(&mut a);
+    target.codex.as_mut().unwrap().runtime = CodexStatus::Active { flags:vec![] };
+    target.status = Status::Busy;
+    target.state = Some(State::Working);
+    show(&mut a, vec![target]);
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().unwrap().0, "running — not archived");
+    assert!(a.pending_delete.is_none() && !calls().contains(&"archive"));
+
+    let mut a = configured();
+    let target = row(1, CodexStatus::NotLoaded);
+    show(&mut a, vec![target.clone()]);
+    ctrl_x(&mut a);
+    a.map.insert(&PaneId::parse("%8").unwrap(), PaneEntry {
+        provider:Provider::Codex, session_id:target.session_id,
+        short_id:target.id.unwrap(), name:target.name, opened_at:1,
+    });
+    age_ctrl_x(&mut a);
+    ctrl_x(&mut a);
+    assert_eq!(a.message.as_ref().unwrap().0, "close its pane first (x) — not archived");
+    assert!(a.pending_delete.is_none() && !calls().contains(&"archive"));
+}
+
+#[test]
 fn unmaterialized_timestamps_anchor_without_freezing_metadata_or_idle_ladder() {
     let mut a = configured();
     let mut r = row(1, CodexStatus::Idle);
@@ -373,7 +627,8 @@ fn diagnostics_wait_for_overlays_and_armed_warning_then_coalesce() {
         assert!(a.message.is_none());
     }
     a.mode = Mode::Normal;
-    a.stop_arm = Some(StopArm { session_id: "claude-id".into(), short_id: "12345678".into(), name: "task".into(), at: now });
+    a.stop_arm = Some(StopArm { provider:Provider::Claude, session_id:"claude-id".into(),
+        short_id:"12345678".into(), name:"task".into(), at:now });
     assert!(!a.deliver_diagnostics(now));
     a.stop_arm = None;
     assert!(a.deliver_diagnostics(now));
@@ -545,15 +800,15 @@ fn codex_navigation_filter_completed_dismiss_undo_and_new_are_local() {
 }
 
 #[test]
-fn unsupported_codex_verbs_refuse_before_any_claude_or_tmux_call() {
+fn logs_refuses_while_ctrl_x_only_arms_without_external_io() {
     let mut a = configured();
     poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
     a.rebuild_rows();
     key(&mut a, KeyCode::Char('L'));
     assert_eq!(a.message.as_ref().unwrap().0, "Codex logs unavailable in v1 — use the Codex TUI");
     a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
-    assert_eq!(a.message.as_ref().unwrap().0, "Codex stop/delete unavailable in v1 — use the Codex TUI");
-    assert!(a.stop_arm.is_none() && a.pending_delete.is_none() && a.logs.is_none());
+    assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to archive task 1");
+    assert!(a.stop_arm.is_some() && a.pending_delete.is_none() && a.logs.is_none());
     assert_eq!(calls(), ["prepare", "codex poll"]);
     a.degraded = true;
     for (code, text) in [(KeyCode::Enter, "open"), (KeyCode::Char('t'), "tabs"), (KeyCode::Char('x'), "close")] {
@@ -711,7 +966,7 @@ fn codex_polls_on_its_own_clock_when_claude_is_not_due() {
 }
 
 #[test]
-fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
+fn a_codex_arm_stamps_the_burst_guard_before_its_row_disappears() {
     let mut a = configured();
     let mut working = claude();
     working.status = Status::Busy;
@@ -725,7 +980,7 @@ fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
     let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
     a.on_key(ctrl_x);
     assert!(a.cx_last_press.is_some());
-    assert!(a.stop_arm.is_none());
+    assert!(a.stop_arm.as_ref().is_some_and(|arm| arm.provider == Provider::Codex));
     poll(&mut a, vec![], true);
     a.rebuild_rows();
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
@@ -755,14 +1010,14 @@ fn codex_ctrl_x_closes_a_claude_delete_window_before_returning_to_claude() {
     assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
     a.cx_last_press = Some(Instant::now() - Duration::from_secs(1));
     a.on_key(ctrl_x);
-    assert_eq!(a.message.as_ref().unwrap().0, "Codex stop/delete unavailable in v1 — use the Codex TUI");
-    assert!(a.stop_arm.is_none() && a.pending_delete.is_none() && a.arm_hint().is_none());
+    assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to archive task 1");
+    assert!(a.stop_arm.as_ref().is_some_and(|arm| arm.provider == Provider::Codex));
+    assert!(a.pending_delete.is_none());
     key(&mut a, KeyCode::Char('k'));
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    assert!(a.stop_arm.is_none(), "crossing back to Claude disarms the archive");
     a.cx_last_press = Some(Instant::now() - Duration::from_secs(1));
     a.on_key(ctrl_x);
-    if let Some(pending) = a.pending_delete.as_mut() { pending.at -= CX_SETTLE; }
-    a.tick_stop_arm();
     assert_eq!(agents::test_spawn::joined(), ["stop 12345678", "stop 12345678"]);
     assert!(!agents::test_spawn::joined().iter().any(|call| call.starts_with("rm ")));
     assert_eq!(calls(), ["prepare", "codex poll"]);

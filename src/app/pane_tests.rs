@@ -382,13 +382,18 @@ fn degraded_tmux_refusals_win_over_codex_configuration_errors() {
 }
 
 #[test]
-fn codex_refusals_and_unbound_keys_have_no_tmux_rpc_or_claude_effects() {
+fn codex_archive_arm_and_unbound_keys_have_no_external_effects() {
     with_sidebar(|a, server| {
         agents::test_spawn::reset();
         for short in [None, Some("display-only")] {
             a.sessions[0].id = short.map(str::to_owned);
+            // Each loop iteration is an independent first press. The previous
+            // Codex disarm intentionally guards its unexpired window.
+            a.cx_last_press = None;
             a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
-            assert_eq!(a.message.as_ref().unwrap().0, "Codex stop/delete unavailable in v1 — use the Codex TUI");
+            assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to archive Codex task");
+            assert!(a.stop_arm.is_some());
+            a.disarm_ctrl_x();
             press(a, 'L');
             assert_eq!(a.message.as_ref().unwrap().0, "Codex logs unavailable in v1 — use the Codex TUI");
         }

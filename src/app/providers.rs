@@ -7,11 +7,12 @@ use crate::settings::CodexSettings;
 
 pub const DIAGNOSTIC_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// The app owns scheduling; the read-only client owns its transport/cache.
+/// The app owns scheduling; the observation client owns its transport/cache.
 /// This seam keeps event-loop tests free of credentials and network IO.
 pub trait PollClient {
     fn poll(&mut self, now_ms: i64) -> CodexObservation;
     fn reload(&mut self, config: &CodexConfig) -> Result<(), CodexDiagnostic>;
+    fn forget(&mut self, id: &str);
 }
 
 impl PollClient for codex::CodexClient {
@@ -21,6 +22,7 @@ impl PollClient for codex::CodexClient {
         self.replace_prepared(prepared);
         Ok(())
     }
+    fn forget(&mut self, id: &str) { codex::CodexClient::forget(self, id); }
 }
 
 fn prepare(config: &CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic> {
@@ -43,6 +45,10 @@ pub struct CodexPoll {
     pub idle_streak: u32,
     fingerprint: Option<u64>,
     rows: BTreeMap<String, Session>,
+    /// Successful local archives are suppressed until one complete server
+    /// observation omits them. `thread/read` remains valid after archive and
+    /// a lagging loaded-list row must not resurrect the just-removed row.
+    archived: BTreeSet<String>,
     pub prepare: fn(&CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic>,
 }
 
@@ -52,7 +58,8 @@ impl Default for CodexPoll {
             settings: CodexSettings::default(), client: None, prepared: false,
             prepare_error: None, open_rejected: false, last_attempt: None,
             force: false, startup: true, reload: false, fail_streak: 0,
-            idle_streak: 0, fingerprint: None, rows: BTreeMap::new(), prepare,
+            idle_streak: 0, fingerprint: None, rows: BTreeMap::new(),
+            archived: BTreeSet::new(), prepare,
         }
     }
 }
@@ -101,6 +108,7 @@ impl CodexPoll {
     fn apply(&mut self, observation: &CodexObservation) {
         let mut fresh = BTreeMap::new();
         for row in &observation.sessions {
+            if self.archived.contains(&row.session_id) { continue; }
             let mut row = row.clone();
             if !observation.history_metadata_ids.contains(&row.session_id)
                 && let Some(old) = self.rows.get(&row.session_id)
@@ -110,6 +118,9 @@ impl CodexPoll {
             fresh.insert(row.session_id.clone(), row);
         }
         if observation.complete {
+            let observed: BTreeSet<_> = observation.sessions.iter()
+                .map(|row| row.session_id.as_str()).collect();
+            self.archived.retain(|id| observed.contains(id.as_str()));
             self.rows = fresh;
             let sessions: Vec<_> = self.rows.values().cloned().collect();
             let fp = codex::fingerprint(&sessions);
@@ -127,6 +138,12 @@ impl CodexPoll {
     fn failed(&mut self) {
         self.fail_streak = self.fail_streak.saturating_add(1);
         self.idle_streak = 0;
+    }
+
+    pub(super) fn archived(&mut self, id: &str) {
+        self.rows.remove(id);
+        self.archived.insert(id.to_owned());
+        if let Some(client) = &mut self.client { client.forget(id); }
     }
 }
 

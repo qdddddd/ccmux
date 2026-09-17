@@ -1,6 +1,6 @@
-//! Read-only app-server observations (SPEC §12). No daemon, session, or thread
-//! is created here. Preparation owns DNS/credential IO; each poll owns one
-//! connection and one deadline. The app integration is a separate step.
+//! App-server observations and the guarded archive operation (SPEC §12). No
+//! daemon, session, turn, or thread is created here. Preparation owns
+//! DNS/credential IO; each wire operation owns one connection and one deadline.
 
 use std::{
     collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
@@ -102,6 +102,12 @@ pub struct CodexObservation {
     /// Source drift has no Session to carry it. Kept separate from the bounded
     /// provider diagnostic for the app's eventual note_drift delivery.
     pub source_drift: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveOutcome {
+    Archived,
+    StateChanged,
 }
 
 impl CodexObservation {
@@ -462,6 +468,7 @@ enum Method<'a> {
     Loaded(Option<&'a str>),
     History(Option<&'a str>),
     Read(&'a str),
+    Archive(&'a str),
 }
 
 impl Method<'_> {
@@ -478,6 +485,14 @@ impl Method<'_> {
                 "modelProviders":[], "useStateDbOnly":true
             })),
             Self::Read(id) => ("thread/read", json!({"threadId":id,"includeTurns":false})),
+            Self::Archive(id) => ("thread/archive", json!({"threadId":id})),
+        }
+    }
+
+    fn rejection(&self) -> &'static str {
+        match self {
+            Self::Archive(_) => "codex archive RPC rejected",
+            _ => "codex read-only RPC rejected",
         }
     }
 }
@@ -493,6 +508,7 @@ impl Rpc<'_> {
     fn request(&mut self, method: Method<'_>) -> Result<Value, CodexError> {
         self.attempted = false;
         self.deadline.check()?;
+        let rejection = method.rejection();
         let (method, params) = method.request();
         // Exercise both protocol ID types: initialize is 0, all later requests
         // have string IDs. Server request IDs never enter this counter.
@@ -519,8 +535,7 @@ impl Rpc<'_> {
                 (None, Some(error)) if error.get("code").and_then(Value::as_i64).is_some()
                     && error.get("message").and_then(Value::as_str).is_some() =>
                 {
-                    let mut error = CodexError::new(CodexFailureKind::Protocol,
-                        "codex read-only RPC rejected");
+                    let mut error = CodexError::new(CodexFailureKind::Protocol, rejection);
                     error.rpc_response = true;
                     return Err(error);
                 }
@@ -783,6 +798,13 @@ impl CodexClient {
         self.prepared = prepared.prepared;
     }
 
+    /// Forget provider-local metadata for a thread removed by an archive.
+    /// A later unarchive is rediscovered from the authoritative history list.
+    pub fn forget(&mut self, id: &str) {
+        self.exclusions.remove(id);
+        self.attempted.remove(id);
+    }
+
     fn redact(&self, text: &str) -> String {
         clean_text(&text.replace(&self.prepared.token, "[redacted]"))
     }
@@ -790,6 +812,48 @@ impl CodexClient {
     pub fn poll(&mut self, now_ms: i64) -> CodexObservation {
         let clock = MonotonicClock(Instant::now());
         self.poll_with(now_ms, &clock, &mut TcpConnector)
+    }
+
+    pub fn archive(&mut self, id: &str) -> Result<ArchiveOutcome, CodexError> {
+        let clock = MonotonicClock(Instant::now());
+        let result = self.archive_with(id, &clock, &mut TcpConnector);
+        result.map_err(|mut error| {
+            if error.diagnostic.kind == CodexFailureKind::Timeout {
+                error.diagnostic.message = "codex archive timed out after 1000 ms".into();
+            }
+            error
+        })
+    }
+
+    fn archive_with(
+        &mut self, id: &str, clock: &dyn Clock, connector: &mut impl Connector,
+    ) -> Result<ArchiveOutcome, CodexError> {
+        if !valid_codex_id(id) { return Err(CodexError::protocol()); }
+        let deadline = Deadline::new(clock);
+        let transport = connector.connect(&self.prepared, deadline)?;
+        deadline.check()?;
+        let mut rpc = Rpc { transport, deadline, next_id: 0, attempted: false };
+        rpc.request(Method::Initialize)?.get("userAgent").and_then(Value::as_str)
+            .ok_or_else(CodexError::protocol)?;
+        rpc.initialized()?;
+        let value = rpc.request(Method::Read(id))?;
+        let row = value.get("thread").filter(|row| thread_id(row) == Some(id))
+            .ok_or_else(CodexError::protocol)?;
+        let eligible = matches!(row.get("status").and_then(|status| status.get("type"))
+            .and_then(Value::as_str), Some("idle" | "notLoaded"));
+        let outcome = if eligible {
+            let result = rpc.request(Method::Archive(id))?;
+            if !result.as_object().is_some_and(serde_json::Map::is_empty) {
+                return Err(CodexError::protocol());
+            }
+            ArchiveOutcome::Archived
+        } else {
+            ArchiveOutcome::StateChanged
+        };
+        deadline.check()?;
+        rpc.transport.close()?;
+        deadline.check()?;
+        Ok(outcome)
     }
 
     fn poll_with(&mut self, now_ms: i64, clock: &dyn Clock, connector: &mut impl Connector)
@@ -907,6 +971,14 @@ impl CodexClient {
         }
         Ok(())
     }
+}
+
+/// Prepare a fresh client, then perform the read-before-archive transaction.
+/// Preparation may do DNS and credential IO; the connection, initialize,
+/// fresh read, optional archive, and close share one 1000 ms deadline.
+pub fn archive(config: &CodexConfig, id: &str) -> Result<ArchiveOutcome, CodexDiagnostic> {
+    let mut client = prepare(config).map_err(|error| error.diagnostic().clone())?;
+    client.archive(id).map_err(|error| error.diagnostic().clone())
 }
 
 #[cfg(test)]

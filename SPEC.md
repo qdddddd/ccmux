@@ -373,6 +373,10 @@ located an interactive Claude session living outside ccmux — went with §5.4.
 confirmation gate**, and never issues them at all for a session it did not
 resolve from the current poll.
 
+**AMENDED BY §§12.1, 12.8:** Codex adds one separately gated mutation,
+`thread/archive`, after two presses, local pane/state checks, and a fresh
+server status read. It never weakens the Claude confirmation gate.
+
 ---
 
 ## 3. Module boundaries and exact signatures
@@ -954,7 +958,8 @@ pub fn sh_join(parts: &[&str]) -> String;
 
 ### 3.3 `src/agents.rs` — owner: Agents
 
-**AMENDED BY §§12.4, 12.7:** read-only Codex RPC and provider-aware verb signatures.
+**AMENDED BY §§12.4, 12.7, 12.8:** bounded Codex RPC and provider-aware verb
+signatures.
 
 Everything that shells out to `claude`, plus the shell-command templates for
 panes. Builds strings; never runs tmux.
@@ -2140,7 +2145,8 @@ agent and return immediately`).
 
 ## 8. The keymap
 
-**AMENDED BY §12.8:** Codex attach/close behavior and exact deferred-verb refusals.
+**AMENDED BY §12.8:** Codex attach/close/archive behavior and exact remaining
+verb refusals.
 
 Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 
@@ -3813,9 +3819,9 @@ of you. The digit therefore never lies about where the verbs go.
 ## 12. Codex sessions — v1 amendment
 
 **This section amends §§0–11 where it says so; the remaining Claude contract
-stands.** It is grounded in [PROBE-FINDINGS §9](PROBE-FINDINGS.md#9-codex-app-server-probes--2026-09-16),
-including the reviewed corrections, and describes the implemented branch
-contract.
+stands.** It is grounded in [PROBE-FINDINGS §9](PROBE-FINDINGS.md#9-codex-app-server-probes--2026-09-16)
+and [§10](PROBE-FINDINGS.md#10-codex-archive-probes--2026-09-17), including
+the reviewed corrections, and describes the implemented branch contract.
 
 ### 12.1 Scope and ownership (§§2, 3.3, 8, 10.3)
 
@@ -3823,24 +3829,28 @@ Codex uses ONE configured app-server endpoint per ccmux workspace. Local
 defaults enable it when the default token file exists (§12.2); an explicit
 empty URL disables it.
 v1 adds listing, grouping, filtering, navigation, `a`, `d/u`, `r`,
-`Enter/o/s/t` remote attach, and `x`. The official Codex TUI owns every
-conversation mutation. The sidebar owns its pane and dismissal records.
+`Enter/o/s/t` remote attach, `x`, and the two-press guarded archive in §12.8.
+The official Codex TUI owns every other conversation mutation. The sidebar
+owns its pane and dismissal records.
 
-**No Codex creation, stop, interrupt, archive, delete, logs, or restart verb.**
+**The production Codex write set is exactly `thread/read` plus
+`thread/archive`.** The read is a mandatory fresh precondition check; it is
+not a mutation. There is no Codex creation, stop, interrupt, hard delete,
+logs, restart, or undo verb.
 No filesystem database/session-index reader, daemon discovery/start, service
 management, Unix transport, persistent subscription, poll thread, async runtime,
 or external websocket-helper process. In particular, `thread/start`,
 `turn/start`, `turn/interrupt`, `thread/resume`, `thread/unsubscribe`,
-`thread/archive`, and `thread/delete` are NOT sidebar RPC methods.
+`thread/unarchive`, and `thread/delete` are NOT sidebar RPC methods.
 The lifecycle probes used mutations on disposable threads; production v1 does
-not inherit that authority.
+not inherit authority beyond the one archive transaction.
 
 R1–R3 and §11.4 apply unchanged to both providers. All pane actions stay on the
 configured tmux socket and inside the ccmux session. No process discovery or
 `/proc` scan is added for Codex. Client termination is limited to the mapped
 pane-close path (§12.8); never kill a client by PID or touch its server.
-R4's Claude confirmation gates remain; a Codex row refuses `Ctrl-x` before
-opening any destructive-action state.
+R4's Claude confirmation gates remain. Codex uses the separate local arm,
+fresh-read gate, and mutation ceiling in §12.8.
 
 ### 12.2 Configuration and propagation (§§1.1, 3.5, 8.10–8.11)
 
@@ -4016,7 +4026,8 @@ commands of already-open Codex panes.
 
 The module boundary changes are explicit: `model` owns `Provider`;
 `tmux` may now consume that model type. New `codex` consumes `model` and owns
-configuration types, the read-only transport, and Codex parsing. New `settings`
+configuration types, the bounded transport, Codex parsing, and guarded archive
+transaction. New `settings`
 consumes `CodexConfig` and `tmux::sh_join`; it owns non-secret resolution and
 propagation. `agents` may consume `CodexConfig` and `PaneEntry` for the
 provider-dispatch builders below, alongside its existing model types and
@@ -4145,13 +4156,13 @@ It says nothing about the last turn's success or a writer in another runtime.
 `systemError` keeps a visible `?` and a provider-labelled warning; it is a
 valid row, not a failed poll and not a stopped thread.
 
-### 12.4 Read-only RPC contract (§3.3)
+### 12.4 RPC contract (§3.3)
 
 Use a small synchronous Rust WebSocket JSON-RPC client (tungstenite's
 synchronous API with explicitly constructed TCP connections/timeouts).
-One new connection per Codex poll, closed/dropped before returning. Do not call
-a library convenience connector that performs unbounded DNS or hides a
-per-request timeout reset on the UI thread.
+One new connection per Codex poll or archive transaction, closed/dropped
+before returning. Do not call a library convenience connector that performs
+unbounded DNS or hides a per-request timeout reset on the UI thread.
 
 The only outbound request methods and their complete v1 parameters are:
 
@@ -4161,19 +4172,21 @@ The only outbound request methods and their complete v1 parameters are:
 | `thread/loaded/list` | `{"limit":100,"cursor":null}`; replace cursor on subsequent pages |
 | `thread/list` | `{"limit":100,"cursor":null,"sortKey":"updated_at","sortDirection":"desc","archived":false,"sourceKinds":["cli","vscode","exec","appServer","unknown"],"modelProviders":[],"useStateDbOnly":true}`; replace cursor on subsequent pages |
 | `thread/read` | `{"threadId":<full Thread.id>,"includeTurns":false}` |
+| `thread/archive` | `{"threadId":<full Thread.id>}`; successful response is exactly `{}` |
 
 Send the `initialized` notification with `params:{}` after successful
 initialization. No `cwd`, `searchTerm`, `sectionId`, or `originators`
 filter is sent: this is the configured server's fleet, not the launching cwd.
-No `model/list`, turn/item-history read, resume, or unsubscribe is needed.
+No `model/list`, turn/item-history read, resume, unarchive, or unsubscribe is needed.
 Bearer authentication is an HTTP upgrade header from the private prepared
 credential; it is never a URL parameter.
 
 Dispatch by FIELD PRESENCE, not truthiness: `method+id` is a server request,
 `method` without `id` a notification, `id` without `method` a response.
 ID `0` and string IDs are valid. Match responses to requests; an error response
-is not data. Ignore notifications as a source of session rows. A lister NEVER
-answers a server request: write no reply, whether result, error, approval,
+is not data. Ignore notifications as a source of session rows. Neither the
+lister nor archive connection EVER answers a server request: write no reply,
+whether result, error, approval,
 auth refresh, or tool output. Never run a requested tool. Ignore the request
 and continue awaiting our own read responses within the SAME deadline.
 The request alone does not make valid listing data incomplete; a flood that
@@ -4182,9 +4195,21 @@ uses up the budget does. Do not log raw messages/headers in an error.
 An error reply is not neutral: app-server pending callbacks can resolve on
 the first response, and an approval error is treated as denied. Broadcast
 `account/chatgptAuthTokens/refresh` can reach non-subscribing clients too;
-a lister's error could defeat the owning client's answer. Sending nothing
-preserves the owner’s chance to answer. This is why the usual JSON-RPC
-unknown-method error is deliberately NOT sent by this read-only observer.
+either connection's error could defeat the owning client's answer. Sending
+nothing preserves the owner’s chance to answer. This is why the usual JSON-RPC
+unknown-method error is deliberately NOT sent.
+
+The archive transaction opens a fresh connection and performs, in order:
+`initialize`, `initialized`, `thread/read(includeTurns:false)`, and only when
+the returned status tag is exactly `idle` or `notLoaded`, one
+`thread/archive`. `active` with any flags, `systemError`, an unknown/malformed
+status, a mismatched thread identity, or any error reaches no archive request.
+Do not parse RPC error message text and never retry `thread/archive`
+automatically. Ignore broadcast notifications and server requests exactly as
+the poll connection does. A successful archive response removes the row from
+the local provider cache immediately. Suppress a lagging loaded/read result
+for that ID until a complete authoritative union omits it; clear its immutable
+exclusion/read-order bookkeeping so cached metadata cannot resurrect it.
 
 Require the server identity/version supplied by `initialize` to be a string,
 but production v1 does not retain or display it. The opt-in live harness records
@@ -4248,6 +4273,13 @@ A timed-out Claude child can still consume its existing 5 s budget before
 this one-second budget. Preparation has NO latency bound: DNS/filesystem IO
 is outside that RPC deadline but inside the timed tick (§12.2). Keep the
 existing slow-tick buffered-input drain over the WHOLE tick.
+
+The fresh archive connection uses the same single **1,000 ms** deadline from
+TCP connect through upgrade, initialization, read, optional archive response,
+and close. Preparation/DNS/credential IO remains outside that deadline. A
+timeout after sending archive is still a failure, never inferred success; the
+next forced poll settles the visible state. The UI thread performs this bounded
+transaction only after the second qualified `Ctrl-x` press.
 No background thread is introduced to hide the stall.
 
 **The existing ladder applies per provider; forces have explicit precedence.**
@@ -4308,8 +4340,9 @@ does. Claude retains its existing fingerprint.
    Stop at null or after a valid descending page crosses strictly below the
    cutoff. Rows exactly at the cutoff are in-window. The eligible history
    half `H` contains only rows at/after the cutoff.
-   Seven days is a product choice: a week of reviewable work survives the
-   measured 30-minute idle unload, while the history walk has a fixed horizon.
+   Seven days is a product choice: a week of reviewable work survives both the
+   historical 30-minute and current approximately 60-second measured idle
+   unloads, while the history walk has a fixed horizon.
    There is no extra history-window flag in v1.
 3. For IDs in `L` without fetched metadata or a cached exclusion below, call
    `thread/read(includeTurns:false)`. Order reads LEAST-RECENTLY-ATTEMPTED
@@ -4450,6 +4483,17 @@ last Codex group with blocked rows first, `a` also toggling `◇` rows,
 unloaded as “not loaded in this server; Enter resumes; last-turn outcome
 unknown”, and the launch-target map limitation (§12.7).
 Say “n creates a Claude session; create Codex threads in the Codex TUI”.
+Add `C-x ×2  archive ○/◇ thread`; keep the ordinary footer's `C-x stop`
+byte-identical because that compact hint describes Claude.
+
+Codex archive messages use the existing transient slot and wrapping rules.
+The first eligible press is Warn `Ctrl-x again to archive <label>` and opens
+the shared two-second destructive window without RPC. Local refusals are Warn:
+`running — not archived`, `state unknown — not archived`,
+`close its pane first (x) — not archived`, or the provider's configuration
+refusal. A fresh-read rejection is Warn `state changed — not archived`.
+RPC/timeout failure is Warn `archive failed: <bounded redacted diagnostic>`.
+Success is Info `archived <label>` after the row has already been removed.
 
 Each enabled provider starts `NotYetObserved` in a fresh process: neither
 healthy nor degraded, with no standing error. Codex becomes degraded when
@@ -4660,7 +4704,7 @@ and every Claude call. `n` and `R` remain global verbs.
 | `d` | append a Codex dismissal; no RPC or immediate tmux write |
 | `u` | undo the newest folded dismissal by identity/provider; no RPC |
 | `r` | existing layout refresh, pending Codex re-preparation, and forced polls for both enabled providers; a failed attempt flashes its diagnostic |
-| `Ctrl-x` | Warn: `Codex stop/delete unavailable in v1 — use the Codex TUI`; no delete window, confirmation, stop, or archive |
+| `Ctrl-x` | two-press guarded archive for eligible Idle/Unloaded rows, under the rules below; never stop, interrupt, or hard-delete |
 | `L` | Warn: `Codex logs unavailable in v1 — use the Codex TUI`; no log overlay or history RPC |
 | `n` | open the ordinary Claude new-background prompt (§8.6), capturing `Provider::Claude` and the sidebar's local cwd; no Codex RPC |
 | `R` | global ccmux/Claude restart under the rules below; never a Codex restart |
@@ -4683,8 +4727,30 @@ it. A Claude selection keeps its existing cwd prefill. The prompt captures
 ID or provider decoration reaches dispatch. There is no provider toggle.
 
 `u` uses the hidden winner's provider, never the currently selected row's.
-Moving from a Claude row to a Codex row disarms any pending Claude `Ctrl-x`
-window, as a selection change already must.
+
+Codex `Ctrl-x` reuses §8.2's one destructive-window state machine and its
+750 ms repeat guard, two-second window, settle delay, and mode/quit disarms.
+The first press stamps the repeat guard before any return and sends no RPC.
+It refuses, as Warn, an unconfigured provider, Working/Blocked row
+(`running — not archived`), unknown/systemError row
+(`state unknown — not archived`), or any ccmux PaneMap record for that full
+Thread.id in any window (`close its pane first (x) — not archived`). Otherwise
+it captures provider plus full Thread.id and warns
+`Ctrl-x again to archive <label>`. Moving to another row, crossing providers,
+the row vanishing, leaving Normal mode, expiry, or a repeat burst disarms it.
+A later Claude selection can never inherit a Codex arm or pending action.
+
+The second qualified press must still select that exact provider/full ID and
+reapply every local refusal to the current row. After the settle guard it runs
+§12.4's fresh read-before-archive transaction on the captured ID. Fresh
+`active` (including empty/known/unknown flags), `systemError`, unknown or
+malformed status, identity mismatch, or a row that is no longer locally
+eligible sends no archive and warns `state changed — not archived`. Success
+removes the row before flashing `archived <label>` and forces a poll. Error or
+timeout warns `archive failed: <bounded redacted diagnostic>` and forces a
+poll; it never infers success. A successful local archive tombstone suppresses
+lagging loaded/read metadata until a complete `archived:false` union omits the
+ID, after which a later unarchive can be rediscovered.
 
 Open/tab refusals in tmux-degraded mode remain exactly
 `not inside tmux — open unavailable`,
@@ -4849,15 +4915,17 @@ can still reappear and be restored with `d`; this does not erase unrelated
 Claude dismissals. The rule is not a claim that old binaries obey the new
 retirement policy.
 
-### 12.10 Measured limits (§9 and PROBE-FINDINGS §9)
+### 12.10 Measured limits (§9 and PROBE-FINDINGS §§9–10)
 
 The following are part of the contract's scope, not details an implementation
 may silently “fix” by expanding its authority. The schema/source review
 refines the contract; it does not turn unrun experiments into live findings.
 
-- The attach gate passed for CLI **0.154.0** / server **0.153.4**. Generated
-  installed-CLI bindings do not prove a running server capability. Parse
-  responses defensively; unsupported protocol degrades only Codex.
+- The attach gate passed for CLI **0.154.0** / server **0.153.4**. The archive
+  probes ran after the server upgraded, with CLI and server both **0.154.0**.
+  Generated installed-CLI bindings still do not prove a running server
+  capability. Parse responses defensively; unsupported protocol degrades only
+  Codex.
 - The three supported last-client completion tests are `active-pane-valid`,
   `active-sigkill`, and `active-graceful-valid`. The initial `active-pane`
   attempt showed zero-client progress but completed AFTER reattach; it is not
@@ -4895,9 +4963,35 @@ refines the contract; it does not turn unrun experiments into live findings.
   established for every empty fork. Keep those rows; anchor step-3-only
   display starts and omit both timestamps from the Codex idle fingerprint.
   Do not create a turn to make a row resumable or use timestamps as identity.
-- Attach did not advance `updatedAt` for loaded or unloaded persisted
-  threads. Unsubscribed idle threads unloaded after about **30 minutes**.
-  Both facts require the recent-history half of the union.
+- Attach did not advance `updatedAt` for loaded or unloaded persisted threads.
+  On server 0.153.4, unsubscribed idle threads unloaded after about **30
+  minutes**. Server 0.154.0 unloaded five or more probes after approximately
+  **60 seconds** (60.006–60.014 s; §10). Both versions require the
+  recent-history half of the union.
+- `thread/archive` has no expected-status, idle-only, or force precondition.
+  Archiving active/waiting threads aborts their turn; a fresh status read is
+  therefore the only available client-side guard. A different client can
+  start a turn in the one-round-trip interval between ccmux's read and archive;
+  that turn would be aborted. The measured read-response-to-archive-request gap
+  was below 1 ms, but the protocol cannot close this race.
+- ccmux can refuse every pane in its maps, but cannot detect a Codex TUI
+  attached outside ccmux. Archiving such an idle thread leaves the TUI silent;
+  its next message fails `thread not found`. A standalone non-remote Codex
+  writer is also outside this endpoint: mid-turn it appears `notLoaded` but
+  archive was refused by the server's active-writer lock in 4/4 trials.
+  A standalone process between turns is invisible and archivable; that exact
+  case is **UNMEASURED**. Archive under an externally attached TUI mid-turn is
+  also **UNMEASURED**.
+- Archive is soft, not a hard delete: the rollout moves to archived storage,
+  turns remain, and `thread/read` still succeeds. Recover with the official
+  `codex unarchive <id> --remote ws://127.0.0.1:8965
+  --remote-auth-token-env CODEX_REMOTE_TOKEN` command, or run
+  `codex --remote ws://127.0.0.1:8965 --remote-auth-token-env
+  CODEX_REMOTE_TOKEN resume <id>` and choose “Unarchive and resume”.
+  Codex does not automatically purge archived threads. Codex Desktop's
+  “Delete all archived” action sends `thread/delete`/filesystem removal and
+  destroys them permanently; that measured bulk-delete behavior is why
+  `thread/archive` is the sidebar's authority ceiling.
 - `/resume`, `/fork`, and `/new` invalidate a pane's launch identity
   without changing its argv. The map deliberately remains a launch record.
   `/new` takes default thread settings/cwd. The materialization turn's cwd
@@ -5114,6 +5208,21 @@ have these tests; existing Claude tests remain authoritative except for
   substitution, no token bytes, validated latch target, parked retry to the
   launch ID, rc propagation, and explicit-only shell handoff. `R` plans no
   Codex pane/agent action and counts skips once.
+- **Guarded archive:** every first-press local refusal sends no RPC and opens no
+  destructive window: unconfigured, Working, Blocked, systemError/unknown,
+  and a matching mapped pane in any window. An eligible first press only arms
+  the full Thread.id. The same second press within two seconds sends exactly
+  one fresh `thread/read`, then exactly one `thread/archive` only for exact
+  `idle`/`notLoaded`. Exercise active with empty, approval, input, and unknown
+  flags; systemError; unknown/malformed status; mismatched identity; RPC error;
+  timeout; unexpected server requests; and broadcast notifications. None may
+  archive or report success. Expiry, navigation, mode change, disappearance,
+  cross-provider movement, and held/repeated input disarm; a neighbouring
+  Claude row cannot inherit stop/delete. Recheck row and pane state on the
+  second press. Success removes the row immediately, clears only that ID's
+  exclusion/read-order cache, forces a poll, and remains absent through a
+  lagging read until a complete `archived:false` union omits it. A later
+  unarchive is discoverable. Keep a Claude-only Ctrl-x baseline unchanged.
 - **Runtime warning episodes:** two full IDs in `systemError` have distinct
   delivery keys, even with equal tail IDs. Repeated unchanged polls cannot
   refresh a warning timer. Cover/overwrite leaves it pending; a full
@@ -5160,7 +5269,7 @@ have these tests; existing Claude tests remain authoritative except for
   varying Claude stderr leave ordinary detail/list space available between
   rate-limited flashes; standing reasons remain truncated on one line.
 
-**Ignored live tests** are opt-in and separate from those fixtures. The five
+**Ignored live tests** are opt-in and separate from those fixtures. The nine
 cases in `codex::live_tests` share one harness. Require
 `CCMUX_CODEX_LIVE_TEST=1`, `CCMUX_CODEX_LIVE_URL`, and an absolute
 `CCMUX_CODEX_LIVE_TOKEN_FILE`; do NOT fall back to the production
@@ -5187,8 +5296,9 @@ and result summaries under `~/.local/tmp/`; no credentials or raw wire
 payloads go into logs. On failure, include a bounded, redacted last observation
 (owned turn/status/error or pane snapshot). Redact before escaping/truncating;
 retain both ends of large fields so a TUI prompt is not lost behind its header.
-Test-only mutation access remains separate from the production lister's
-read-only method enum.
+The live harness's broader owned-thread mutation registry remains separate
+from the production allowlist, which contains only polling plus §12.4's
+guarded archive transaction.
 
 Mutation responses do not prove their effects are already visible. Open ONE
 creator connection for the case's creation work and keep it through each
@@ -5290,6 +5400,21 @@ The shipped cases are:
   Verify exit of the client descendants recorded under each owned pane
   (PID plus start time, no argv/environ reads). These cases cover `kill-pane`,
   not a separate native-client SIGKILL.
+- **Archive idle loaded:** archive an owned idle loaded thread through the
+  production guarded transaction; require it absent from `archived:false`,
+  present in `archived:true`, still readable as `notLoaded`, and absent from
+  loaded membership.
+- **Archive notLoaded:** establish the owned archived/unarchived persisted
+  fixture, require `notLoaded`, then archive it through production and assert
+  the same archived-list/read/loaded postconditions.
+- **Archive active refusal:** start an owned `sleep 5` turn, require fresh
+  `active` status, and require production archive to return `StateChanged`.
+  The same owned turn must subsequently complete and the thread return idle;
+  cleanup cannot supply that evidence.
+- **Archive approval refusal:** create an owned restrictive-policy thread,
+  require fresh `waitingOnApproval`, and require production archive to return
+  `StateChanged`. Require the same approval still pending, then decline that
+  owned request through the creator and prove its marker command did not run.
 
 Always close the owned clients and archive ONLY registered thread IDs;
 never delete. Cleanup runs after case failure/panic as well as success,
@@ -5317,14 +5442,18 @@ CCMUX_CODEX_LIVE_TOKEN_FILE=$HOME/.config/agents/codex-serve.token \
 cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1
 ```
 
-**Probe-established facts, not shipped live cases:** natural ~30-minute idle
-unload, pending-approval survival/replay, native-client SIGKILL, and in-TUI
+**Probe-established facts, not shipped live cases:** the historical ~30-minute
+and current ~60-second natural idle unloads, last-client pending-approval
+survival/replay, native-client SIGKILL, standalone-writer archive refusal, and
+in-TUI
 `/resume` / `/fork` / `/new` identity and default-cwd behavior remain the
-recorded observations in `PROBE-FINDINGS.md` §9 and the evidence limits in
+recorded observations in `PROBE-FINDINGS.md` §§9–10 and the evidence limits in
 §12.10. They need manual re-probing after a Codex upgrade before extending
 those claims to the new version. A pass of the bounded suite does not
-revalidate them. The long idle wait and interactive approval/identity flows
-are intentionally outside the automatic harness.
+revalidate them. The long idle wait, external standalone process, and
+interactive last-client approval/identity flows are intentionally outside the
+automatic harness. The shipped approval case tests only the archive gate while
+the creator remains attached.
 
 Cross-runtime contention also remains probe-only (§9), not a shipped ignored
 case. Future contention tests may use a tightly bounded owned stdio process,

@@ -1,6 +1,6 @@
 //! Fixtures follow the measured 0.153.4 response subset in PROBE-FINDINGS §9.
 //! Tests use fake IO, test-owned loopback listeners and temporary fixture tokens.
-//! Only the ignored live test can contact a daemon or read an external credential.
+//! Only ignored live tests can contact a daemon or read an external credential.
 
 use super::*;
 use std::{cell::{Cell, RefCell}, collections::VecDeque, rc::Rc};
@@ -68,6 +68,9 @@ struct Script {
     rpc_errors: BTreeSet<String>,
     response_ids: BTreeMap<String, Value>,
     read_costs: BTreeMap<String, Duration>,
+    archive_result: Value,
+    archive_ids: Vec<String>,
+    archive_cost: Duration,
     incoming: VecDeque<(Duration, Value)>,
     ahead: Vec<Value>,
     sent: Vec<Value>,
@@ -87,6 +90,7 @@ impl Default for Script {
             history: BTreeMap::from([(String::new(), response_page(vec![], None))]),
             reads: BTreeMap::new(), rpc_errors: BTreeSet::new(),
             response_ids: BTreeMap::new(), read_costs: BTreeMap::new(),
+            archive_result:json!({}), archive_ids:Vec::new(), archive_cost:Duration::ZERO,
             incoming: VecDeque::new(), ahead: Vec::new(), sent: Vec::new(), read_ids: Vec::new(),
             connect_cost: Duration::ZERO, send_cost: Duration::ZERO, receive_cost: Duration::ZERO,
             read_cost: Duration::ZERO, close_cost: Duration::ZERO, closes: 0,
@@ -141,7 +145,13 @@ impl Transport for FakeTransport {
                 cost += script.read_costs.get(id).copied().unwrap_or(script.read_cost);
                 script.reads.get(id).cloned().map(|thread| json!({"thread":thread}))
             }
-            _ => panic!("request outside read-only allowlist"),
+            "thread/archive" => {
+                let id = value["params"]["threadId"].as_str().unwrap();
+                script.archive_ids.push(id.into());
+                cost += script.archive_cost;
+                Some(script.archive_result.clone())
+            }
+            _ => panic!("request outside RPC allowlist"),
         };
         let response_id = script.response_ids.get(method).unwrap_or(&value["id"]);
         let response = match data {
@@ -171,6 +181,15 @@ fn poll(script: Script) -> (CodexObservation, Rc<RefCell<Script>>) {
     let clock = FakeClock::default();
     let mut connector = FakeConnector::new(&clock, script);
     let result = client().poll_with(NOW, &clock, &mut connector);
+    (result, connector.script)
+}
+
+fn archive(script: Script, thread_id: &str)
+    -> (Result<ArchiveOutcome, CodexError>, Rc<RefCell<Script>>)
+{
+    let clock = FakeClock::default();
+    let mut connector = FakeConnector::new(&clock, script);
+    let result = client().archive_with(thread_id, &clock, &mut connector);
     (result, connector.script)
 }
 
@@ -686,6 +705,120 @@ fn initialize_order_and_exact_read_only_method_parameters() {
             "modelProviders":[],"useStateDbOnly":true}}),
         json!({"id":"ccmux-3","method":"thread/read","params":{"threadId":id(1),"includeTurns":false}}),
     ]);
+}
+
+#[test]
+fn archive_uses_one_fresh_read_and_exactly_one_mutation() {
+    for status in [json!({"type":"idle"}), json!({"type":"notLoaded"})] {
+        let mut row = thread(1);
+        row["status"] = status;
+        let mut script = Script::default();
+        script.reads.insert(id(1), row);
+        let (result, script) = archive(script, &id(1));
+        assert_eq!(result.unwrap(), ArchiveOutcome::Archived);
+        let script = script.borrow();
+        assert_eq!(script.archive_ids, vec![id(1)]);
+        assert_eq!(script.closes, 1);
+        assert_eq!(script.sent, vec![
+            json!({"id":0,"method":"initialize","params":{
+                "clientInfo":{"name":"ccmux","version":env!("CARGO_PKG_VERSION")},
+                "capabilities":{"experimentalApi":true}}}),
+            json!({"method":"initialized","params":{}}),
+            json!({"id":"ccmux-1","method":"thread/read",
+                "params":{"threadId":id(1),"includeTurns":false}}),
+            json!({"id":"ccmux-2","method":"thread/archive",
+                "params":{"threadId":id(1)}}),
+        ]);
+    }
+}
+
+#[test]
+fn every_non_idle_fresh_status_refuses_before_archive() {
+    for status in [
+        json!({"type":"active","activeFlags":[]}),
+        json!({"type":"active","activeFlags":["waitingOnApproval"]}),
+        json!({"type":"active","activeFlags":["waitingOnUserInput"]}),
+        json!({"type":"active","activeFlags":["futureFlag"]}),
+        json!({"type":"systemError"}),
+        json!({"type":"future"}),
+        json!({}),
+    ] {
+        let mut row = thread(1);
+        row["status"] = status.clone();
+        let mut script = Script::default();
+        script.reads.insert(id(1), row);
+        let (result, script) = archive(script, &id(1));
+        assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged, "{status}");
+        assert!(script.borrow().archive_ids.is_empty(), "{status}");
+        assert_eq!(script.borrow().closes, 1);
+    }
+}
+
+#[test]
+fn archive_errors_timeouts_and_invalid_success_are_never_success() {
+    let mut rpc_error = Script::default();
+    rpc_error.reads.insert(id(1), thread(1));
+    rpc_error.rpc_errors.insert("thread/archive".into());
+    let (result, script) = archive(rpc_error, &id(1));
+    assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Protocol);
+    assert_eq!(script.borrow().archive_ids, vec![id(1)]);
+
+    let mut timeout = Script::default();
+    timeout.reads.insert(id(1), thread(1));
+    timeout.archive_cost = POLL_TIMEOUT;
+    let (result, script) = archive(timeout, &id(1));
+    assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
+    assert_eq!(script.borrow().archive_ids, vec![id(1)]);
+
+    let mut malformed = Script::default();
+    malformed.reads.insert(id(1), thread(1));
+    malformed.archive_result = json!({"unexpected":true});
+    assert_eq!(archive(malformed, &id(1)).0.unwrap_err().diagnostic.kind,
+        CodexFailureKind::Protocol);
+}
+
+#[test]
+fn archive_connection_ignores_requests_and_broadcast_notifications() {
+    let mut script = Script::default();
+    script.reads.insert(id(1), thread(1));
+    script.ahead = vec![
+        json!({"id":"approval","method":"item/commandExecution/requestApproval",
+            "params":{"command":SECRET}}),
+        json!({"method":"thread/archived","params":{"threadId":id(1)}}),
+        json!({"method":"thread/status/changed","params":{"threadId":id(1),
+            "status":{"type":"notLoaded"}}}),
+    ];
+    let (result, script) = archive(script, &id(1));
+    assert_eq!(result.unwrap(), ArchiveOutcome::Archived);
+    let sent = &script.borrow().sent;
+    assert_eq!(sent.len(), 4);
+    assert!(sent.iter().all(|value| value.get("method").is_some()));
+    assert!(!serde_json::to_string(sent).unwrap().contains(SECRET));
+}
+
+#[test]
+fn archive_rejects_invalid_addresses_without_connecting() {
+    let clock = FakeClock::default();
+    let mut connector = FakeConnector::new(&clock, Script::default());
+    let error = client().archive_with("not-a-thread", &clock, &mut connector).unwrap_err();
+    assert_eq!(error.diagnostic.kind, CodexFailureKind::Protocol);
+    assert!(connector.script.borrow().sent.is_empty());
+}
+
+#[test]
+fn forgetting_an_archived_id_clears_only_its_poll_bookkeeping() {
+    let mut client = client();
+    client.exclusions.insert(id(1), Exclusion::Custom);
+    client.exclusions.insert(id(2), Exclusion::SubAgent);
+    client.attempted.insert(id(1), 10);
+    client.attempted.insert(id(2), 20);
+
+    client.forget(&id(1));
+
+    assert!(!client.exclusions.contains_key(&id(1)));
+    assert!(!client.attempted.contains_key(&id(1)));
+    assert_eq!(client.exclusions.get(&id(2)), Some(&Exclusion::SubAgent));
+    assert_eq!(client.attempted.get(&id(2)), Some(&20));
 }
 
 #[test]

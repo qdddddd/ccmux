@@ -520,6 +520,10 @@ on this host, with tmux 3.4. All measurements below were made on **2026-09-16
 stdio contention probe also used 0.153.4. These version and date qualifiers
 apply to every finding below.
 
+This is the historical version-skew snapshot. §10 records the 2026-09-17
+archive probes after app-server upgraded to 0.154.0 and supersedes only the
+current unload timing and archive-authority conclusions called out there.
+
 ### Method and isolation
 
 Only the explicitly authorized `ccmux-probe` tmux socket was used, overriding
@@ -781,7 +785,9 @@ and turn cwd; the thread's own cwd remained the default described below.
 
 ### Idle unload, read side effects, and attach recency
 
-- **Unsubscribed idle threads unloaded after approximately 30 minutes.**
+- **On server 0.153.4, unsubscribed idle threads unloaded after approximately
+  30 minutes.** §10 measures an approximately 60-second boundary on 0.154.0;
+  the older result remains here as version-qualified evidence.
   Method: complete one trivial turn in each of `grace-control` and
   `grace-read`; explicitly `thread/unsubscribe` and close the creating
   connection. Neither had a TUI. The control had no subsequent
@@ -1004,9 +1010,146 @@ The same active turns completed after pane kill, SIGKILL, and graceful quit;
 pending approval reappeared on reattach; an idle thread unloaded naturally and
 resumed through the ordinary remote command.
 
-The approved read-only listing + attach + `x` scope remains viable. The SPEC
-amendment must carry the measured version skew, empty-thread resume failure,
-unchanged attach timestamps, approximately 30-minute unload, and launch-target
+The approved read-only listing + attach + `x` scope was viable at this stage.
+§10 later supports adding only the guarded archive transaction; it does not
+expand any other mutation authority. The SPEC amendment must carry this
+historical version skew, empty-thread resume failure, unchanged attach
+timestamps, this server's approximately 30-minute unload, and launch-target
 pane-map limitation. The 1000 ms poll budget has measured headroom here, not a
 general latency guarantee. The explicitly UNMEASURED cases above remain
 evidence limits.
+
+## 10. Codex archive probes — 2026-09-17
+
+These findings apply to **codex-cli 0.154.0 connecting to app-server 0.154.0**
+on **2026-09-17 (Asia/Taipei, UTC+08:00)**. Every mutation targeted a disposable
+probe thread owned by this run. Evidence was collected under
+`~/.local/tmp/ccmux-archprobe-*`; those scratch artifacts are not retained in
+this repository. No production thread was interrupted, archived, unarchived,
+or deleted.
+
+### Method and protocol boundary
+
+Each RPC trial opened an authenticated WebSocket, sent `initialize`, then the
+measured request on the same app-server. State checks used
+`thread/read({"threadId":<owned ID>,"includeTurns":false})`, cursor-followed
+`thread/loaded/list`, and cursor-followed
+`thread/list({...,"archived":true|false,"useStateDbOnly":true})`. TUI trials
+used the official loopback remote command with the token supplied by an
+environment-variable name; standalone-writer trials used `codex exec` against
+the same Codex home. Token bytes were not placed in argv or retained evidence.
+
+- **Archive has no server-side status precondition.** Method: inspect the
+  generated 0.154.0 request schema, then send
+  `thread/archive({"threadId":<owned ID>})`. Its only parameter is `threadId`;
+  success is `{}`. There is no expected-status, idle-only, force, or
+  archive-specific error field. **Consequence:** a fresh client-side status
+  read is the only available guard, and it cannot make read-plus-archive
+  atomic.
+
+- **Archive aborts active and blocked work.** Method: archive one owned active
+  turn, two owned `active{waitingOnApproval}` turns, and one owned
+  `active{waitingOnUserInput}` turn. Active abort followed the archive by
+  27 ms (n=1). All three pending requests resolved, their commands did not run,
+  and the rollout described the previous turn as deliberately interrupted by
+  the user. None was refused by `thread/archive`.
+  **Consequence:** ccmux must refuse every `active` value, whatever its flags;
+  approval/input flags do not make archive safer.
+
+- **Loaded status is fresh enough to gate.** Method: while owned threads were
+  active, compare `thread/read(includeTurns:false)` with their DB-only
+  `thread/list` rows. Both reported `active` and the current `activeFlags`.
+  **Consequence:** use a new `thread/read` immediately before archive rather
+  than trusting the sidebar's cached row.
+
+- **The guarded transaction fits one second on this population.** Method: on
+  one fresh connection, run connect, initialize, `thread/read`, local status
+  check, eligible `thread/archive`, and close. Loaded-idle trials measured
+  p50 99 ms and maximum 104 ms; notLoaded trials measured p50 44 ms and
+  maximum 59 ms. The read response to archive request gap was below 1 ms.
+  **Consequence:** the existing 1,000 ms whole-operation deadline has measured
+  headroom, but the sub-millisecond gap is still a real race with another
+  client starting a turn.
+
+### Archive effects and visibility
+
+- **Idle loaded archive is soft and preserves history.** Method: archive an
+  owned idle loaded thread, then poll status, both archived list partitions,
+  DB state, and the rollout paths. The call returned `{}` in about 43 ms;
+  notifications reported `notLoaded` then `thread/archived`. The rollout moved
+  from `~/.codex/sessions/` to `~/.codex/archived_sessions/`; the DB row stayed
+  with `archived=1`, `updatedAt` did not change, and turns remained intact.
+  **Consequence:** successful archive can remove the row immediately without
+  claiming deletion or loss of transcript.
+
+- **notLoaded archive is also soft.** Method: archive owned persisted
+  notLoaded threads and compare both list partitions. Calls returned `{}` in
+  approximately 2–7 ms and emitted `thread/archived` without a load/unload
+  cycle. **Consequence:** both `idle` and `notLoaded` are eligible; neither
+  requires resume.
+
+- **Readability does not prove an ID is unarchived.** Method: after archive,
+  call `thread/read` and list with `archived:true` and `archived:false`.
+  `thread/read` still succeeded with `notLoaded` and an archived rollout path;
+  only the list partition distinguished it. A second archive returned -32600
+  `no rollout found for thread id …`. `thread/unarchive` returned the Thread,
+  advanced `updatedAt`, reordered `updated_at` listing, and left it notLoaded.
+  **Consequence:** ccmux's row source remains the `archived:false` union; a
+  lagging loaded/read result needs a temporary local tombstone, and archive is
+  never retried automatically.
+
+- **Archive notifications are broadcast.** Method: keep initialized
+  non-subscribing observer connections open while other clients archive and
+  unarchive owned threads. They received `thread/archived`,
+  `thread/unarchived`, `thread/status/changed`, and `thread/closed`.
+  **Consequence:** the archive connection must ignore notifications and any
+  unrelated server requests while waiting for its own response.
+
+### Other clients, unloading, and retention
+
+- **A standalone active writer is invisible to status but protected by its
+  writer lock.** Method: start four owned standalone `codex exec` turns, query
+  them from app-server, and attempt archive mid-turn. They appeared
+  `notLoaded`, were absent from `thread/loaded/list`, and their turn rows could
+  transiently say `interrupted`; all 4/4 archive calls were refused with
+  -32600 `thread <id> already has an active writer`. The lock released when
+  the turn ended, before process exit. **Consequence:** do not parse this error
+  text or treat notLoaded as global idleness. A standalone TUI between turns
+  is invisible and appears archivable, but that exact archive is UNMEASURED.
+
+- **An externally attached idle remote TUI is not protected.** Method: attach
+  an official remote TUI to an owned idle thread, archive it from another
+  connection, then submit text in the TUI (n=2). Archive succeeded; the TUI
+  displayed no archive notice, and its next submission failed
+  `turn/start failed: thread not found`. Resuming the archived ID offered
+  “Unarchive and resume” or cancel; the official `codex unarchive <id>
+  --remote ws://127.0.0.1:8965 --remote-auth-token-env CODEX_REMOTE_TOKEN`
+  command exited 0. **Consequence:** ccmux must refuse every thread represented
+  in its own pane maps. It cannot detect an external TUI, so that risk remains.
+
+- **Idle unload changed in app-server 0.154.0.** Method: leave five or more
+  owned idle, unsubscribed threads without a TUI and sample loaded membership.
+  They unloaded after 60.006, 60.009, 60.012, 60.013, and 60.014 seconds,
+  replacing §9's approximately 30-minute 0.153.4 result. `Thread.cwd` returned
+  the symlink-resolved real path. **Consequence:** recent archived:false
+  history remains necessary, and neither loaded membership nor lexical cwd is
+  a stable ownership signal.
+
+- **Codex does not purge archived threads automatically.** Method: inspect the
+  previously archived probe population and app-server/desktop activity. About
+  65 archived probes from 2026-09-15/16 remained until Codex Desktop issued a
+  burst of `thread/delete` plus filesystem removal from its “Delete all
+  archived” UI. No other caller was found. **Consequence:** ccmux archive is a
+  reversible soft delete, but a later Desktop bulk delete destroys archived
+  threads permanently. This is why ccmux never calls `thread/delete`.
+
+### Evidence limits
+
+**UNMEASURED:** archiving a standalone Codex TUI between turns; archive under
+an externally attached TUI while its turn is active; pending file-change,
+permission, or MCP requests beyond the approval/user-input cases above; and
+retention over longer periods than the observed minutes/days. The standalone
+writer result is four mid-turn `codex exec` trials, not proof for every native
+runtime. The attached-idle TUI result is n=2 and cannot supply process
+discovery. These limits prohibit stronger claims; they do not justify broader
+mutation authority.

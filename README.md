@@ -101,15 +101,33 @@ Claude Completed group.
 
 `Enter/o/s/t` open the official Codex TUI; `x` closes a pane while work
 stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
-as usual; `r` also reloads credentials and DNS. `Ctrl-x` and `L` refuse
-on Codex rows. `n` always creates a Claude session, using the sidebar's local
+as usual; `r` also reloads credentials and DNS. On an idle (`○`) or unloaded
+(`◇`) Codex row, press `Ctrl-x` twice within 2 s to archive it. The first
+press sends no RPC. ccmux refuses running, blocked, error/unknown, or mapped
+pane rows; the second press re-reads server status before archiving. `L`
+still refuses. `n` always creates a Claude session, using the sidebar's local
 cwd when Codex is selected. `R` skips Codex panes.
 
 After `/quit` in the Codex TUI, the pane parks: Enter resumes, `s` opens a
 shell, `q` closes it. The pane map records the **launch target**.
 `/resume`, `/new` and `/fork` can change the TUI's thread without
 changing that record: sidebar Enter/`x` still refer to the original launch,
-and a parked retry returns to it. The Codex TUI owns all thread mutations.
+and a parked retry returns to it. The Codex TUI owns every other thread
+mutation.
+
+Archive is a soft delete: turns stay intact and the official client can undo
+it. Either run
+`codex unarchive <id> --remote ws://127.0.0.1:8965 --remote-auth-token-env CODEX_REMOTE_TOKEN`
+with that environment variable set, or resume the archived ID and choose
+**Unarchive and resume**. Codex Desktop's **Delete all archived** action
+permanently deletes archived threads. ccmux has no unarchive key.
+
+The fresh read and archive are separate RPCs. Another client can start a turn
+between them, and that turn would be aborted. ccmux cannot detect an idle TUI
+attached outside its pane maps; archiving leaves that TUI silent and its next
+message fails `thread not found`. A standalone non-remote Codex process is
+also invisible between turns. Mid-turn, its writer lock refused archive in the
+measured probes; between turns remains a risk.
 
 ## Keys
 
@@ -126,7 +144,7 @@ are listed above.
 | `o` / `s` | Open in a side-by-side / stacked split |
 | `t` | Open in a new tab |
 | `x` | Close the session's pane. The agent keeps running |
-| `Ctrl-x` | Stop the session. Press again within 2 s to **delete** it |
+| `Ctrl-x` | Claude: stop, then delete on a second press. Codex: archive eligible `○`/`◇` rows on a second press |
 | `n` | Dispatch a new background session |
 | `L` | Show the session's logs |
 | `d` / `u` | Hide the row from the list / undo the last hide |
@@ -136,7 +154,7 @@ are listed above.
 | `R` | Restart ccmux and idle agents after an upgrade |
 | `?` | Help |
 | `q` | Quit the sidebar. Sessions and panes are untouched |
-| `Esc` | Cancel a pending delete, or clear the filter |
+| `Esc` | Cancel a pending delete/archive, or clear the filter |
 | `Ctrl-c` | Quit from any mode |
 
 `o` and `s` follow vim's naming: `o` puts panes side by side, `s` stacks them.
@@ -259,14 +277,19 @@ v2 pane map, including Claude pane records, and strip Codex dismissal tags.
 
 - `x` closes a pane and never stops the agent.
 - `d` only hides a row.
-- `Ctrl-x` is the only verb that can **delete** a session. The first press stops
-  it; the conversation is kept and `Enter` resumes it. A second press within
-  2 s runs `claude rm`, which deletes the session and its git worktree.
-  `claude rm` refuses a worktree with uncommitted or unpushed work.
+- On a Claude row, `Ctrl-x` is the only verb that can **delete** a session.
+  The first press stops it; the conversation is kept and `Enter` resumes it.
+  A second press within 2 s runs `claude rm`, which deletes the session and
+  its git worktree. `claude rm` refuses a worktree with uncommitted or
+  unpushed work.
+- On an eligible Codex row, the first `Ctrl-x` only arms a two-second window.
+  The second performs a fresh status read and one soft archive. It never calls
+  `thread/delete` or `turn/interrupt`, and never retries an uncertain result.
 - The footer names the session while the delete window is open.
   Moving between Claude rows does **not** close it; a second press on another
-  row deletes nothing. Selecting a Codex row closes it. A press within 750 ms
-  of the previous one is ignored, so a held key deletes nothing.
+  row deletes nothing. Selecting a Codex row closes it. A Codex archive window
+  closes on any row move or provider change. A press within 750 ms of the
+  previous one is ignored, so a held key deletes or archives nothing.
 - A delete closes the panes parked on that session, but not a pane you turned
   into a shell with `s`.
 - `R` also runs `claude stop` and `claude respawn`, only on idle or done agents,
