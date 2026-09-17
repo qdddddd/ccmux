@@ -141,7 +141,23 @@ impl Fixture {
     fn executable(&self, name: &str, text: &str) {
         let path = self.0.join(name);
         std::fs::write(&path, text).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // A parallel fork may briefly inherit the writer fd. Prove direct exec
+        // is past Linux's ETXTBSY window before a wrapper test uses this path.
+        for _ in 0..100 {
+            let result = Command::new(&path)
+                .env("TRACE", "/dev/null").env_remove("CODEX_REMOTE_TOKEN")
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+                .status();
+            match result {
+                Ok(_) => return,
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("fixture executable did not settle: {error}"),
+            }
+        }
+        panic!("fixture executable remained busy");
     }
 
     fn config(&self) -> CodexConfig {

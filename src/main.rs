@@ -9,7 +9,6 @@
 
 mod agents;
 mod app;
-#[allow(dead_code)]
 mod codex;
 mod model;
 mod restart;
@@ -68,14 +67,18 @@ pub struct Cli {
     #[arg(short = 'L', long, global = true, value_parser = validate_socket_name)]
     pub socket: Option<String>,
 
-    /// Loopback ws:// Codex app-server URL; empty disables
-    /// (default ws://127.0.0.1:8965; CCMUX_CODEX_URL)
-    #[arg(long, global = true)]
+    /// Codex app-server endpoint
+    ///
+    /// Loopback ws:// only; empty disables. Defaults to ws://127.0.0.1:8965;
+    /// environment fallback: CCMUX_CODEX_URL.
+    #[arg(long, global = true, value_name = "URL")]
     pub codex_url: Option<String>,
 
-    /// Codex bearer-token file path (default under XDG_CONFIG_HOME/HOME);
-    /// CCMUX_CODEX_TOKEN_FILE; never a token
-    #[arg(long, global = true)]
+    /// Codex bearer-token file path; never a token
+    ///
+    /// Defaults under XDG_CONFIG_HOME/HOME; environment fallback:
+    /// CCMUX_CODEX_TOKEN_FILE.
+    #[arg(long, global = true, value_name = "PATH")]
     pub codex_token_file: Option<String>,
 }
 

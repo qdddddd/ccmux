@@ -84,6 +84,14 @@ Only loopback `ws://` is supported: `localhost`, `127.0.0.0/8` or
 `[::1]`. For a remote server, open your own SSH tunnel, for example
 `ssh -N -L 8965:127.0.0.1:8965 host`, then use the local URL above.
 
+Loopback does not prove which process owns the port. If the server is down,
+another process that binds the configured port receives the
+`Authorization: Bearer` header on the next automatic poll and roughly every
+10 seconds once failure backoff engages. This matters on shared multi-user
+hosts; run there with `--codex-url ''` or `CCMUX_CODEX_URL=` unless the
+endpoint is trusted. A process under your own uid can already read the token
+file.
+
 The list includes loaded threads and unloaded threads updated in the last
 seven days, limited to persistent, top-level threads. They share a final
 **Codex** group, with blocked threads first and unloaded threads last.
@@ -155,7 +163,7 @@ Empty groups have no header.
 | `✓` green | Completed |
 | `■` gray | Stopped. Opening it resumes it |
 | `◇` gray | Codex thread unloaded from this server |
-| `?` purple | A state this build does not recognize. The footer names it |
+| `?` purple | An unrecognized state, or Codex `systemError`; the footer reports the value or runtime error |
 | `▌` aqua | Open in a pane in this tab |
 | `▌` grey | Open in a pane in another tab |
 | `2` | The tab it is open in. `+` means tab 10 or higher |
@@ -240,6 +248,12 @@ the start time is the worker's. Pane scrollback is lost.
 `R` checks that the new binary runs before it restarts anything. If it does not,
 nothing is touched and the footer shows the error. It also requires Codex flag
 support, even with Codex disabled, so `R` cannot roll back to a pre-Codex build.
+
+Before installing a pre-Codex build, quit every running sidebar with `q` and
+close Codex panes, or kill the whole ccmux tmux session. A mixed-version `t`
+can leave a new tab without a sidebar because the old binary rejects the Codex
+flags. An old sidebar that adopts a Codex-bearing window can also discard its
+v2 pane map, including Claude pane records, and strip Codex dismissal tags.
 
 ## Safety
 

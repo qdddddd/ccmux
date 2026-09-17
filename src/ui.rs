@@ -1181,9 +1181,6 @@ const KEYS: &[(&str, &str)] = &[
     ("▌N", "open in tab N (blank: here)"),
 ];
 
-/// Number of lines the `?` overlay renders. `main.rs` copies it into
-/// `App::help_lines` each frame so `app.rs` can clamp `help_scroll` against the
-/// real content without importing `ui` (the DAG stays acyclic).
 const CODEX_KEYS: &[(&str, &str)] = &[
     ("Codex", "last group; ▲ first"),
     ("a", "also toggles ◇ rows"),
@@ -1203,6 +1200,9 @@ const CODEX_KEYS: &[(&str, &str)] = &[
     ("C-x/L", "stop/logs: Codex TUI"),
 ];
 
+/// Number of lines the `?` overlay renders. `main.rs` copies it into
+/// `App::help_lines` each frame so `app.rs` can clamp `help_scroll` against the
+/// real content without importing `ui` (the DAG stays acyclic).
 pub fn help_line_count(codex: bool) -> usize {
     KEYS.len() + if codex { CODEX_KEYS.len() } else { 0 }
 }

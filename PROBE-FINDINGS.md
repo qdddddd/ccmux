@@ -665,9 +665,9 @@ and turn cwd; the thread's own cwd remained the default described below.
   the creator; cleanup then archives. The filesystem abort and the earlier
   erroneous history status are different events.
 
-  **Controlled follow-up:** retained log
-  `/home/qdu/.claude/jobs/4fd85d5a/tmp/turnprobe/probe.jsonl`,
-  methods `probe.py::variant_a/b/c/d`, and the owned archived rollouts.
+  **Controlled follow-up:** the temporary `probe.jsonl` log was not retained in
+  this repository. Methods `probe.py::variant_a/b/c/d` and the owned archived
+  rollouts supplied the recorded evidence.
   Four turns used `gpt-5.6-luna` / low, a read-only sandbox, never-approve
   policy, and the foreground command `/usr/bin/sleep 25`, followed by
   `done`. Reads used `thread/turns/list(limit:5,sortDirection:"desc",
@@ -901,12 +901,13 @@ and turn cwd; the thread's own cwd remained the default described below.
   history. Measured median **412.8 ms**, nearest-rank p95 **422.5 ms**, maximum
   **422.5 ms**; initialize/connect was about 10–22 ms.
   The separate full-population DB query took **60.1 ms**, scan query
-  **112.9 ms**. **Consequence:** 1.5 s has headroom for this measured Codex poll,
-  but roughly 0.42 s still adds to input latency when run synchronously after
-  Claude. Seven days was a measurement parameter, not a newly fixed product
-  default. Enforce one deadline across connection, writes, all pages/reads,
-  and close in the implementation: the probe's per-request remaining-time
-  check does not validate hard-deadline behavior under stalled connect/close.
+  **112.9 ms**. **Consequence:** the measured p95 **422.5 ms** fits the pinned
+  **1000 ms** whole-poll budget, but roughly 0.42 s still adds to input latency
+  when run synchronously after Claude. Seven days was a measurement parameter,
+  not a newly fixed product default. Enforce one deadline across connection,
+  writes, all pages/reads, and close in the implementation: the probe's
+  per-request remaining-time check does not validate hard-deadline behavior
+  under stalled connect/close.
   Large-history, saturated-server, and failure-path latency are **UNMEASURED**;
   the live server was not overloaded, stopped, or fault-injected.
 
@@ -1006,6 +1007,6 @@ resumed through the ordinary remote command.
 The approved read-only listing + attach + `x` scope remains viable. The SPEC
 amendment must carry the measured version skew, empty-thread resume failure,
 unchanged attach timestamps, approximately 30-minute unload, and launch-target
-pane-map limitation. The 1.5 s poll budget has measured headroom here, not a
+pane-map limitation. The 1000 ms poll budget has measured headroom here, not a
 general latency guarantee. The explicitly UNMEASURED cases above remain
-evidence limits. This stage changes only this findings document.
+evidence limits.

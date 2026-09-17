@@ -22,8 +22,6 @@ impl Provider {
 }
 
 /// Runtime metadata stays separate from Claude's pid-presence contract.
-/// The Codex parser will construct these; no Codex poll source is wired yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CodexStatus {
     NotLoaded,
@@ -84,7 +82,6 @@ pub enum State {
     /// purple `?` under Idle — reading as broken when it is merely parked.
     Stopped,
     /// Not loaded in this Codex server; no assertion about the last turn.
-    #[allow(dead_code)] // The Codex parser is not wired into polling yet.
     Unloaded,
     /// Running, but stopped at a permission prompt or a question and WAITING ON
     /// THE OPERATOR.

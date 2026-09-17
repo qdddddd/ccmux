@@ -1,6 +1,6 @@
 # ccmux — Implementation Spec v1
 
-**AMENDED BY §§11–12:** tabs and opt-in Codex sessions extend the original scope.
+**AMENDED BY §§11–12:** tabs and default-on Codex sessions extend the original scope.
 
 Authoritative. Derived from and consistent with `PROBE-FINDINGS.md`; every tmux
 mechanism below was additionally re-verified on this machine (tmux 3.4) during
@@ -15,7 +15,7 @@ sidebar pinned on the left, Claude Code TUIs in the panes to its right.
 
 ## 0. Ownership, parallelism, and the day-0 stub commit
 
-**AMENDED BY §12.3:** provider ownership and the new Codex module dependencies.
+**AMENDED BY §12.3:** provider ownership and the Codex/settings module dependencies.
 
 The file split is fixed. Nobody edits a file they do not own.
 
@@ -39,6 +39,13 @@ tmux ──────┤             ├──> app ──> main
 
 `tmux` has no in-crate dependencies, so `agents -> tmux` introduces no cycle;
 `agents` uses exactly one item from it, `sh_quote`.
+
+**§12 module amendment:** add `src/codex.rs` (depends on `model`) and
+`src/settings.rs` (depends on `codex` and `tmux`). `tmux` now consumes
+`model::Provider`; `agents` also consumes `codex`; `app` consumes `codex` and
+`settings`; `restart` and `main` consume `settings`. These added edges preserve
+the acyclic rule: neither `model` nor `codex` imports `tmux`, `agents`, `app`,
+or `ui`, and `settings` does not import `app`, `restart`, `main`, or `ui`.
 
 **Day-0 stub commit (Scaffold does this first, before anyone else starts).**
 Scaffold commits `Cargo.toml` plus all six `src/*.rs` files containing *exactly*
@@ -3807,8 +3814,8 @@ of you. The digit therefore never lies about where the verbs go.
 
 **This section amends §§0–11 where it says so; the remaining Claude contract
 stands.** It is grounded in [PROBE-FINDINGS §9](PROBE-FINDINGS.md#9-codex-app-server-probes--2026-09-16),
-including the reviewed corrections. It is a contract for implementation, not a
-claim that the implementation already exists.
+including the reviewed corrections, and describes the implemented branch
+contract.
 
 ### 12.1 Scope and ownership (§§2, 3.3, 8, 10.3)
 
@@ -3894,6 +3901,14 @@ Codex 0.154.0 allows its token option only with loopback `ws://` or
 disagree and expose the sidebar's bearer. For a remote server, the operator
 can run `ssh -N -L 8965:127.0.0.1:8965 host` and configure ccmux with
 `ws://127.0.0.1:8965`. ccmux does not start or manage the tunnel.
+
+Loopback limits routing; it does not authenticate the listening process. If
+the configured app-server is down, another process that binds that loopback
+port receives the `Authorization: Bearer` header on the next automatic poll
+and roughly every 10 seconds once failure backoff engages. A same-uid process
+could already read the token file, but on a shared multi-user host another user
+may be able to claim the unbound port. Run shared-host sidebars with
+`--codex-url ''` or `CCMUX_CODEX_URL=` unless that endpoint is trusted.
 
 The token-file path defaults as above and is otherwise required for an enabled
 configuration. Thus `--codex-url X` without a token flag or environment value
@@ -4001,11 +4016,13 @@ commands of already-open Codex panes.
 
 The module boundary changes are explicit: `model` owns `Provider`;
 `tmux` may now consume that model type. New `codex` consumes `model` and owns
-configuration, the read-only transport, and Codex parsing. `agents` may consume
-`CodexConfig` and `PaneEntry` for the provider-dispatch builders below, alongside
-its existing model types and `sh_quote`. `app` integrates both poll sources;
-`main` resolves non-secret settings; `app::tick` owns lazy preparation.
-Neither `model` nor `codex` imports `tmux`, `agents`, or `app`; no dependency
+configuration types, the read-only transport, and Codex parsing. New `settings`
+consumes `CodexConfig` and `tmux::sh_join`; it owns non-secret resolution and
+propagation. `agents` may consume `CodexConfig` and `PaneEntry` for the
+provider-dispatch builders below, alongside its existing model types and
+`sh_quote`. `app` integrates both poll sources and consumes resolved settings;
+`main` resolves those settings; `app::tick` owns lazy preparation. Neither
+`model` nor `codex` imports `tmux`, `agents`, `app`, or `settings`; no dependency
 cycle or new process/thread owner is added.
 
 The following additions are authoritative; existing fields remain:
@@ -4169,8 +4186,10 @@ a lister's error could defeat the owning client's answer. Sending nothing
 preserves the owner’s chance to answer. This is why the usual JSON-RPC
 unknown-method error is deliberately NOT sent by this read-only observer.
 
-Record the server identity/version supplied by `initialize` for diagnostics.
-The installed CLI's generated schema is NOT a capability test: probes used
+Require the server identity/version supplied by `initialize` to be a string,
+but production v1 does not retain or display it. The opt-in live harness records
+it separately as compatibility evidence. The installed CLI's generated schema
+is NOT a capability test: probes used
 CLI 0.154.0 with server 0.153.4, whose `thread/list` lacked `originators`.
 Use the actual responses to the subset above; an unsupported method/parameter
 degrades Codex. Do not retry with a scan-and-repair listing, private storage,
@@ -5294,7 +5313,7 @@ Run only these ignored cases, not the older unrelated ignored tests:
 ```sh
 CCMUX_CODEX_LIVE_TEST=1 \
 CCMUX_CODEX_LIVE_URL=ws://127.0.0.1:8965 \
-CCMUX_CODEX_LIVE_TOKEN_FILE=/home/qdu/.config/agents/codex-serve.token \
+CCMUX_CODEX_LIVE_TOKEN_FILE=$HOME/.config/agents/codex-serve.token \
 cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1
 ```
 
@@ -5311,7 +5330,7 @@ Cross-runtime contention also remains probe-only (§9), not a shipped ignored
 case. Future contention tests may use a tightly bounded owned stdio process,
 never a second long-lived server. Live deadline/failure, credential rotation,
 and resolver experiments require a controlled test endpoint and temporary
-token file, not fault injection into DuDu's server, credential, or host
+token file, not fault injection into the operator's server, credential, or host
 configuration. Do not send an error reply to a live approval to test §12.4.
 
 ---

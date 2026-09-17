@@ -144,7 +144,6 @@ pub struct CodexClient {
     exclusions: BTreeMap<String, Exclusion>,
     attempted: BTreeMap<String, u64>,
     sequence: u64,
-    server_identity: Option<String>,
 }
 
 fn endpoint(url: &str) -> Result<Endpoint, CodexError> {
@@ -237,7 +236,6 @@ fn prepare_with(
         exclusions: BTreeMap::new(),
         attempted: BTreeMap::new(),
         sequence: 0,
-        server_identity: None,
     })
 }
 
@@ -785,10 +783,6 @@ impl CodexClient {
         self.prepared = prepared.prepared;
     }
 
-    pub fn server_identity(&self) -> Option<&str> {
-        self.server_identity.as_deref()
-    }
-
     fn redact(&self, text: &str) -> String {
         clean_text(&text.replace(&self.prepared.token, "[redacted]"))
     }
@@ -807,10 +801,8 @@ impl CodexClient {
             let transport = connector.connect(&self.prepared, deadline)?;
             deadline.check()?;
             let mut rpc = Rpc { transport, deadline, next_id: 0, attempted: false };
-            let identity = rpc.request(Method::Initialize)?;
-            let identity = identity.get("userAgent").and_then(Value::as_str)
+            rpc.request(Method::Initialize)?.get("userAgent").and_then(Value::as_str)
                 .ok_or_else(CodexError::protocol)?;
-            self.server_identity = Some(self.redact(identity).chars().take(120).collect());
             rpc.initialized()?;
             self.collect(&mut rpc, &mut union)?;
             deadline.check()?;

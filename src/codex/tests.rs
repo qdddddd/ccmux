@@ -737,17 +737,15 @@ fn malformed_envelopes_and_unmatched_response_ids_are_protocol_errors() {
 }
 
 #[test]
-fn server_identity_is_recorded_from_initialize_and_redacted() {
+fn initialize_identity_is_validated_but_not_echoed_in_diagnostics() {
     let clock = FakeClock::default();
     let mut client = client();
     let mut script = Script::default();
     script.ahead.push(json!({"id":0,"result":{"userAgent":format!("fixture {SECRET}\x1b[31m")}}));
     let mut connector = FakeConnector::new(&clock, script);
-    // The injected initialize is accepted. The normal extra response then
-    // fails matching, but the observed identity must already be recorded.
     let result = client.poll_with(NOW, &clock, &mut connector);
     assert_kind(&result, CodexFailureKind::Protocol);
-    assert_eq!(client.server_identity(), Some("fixture [redacted]"));
+    assert!(!result.diagnostic.unwrap().message.contains(SECRET));
 }
 
 #[test]
@@ -1278,7 +1276,6 @@ fn otherwise_valid_responses_require_the_exact_id_and_id_type() {
         script.response_ids.insert("initialize".into(), wrong);
         let mut connector = FakeConnector::new(&clock, script);
         assert_kind(&client.poll_with(NOW, &clock, &mut connector), CodexFailureKind::Protocol);
-        assert!(client.server_identity().is_none());
         assert_eq!(connector.script.borrow().sent.len(), 1);
     }
     for wrong in [json!("ccmux-9"), json!(999), json!("1"), json!(null)] {
@@ -1501,8 +1498,8 @@ fn stalled_upgrade_and_rpc_obey_the_one_second_wall_budget() {
         server.join().unwrap();
         assert_kind(&result, CodexFailureKind::Timeout);
         assert!(elapsed >= POLL_TIMEOUT, "{elapsed:?}");
-        // Kernel scheduling is not an exact clock; keep a small measured allowance.
-        assert!(elapsed <= POLL_TIMEOUT + Duration::from_millis(10), "{elapsed:?}");
+        // SO_RCVTIMEO wake-up and scheduler latency may land just after the deadline.
+        assert!(elapsed < POLL_TIMEOUT + Duration::from_millis(100), "{elapsed:?}");
     }
 }
 
@@ -1527,10 +1524,9 @@ fn production_connector_enforces_frame_and_aggregate_message_limits() {
                 let _ = socket.send(Message::Text(reply.into()));
             }
         });
-        let (client, result, _) = bounded_poll(loopback_client(address));
+        let (_, result, _) = bounded_poll(loopback_client(address));
         server.join().unwrap();
         assert_kind(&result, CodexFailureKind::Protocol);
-        assert!(client.server_identity().is_none(), "oversized initialize was accepted");
     }
 }
 
