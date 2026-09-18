@@ -1942,7 +1942,7 @@ mod tests {
     #[test]
     fn the_sidebar_command_is_the_resolved_binary_plus_my_own_argv() {
         let cmd = sidebar_command(Path::new("/opt/ccmux"), &crate::settings::CodexSettings::default()).expect("build");
-        assert!(cmd.starts_with("env CCMUX_CODEX_BIN=codex /bin/sh -c 'exec \"$0\" \"$@\"' /opt/ccmux"), "{cmd:?}");
+        assert!(cmd.starts_with("env CCMUX_CODEX_BIN=codex CCMUX_CODEX_IMPORTS=hide /bin/sh -c 'exec \"$0\" \"$@\"' /opt/ccmux"), "{cmd:?}");
         assert!(cmd.ends_with("--codex-url= --codex-token-file="));
         let args: Vec<String> = std::env::args().skip(1).collect();
         for a in &args {

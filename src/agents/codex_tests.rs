@@ -18,7 +18,7 @@ fn row() -> Session {
 
 fn config() -> CodexConfig {
     CodexConfig { url: "ws://127.0.0.1:8965".into(),
-        token_file: "/fixture/token".into(), bin: "codex".into() }
+        token_file: "/fixture/token".into(), bin: "codex".into(), show_imports: false }
 }
 
 fn entry(row: &Session) -> PaneEntry {

@@ -13,11 +13,14 @@ pub struct CodexSettings {
     pub url: String,
     pub token_file: PathBuf,
     pub bin: String,
+    /// `CCMUX_CODEX_IMPORTS=show` lists Codex Desktop's Claude-transcript
+    /// imports; anything else, including unset, hides them (§12.2).
+    pub show_imports: bool,
 }
 
 impl Default for CodexSettings {
     fn default() -> Self {
-        Self { url: String::new(), token_file: PathBuf::new(), bin: "codex".into() }
+        Self { url: String::new(), token_file: PathBuf::new(), bin: "codex".into(), show_imports: false }
     }
 }
 
@@ -32,6 +35,7 @@ impl CodexSettings {
         exists: impl Fn(&Path) -> bool,
     ) -> Self {
         let bin = env("CCMUX_CODEX_BIN").filter(|s| !s.is_empty()).unwrap_or_else(|| "codex".into());
+        let show_imports = env("CCMUX_CODEX_IMPORTS").as_deref() == Some("show");
         let (url, url_defaulted) = match url {
             Some(url) => (url, false),
             None => match env("CCMUX_CODEX_URL") {
@@ -40,7 +44,7 @@ impl CodexSettings {
             },
         };
         if url.is_empty() {
-            return Self { url, token_file: PathBuf::new(), bin };
+            return Self { url, token_file: PathBuf::new(), bin, show_imports };
         }
 
         let (token_file, token_defaulted) = match token {
@@ -65,9 +69,9 @@ impl CodexSettings {
         if url_defaulted && token_defaulted
             && (token_file.as_os_str().is_empty() || !exists(&token_file))
         {
-            return Self { url: String::new(), token_file: PathBuf::new(), bin };
+            return Self { url: String::new(), token_file: PathBuf::new(), bin, show_imports };
         }
-        Self { url, token_file, bin }
+        Self { url, token_file, bin, show_imports }
     }
 
     pub fn enabled(&self) -> bool { !self.url.is_empty() }
@@ -82,6 +86,7 @@ impl CodexSettings {
         }
         Ok(CodexConfig {
             url: self.url.clone(), token_file: self.token_file.clone(), bin: self.bin.clone(),
+            show_imports: self.show_imports,
         })
     }
 
@@ -109,13 +114,21 @@ impl CodexSettings {
         out
     }
 
+    pub fn imports_value(&self) -> &'static str {
+        if self.show_imports { "show" } else { "hide" }
+    }
+
     pub fn command(&self, exe: &Path, args: impl IntoIterator<Item = OsString>) -> Option<String> {
         let args = self.args(args);
         let bin_env = format!("CCMUX_CODEX_BIN={}", self.bin);
+        // Resolved once, then carried: a pane must not re-decide from its own
+        // environment, the same rule the URL and token path follow.
+        let imports_env = format!("CCMUX_CODEX_IMPORTS={}", self.imports_value());
         // env treats even an absolute program path containing '=' as an
         // assignment. A fixed shell executable ends that scan; the launch
         // target and arguments stay positional data, not shell source.
-        let mut words = vec!["env", bin_env.as_str(), "/bin/sh", "-c", "exec \"$0\" \"$@\"", exe.to_str()?];
+        let mut words = vec!["env", bin_env.as_str(), imports_env.as_str(),
+            "/bin/sh", "-c", "exec \"$0\" \"$@\"", exe.to_str()?];
         for arg in &args { words.push(arg.to_str()?); }
         Some(tmux::sh_join(&words))
     }

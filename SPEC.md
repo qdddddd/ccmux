@@ -3864,6 +3864,21 @@ Add these global CLI options, accepted by the launcher and `sidebar`:
 | `--codex-url <URL>` | `CCMUX_CODEX_URL` | `ws://127.0.0.1:8965`; flag, environment, default |
 | `--codex-token-file <PATH>` | `CCMUX_CODEX_TOKEN_FILE` | `$XDG_CONFIG_HOME/agents/codex-serve.token`, else `$HOME/.config/agents/codex-serve.token`; flag, environment, default |
 | no new binary flag | `CCMUX_CODEX_BIN` | `codex`; one executable, not shell text |
+| no new flag | `CCMUX_CODEX_IMPORTS` | `hide`; exactly `show` lists Claude-transcript imports |
+
+**Claude-transcript imports are hidden by default.** Codex Desktop imports
+Claude Code conversations as threads. They record no `model` and no
+`reasoningEffort` — every thread a Codex client works in records both — and
+they duplicate rows the sidebar already lists from Claude, under the same
+names. A row whose `model` AND `reasoningEffort` are absent or null is
+excluded as `Imported`, after the ephemeral, parent and source rules so a
+source exclusion still outranks it, and the exclusion is contradicted the
+moment the row records either field. `CCMUX_CODEX_IMPORTS=show` lists them;
+any other value, including unset and an empty string, hides them. The
+resolved answer is carried to panes and restarts in the launch environment
+beside `CCMUX_CODEX_BIN`, so a child never re-decides from its own
+environment. Hiding is a listing rule only: it changes no verb, no dismissal
+record and no pane map.
 
 Resolve URL and token path independently. A PRESENT flag wins over a PRESENT
 environment value, including an empty string; only an absent value falls

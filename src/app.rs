@@ -11958,6 +11958,7 @@ mod tests {
         a.codex.settings = crate::settings::CodexSettings {
             url: "ws://127.0.0.1:8965".into(),
             token_file: "/absolute/token file".into(), bin: "/custom/codex bin".into(),
+            show_imports: false,
         };
         let entry = a.map.panes.get_mut("%2").expect("own Claude pane");
         entry.provider = Provider::Codex;

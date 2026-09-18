@@ -784,6 +784,7 @@ fn exec_command(p: &restart::Pending, codex: &settings::CodexSettings) -> std::p
     let mut command = std::process::Command::new(&p.exe);
     command.args(codex.args(std::env::args_os().skip(1)))
         .env("CCMUX_CODEX_BIN", &codex.bin)
+        .env("CCMUX_CODEX_IMPORTS", codex.imports_value())
         .env(restart::HANDOFF_ENV, restart::handoff_token());
     command
 }
@@ -1405,6 +1406,7 @@ mod tests {
             let cli = Cli::try_parse_from(["ccmux", "--socket", "ccmux-smoke"]).unwrap();
             let settings = settings::CodexSettings {
                 url: url.into(), token_file: "/absolute/token file".into(), bin: "/custom/codex bin".into(),
+                show_imports: false,
             };
             // Launcher create/heal and t all consume this one command builder.
             let launch = sidebar_command(&cli, 34, &settings).unwrap();
@@ -1418,6 +1420,20 @@ mod tests {
                 OsStr::new("--codex-token-file=/absolute/token file")]));
             assert!(command.get_envs().any(|(key, value)| key == "CCMUX_CODEX_BIN"
                 && value == Some(OsStr::new("/custom/codex bin"))));
+            // The import policy rides with the rest: a restarted sidebar and a
+            // new tab inherit the resolved answer, never their own environment.
+            for (settings, want) in [(&settings, "hide"),
+                (&settings::CodexSettings { show_imports: true, ..settings.clone() }, "show")]
+            {
+                let command = exec_command(&pending, settings);
+                assert!(command.get_envs().any(|(key, value)| key == "CCMUX_CODEX_IMPORTS"
+                    && value == Some(OsStr::new(want))), "{want}");
+                for line in [sidebar_command(&cli, 34, settings).unwrap(),
+                    restart::sidebar_command(&pending.exe, settings).unwrap()]
+                {
+                    assert!(line.contains(&format!("CCMUX_CODEX_IMPORTS={want}")), "{want}: {line}");
+                }
+            }
             let peer = restart::sidebar_command(&pending.exe, &settings).unwrap();
             assert!(peer.contains(&tmux::sh_quote(&format!("CCMUX_CODEX_BIN={}", settings.bin))));
             assert!(peer.ends_with(&format!("{} '--codex-token-file=/absolute/token file'", tmux::sh_quote(&format!("--codex-url={url}")))));

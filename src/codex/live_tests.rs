@@ -147,6 +147,8 @@ fn settings(get: impl Fn(&str) -> Option<String>) -> Result<CodexConfig> {
     ensure!(get("CCMUX_CODEX_LIVE_TEST").as_deref() == Some("1"),
         "set CCMUX_CODEX_LIVE_TEST=1 explicitly");
     let config = CodexConfig {
+        // The harness owns every thread it lists; imports cannot appear.
+        show_imports: true,
         url: get("CCMUX_CODEX_LIVE_URL").filter(|s| !s.is_empty())
             .ok_or_else(|| anyhow::anyhow!("set CCMUX_CODEX_LIVE_URL explicitly"))?,
         token_file: get("CCMUX_CODEX_LIVE_TOKEN_FILE").filter(|s| !s.is_empty())

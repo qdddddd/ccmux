@@ -38,6 +38,11 @@ pub struct CodexConfig {
     pub url: String,
     pub token_file: PathBuf,
     pub bin: String,
+    /// Codex Desktop imports Claude Code transcripts as threads. They carry no
+    /// model and no reasoning effort, they duplicate rows the sidebar already
+    /// lists from Claude, and no Codex work happens in them, so they are
+    /// hidden unless the operator asks for them (§12.2).
+    pub show_imports: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +154,7 @@ struct Prepared {
 
 pub struct CodexClient {
     prepared: Prepared,
+    show_imports: bool,
     exclusions: BTreeMap<String, Exclusion>,
     attempted: BTreeMap<String, u64>,
     sequence: u64,
@@ -241,6 +247,7 @@ fn prepare_with(
     authorization.set_sensitive(true);
     Ok(CodexClient {
         prepared: Prepared { endpoint, addresses, authorization, token },
+        show_imports: config.show_imports,
         exclusions: BTreeMap::new(),
         attempted: BTreeMap::new(),
         sequence: 0,
@@ -556,13 +563,16 @@ impl Rpc<'_> {
 // ── Thread parsing and observation union ──────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Exclusion { Ephemeral, Parent, SubAgent, Custom }
+enum Exclusion { Ephemeral, Parent, SubAgent, Custom, Imported }
 
 impl Exclusion {
     fn contradicted(self, row: &Value) -> bool {
         match self {
             Self::Ephemeral => row.get("ephemeral") == Some(&Value::Bool(false)),
             Self::Parent => row.get("parentThreadId").is_none_or(Value::is_null),
+            // An import that acquires a model or an effort has become a thread
+            // someone works in; it is a row again.
+            Self::Imported => !imported(row),
             Self::SubAgent | Self::Custom => match source(row.get("source")) {
                 Source::Eligible => true,
                 Source::Excluded(other) => self != other,
@@ -598,7 +608,14 @@ fn timestamp(row: &Value, key: &str) -> Option<i64> {
     row.get(key).and_then(Value::as_i64)?.checked_mul(1000)
 }
 
-fn parse_thread(row: &Value) -> Result<Parsed, RowError> {
+/// Codex Desktop's Claude-transcript imports: no `model` and no
+/// `reasoningEffort`. Every thread a Codex client works in records both.
+fn imported(row: &Value) -> bool {
+    let absent = |key| row.get(key).is_none_or(Value::is_null);
+    absent("model") && absent("reasoningEffort")
+}
+
+fn parse_thread(row: &Value, show_imports: bool) -> Result<Parsed, RowError> {
     let id = thread_id(row).ok_or(RowError::Invalid)?;
     if row.get("ephemeral") == Some(&Value::Bool(true)) {
         return Ok(Parsed::Excluded(Exclusion::Ephemeral));
@@ -613,6 +630,9 @@ fn parse_thread(row: &Value) -> Result<Parsed, RowError> {
     }
     if row.get("ephemeral") != Some(&Value::Bool(false)) {
         return Err(RowError::Invalid);
+    }
+    if !show_imports && imported(row) {
+        return Ok(Parsed::Excluded(Exclusion::Imported));
     }
     let cwd = row.get("cwd").and_then(Value::as_str).filter(|s| {
         Path::new(s).is_absolute() && !s.contains('\0')
@@ -745,7 +765,7 @@ impl Union {
             client.exclusions.remove(&id);
             self.observation.fail(CodexError::incomplete());
         }
-        let valid = match parse_thread(&row) {
+        let valid = match parse_thread(&row, client.show_imports) {
             Ok(Parsed::Excluded(exclusion)) => {
                 if self.loaded.contains(&id) && !contradiction {
                     client.exclusions.insert(id.clone(), exclusion);

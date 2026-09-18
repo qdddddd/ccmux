@@ -75,7 +75,10 @@ ccmux --codex-url ws://127.0.0.1:8965 \
 
 The environment equivalents are `CCMUX_CODEX_URL` and
 `CCMUX_CODEX_TOKEN_FILE`; flags take precedence. `CCMUX_CODEX_BIN`
-selects the Codex executable. Settings follow new tabs and `R` restarts.
+selects the Codex executable. `CCMUX_CODEX_IMPORTS=show` lists the Claude
+conversations Codex Desktop imported as threads; they are hidden by default
+because they duplicate rows the sidebar already shows from Claude and no
+Codex work happens in them. Settings follow new tabs and `R` restarts.
 The token is read inside each attach pane, never placed in tmux options or
 command arguments. An empty URL disables Codex; an absent URL uses the
 loopback default above.

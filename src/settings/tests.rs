@@ -107,6 +107,7 @@ fn empty_flag_or_environment_url_is_off_before_any_existence_probe() {
         });
     assert_eq!(explicit, CodexSettings {
         url: String::new(), token_file: PathBuf::new(), bin: "/opt/codex custom".into(),
+        show_imports: false,
     });
     assert_eq!(probes.get(), 0);
 
@@ -126,7 +127,8 @@ fn empty_flag_or_environment_url_is_off_before_any_existence_probe() {
 #[test]
 fn canonical_args_pin_on_and_off_over_conflicting_tmux_environment() {
     for url in ["", "ws://localhost:8965"] {
-        let s = CodexSettings { url: url.into(), token_file: "/resolved/token".into(), bin: "codex".into() };
+        let s = CodexSettings { url: url.into(), token_file: "/resolved/token".into(),
+            bin: "codex".into(), show_imports: false };
         let original = ["sidebar", "--socket", "ccmux-smoke", "--codex-url=ws://stale",
             "--codex-token-file", "stale", "--interval", "9000"].map(Into::into);
         let args = s.args(original);
@@ -141,11 +143,12 @@ fn canonical_args_pin_on_and_off_over_conflicting_tmux_environment() {
 fn command_quotes_each_nonsecret_word_without_reading_token_path() {
     let s = CodexSettings {
         url: "ws://127.0.0.1:8965".into(), token_file: "/never read/a'b $(false)".into(),
-        bin: "/bin/a; $(false)".into(),
+        bin: "/bin/a; $(false)".into(), show_imports: false,
     };
     let cmd = s.command(Path::new("/opt/ccmux build"), [OsString::from("sidebar")]).unwrap();
     let bin = format!("CCMUX_CODEX_BIN={}", s.bin);
-    assert_eq!(cmd, tmux::sh_join(&["env", &bin, "/bin/sh", "-c", "exec \"$0\" \"$@\"", "/opt/ccmux build",
+    let imports = format!("CCMUX_CODEX_IMPORTS={}", s.imports_value());
+    assert_eq!(cmd, tmux::sh_join(&["env", &bin, &imports, "/bin/sh", "-c", "exec \"$0\" \"$@\"", "/opt/ccmux build",
         "sidebar", &format!("--codex-url={}", s.url),
         &format!("--codex-token-file={}", s.token_file.to_str().unwrap())]));
     assert!(!cmd.contains("CODEX_REMOTE_TOKEN"));
@@ -183,7 +186,7 @@ fn commands_execute_paths_containing_equals_and_preserve_bin_and_argv() {
     for url in ["", "ws://127.0.0.1:8965"] {
         let settings = CodexSettings {
             url: url.into(), token_file: "/fixture/token ' file".into(),
-            bin: "/opt/a b' $(false) codex".into(),
+            bin: "/opt/a b' $(false) codex".into(), show_imports: false,
         };
         let probe = r#"printf '%s\0' "$CCMUX_CODEX_BIN" "$0" "$@""#;
         let args = ["-c", probe, "sidebar", "--session", "scratch"].map(OsString::from);
@@ -210,5 +213,31 @@ fn rejected_urls_are_forwarded_as_invalid_without_copying_private_values() {
         let child = CodexSettings { url: "invalid".into(), ..CodexSettings::default() };
         assert!(child.enabled());
         assert_eq!(child.config().err().unwrap().message, settings.config().err().unwrap().message);
+    }
+}
+
+#[test]
+fn only_an_explicit_show_lists_claude_transcript_imports() {
+    for (value, shown) in [(None, false), (Some(""), false), (Some("show"), true),
+        (Some("hide"), false), (Some("Show"), false), (Some("1"), false), (Some("true"), false)]
+    {
+        let env = |key: &str| match key {
+            "CCMUX_CODEX_IMPORTS" => value.map(str::to_owned),
+            "HOME" => Some("/home/fixture".into()),
+            _ => None,
+        };
+        let on = CodexSettings::resolve(Some("ws://127.0.0.1:8965".into()),
+            Some("/fixture/token".into()), env, None, |_| true);
+        assert_eq!(on.show_imports, shown, "{value:?}");
+        assert_eq!(on.config().unwrap().show_imports, shown, "{value:?}");
+        assert_eq!(on.imports_value(), if shown { "show" } else { "hide" });
+        // The resolved value is carried, so a pane never re-decides from its
+        // own environment — the rule the URL and token path already follow.
+        let cmd = on.command(Path::new("/opt/ccmux"), [OsString::from("sidebar")]).unwrap();
+        assert!(cmd.contains(&format!("CCMUX_CODEX_IMPORTS={}", on.imports_value())), "{cmd}");
+        // Explicit OFF still answers the question it was asked.
+        let off = CodexSettings::resolve(Some(String::new()), None, env, None,
+            |_: &Path| panic!("explicit OFF must not probe"));
+        assert_eq!(off.show_imports, shown, "{value:?} with codex off");
     }
 }

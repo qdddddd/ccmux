@@ -13,7 +13,8 @@ const CUTOFF: i64 = NOW - HISTORY_DAYS * 86_400_000;
 fn id(n: u64) -> String { format!("01a0a609-12a6-7000-8000-{n:012x}") }
 
 fn config(url: &str) -> CodexConfig {
-    CodexConfig { url: url.into(), token_file: "/unused/fixture-token".into(), bin: "codex".into() }
+    CodexConfig { url: url.into(), token_file: "/unused/fixture-token".into(), bin: "codex".into(),
+        show_imports: false }
 }
 
 fn client() -> CodexClient {
@@ -28,12 +29,13 @@ fn thread(n: u64) -> Value {
         "cwd":"/fixture/work", "createdAt":NOW/1000-100, "updatedAt":NOW/1000,
         "ephemeral":false, "parentThreadId":null, "forkedFromId":null,
         "source":"cli", "status":{"type":"idle"}, "turns":[],
-        "cliVersion":"0.153.4", "modelProvider":"openai", "projectId":null
+        "cliVersion":"0.153.4", "modelProvider":"openai", "projectId":null,
+        "model":"gpt-5.6-luna", "reasoningEffort":"low"
     })
 }
 
 fn eligible(value: &Value) -> Session {
-    match parse_thread(value) {
+    match parse_thread(value, false) {
         Ok(Parsed::Eligible(row)) => *row,
         _ => panic!("expected eligible fixture"),
     }
@@ -286,7 +288,7 @@ fn malformed_eligible_fields_are_loss_not_idle() {
     for field in ["id", "cwd", "createdAt", "updatedAt", "ephemeral", "source", "status", "preview"] {
         let mut row = thread(1);
         row.as_object_mut().unwrap().remove(field);
-        assert!(parse_thread(&row).is_err(), "{field}");
+        assert!(parse_thread(&row, false).is_err(), "{field}");
     }
     for (field, value) in [
         ("id",json!("short")), ("id",json!(4)), ("cwd",json!("relative")),
@@ -299,7 +301,7 @@ fn malformed_eligible_fields_are_loss_not_idle() {
     ] {
         let mut row = thread(1);
         row[field] = value;
-        assert!(parse_thread(&row).is_err(), "{field}");
+        assert!(parse_thread(&row, false).is_err(), "{field}");
     }
 }
 
@@ -317,7 +319,7 @@ fn all_eligible_source_strings_are_accepted() {
     for source in ["cli","vscode","exec","appServer","unknown"] {
         let mut row = thread(1);
         row["source"] = json!(source);
-        assert!(matches!(parse_thread(&row), Ok(Parsed::Eligible(_))));
+        assert!(matches!(parse_thread(&row, false), Ok(Parsed::Eligible(_))));
     }
 }
 
@@ -330,7 +332,7 @@ fn every_sole_subagent_payload_and_string_custom_are_deliberate_exclusions() {
         json!({"subAgent":[]}), json!({"subAgent":{"future":true}}), json!({"custom":"x"}),
     ] {
         let row = json!({"id":id(1),"source":source});
-        assert!(matches!(parse_thread(&row), Ok(Parsed::Excluded(_))));
+        assert!(matches!(parse_thread(&row, false), Ok(Parsed::Excluded(_))));
         let mut script = fleet(vec![], vec![id(1)]);
         script.reads.insert(id(1), row);
         let (result, _) = poll(script);
@@ -346,7 +348,7 @@ fn independent_exclusions_precede_unfamiliar_sources_in_both_halves() {
         for field in ["ephemeral", "parentThreadId"] {
             let mut row = json!({"id":id(1),"source":source,"updatedAt":NOW/1000});
             row[field] = if field == "ephemeral" { json!(true) } else { json!(id(8)) };
-            assert!(matches!(parse_thread(&row), Ok(Parsed::Excluded(_))));
+            assert!(matches!(parse_thread(&row, false), Ok(Parsed::Excluded(_))));
             for history in [true, false] {
                 let mut script = fleet(if history { vec![row.clone()] } else { vec![] }, vec![id(1)]);
                 script.reads.insert(id(1), row.clone());
@@ -357,7 +359,7 @@ fn independent_exclusions_precede_unfamiliar_sources_in_both_halves() {
             }
         }
     }
-    assert!(parse_thread(&json!({"id":"bad","ephemeral":true})).is_err());
+    assert!(parse_thread(&json!({"id":"bad","ephemeral":true}), false).is_err());
 }
 
 #[test]
@@ -1868,4 +1870,71 @@ fn real_token_reader_bounds_sparse_file_reads_before_allocating_its_size() {
         .args(["--exact", "codex::tests::real_token_reader_bounds_sparse_file_reads_before_allocating_its_size"])
         .env("CCMUX_TOKEN_READER_CHILD", "1").current_dir(&dir.0).output().unwrap();
     assert!(output.status.success(), "bounded reader failed: {}", String::from_utf8_lossy(&output.stderr));
+}
+
+// ── Codex Desktop's Claude-transcript imports (§12.2) ──────────────────────
+//
+// They carry no `model` and no `reasoningEffort`, they duplicate rows the
+// sidebar already lists from Claude, and no Codex work happens in them.
+
+fn import_row(n: u64) -> Value {
+    let mut row = thread(n);
+    row.as_object_mut().unwrap().remove("model");
+    row.as_object_mut().unwrap().remove("reasoningEffort");
+    row["name"] = json!("kronos/pipeline");
+    row
+}
+
+#[test]
+fn a_claude_transcript_import_is_hidden_unless_the_operator_asks_for_it() {
+    let row = import_row(1);
+    assert!(matches!(parse_thread(&row, false), Ok(Parsed::Excluded(Exclusion::Imported))));
+    match parse_thread(&row, true) {
+        Ok(Parsed::Eligible(session)) => assert_eq!(session.name, "kronos/pipeline"),
+        other => panic!("showing imports must list the row: {:?}", other.is_ok()),
+    }
+    // Null is the same as absent: both are what the server sends for these.
+    let mut nulls = import_row(2);
+    nulls["model"] = Value::Null;
+    nulls["reasoningEffort"] = Value::Null;
+    assert!(matches!(parse_thread(&nulls, false), Ok(Parsed::Excluded(Exclusion::Imported))));
+}
+
+#[test]
+fn a_thread_with_either_a_model_or_an_effort_is_never_an_import() {
+    for keep in ["model", "reasoningEffort"] {
+        let mut row = import_row(1);
+        row[keep] = if keep == "model" { json!("gpt-5.6-luna") } else { json!("low") };
+        assert!(matches!(parse_thread(&row, false), Ok(Parsed::Eligible(_))), "{keep} alone");
+    }
+}
+
+#[test]
+fn an_import_that_gains_a_model_contradicts_its_cached_exclusion() {
+    let clock = FakeClock::default();
+    let mut client = client();
+    let rows = vec![import_row(1)];
+    let mut connector = FakeConnector::new(&clock, fleet(rows, vec![id(1)]));
+    assert!(client.poll_with(NOW, &clock, &mut connector).complete);
+    assert_eq!(client.exclusions[&id(1)], Exclusion::Imported);
+
+    // Someone works in it from a Codex client: it is a row again, and the
+    // stale exclusion must not keep it hidden.
+    let mut worked = import_row(1);
+    worked["model"] = json!("gpt-5.6-luna");
+    let mut connector = FakeConnector::new(&clock, fleet(vec![worked], vec![id(1)]));
+    let result = client.poll_with(NOW, &clock, &mut connector);
+    assert!(!client.exclusions.contains_key(&id(1)));
+    assert_eq!(result.sessions.len(), 1);
+}
+
+#[test]
+fn a_source_exclusion_outranks_the_import_rule() {
+    let mut row = import_row(1);
+    row["source"] = json!({"subAgent":"x"});
+    assert!(matches!(parse_thread(&row, false), Ok(Parsed::Excluded(Exclusion::SubAgent))));
+    row["source"] = json!({"custom":"x"});
+    assert!(matches!(parse_thread(&row, false), Ok(Parsed::Excluded(Exclusion::Custom))));
+    row["source"] = json!("future");
+    assert!(matches!(parse_thread(&row, false), Err(RowError::Source)));
 }

@@ -128,7 +128,7 @@ fn with_sidebar(test: impl FnOnce(&mut App, &Rc<RefCell<Server>>)) {
     a.kill_pane = tmux::kill_pane;
     a.codex.settings = crate::settings::CodexSettings {
         url: "ws://127.0.0.1:8965".into(), token_file: "/missing/fixture/token file".into(),
-        bin: "/fixture/codex bin".into(),
+        bin: "/fixture/codex bin".into(), show_imports: false,
     };
     a.codex.prepare = |_| panic!("pane key must not prepare or call RPC");
     a.sidebar_cmd = a.codex.settings.command(Path::new("/fixture/ccmux"),
