@@ -37,6 +37,8 @@ cargo install --path .
 ```
 
 Requires `tmux` and the `claude` CLI on `PATH`, and Rust with edition 2024.
+The `codex` CLI is needed only to open a Codex row; listing them works
+without it.
 
 ## Launch
 
@@ -56,10 +58,14 @@ sidebar was quit with `q`, running `ccmux` puts it back.
 | `--light` / `--dark` | light | Palette. Not auto-detected |
 | `-L`, `--socket <NAME>` | tmux default | Use a separate tmux server |
 | `--interval <MS>` | `2500` | Poll interval, for `ccmux sidebar` only |
+| `--codex-url <URL>` | loopback, if the token file exists | Codex app-server endpoint; empty disables Codex |
+| `--codex-token-file <PATH>` | under `$XDG_CONFIG_HOME` or `$HOME` | Codex bearer-token file path; never a token |
 
 The palette can also be set with `CCMUX_THEME=dark`. A flag wins over the
 variable. `CCMUX_CLAUDE_BIN` overrides the `claude` binary, and
-`CCMUX_TMUX_SOCKET` is the variable form of `--socket`.
+`CCMUX_TMUX_SOCKET` is the variable form of `--socket`. The Codex variables
+are `CCMUX_CODEX_URL`, `CCMUX_CODEX_TOKEN_FILE`, `CCMUX_CODEX_BIN` and
+`CCMUX_CODEX_IMPORTS`, described under Codex sessions.
 
 ## Codex sessions
 
@@ -322,6 +328,10 @@ window is on screen. A list that stops changing is polled less often, down to
 every 30 s. A keypress or `r` restores the fast rate. The header dot is hollow
 while polling is paused.
 
+When Codex is on, its poll shares that tick under a 1000 ms budget covering
+connect, send and read together, so a slow or unreachable app-server cannot
+stall the sidebar for longer than that.
+
 ## Degraded mode
 
 `ccmux sidebar` also runs outside tmux. The list, filtering, `n`, `L`,
@@ -342,6 +352,20 @@ name, one at a time, because the tmux socket is process-global:
 ```sh
 cargo test -- --ignored --nocapture live_even_layout
 ```
+
+The Codex cases are gated on three variables and run as one filtered group,
+against an app-server you already have:
+
+```sh
+CCMUX_CODEX_LIVE_TEST=1 \
+CCMUX_CODEX_LIVE_URL=ws://127.0.0.1:8965 \
+CCMUX_CODEX_LIVE_TOKEN_FILE=$HOME/.config/agents/codex-serve.token \
+cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1
+```
+
+They create, name and archive only the threads they start themselves, use a
+private tmux server, and never touch the default one. Without the variables
+they refuse to run rather than falling back to your Codex configuration.
 
 Try the launcher against a throwaway tmux server:
 
