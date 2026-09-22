@@ -83,6 +83,13 @@ The token is read inside each attach pane, never placed in tmux options or
 command arguments. An empty URL disables Codex; an absent URL uses the
 loopback default above.
 
+Opening a Codex row attaches to that thread, and from Codex 0.155.1 an attach
+rewrites the thread's update time, so the row's age resets and it sorts to the
+top.
+Codex 0.155.1 also asks whether you trust a directory the first time you start
+it there; that prompt belongs to a local `codex` start, not to the remote
+attach ccmux uses, and ccmux never answers it for you.
+
 Only loopback `ws://` is supported: `localhost`, `127.0.0.0/8` or
 `[::1]`. For a remote server, open your own SSH tunnel, for example
 `ssh -N -L 8965:127.0.0.1:8965 host`, then use the local URL above.

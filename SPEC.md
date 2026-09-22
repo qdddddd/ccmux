@@ -4993,6 +4993,11 @@ refines the contract; it does not turn unrun experiments into live findings.
 
 - The attach gate passed for CLI **0.154.0** / server **0.153.4**. The archive
   probes ran after the server upgraded, with CLI and server both **0.154.0**.
+  Both components were re-probed at **0.155.1** (PROBE-FINDINGS §11): every
+  RPC the sidebar uses is schema-identical, and archive semantics, the abort
+  of an active turn, the unload boundary and the unprotected external TUI all
+  held. Older §§9–10 findings not listed there stay qualified to their
+  version.
   Generated installed-CLI bindings still do not prove a running server
   capability. Parse responses defensively; unsupported protocol degrades only
   Codex.
@@ -5033,15 +5038,23 @@ refines the contract; it does not turn unrun experiments into live findings.
   established for every empty fork. Keep those rows; anchor step-3-only
   display starts and omit both timestamps from the Codex idle fingerprint.
   Do not create a turn to make a row resumable or use timestamps as identity.
-- Attach did not advance `updatedAt` for loaded or unloaded persisted threads.
+- Attach did not advance `updatedAt` on server 0.153.4. **Server 0.155.1
+  rewrites `updatedAt` on a load or an attach**, by RPC resume, by a remote
+  TUI resume of an unloaded thread, or by the first remote TUI attaching to an
+  already-loaded one; a concurrent second attach did not, and metadata reads
+  never do (n=1 per condition, PROBE-FINDINGS §11). So it orders by last
+  attach, not by last conversational activity: opening a Codex pane moves that
+  row up an `updated_at` ordering and resets its displayed age. The archive tombstone is unaffected, because it compares `updatedAt`
+  only for IDs the `archived:false` history still lists.
   On server 0.153.4, unsubscribed idle threads unloaded after about **30
   minutes**. Server 0.154.0 unloaded them after approximately **60 seconds**:
   60.009–60.014 s in the state probe (n=3) and 60.006/60.012 s in the
-  attached-TUI probe (n=2; PROBE-FINDINGS §10). Both versions require the
-  recent-history half of the union.
-- On server 0.154.0, `thread/read` and DB-only `thread/list` return `cwd` as
-  the symlink-resolved real path, while scan-mode `thread/list` returns it as
-  given; a `cwd` filter given the unresolved path still matched
+  attached-TUI probe (n=2; PROBE-FINDINGS §10); server 0.155.1 measured
+  60.03 s (n=3; §11). Every version requires the recent-history half of the
+  union.
+- On servers 0.154.0 and 0.155.1, `thread/read` and DB-only `thread/list`
+  return `cwd` as the symlink-resolved real path, while scan-mode
+  `thread/list` returns it as given; a `cwd` filter given the unresolved path still matched
   (PROBE-FINDINGS §10). Compare a live `cwd` only after canonicalizing both
   sides, and never treat lexical cwd as identity.
 - `thread/archive` has no expected-status, idle-only, or force precondition.
@@ -5462,8 +5475,11 @@ The shipped cases are:
 
 - **Multi-attach and loaded/unloaded resume:** two real remote TUIs identify
   the same launch thread through `/status`; one exits while the other remains.
-  Attach must preserve `updatedAt`, measured across a timestamp-second
-  boundary. Resume both a loaded thread and an unloaded persisted fixture.
+  Attach must not move `updatedAt` backwards; it may advance it, because
+  server 0.155.1 rewrites the field on load and on the first attach (§11).
+  The invariant that a metadata read never moves it belongs to the
+  non-loading/non-subscribing case. Resume both a loaded thread and an
+  unloaded persisted fixture.
   The fixture archives and unarchives ONLY its registered thread, then
   requires absent loaded membership and `notLoaded` before opening it. If
   archive/unarchive no longer produces that fixture, fail setup; do not claim
@@ -5555,10 +5571,13 @@ and current ~60-second natural idle unloads, last-client pending-approval
 survival/replay, native-client SIGKILL, standalone-writer archive refusal, and
 in-TUI
 `/resume` / `/fork` / `/new` identity and default-cwd behavior remain the
-recorded observations in `PROBE-FINDINGS.md` §§9–10 and the evidence limits in
+recorded observations in `PROBE-FINDINGS.md` §§9–11 and the evidence limits in
 §12.10. They need manual re-probing after a Codex upgrade before extending
 those claims to the new version. A pass of the bounded suite does not
-revalidate them. The long idle wait, external standalone process, and
+revalidate them. The 0.154.0 to 0.155.1 upgrade was re-probed in §11; the
+claims it did not re-measure, including last-client pending-approval behavior,
+standalone-writer refusal and the in-TUI identity flows, stay qualified to the
+version that measured them. The long idle wait, external standalone process, and
 interactive last-client approval/identity flows are intentionally outside the
 automatic harness. The shipped approval case tests only the archive gate while
 the creator remains attached.

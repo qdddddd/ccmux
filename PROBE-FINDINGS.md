@@ -523,6 +523,8 @@ apply to every finding below.
 This is the historical version-skew snapshot. §10 records the 2026-09-17
 archive probes after app-server upgraded to 0.154.0 and supersedes only the
 current unload timing and archive-authority conclusions called out there.
+§11 re-probes both components at 0.155.1 and supersedes this section's
+unchanged-attach-timestamp result.
 
 ### Method and isolation
 
@@ -1022,7 +1024,8 @@ evidence limits.
 ## 10. Codex archive probes — 2026-09-17
 
 These findings apply to **codex-cli 0.154.0 connecting to app-server 0.154.0**
-on **2026-09-17 (Asia/Taipei, UTC+08:00)**. Every mutation targeted a disposable
+on **2026-09-17 (Asia/Taipei, UTC+08:00)**. §11 re-measures the load-bearing
+ones at 0.155.1; the rest stay qualified to this version. Every mutation targeted a disposable
 probe thread owned by this run. Evidence was collected under
 `~/.local/tmp/ccmux-archprobe-*`; those scratch artifacts are not retained in
 this repository. No production thread was interrupted, archived, unarchived,
@@ -1192,3 +1195,100 @@ refused attempts on 3 `codex exec` threads, only one of them (2 attempts)
 mid-command, not proof for every native runtime. The attached-idle TUI result
 is n=2 and cannot supply process discovery. These limits prohibit stronger
 claims; they do not justify broader mutation authority.
+
+## 11. Codex 0.155.1 re-probe — 2026-09-22
+
+These findings apply to **codex-cli 0.155.1 connecting to app-server 0.155.1**
+on **2026-09-22 (Asia/Taipei, UTC+08:00)**, after both the CLI and the
+app-server were upgraded from 0.154.0. SPEC §12.11 requires this re-probe
+before extending §§9–10 claims to a new version. Every mutation targeted a
+disposable probe thread created and registered by this run, left archived
+afterwards; evidence was collected under scratch directories that are not
+retained in this repository. No production thread was interrupted, archived,
+unarchived, or deleted.
+
+### What carried over unchanged
+
+- **Every RPC the sidebar uses is schema-identical.** Method: generate the
+  0.155.1 request schema and compare it with the retained 0.154.0 schema.
+  `ThreadListParams`, `ThreadListResponse`, `ThreadReadParams`,
+  `ThreadReadResponse`, `ThreadLoadedListParams`, `ThreadLoadedListResponse`,
+  `ThreadArchiveParams`, `ThreadArchiveResponse` and `ThreadUnarchiveParams`
+  compare byte for byte, and no `thread/`, `turn/` or `item/` method name was
+  added or removed. The only additions are thread attachments and one feedback
+  field, neither of which the sidebar reads.
+- **Archive semantics.** Method: archive owned threads and re-read.
+  A `notLoaded` thread archived in 2.5 ms and an idle loaded one in 43.8 ms,
+  each returning `{}` (n=1 per state); the loaded thread left
+  `thread/loaded/list`; both rollouts moved under the archived-session
+  directory; `updatedAt` did not change; `thread/read` still succeeded on the
+  archived ID; the ID appeared only in the `archived:true` listing. Archiving
+  an already-archived ID failed `-32600 no rollout found for thread id <id>`,
+  unarchiving bumped `updatedAt`, and re-archiving returned `{}` (n=1 each).
+- **Archive still aborts an active turn.** Method: archive one owned thread
+  running a foreground sleep (n=1). The archive returned `{}`, the thread went
+  `notLoaded`, and the turn ended `interrupted`. The client-side status gate
+  remains the only guard.
+- **Idle unload boundary.** Method: complete a turn on three owned threads,
+  unsubscribe all three, and sample `thread/loaded/list` every 2 seconds. All
+  three had left the loaded set by the 60.03 s sample (n=3, all on the same
+  sample, so the boundary is located only to that 2-second resolution),
+  matching §10's approximately 60-second 0.154.0 result.
+- **An externally attached remote TUI is still unprotected.** Method: attach
+  the official remote TUI to an owned idle thread, archive it from another
+  connection, then submit text (n=1). The archive returned `{}`, the TUI
+  displayed no notice, and its next submission failed
+  `turn/start failed: thread not found` with `-32600`.
+- **`Thread.cwd` still depends on the read path.** `thread/start` echoed the
+  path as given while `thread/read` returned the symlink-resolved real path
+  for the same owned thread (n=1), as in §10.
+- **Import classification holds.** Method: list the 7-day `archived:false`
+  window read-only. 8 of 15 rows carried neither `model` nor `reasoningEffort`
+  and were Claude-transcript imports; the other 7 carried both. No row carried
+  exactly one of the two fields.
+
+### What changed in 0.155.1
+
+- **Loading or attaching rewrites `updatedAt`.** Method: take a baseline
+  `updatedAt` on an owned thread, issue each metadata read, then load or
+  attach. `thread/read`, `thread/list` and `thread/loaded/list` left
+  `updatedAt` untouched, and so did a second read of an already-loaded thread.
+  An RPC `thread/resume` of an unloaded thread moved it from 1790054877 to
+  1790054945, and a remote-TUI resume of a second unloaded thread moved it
+  from 1790054980 to 1790055045. A remote-TUI attach to a third thread that
+  was ALREADY loaded and subscribed also moved it, from 1790055525 to
+  1790055533; a second TUI attached to that same thread moments later left it
+  at 1790055533, as did closing both panes (n=1 per condition). Each new value
+  is the time of the load or attach, so the field is rewritten rather than
+  incremented. §9 recorded attach as leaving the timestamp unchanged on
+  0.153.4. **Consequence:** `updatedAt` orders by last load, not
+  by last conversational activity, so opening a Codex pane moves that row up an
+  `updated_at` ordering and resets its displayed age. By code reading, not
+  measurement, the archive tombstone is unaffected: it compares `updatedAt`
+  only for IDs the `archived:false` history still lists, which an archived
+  thread is not, and an unarchive already bumps the field before any later
+  load bumps it again. The ignored multi-attach live case pinned the old
+  behavior; because one attach rewrites the field and a concurrent second one
+  does not, it now holds attach only to monotonicity, and the invariant that a
+  metadata read never moves the field stays pinned by the
+  non-loading/non-subscribing case.
+- **A local TUI start prompts for directory trust; a remote attach does not.**
+  Method: start `codex` in a directory with no trust entry, then attach an
+  owned thread with the remote command shape the sidebar uses. The local start
+  showed a trust prompt occupying the composer; the remote attach went straight
+  to the composer, and the trust entries in the Codex configuration were
+  unchanged before and after both the probe and a full ignored-case run.
+  **Consequence:** the sidebar's own attach path is unaffected, and ccmux must
+  not answer that prompt on the operator's behalf for local Codex use.
+
+### Evidence limits
+
+Re-measured facts carry the sample sizes stated above; single-sample results
+are marked n=1 and were taken on one host with a lightly loaded server. These
+§§9–10 findings were NOT re-measured on 0.155.1 and remain version-qualified
+where they were recorded: abort of a turn holding a pending approval or a
+user-input request, standalone `codex exec` writer-lock refusal, native-client
+termination, in-TUI `/resume`, `/fork` and `/new` identity behavior, and
+Desktop's bulk-delete path. Long-term archive retention remains UNMEASURED,
+though the two owned canaries archived on 2026-09-17 were still present and
+still archived five days later, across this upgrade.

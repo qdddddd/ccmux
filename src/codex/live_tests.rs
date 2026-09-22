@@ -1066,6 +1066,17 @@ fn unchanged(before: &Value, after: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Attaching REWRITES `updatedAt` on server 0.155.1, whether or not the thread
+/// was already loaded (§11), so an attach can only be held to monotonicity.
+/// The invariant that still holds — a metadata read never moves it — is
+/// `unchanged`, pinned by the non-loading/non-subscribing case.
+fn not_rewound(before: &Value, after: &Value) -> Result<()> {
+    let before = before["updatedAt"].as_i64().ok_or_else(|| anyhow::anyhow!("updatedAt missing"))?;
+    let after = after["updatedAt"].as_i64().ok_or_else(|| anyhow::anyhow!("updatedAt missing"))?;
+    ensure!(after >= before, "attach moved updatedAt backwards: {before} -> {after}");
+    Ok(())
+}
+
 fn archived_everywhere(h: &Harness<'_>, id: &str) -> Result<()> {
     let mut rpc = h.rpc(Duration::from_secs(30))?;
     let wait = rpc.wait.scoped(Duration::from_secs(15));
@@ -1189,7 +1200,7 @@ fn live_multi_attach_and_loaded_unloaded_resume() {
         let second = h.open(&id)?;
         h.attached(&first, &id)?;
         h.attached(&second, &id)?;
-        unchanged(&before, &h.rpc(Duration::from_secs(30))?.thread_state(&id, "idle", true)?)?;
+        not_rewound(&before, &h.rpc(Duration::from_secs(30))?.thread_state(&id, "idle", true)?)?;
         h.quit(&first)?;
         h.attached(&second, &id)?;
         h.quit(&second)?;
@@ -1200,7 +1211,7 @@ fn live_multi_attach_and_loaded_unloaded_resume() {
         thread::sleep(Duration::from_millis(1100));
         let pane = h.open(&id)?;
         let mut observer = h.rpc(Duration::from_secs(30))?;
-        unchanged(&before, &observer.thread_state(&id, "idle", true)?)?;
+        not_rewound(&before, &observer.thread_state(&id, "idle", true)?)?;
         observer.close()?;
         h.quit(&pane)?;
         h.record(json!({"event":"multi_attach_resume_pass","id":id}))
