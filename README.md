@@ -312,7 +312,8 @@ v2 pane map, including Claude pane records, and strip Codex dismissal tags.
   closes on any row move, provider change or repeated press, and further
   presses until its 2 s would have ended only say
   `archive window closed — nothing archived`. A press within 750 ms of the
-  previous one is ignored, so a held key deletes or archives nothing.
+  previous one is ignored, and the footer says so; a held key deletes or
+  archives nothing.
 - A delete closes the panes parked on that session, but not a pane you turned
   into a shell with `s`.
 - `R` also runs `claude stop` and `claude respawn`, only on idle or done agents,

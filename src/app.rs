@@ -112,7 +112,8 @@ const CX_WINDOW: Duration = Duration::from_secs(2);
 /// the operator time to read what the press answers: 60 characters of "delete
 /// <name> and its worktree — cannot be undone", which 250 ms never was.
 /// A press inside the bar is not lost — it says so in the footer and the
-/// window stays open (`act_ctrl_x`).
+/// window stays open (`act_ctrl_x`), unless a delete was already settling:
+/// that press cancels the delete, and the window goes with it.
 const CX_MIN_GAP: Duration = Duration::from_millis(750);
 /// How long a qualifying second press waits before the delete actually runs.
 ///
@@ -134,6 +135,16 @@ const _: () = assert!(CX_SETTLE.as_millis() < CX_MIN_GAP.as_millis());
 const CODEX_INVITATION: &str = "Ctrl-x again to archive ";
 /// A Codex window that closed without archiving. It invites no further press.
 const CODEX_CLOSED: &str = "archive window closed — nothing archived";
+/// A Claude press refused by `CX_MIN_GAP`. It names no next press: whether
+/// one would delete depends on a window this flash cannot see, and while one
+/// is open its warning carries the refusal instead (`arm_hint`).
+const CX_TOO_FAST: &str = "too fast — press ignored";
+/// A refused press that cancelled a settling delete. Its window went with it.
+const CX_CANCELLED: &str = "too fast — delete cancelled";
+/// A Claude window that lapsed after a refused press. Once it has gone, the
+/// next press is a first press again — it re-arms a Completed row and stops a
+/// running one — so this invites none.
+const CLAUDE_CLOSED: &str = "delete window closed — nothing deleted";
 /// Names stored in `@ccmux_map`, truncated. tmux rejects a `set-option` value
 /// over ~16 KB (measured: ok at 16323 bytes, "command too long" at 16324), and
 /// `name` is the only unbounded field in a `PaneEntry`.
@@ -520,6 +531,10 @@ pub struct App {
     /// When the LAST `Ctrl+X` arrived, acted on or not. The burst / auto-repeat
     /// guard; see `CX_MIN_GAP`.
     pub cx_last_press: Option<Instant>,
+    /// The open Claude window refused a press under `CX_MIN_GAP`. Lives
+    /// exactly as long as that window: `open_window` clears it, and so does
+    /// the lapse that reads it.
+    pub cx_refused: bool,
     /// A qualifying second press, waiting out `CX_SETTLE`; see the constant.
     pub pending_delete: Option<PendingDelete>,
     /// The end of a Codex window that closed without archiving. Until then
@@ -742,6 +757,7 @@ impl App {
 
             stop_arm: None,
             cx_last_press: None,
+            cx_refused: false,
             pending_delete: None,
             codex_closed_until: None,
             pending_jump: None,
@@ -2305,16 +2321,22 @@ impl App {
             // Buffered burst, or auto-repeat. It acts on nothing, and it
             // CANCELS a settling delete: a second chord this soon after the one
             // that scheduled it is a repeat stream, not a human pressing twice.
-            // The arm itself survives, so a human who merely tapped too fast
-            // still has their window.
-            self.pending_delete = None;
+            // That window went into the delete, so it closes with it. An open
+            // window that has not had its second press survives, so a human
+            // who merely tapped too fast still has it.
+            //
             // Say so. Silence here is indistinguishable from a wedged sidebar:
             // the press acts on nothing and — before this — asked for no redraw
             // either, so the screen kept whatever stale line was on it. While
-            // the window is open `arm_hint` outranks this in the footer, so the
-            // warning is never displaced; it is read exactly when there is no
-            // warning to read, which is the case that looked broken.
-            self.flash("too fast — press Ctrl+X again", MsgLevel::Warn);
+            // the window is open `arm_hint` outranks the flash, so the warning
+            // itself carries the refusal; the flash is read once there is no
+            // window, and invites nothing then.
+            if self.pending_delete.take().is_some() {
+                self.flash(CX_CANCELLED, MsgLevel::Warn);
+            } else {
+                if self.stop_arm.is_some() { self.cx_refused = true; }
+                self.flash(CX_TOO_FAST, MsgLevel::Warn);
+            }
             return Action::Redraw;
         }
 
@@ -2378,7 +2400,7 @@ impl App {
             // window lapses. `claude rm` is documented to work on already-exited
             // sessions (PROBE-FINDINGS §2); this is the press that offers it.
             self.flash(format!("{label} is already stopped"), MsgLevel::Info);
-            self.stop_arm = Some(StopArm {
+            self.open_window(StopArm {
                 provider: Provider::Claude,
                 session_id,
                 short_id,
@@ -2394,7 +2416,7 @@ impl App {
                 // Stamped AFTER the shell-out: the window the footer promises
                 // must be two seconds of the operator's time, not two seconds
                 // minus however long `claude stop` took.
-                self.stop_arm = Some(StopArm {
+                self.open_window(StopArm {
                     provider: Provider::Claude,
                     session_id,
                     short_id,
@@ -2410,17 +2432,24 @@ impl App {
         }
     }
 
+    /// Every window opens here, so none inherits the last one's refusal.
+    fn open_window(&mut self, arm: StopArm) {
+        self.cx_refused = false;
+        self.stop_arm = Some(arm);
+    }
+
     /// Codex first press: local safety checks, then an in-memory arm only.
     fn archive_and_arm(&mut self, session: &Session) {
         if let Some(reason) = self.codex_archive_refusal(session) {
             self.flash(reason, MsgLevel::Warn);
             // A double tap on a refused row is a burst against this press's
-            // stamp; it must not say "press Ctrl+X again" (§12.8).
+            // stamp; it must say the archive window closed, not fall back to
+            // Claude's burst wording (§12.8).
             self.extend_codex_closed(Instant::now() + CX_MIN_GAP);
             return;
         }
         let label = session_label(session);
-        self.stop_arm = Some(StopArm {
+        self.open_window(StopArm {
             provider: Provider::Codex,
             session_id: session.session_id.clone(),
             short_id: session.id.clone().unwrap_or_default(),
@@ -2538,6 +2567,11 @@ impl App {
         if let Some(arm) = self.stop_arm.take_if(|a| a.at.elapsed() > CX_WINDOW) {
             if arm.provider == Provider::Codex {
                 self.close_codex_invitation();
+            } else if std::mem::take(&mut self.cx_refused) {
+                // The refusal's flash may still be up, and with the window
+                // gone it no longer says what the next press does. A window
+                // that refused nothing keeps its own flash (`stopped <label>`).
+                self.flash(CLAUDE_CLOSED, MsgLevel::Warn);
             }
             redraw = true;
         }
@@ -2744,6 +2778,12 @@ impl App {
         if arm.provider == Provider::Codex {
             Some(format!("{CODEX_INVITATION}{label}"))
         } else {
+            if self.cx_refused {
+                // Says the last press did not count, in a line that wraps no
+                // taller than the plain one from 21 columns up — `+ worktree`,
+                // the success flash's own words, buys back the prefix (§8.2).
+                return Some(format!("too fast — Ctrl+X: delete {label} + worktree — cannot be undone"));
+            }
             Some(format!(
                 "Ctrl+X again: delete {label} and its worktree — cannot be undone"
             ))
@@ -5154,6 +5194,7 @@ mod tests {
             degraded: false,
             stop_arm: None,
             cx_last_press: None,
+            cx_refused: false,
             pending_delete: None,
             codex_closed_until: None,
             pending_jump: None,
@@ -6094,10 +6135,7 @@ mod tests {
         assert!(stamped >= killed_at, "the re-stamp must follow the last kill");
         // And it does what it is for: a press dequeued now is a burst.
         assert_eq!(a.on_key(ctrl('x')), Action::Redraw);
-        assert_eq!(
-            a.message.clone().unwrap_or_default_msg().0,
-            "too fast — press Ctrl+X again"
-        );
+        assert_eq!(a.message.clone().unwrap_or_default_msg().0, CX_TOO_FAST);
         assert_eq!(agents::test_spawn::joined(), vec!["stop 1c45d64f", "rm 1c45d64f"]);
     }
 
@@ -6506,14 +6544,19 @@ mod tests {
     fn a_press_inside_the_burst_guard_says_so_instead_of_going_silent() {
         agents::test_spawn::reset();
         let mut a = app();
-        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        load(&mut a, vec![
+            bg("1c45d64f", "bt/reg-update", State::Working),
+            bg("629da7fc", "kernel bugs", State::Working),
+        ]);
 
-        // Arm, then close the window by moving off and pressing again.
+        // Arm, then close the window by moving off and pressing again. With a
+        // second row `j` really moves, so nothing is left settling either.
         a.on_key(ctrl('x'));
         a.on_key(press('j'));
         after(&mut a, BEAT);
         a.on_key(ctrl('x'));
         assert!(a.stop_arm.is_none(), "the window is closed");
+        assert!(a.pending_delete.is_none(), "and no delete is settling");
 
         // A press right behind it: suppressed, but not silent.
         assert_eq!(
@@ -6522,7 +6565,7 @@ mod tests {
             "a suppressed press must still ask for a redraw"
         );
         let (text, level) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!(text, "too fast — press Ctrl+X again");
+        assert_eq!(text, CX_TOO_FAST);
         assert_eq!(level, MsgLevel::Warn);
         assert_eq!(
             agents::test_spawn::joined(),
@@ -6533,6 +6576,162 @@ mod tests {
         // outranked, so it can never displace what the next press will do.
         a.on_key(ctrl('x'));
         assert!(a.arm_hint().is_none(), "nothing is armed here");
+    }
+
+    /// The double tap that looked broken: a second press inside `CX_MIN_GAP`
+    /// while the window is open. It is refused and the window survives, and
+    /// the warning that owns the footer says the press did not count — the
+    /// flash under it is outranked for the rest of the window, so only the
+    /// warning can.
+    #[test]
+    fn a_refused_press_inside_an_open_window_says_so_in_the_warning() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Done)]);
+
+        a.on_key(ctrl('x'));
+        let hint = a.arm_hint().expect("armed");
+        assert!(hint.starts_with("Ctrl+X again: delete bt/reg-update"), "{hint}");
+
+        assert_eq!(a.on_key(ctrl('x')), Action::Redraw);
+        assert!(a.stop_arm.is_some(), "a refused press keeps the window");
+        let hint = a.arm_hint().expect("still armed");
+        assert!(hint.starts_with("too fast — Ctrl+X: delete bt/reg-update"), "{hint}");
+        assert!(hint.ends_with("+ worktree — cannot be undone"), "{hint}");
+        assert_eq!(a.message.clone().unwrap_or_default_msg().0, CX_TOO_FAST);
+
+        // It cost nothing: a deliberate press inside the same window deletes.
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(settle(&mut a));
+        assert_eq!(agents::test_spawn::joined(), vec!["rm 1c45d64f"]);
+    }
+
+    /// A tap inside the settle cancels the delete it lands on, and the window
+    /// that delete was scheduled from goes with it. The footer must say the
+    /// delete was cancelled, not that the press was merely ignored.
+    #[test]
+    fn a_refused_press_that_cancels_a_settling_delete_closes_the_window_and_says_so() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Done)]);
+
+        a.on_key(ctrl('x'));
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        assert!(a.pending_delete.is_some(), "the second press qualified");
+
+        assert_eq!(a.on_key(ctrl('x')), Action::Redraw);
+        assert!(a.pending_delete.is_none());
+        assert!(a.stop_arm.is_none(), "the window went with the delete");
+        assert!(a.arm_hint().is_none());
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, CX_CANCELLED);
+        assert_eq!(level, MsgLevel::Warn);
+
+        settle(&mut a);
+        assert!(agents::test_spawn::joined().is_empty(), "nothing was deleted");
+    }
+
+    /// Once a window that refused a press has lapsed, the refusal's flash no
+    /// longer says what the next press does — that press is a FIRST press,
+    /// which re-arms a Completed row and stops a running one. The lapse
+    /// replaces it with a line that invites nothing.
+    #[test]
+    fn a_window_that_lapses_after_a_refused_press_invites_no_press() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Done)]);
+        a.on_key(ctrl('x'));
+        a.on_key(ctrl('x'));
+        assert!(a.cx_refused);
+
+        if let Some(arm) = a.stop_arm.as_mut() {
+            arm.at = arm.at.checked_sub(Duration::from_secs(3)).unwrap_or(arm.at);
+        }
+        assert!(a.tick_stop_arm());
+        assert!(a.stop_arm.is_none());
+        let (text, level) = a.message.clone().unwrap_or_default_msg();
+        assert_eq!(text, CLAUDE_CLOSED);
+        assert_eq!(level, MsgLevel::Warn);
+        assert!(!a.cx_refused, "the lapse that reads the refusal clears it");
+        assert!(agents::test_spawn::joined().is_empty());
+    }
+
+    /// A window that refused nothing lapses exactly as before: the stop's own
+    /// flash is the truth about what happened, and it stays.
+    #[test]
+    fn a_window_that_refused_nothing_keeps_its_own_flash_when_it_lapses() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        a.on_key(ctrl('x'));
+        assert_eq!(a.message.clone().unwrap_or_default_msg().0, "stopped bt/reg-update");
+
+        if let Some(arm) = a.stop_arm.as_mut() {
+            arm.at = arm.at.checked_sub(Duration::from_secs(3)).unwrap_or(arm.at);
+        }
+        assert!(a.tick_stop_arm());
+        assert_eq!(a.message.clone().unwrap_or_default_msg().0, "stopped bt/reg-update");
+    }
+
+    /// A window closed by a path that does not read the refusal — `Esc` here —
+    /// must not hand it to the next window: that one has refused nothing.
+    #[test]
+    fn a_new_window_does_not_inherit_the_last_ones_refusal() {
+        agents::test_spawn::reset();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Done)]);
+        a.on_key(ctrl('x'));
+        a.on_key(ctrl('x'));
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.stop_arm.is_none());
+
+        after(&mut a, BEAT);
+        a.on_key(ctrl('x'));
+        let hint = a.arm_hint().expect("a fresh window");
+        assert!(hint.starts_with("Ctrl+X again: delete "), "{hint}");
+    }
+
+    /// The warning's TAIL is the consequence, so the refused form must keep it
+    /// wherever the plain form does: every height, every width from 21 columns
+    /// up, and names from one character to a full label. At 20 columns a name
+    /// that fills the label cannot share a line with `delete`, which is the one
+    /// shape §8.2 states as lost.
+    #[test]
+    fn the_refused_warning_keeps_its_tail_wherever_the_plain_one_does() {
+        fn screen(a: &App, w: u16, h: u16) -> (String, String) {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+                .expect("test backend");
+            term.draw(|f| crate::ui::draw(f, a)).expect("draw");
+            let buf = term.backend().buffer().clone();
+            let rows: Vec<String> = (0..h)
+                .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                .collect();
+            let flat = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+            (flat, rows[0].clone())
+        }
+        for name in ["a", "kronos/ffe", "bt/reg-update", "kronos/options-features"] {
+            let mut plain = app();
+            load(&mut plain, vec![bg("1c45d64f", name, State::Done)]);
+            plain.on_key(ctrl('x'));
+            let mut refused = app();
+            load(&mut refused, vec![bg("1c45d64f", name, State::Done)]);
+            refused.on_key(ctrl('x'));
+            refused.on_key(ctrl('x'));
+            assert!(refused.cx_refused);
+
+            for w in 21u16..=80 {
+                for h in 5u16..=14 {
+                    let (base, _) = screen(&plain, w, h);
+                    if !base.contains("cannot be undone") { continue; }
+                    let (flat, header) = screen(&refused, w, h);
+                    assert!(flat.contains("too fast — Ctrl+X: delete"), "{name} {w}x{h}: {flat:?}");
+                    assert!(flat.contains("cannot be undone"), "{name} {w}x{h}: tail lost: {flat:?}");
+                    assert!(header.contains("ccmux"), "{name} {w}x{h}: header lost: {header:?}");
+                }
+            }
+        }
     }
 
     /// The refusal has to name the right cause. A row that LEFT the list — `a`

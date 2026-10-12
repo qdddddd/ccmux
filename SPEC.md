@@ -2355,29 +2355,42 @@ arrive without a human meaning it twice remain, and both are closed:
   unpushed work (§8.2, above).
 
 A press suppressed by `CX_MIN_GAP` is not silent: it flashes
-`too fast — press Ctrl+X again` and asks for a redraw. Silence there was
+`too fast — press ignored` and asks for a redraw. Silence there was
 indistinguishable from a wedged sidebar, because the press acted on nothing and
 left whatever stale line was already on screen. While the window is open the
-warning outranks the flash, so this is read exactly when there is no warning to
-displace. The window is NOT consumed — a press inside the bar costs the operator
-one keystroke, never the escalation.
+warning outranks that flash, so the warning itself carries the refusal: from
+the first refused press to the window's end it reads
+`too fast — Ctrl+X: delete <label> + worktree — cannot be undone`. The window
+is NOT consumed — a press inside the bar costs the operator one keystroke,
+never the escalation — except by a press inside `CX_SETTLE`, which cancels the
+delete it lands on and closes the window that delete came from; that press says
+`too fast — delete cancelled`. A window that lapses after refusing a press says
+`delete window closed — nothing deleted`. None of these names a next press:
+once the window has gone, the next press is a first press again, which re-arms
+a Completed row and stops a running one. A window that refused nothing lapses
+under the flash of the press that opened it (`stopped <label>`,
+`<label> is already stopped`).
 
 #### The window on screen
 
 While it is open the footer says
-`Ctrl+X again: delete <label> and its worktree — cannot be undone`, in `p.red`.
+`Ctrl+X again: delete <label> and its worktree — cannot be undone`, in `p.red`,
+or the refused form above once a press inside it has been refused.
 It **outranks the flashed message and the poll error**, so nothing can push the
 warning off screen while the verb is loaded, and it inherits §6.8's overflow
 wrap, so at 34 columns it wraps rather than clipping. It is 70 columns — the
-longest line ccmux produces, and the only one whose TAIL carries the
-consequence — so the wrap has to work at every height, not only where there is
+longest line ccmux produces, and, with its refused form, the only one whose
+TAIL carries the consequence — so the wrap has to work at every height, not only where there is
 a detail block to wrap into. §6.8 AMENDMENT: below height 12, where `slots`
 allocates no detail block, the wrapped message is carved out of the bottom of
 the LIST instead (`overflow_rect`), capped so the header and at least one
 session row always survive; the carve is transient and changes nothing about
 `list_viewport_rows`, so the row-index-to-screen-line mapping underneath it is
 untouched. Only a sidebar under 5 rows tall still loses the tail, which is
-below the height at which the list itself is usable. It names the session
+below the height at which the list itself is usable. The refused form keeps its
+tail wherever the plain form does from 21 columns up. At the 20-column minimum
+a name that fills the 14-column label cannot share a line with `delete`, so
+there the refused form needs a fifth line and can lose its tail. It names the session
 because the cursor is free to move while it is open. `u` undoes a dismissal
 (§8.1), never a delete; the footer says so because there is no other way to
 learn it in time.
@@ -2385,7 +2398,8 @@ learn it in time.
 #### The window closes on
 
 two seconds passing (expired from the event-loop tick, so it closes with no key
-pressed), `Esc`, `q`/`Ctrl-c`, a second press (whether it deleted or refused),
+pressed), `Esc`, `q`/`Ctrl-c`, a second press clear of `CX_MIN_GAP` (whether
+it deleted or refused), a press inside `CX_SETTLE` (which cancels the delete),
 and any departure from `Mode::Normal` — `/`, `n`, `?`, `L`. The last is enforced
 in one place, at the end of `on_key`, so no handler can forget it.
 
@@ -4792,8 +4806,8 @@ cursor on a Claude neighbour once the forced poll drops the row. A burst, a
 refused first press, and every press refused inside that remainder, warn
 `archive window closed — nothing archived` and never invite another press;
 that wording lasts as long as the guard the refused press itself set
-(`CX_MIN_GAP` past it), so it never lapses into Claude's inviting
-`too fast — press Ctrl+X again` while that press's guard still refuses. A
+(`CX_MIN_GAP` past it), so it never lapses into Claude's
+`too fast — press ignored` while that press's guard still refuses. A
 successful archive keeps Claude's post-delete behavior. A tick that blocks for
 at least `SLOW_KEY` while a Codex window is open re-dates the guard to the
 tick's end, so a double tap typed during a tick shorter than `SLOW_TICK` (which
@@ -5675,3 +5689,4 @@ behaviour, the pin is superseded by this appendix.
 | §6.2 | The header shows `matching/total` only while `/` is active. | It shows the ratio whenever fewer than all sessions are listed, so `a` (hide Completed) cannot leave the header contradicting the list. |
 | §6.5 | The detail block renders `Status::Unknown("")` as `?`. | A `state: "done"` session renders `done`, matching `status_glyph`. The live payload omits `status` on almost every completed row. |
 | §5.5 | `PaneEntry::name` is stored verbatim. | Truncated to 80 columns, and a failed `@ccmux_map` write is flashed once and clears `map_dirty` instead of being reissued every tick. tmux rejects a `set-option` value over ~16 KB. |
+| §8.2 | A suppressed press flashes `too fast — press Ctrl+X again`. The open window's warning outranks it, so a refused second press changed nothing on screen, and the flash surfaced only once the window had lapsed, inviting a press that re-arms a Completed row or stops a running one. A press inside the settle was said not to consume the window. | A suppressed press flashes `too fast — press ignored`. While a window is open its warning becomes `too fast — Ctrl+X: delete <label> + worktree — cannot be undone` for the rest of that window. A press that cancels a settling delete says `too fast — delete cancelled` and closes the window with it, and a window that lapses after a refusal says `delete window closed — nothing deleted`. No Claude refusal names a next press. `CX_MIN_GAP` and `CX_SETTLE` are unchanged. |

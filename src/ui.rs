@@ -1572,6 +1572,7 @@ mod tests {
             degraded: false,
             stop_arm: None,
             cx_last_press: None,
+            cx_refused: false,
             pending_delete: None,
             codex_closed_until: None,
             pending_jump: None,

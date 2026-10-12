@@ -1486,7 +1486,7 @@ fn a_press_buffered_during_a_slow_archive_reads_as_a_burst() {
     // The press the operator made at the frozen screen.
     ctrl_x(&mut a);
     assert!(agents::test_spawn::joined().is_empty(), "a press buffered during the RPC stopped Claude");
-    assert_eq!(a.message.as_ref().unwrap().0, "too fast — press Ctrl+X again");
+    assert_eq!(a.message.as_ref().unwrap().0, "too fast — press ignored");
 }
 
 #[test]
