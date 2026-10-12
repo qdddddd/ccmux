@@ -49,12 +49,15 @@ ccmux --width 40 --dark   # wider sidebar, dark palette
 ```
 
 Running `ccmux` again from another terminal attaches the same session. If a
-sidebar was quit with `q`, running `ccmux` puts it back.
+sidebar was quit with `q`, running `ccmux` puts it back. Each launch from
+outside the session also applies its `--width` (default `28`) to every sidebar
+in it, so pass `--width 34` to keep the previous default; `R` keeps the
+current width.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--session <NAME>` | `ccmux` | tmux session name, `[A-Za-z0-9_-]{1,64}` |
-| `--width <COLS>` | `34` | Sidebar width, clamped to `20..=120` |
+| `--width <COLS>` | `28` | Sidebar width, clamped to `20..=120` |
 | `--light` / `--dark` | light | Palette. Not auto-detected |
 | `-L`, `--socket <NAME>` | tmux default | Use a separate tmux server |
 | `--interval <MS>` | `2500` | Poll interval, for `ccmux sidebar` only |

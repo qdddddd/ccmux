@@ -57,6 +57,13 @@ fn codex_states_keep_their_glyphs_in_the_provider_group() {
             }
             let rendered = rows_at(&app, 60, 24).join("\n");
             assert!(rendered.contains(&format!("00000011 codex {detail}")), "{rendered}");
+            // At the default the `codex` word yields whole before the state
+            // would be cut: `systemError` and `unknown` differ only here.
+            let id = rows_at(&app, crate::WIDTH_DEFAULT, 24).into_iter()
+                .find(|r| r.trim_start().starts_with("id")).expect("id line");
+            assert!(id.contains(&format!("00000011 {detail}"))
+                || id.contains(&format!("00000011 codex {detail}")), "{id:?}");
+            assert!(!id.contains('…'), "{id:?}");
             all_modes(&mut app);
         }
         assert!(!row.name.starts_with("> "));
@@ -161,19 +168,23 @@ fn codex_help_is_opt_in_and_matches_scroll_geometry() {
     assert!(!plain.contains("Codex"));
     app.codex.settings.url = "ws://localhost".into();
     app.help_lines = help_line_count(true);
-    let enabled = rows_at(&app, 34, 60).join("\n");
-    for (key, action) in CODEX_KEYS {
-        assert!(display_width(key) <= 10 && display_width(action) <= 22, "{key}: {action}");
-        let line = enabled.lines().find(|line| line.contains(action)).expect(action);
-        assert!(!line.contains('…'), "{line}");
+    // Whole in both forms: two columns at 34, one column at the 28 default.
+    for w in [34u16, crate::WIDTH_DEFAULT] {
+        let enabled = rows_at(&app, w, 60).join("\n");
+        for (key, action) in CODEX_KEYS {
+            assert!(display_width(key) <= 10 && display_width(action) <= 22, "{key}: {action}");
+            let line = enabled.lines().find(|line| line.contains(action)).expect(action);
+            assert!(!line.contains('…'), "w={w}: {line}");
+        }
     }
+    let enabled = rows_at(&app, 34, 60).join("\n");
     assert!(enabled.contains("not loaded in server"));
     assert!(enabled.contains("creates Claude session"));
     assert!(enabled.contains("records launch target"));
     assert!(enabled.contains("open Codex TUI"));
     assert!(enabled.contains("Codex panes skipped"));
     assert!(enabled.contains("change TUI, not map"));
-    assert!(enabled.contains("parked: resume launch"));
+    assert!(enabled.contains("resume parked launch"));
     assert!(CODEX_KEYS.contains(&("C-x ×2", "archive ○/◇ thread")));
     assert!(!enabled.contains("pane actions unavailable"));
     assert_eq!(help_line_count(true), help_line_count(false) + CODEX_KEYS.len());

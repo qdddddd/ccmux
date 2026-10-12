@@ -151,19 +151,23 @@ const CLAUDE_CLOSED: &str = "delete window closed — nothing deleted";
 const MAP_NAME_MAX: usize = 80;
 /// Columns left for the Claude panes when the sidebar is pinned (§1.3).
 const MIN_CONTENT_COLS: u16 = 20;
-/// Columns a session name may take in a flashed message. The `d` flash has to
-/// fit `hidden <name> — u to undo` into a 34-column footer, and the part that
-/// must survive is the part that says how to get the row back.
+/// Columns a session name may take in a flashed message. The `d` flash is
+/// `hidden <name> — u to undo`: one line at 34 columns, two at the 28-column
+/// default, where §6.8's overflow carve wraps it whole. The part that must
+/// survive is the part that says how to get the row back, and it does at
+/// every height with a carve.
 const LABEL_MAX: usize = 14;
 /// Columns a cwd may take in a §8.6 flash, on `LABEL_MAX`'s precedent: bound
-/// the variable half so the actionable tail survives the default sidebar. The
-/// widest fixed tail is ` does not exist — ⏎ again to create it` (~39 cols),
-/// the overflow carve is at most 4 rows × 34 default columns, and a no-space
-/// path token hard-wraps, so a path elided to 60 fills ≤ 2 rows and leaves the
-/// tail its own ≤ 2. `shorten_cwd` keeps the FINAL components, so what the
-/// flash names is the identifying part of the path — the same rule the detail
-/// block renders every cwd under.
-const CWD_FLASH_MAX: usize = 60;
+/// the variable half so the arm flash's actionable tail survives the default
+/// sidebar. The overflow carve is at most 4 rows of the 28-column default, and
+/// word wrap can waste most of a row on a path with spaces in it, so the bound
+/// is measured, not divided: 40 is the largest that keeps `cwd_arm_flash`
+/// whole in 4 rows for every path shape tried, with the `[codex!]` marker in
+/// front of it too (`the_arm_flash_survives_the_default_carve_for_any_path`).
+/// `shorten_cwd` keeps the FINAL components, so what the flash names is the
+/// identifying part of the path — the same rule the detail block renders every
+/// cwd under.
+const CWD_FLASH_MAX: usize = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgLevel {
@@ -1091,9 +1095,9 @@ impl App {
         if self.drift_pending.is_empty() || self.footer_is_covered() || self.message.is_some() {
             return;
         }
-        // Truncated to the sidebar's own budget by `draw_footer`; naming the
-        // first value and counting the rest keeps the sentence readable at 34
-        // columns, where the whole list of them would not fit.
+        // Wrapped by §6.8's overflow carve at the default width; naming the
+        // first value and counting the rest keeps the sentence short enough to
+        // read there, where the whole list of them would not fit.
         let first = self.drift_pending.iter().next().cloned().unwrap_or_default();
         let msg = match self.drift_pending.len() - 1 {
             0 => format!("unmodelled {first} — update ccmux"),
@@ -1859,9 +1863,12 @@ impl App {
                 // laid the sidebar out at the width it is about to ask for.
                 self.even_content(Some(dir.shape()), Force::No);
                 self.pin_sidebar();
+                // `session_label`, as every other flash names a session: an
+                // unbounded name pushed `in pane N` off the default sidebar.
+                let label = session_label(&sel);
                 match self.pane_index_of(&pane) {
-                    Some(i) => self.flash(format!("opened {name} in pane {i}"), MsgLevel::Info),
-                    None => self.flash(format!("opened {name}"), MsgLevel::Info),
+                    Some(i) => self.flash(format!("opened {label} in pane {i}"), MsgLevel::Info),
+                    None => self.flash(format!("opened {label}"), MsgLevel::Info),
                 }
             }
             Err(e) => self.flash(format!("split failed: {}", tmux_msg(&e)), MsgLevel::Error),
@@ -1966,7 +1973,7 @@ impl App {
         }
         self.refresh_panes();
         self.pin_sidebar();
-        self.flash(format!("opened {name} in tab {index}"), MsgLevel::Info);
+        self.flash(format!("opened {} in tab {index}", session_label(&sel)), MsgLevel::Info);
     }
 
     /// `r`'s geometry half — re-assert ccmux's own layout NOW (SPEC §1.3, §1.4).
@@ -2779,9 +2786,10 @@ impl App {
             Some(format!("{CODEX_INVITATION}{label}"))
         } else {
             if self.cx_refused {
-                // Says the last press did not count, in a line that wraps no
-                // taller than the plain one from 21 columns up — `+ worktree`,
-                // the success flash's own words, buys back the prefix (§8.2).
+                // Says the last press did not count. At five rows and up it
+                // keeps its tail wherever the plain line does from 25 columns
+                // (27 while Codex is degraded): `+ worktree`, the success
+                // flash's own words, buys back the prefix (§8.2).
                 return Some(format!("too fast — Ctrl+X: delete {label} + worktree — cannot be undone"));
             }
             Some(format!(
@@ -2814,7 +2822,7 @@ impl App {
         // with no affordance left to close or jump to it. Not killing it is
         // correct — `d` touches nothing outside this view — but saying nothing
         // is not, so this variant spends the name to buy the warning and stays
-        // inside a 34-column footer. `@ccmux_map` keeps its entry on purpose:
+        // on one line of the default sidebar. `@ccmux_map` keeps its entry on purpose:
         // the pane is live, and `u` + `x` is the recovery.
         let provider = sel.provider;
         let owns_pane = self.map.pane_for_session(provider, &id).is_some();
@@ -2844,7 +2852,7 @@ impl App {
         self.hidden_dirty = true;
         self.rebuild_rows();
         if owns_pane {
-            self.flash("hidden — pane open, u to undo", MsgLevel::Warn);
+            self.flash("hidden, pane open: u to undo", MsgLevel::Warn);
         } else {
             self.flash(format!("hidden {label} — u to undo"), MsgLevel::Info);
         }
@@ -3648,7 +3656,7 @@ impl App {
                         pr.pending_create = Some(cwd.clone());
                     }
                     self.flash(
-                        format!("{shown} does not exist — ⏎ again to create it"),
+                        cwd_arm_flash(&shown),
                         MsgLevel::Warn,
                     );
                 }
@@ -5078,9 +5086,14 @@ fn complete_dir(input: &str, home: Option<&str>) -> Completion {
     }
 }
 
+/// §8.6's mkdir offer, with `shown` already elided to `CWD_FLASH_MAX`.
+fn cwd_arm_flash(shown: &str) -> String {
+    format!("{shown} does not exist — ⏎ again to create it")
+}
+
 /// Footer label for a session: its name, or an id when the CLI handed us an
-/// empty one. Bounded so `hidden <label> — u to undo` still fits a 34-column
-/// footer with the part that says how to undo intact.
+/// empty one. Bounded so `hidden <label> — u to undo` wraps to at most two
+/// rows of the default sidebar with the part that says how to undo intact.
 fn session_label(sess: &Session) -> String {
     let raw = match (sess.name.trim().is_empty(), sess.id.as_deref()) {
         (false, _) => sess.name.trim().to_string(),
@@ -6694,12 +6707,14 @@ mod tests {
     }
 
     /// The warning's TAIL is the consequence, so the refused form must keep it
-    /// wherever the plain form does: every height, every width from 21 columns
-    /// up, and names from one character to a full label. At 20 columns a name
-    /// that fills the label cannot share a line with `delete`, which is the one
-    /// shape §8.2 states as lost.
+    /// wherever the plain form does, at every height §8.2 covers (5 and up),
+    /// for every label length, from 25 columns — from 27 while Codex is
+    /// degraded, where the `[codex!]` marker in front of the first line moves
+    /// the breaks. Narrower than that its different line breaks can cost it a
+    /// row, which §8.2 states; the 28-column default is clear of both.
     #[test]
     fn the_refused_warning_keeps_its_tail_wherever_the_plain_one_does() {
+        use crate::app::providers::{FailureCategory, Health};
         fn screen(a: &App, w: u16, h: u16) -> (String, String) {
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
                 .expect("test backend");
@@ -6711,24 +6726,42 @@ mod tests {
             let flat = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
             (flat, rows[0].clone())
         }
-        for name in ["a", "kronos/ffe", "bt/reg-update", "kronos/options-features"] {
-            let mut plain = app();
-            load(&mut plain, vec![bg("1c45d64f", name, State::Done)]);
-            plain.on_key(ctrl('x'));
-            let mut refused = app();
-            load(&mut refused, vec![bg("1c45d64f", name, State::Done)]);
-            refused.on_key(ctrl('x'));
-            refused.on_key(ctrl('x'));
-            assert!(refused.cx_refused);
+        let names: Vec<String> = (1..=14)
+            .map(|n| "a".repeat(n))
+            .chain(["kronos/options-features".to_string()])
+            .collect();
+        for name in &names {
+            for degraded in [false, true] {
+                let armed = |presses: usize| {
+                    let mut a = app();
+                    if degraded {
+                        a.codex.settings.url = "ws://localhost:8965".into();
+                        a.diagnostics.codex.health = Health::Degraded(
+                            FailureCategory::Codex(crate::codex::CodexFailureKind::Connection),
+                            "connection refused".into(),
+                        );
+                    }
+                    load(&mut a, vec![bg("1c45d64f", name, State::Done)]);
+                    for _ in 0..presses {
+                        a.on_key(ctrl('x'));
+                    }
+                    a
+                };
+                let (plain, refused) = (armed(1), armed(2));
+                assert!(refused.cx_refused);
 
-            for w in 21u16..=80 {
-                for h in 5u16..=14 {
-                    let (base, _) = screen(&plain, w, h);
-                    if !base.contains("cannot be undone") { continue; }
-                    let (flat, header) = screen(&refused, w, h);
-                    assert!(flat.contains("too fast — Ctrl+X: delete"), "{name} {w}x{h}: {flat:?}");
-                    assert!(flat.contains("cannot be undone"), "{name} {w}x{h}: tail lost: {flat:?}");
-                    assert!(header.contains("ccmux"), "{name} {w}x{h}: header lost: {header:?}");
+                for w in (if degraded { 27u16 } else { 25 })..=48 {
+                    for h in [5u16, 6, 12, 14] {
+                        let (base, _) = screen(&plain, w, h);
+                        if !base.contains("cannot be undone") {
+                            continue;
+                        }
+                        let (flat, header) = screen(&refused, w, h);
+                        let at = format!("{name} degraded={degraded} {w}x{h}");
+                        assert!(flat.contains("too fast — Ctrl+X: delete"), "{at}: {flat:?}");
+                        assert!(flat.contains("cannot be undone"), "{at}: tail lost: {flat:?}");
+                        assert!(header.contains("ccmux"), "{at}: header lost: {header:?}");
+                    }
                 }
             }
         }
@@ -8090,7 +8123,7 @@ mod tests {
         let target = tmp.join("newdir");
         let mut a = app();
         a.dispatch = recording_dispatch;
-        a.home = None; // flashes carry the full path
+        a.home = None; // no `~` substitution: the elided path below is home-independent
         load(&mut a, vec![bg("aaaaaaaa", "one", State::Working)]);
         prompt_with(&mut a, &target.to_string_lossy(), "build");
 
@@ -8112,10 +8145,11 @@ mod tests {
         assert_eq!(dispatched(), vec![(target.to_string_lossy().into_owned(), "build".into())]);
         let (text, level) = a.message.clone().unwrap_or_default_msg();
         assert_eq!(level, MsgLevel::Info);
-        assert!(
-            text.contains(&*target.to_string_lossy()),
-            "the flash must name the created path: {text}"
-        );
+        // Named under the display rule every §8.6 flash uses; the full path
+        // is what was created and dispatched (asserted above).
+        let shown = model::shorten_cwd(&target.to_string_lossy(), None, CWD_FLASH_MAX);
+        assert!(text.contains(&shown), "the flash must name the created path: {text}");
+        assert!(text.contains("newdir"), "{text}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -8289,10 +8323,86 @@ mod tests {
     }
 
     /// The arm flash must survive the overflow carve — at most 4 rows of the
-    /// default 34-column sidebar — with its actionable tail intact, so a long
+    /// default sidebar — with its actionable tail intact, so a long
     /// path is elided to `CWD_FLASH_MAX` instead of shoving `⏎ again to create
     /// it` off the bottom. The elision is display-only: dispatch still gets
     /// the full expanded path.
+    /// `CWD_FLASH_MAX` is measured, not derived: word wrap can waste most of a
+    /// row on a path with spaces in it. Every path shape here must fit the
+    /// whole arm flash into the 4-row carve of the default sidebar, and of 34
+    /// columns, with and without the `[codex!]` marker in front of it — the
+    /// space §8.6 sizes the bound for. The fixed paths are the ones that broke a
+    /// bound of 41 to 47, and the trailing-slash shape Tab completion leaves.
+    #[test]
+    fn the_arm_flash_survives_the_default_carve_for_any_path() {
+        use crate::app::providers::{FailureCategory, Health};
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut paths: Vec<String> = (1..=70).map(|l| format!("/home/dev/{}", "a".repeat(l))).collect();
+        paths.push("/home/dev/xx/idgvmrbbqqgrhjea gp/qnsvglfmax yzz/vo".into());
+        paths.push("/home/dev/zw/lprewxchwhmektnpv acyntl/wtecmrn mqzgd".into());
+        paths.push("/home/dev/a-new-directory-for-the-nightly-regression-run/".into());
+        paths.push("/home/dev/projects/price-sanitize-pipeline/".into());
+        for _ in 0..300 {
+            let mut path = String::from("/home/dev");
+            for _ in 0..1 + rnd(8) {
+                let len = 1 + rnd(24) as usize;
+                let mut part: String = (0..len).map(|_| (b'a' + rnd(26) as u8) as char).collect();
+                for _ in 0..rnd(3) {
+                    if len > 2 {
+                        let at = 1 + rnd(len as u64 - 2) as usize;
+                        part.replace_range(at..=at, " ");
+                    }
+                }
+                path.push('/');
+                path.push_str(&part);
+            }
+            paths.push(path);
+        }
+        let screen = |a: &App, w: u16, h: u16| -> String {
+            let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))
+                .expect("test backend");
+            term.draw(|f| crate::ui::draw(f, a)).expect("draw");
+            let buf = term.backend().buffer();
+            let mut out = String::new();
+            for y in 0..h {
+                for x in 0..w {
+                    out.push_str(buf[(x, y)].symbol());
+                }
+            }
+            out
+        };
+        let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let mut a = app();
+        load(&mut a, vec![bg("1c45d64f", "bt/reg-update", State::Working)]);
+        for marked in [false, true] {
+            if marked {
+                a.codex.settings.url = "ws://localhost:8965".into();
+                a.diagnostics.codex.health = Health::Degraded(
+                    FailureCategory::Codex(crate::codex::CodexFailureKind::Connection),
+                    "connection refused".into(),
+                );
+            }
+            for path in &paths {
+                let text = cwd_arm_flash(&model::shorten_cwd(path, Some("/home/dev"), CWD_FLASH_MAX));
+                a.message = Some((text.clone(), MsgLevel::Warn));
+                for w in [crate::WIDTH_DEFAULT, 34] {
+                    for h in [6u16, 8, 12, 24] {
+                        assert!(
+                            squash(&screen(&a, w, h)).contains(&squash(&text)),
+                            "marked={marked} {w}x{h}: {text:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_arm_flash_elides_a_long_path_and_keeps_its_actionable_tail() {
         let tmp = fs_fixture("long-arm");
@@ -10302,12 +10412,12 @@ mod tests {
         a.on_key(press('d'));
 
         let (text, level) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!(text, "hidden — pane open, u to undo");
+        assert_eq!(text, "hidden, pane open: u to undo");
         assert_eq!(level, MsgLevel::Warn, "yellow, because a pane is now unreachable");
         assert!(text.contains("u to undo"), "the recovery must survive every variant");
         assert!(
-            model::display_width(&text) <= 34,
-            "the warning still has to fit the narrowest sidebar: {text:?}"
+            model::display_width(&text) <= crate::WIDTH_DEFAULT as usize,
+            "the warning has to fit one line of the default sidebar: {text:?}"
         );
         assert_eq!(
             a.map.pane_for_session(Provider::Claude, "aaaaaaaa-uuid"),

@@ -685,10 +685,12 @@ pub struct Report {
 /// no session ccmux opened was in scope — so a session with no Claude panes
 /// reads exactly as it did before agents were part of `R`.
 ///
-/// Sized for the 34-column default: `restarted 3 sidebars, 4 panes` is 29
-/// columns and the clauses only appear when they apply. A line that outgrows
-/// the sidebar is not truncated — §6.8's overflow carve wraps it into the
-/// detail block — so the counts survive at any width.
+/// Sized for the 28-column default: one sidebar and up to nine panes
+/// (`restarted 1 sidebar, 9 panes`) is 28 columns and fits one row; two
+/// sidebars and two panes make 29 and wrap to two, and the clauses only appear
+/// when they apply. A line that outgrows the sidebar is not truncated — §6.8's
+/// overflow carve wraps it into the detail block — so the counts survive; only
+/// a note longer than the four-row carve can lose its tail.
 pub fn note(r: &Report) -> String {
     let mut s = format!(
         "restarted {} {}, {} {}",
@@ -1626,7 +1628,7 @@ mod tests {
     }
 
     #[test]
-    fn the_note_names_what_happened_and_fits_the_default_width() {
+    fn the_note_names_what_happened_and_stays_short() {
         let r = |sidebars, panes, failed, skipped| Report {
             sidebars,
             panes,
@@ -1639,8 +1641,12 @@ mod tests {
         assert_eq!(note(&r(1, 1, 0, 0)), "restarted 1 sidebar, 1 pane");
         assert_eq!(note(&r(2, 3, 1, 0)), "restarted 2 sidebars, 3 panes (1 failed)");
         assert!(
+            crate::model::display_width(&note(&r(1, 9, 0, 0))) <= crate::WIDTH_DEFAULT as usize,
+            "the one-tab note must fit one row of the default sidebar"
+        );
+        assert!(
             crate::model::display_width(&note(&r(3, 4, 0, 0))) <= 34,
-            "the ordinary note must fit the 34-column default"
+            "the ordinary note must stay one line at 34 columns (two rows at the default)"
         );
     }
 

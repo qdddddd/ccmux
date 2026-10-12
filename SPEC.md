@@ -104,7 +104,7 @@ pub struct Cli {
     pub session: String,
 
     /// Pinned sidebar width in columns
-    #[arg(long, default_value_t = 34, global = true)]
+    #[arg(long, default_value_t = WIDTH_DEFAULT, global = true)]  // 28
     pub width: u16,
 
     /// Use the light palette (default: dark)
@@ -130,7 +130,12 @@ pub fn validate_session_name(s: &str) -> Result<String, String>;
 else with `"session name must match [A-Za-z0-9_-]{1,64}"`.
 
 `--width` is clamped to `20..=120` before use. Values below 20 are accepted at
-the CLI and clamped up, so a typo cannot produce an unusable sidebar.
+the CLI and clamped up, so a typo cannot produce an unusable sidebar. The
+default is `WIDTH_DEFAULT` (28), the narrowest width whose rows keep the age
+rail (§6.4). Every launch from outside the session writes its width — given or
+default — to `@ccmux_width`, which every running sidebar re-pins to, so a
+plain relaunch after an upgrade moves an existing session to the new default;
+`R` keeps whatever width the session has.
 
 ### 1.2 Launcher algorithm (`main::run_launcher`)
 
@@ -1785,8 +1790,8 @@ tab's pane while the badge said the opposite.
 
 ## 6. Sidebar rendering spec
 
-`ui.rs` only. Pure. Target width 30–40 columns; **must not panic at any width or
-height, including 0**.
+`ui.rs` only. Pure. Target width 28–40 columns, the default 28; **must not panic
+at any width or height, including 0**.
 
 ### 6.1 Vertical layout
 
@@ -1995,7 +2000,10 @@ keeps its own colour. No cursor character is drawn; the bar is the cursor.
 | `< 6` | glyph only; if `W == 0`, nothing |
 
 The gutter is all-or-nothing at `MARGIN_MIN` (20) and the age appears at
-`RAIL_MIN` (28); nothing else keys off the 34-column default. The badge never
+`RAIL_MIN` (28). The 28-column default sits exactly on `RAIL_MIN` — a
+compile-time assertion keeps it from falling below — so any narrower
+`--width` drops the age; nothing else in the row grid keys off the default.
+The badge never
 widens the gutter — a tab index of ten or more degrades to `+` rather than
 taking a second column and shifting every name on the row.
 
@@ -2014,14 +2022,21 @@ Three lines describing the **selected** session, all `p.gray` except values:
  cwd     ~/p/shared/…/price-sanitize
 ```
 
-- `cwd` uses `model::shorten_cwd(cwd, app.home.as_deref(), W - 9)`.
+- `cwd` uses `model::shorten_cwd(cwd, app.home.as_deref(), W - 7)`: values
+  start on column 7 and the margin keeps one, so the budget is 21 columns at
+  the 28-column default.
 - A session with no short id reads `id      —  background  busy` (§9.7).
+- When `<short> <kind>` does not fit beside the status word, the kind word is
+  dropped whole — `674b1d29        blocked`, never `674b1d29 bac… blocked`.
+  Nearly every listed row is `background`, so the word says least of the
+  three; the status word yields next, and the short id never. With an 8-hex
+  short id at the 28-column default this applies to every status but `?`; at
+  34 the kind fits. A row with no short id keeps its `—` the same way.
 - Openness is NOT restated here. The pane-index suffix line 2 used to append
   for an open session is gone: it spent 9 columns repeating what the row's own
   gutter (§6.4) already says at every width the gutter exists — `▌` for open,
-  and which tab in both the shade and the digit — and those 9 columns are what
-  keep the id line from truncating at the 34-column default. `draw_detail`
-  reads no open state at all; `p.aqua` appears nowhere in this block.
+  and which tab in both the shade and the digit. `draw_detail` reads no open
+  state at all; `p.aqua` appears nowhere in this block.
 - Empty selection (no sessions, or all filtered out) renders three blank lines.
 
 ### 6.6 Truncation and unicode
@@ -2039,13 +2054,19 @@ All overlays render **inside the sidebar Rect** — ccmux never draws over a
 Claude pane.
 
 - **Help (`?`)** — `Mode::Help`. Full-sidebar `Block` titled ` keys `, the §8
-  table one binding per line, two columns (`key`, `action`) when `W >= 30`,
-  otherwise `key action` on one line each. Scrolls with `j`/`k` when it
-  overflows.
+  table one binding per line, two columns (`key`, `action`) when the overlay's
+  inner width is at least 30 (a sidebar of 32 or more), otherwise `key action`
+  on one line each — the form the 28-column default renders, so every binding
+  is worded to fit its 26 inner columns whole (`C-x ×2  delete + worktree`). A
+  line with a blank key continues the entry above it and hangs under that
+  entry's action. Scrolls with `j`/`k` when it overflows.
 - **Prompt (`n`)** — `Mode::Prompt`. Block titled ` new background session `.
   One line per field, the focused field prefixed
   `> ` and carrying a reverse-video cursor cell at `prompt.cursor`; unfocused
-  fields dim. Footer = `Tab: field   Enter: run   Esc: cancel`.
+  fields dim, and an unfocused cwd renders under `shorten_cwd` as the detail
+  block's does. The hint line tracks the prompt's state (§8.6):
+  `Tab: cwd  ⏎ run  Esc: ✕`, `Tab: complete dir  ⏎ run`, or
+  `⏎ create cwd + run`, each whole in the default's 26 inner columns.
 - **Filter (`/`)** — no block; the footer becomes the input line: `/` + buffer +
   cursor. The list keeps updating live underneath.
 - **Logs (`L`)** — `Mode::Logs`. Full-sidebar block titled with the session name,
@@ -2290,8 +2311,8 @@ spent inside the shell-out.
 
   Then flash `deleted <label> + worktree` (Warn), with ` · closed N panes`
   (`· closed 1 pane` for one) appended when anything closed, and force a
-  refresh. With the count the line is ~50 columns, so at the 34-column
-  default it wraps through §6.8's overflow path like the arm hint does. The
+  refresh. With the count the line is ~50 columns, so at the default width
+  it wraps through §6.8's overflow path like the arm hint does. The
   `cx_last_press` re-stamp below stays LAST: the kills are one more blocking
   shell-out on this path.
 - Err → flash `delete failed: <first line>` (Error). The line comes from stderr,
@@ -2378,22 +2399,23 @@ While it is open the footer says
 or the refused form above once a press inside it has been refused.
 It **outranks the flashed message and the poll error**, so nothing can push the
 warning off screen while the verb is loaded, and it inherits §6.8's overflow
-wrap, so at 34 columns it wraps rather than clipping. It is 70 columns — the
-longest line ccmux produces, and, with its refused form, the only one whose
-TAIL carries the consequence — so the wrap has to work at every height, not only where there is
-a detail block to wrap into. §6.8 AMENDMENT: below height 12, where `slots`
-allocates no detail block, the wrapped message is carved out of the bottom of
-the LIST instead (`overflow_rect`), capped so the header and at least one
-session row always survive; the carve is transient and changes nothing about
-`list_viewport_rows`, so the row-index-to-screen-line mapping underneath it is
-untouched. Only a sidebar under 5 rows tall still loses the tail, which is
-below the height at which the list itself is usable. The refused form keeps its
-tail wherever the plain form does from 21 columns up. At the 20-column minimum
-a name that fills the 14-column label cannot share a line with `delete`, so
-there the refused form needs a fifth line and can lose its tail. It names the session
-because the cursor is free to move while it is open. `u` undoes a dismissal
-(§8.1), never a delete; the footer says so because there is no other way to
-learn it in time.
+wrap, so at the 28-column default it wraps to three lines rather than clipping,
+as at 34. It is up to 71 columns, and with its refused form the only line whose
+TAIL carries the consequence, so the wrap has to work at every height, not only
+where there is a detail block to wrap into. §6.8 AMENDMENT: below height 12,
+where `slots` allocates no detail block, the wrapped message is carved out of
+the bottom of the LIST instead (`overflow_rect`), capped so the header and at
+least one session row always survive; the carve is transient and changes nothing
+about `list_viewport_rows`, so the row-index-to-screen-line mapping underneath
+it is untouched. At the default width only a sidebar under 5 rows tall still
+loses the tail, which is below the height at which the list itself is usable —
+under 6 while Codex is degraded, when the `[codex!]` marker in front of a full
+14-column label makes a fourth line; a narrower sidebar can need a row more. At
+5 rows and up the refused form keeps its tail wherever the plain form does from
+25 columns, and from 27 while Codex is degraded; below those its different line
+breaks can cost it a row. It names the session because the cursor is free to
+move while it is open. `u` undoes a dismissal (§8.1), never a delete; the footer
+says so because there is no other way to learn it in time.
 
 #### The window closes on
 
@@ -2468,8 +2490,8 @@ act_open(dir):
   6. pane = tmux::split(session, anchor, dir, cmd)?
   7. map.insert(pane, PaneEntry { session_id, short_id, name, opened_at: now_ms })
      map_dirty = true; save_map now (do not wait for the tick)
-  8. tmux::pin_sidebar(session, sidebar, sidebar_width)
-  9. flash "opened <name> in pane <index>" (Info)
+  8. tmux::pin_sidebar(session, sidebar, requested_width())
+  9. flash "opened <label> in pane <index>" (Info)
      on Err(TmuxError) -> flash "split failed: <msg>" (Error)
 ```
 
@@ -2580,11 +2602,18 @@ daemon-owned, and closing its pane never touched it.
      the mkdir offer below.
 - **The mkdir offer.** A cwd that does not exist is created on request, one
   level deep, via an inline arm — there is no confirm modal. Every `<path>` in
-  the flashes below is elided to `CWD_FLASH_MAX` (60) columns via
+  the flashes below is elided to `CWD_FLASH_MAX` (40) columns via
   `shorten_cwd` — the same rule the detail block renders every cwd under, so
   the FINAL, identifying components survive — because the overflow carve is at
-  most 4 rows of a 34-column sidebar and the actionable tail of the arm flash
-  must never wrap off the bottom. The elision is display-only: arming,
+  most 4 rows of the 28-column default and the actionable tail of the arm flash
+  must never wrap off the bottom. Word wrap can spend most of a row on a path
+  with spaces in it, so the bound is measured, not divided: 40 is the largest
+  that keeps the whole arm flash in those 4 rows for every path shape tested,
+  with the `[codex!]` marker in front of it too. The other path flashes use the
+  same elision; those with longer fixed text (`could not create …`,
+  `created … — dispatched background session`) wrap through the carve as any
+  long message does. A trailing `/`, the shape Tab completion leaves, is not a
+  component: the final name survives it. The elision is display-only: arming,
   creation, and dispatch all use the full expanded path.
   - An entry that EXISTS but is not an enterable directory (a plain file, a
     dangling symlink, a symlink to a file — probed with `symlink_metadata`,
@@ -2733,7 +2762,7 @@ lose.
    tmux::set_tab_sidebar(session, sidebar)                                [R2-gated]
    tmux::pin_sidebar(session, sidebar, requested_width())
 8. tmux::select_pane(session, claude)                                    [R2-gated]
-9. refresh_panes; pin_sidebar; flash "opened <name> in tab <index>" (Info)
+9. refresh_panes; pin_sidebar; flash "opened <label> in tab <index>" (Info)
 ```
 
 Guards 1-3 mirror `o`/`s` exactly, and all four refusals happen before any tmux
@@ -3316,7 +3345,10 @@ to act. When the tmux reads themselves failed there is no report at all, only
 computed from a blank inventory would be worse than none. The agent clause is
 omitted entirely when nothing was in scope, so a session with no Claude panes
 reads exactly as it did before agents were part of `R`. A line wider than the
-sidebar wraps into §6.8's overflow carve rather than truncating. The count
+sidebar wraps into §6.8's overflow carve rather than truncating; the ordinary
+note is two rows at the 28-column default, and the carve's four rows hold about
+100 columns, so a note carrying most exception clauses can still lose its
+tail. The count
 includes this sidebar. It is a report, not a promise
 made before the fact — which is only possible because the respawns happen after
 the `exec` rather than before it. `event_loop` draws one frame before its first
@@ -3545,8 +3577,8 @@ blocked Codex rows keep `▲` inside their own provider group.
   alt-screen preamble (`\x1b[?1049h\x1b[H\x1b[2J`) strips to empty.
 
 **ui.rs (UI)**
-- `ui::draw` into a `TestBackend` at **20x8, 30x24, 34x76, 40x76, 5x3, 1x1, and
-  0x0** does not panic, in every `Mode`, with 0 sessions and with 40.
+- `ui::draw` into a `TestBackend` at **20x8, 28x76, 30x24, 34x76, 40x76, 5x3,
+  1x1, and 0x0** does not panic, in every `Mode`, with 0 sessions and with 40.
 - `list_viewport_rows(0..=12)` matches the §6.1 table.
 - A mapped pane that latches `@ccmux_detached` loses BOTH the `▌` and its tab
   badge, while the map entry it came from stays.
@@ -3588,17 +3620,18 @@ Run **only** against `--session ccmux-test-<something>`. Never against `ccmux`
 while the operator is using it, and never against `agents` or `dev`.
 
 1. `ccmux --session ccmux-test-a` from outside tmux → attaches; sidebar is
-   leftmost, 34 cols, full height.
+   leftmost, 28 cols, full height.
 2. Re-run the same command from another terminal → attaches the **same** session;
    no second window, no second sidebar.
 3. From inside it, re-run → prints `already inside session 'ccmux-test-a'`,
    exit 0.
-4. `o` three times, then `s` → sidebar still exactly 34 cols (compare against the
-   verified geometry table in §1.3).
+4. `o` three times, then `s` → sidebar still exactly 28 cols (§1.3's verified
+   geometry table was recorded at `--width 34`: compare the invariant, or run
+   this step with `--width 34` to compare the numbers).
 5. `x` on an open session → pane closes; the session stays in the list; the next
    poll still shows it under Working with no open marker.
 6. `q`, then re-run `ccmux --session ccmux-test-a` → sidebar is re-inserted on
-   the left at 34 cols and `@ccmux_map` still resolves the open panes.
+   the left at 28 cols and `@ccmux_map` still resolves the open panes.
 7. `tmux kill-session -t ccmux-test-a` to clean up.
 
 ### 10.3 Explicit non-goals for v1
@@ -3802,7 +3835,7 @@ sidebar is the ONLY place tab identity can appear.
   read against a tab number the operator must remember, whereas with this rule a
   digit ALWAYS means "somewhere else", and a single-tab session renders exactly
   the ink it rendered before. The exact pane index survives where it is
-  actionable — the `opened <name> in pane N` flash.
+  actionable — the `opened <label> in pane N` flash.
 - **A header chip `tab N`**, rendered only from two ccmux tabs up, so all tab UI
   is invisible until there is a second tab to name. `N` is tmux's own
   `#{window_index}`, so `prefix-3` goes exactly where a `tab 3` chip — or a `3`
@@ -4511,7 +4544,11 @@ Filtering must not require a unique short-ID suffix.
 inside the Codex group. It never uses `■` or `✓`.
 The selected row's middle detail line is
 `id      <tail-eight> codex unloaded`; other Codex states replace the last
-word with `idle`, `working`, `blocked`, `systemError`, or `unknown`.
+word with `idle`, `working`, `blocked`, `systemError`, or `unknown`. When the
+line does not fit, `codex` is dropped first — the state is the only place
+`systemError` and `unknown` differ, since both draw `?` — so at the 28-column
+default every state but `idle` reads `<tail-eight> <state>`, and from 27
+columns the state is never cut.
 Active with unknown-only flags uses `unknown` here but retains Working
 rank inside Codex with a purple `?`. The name and cwd occupy the existing
 other two detail lines. Preserve full unknown status/flag values in the
@@ -5383,7 +5420,8 @@ have these tests; existing Claude tests remain authoritative except for
   Select each Codex state at every size so the viewport actually renders it.
   Assert visible header counts and state contrast, unchanged gutter/age
   rails, and the full name budget after removing `> `, including widths
-  34 and 20. Preserve literal name content and the unchanged detail line.
+  34, 28 and 20. Preserve literal name content and the detail line, whose
+  state is whole at the default (§12.6).
   With unchanged standing Codex error and no flash,
   34x40 still draws name/id/state/cwd detail; 34x8 clears no list row and
   keeps the selected row visible. Repeat with Claude-only and combined
@@ -5690,3 +5728,4 @@ behaviour, the pin is superseded by this appendix.
 | §6.5 | The detail block renders `Status::Unknown("")` as `?`. | A `state: "done"` session renders `done`, matching `status_glyph`. The live payload omits `status` on almost every completed row. |
 | §5.5 | `PaneEntry::name` is stored verbatim. | Truncated to 80 columns, and a failed `@ccmux_map` write is flashed once and clears `map_dirty` instead of being reissued every tick. tmux rejects a `set-option` value over ~16 KB. |
 | §8.2 | A suppressed press flashes `too fast — press Ctrl+X again`. The open window's warning outranks it, so a refused second press changed nothing on screen, and the flash surfaced only once the window had lapsed, inviting a press that re-arms a Completed row or stops a running one. A press inside the settle was said not to consume the window. | A suppressed press flashes `too fast — press ignored`. While a window is open its warning becomes `too fast — Ctrl+X: delete <label> + worktree — cannot be undone` for the rest of that window. A press that cancels a settling delete says `too fast — delete cancelled` and closes the window with it, and a window that lapses after a refusal says `delete window closed — nothing deleted`. No Claude refusal names a next press. `CX_MIN_GAP` and `CX_SETTLE` are unchanged. |
+| §1.1, §6, §6.5, §6.7, §8.2, §8.6, §10.1, §10.2, §12.6 | `--width` defaults to 34 and §6 targets 30–40 columns. The id line cuts its kind word (and a Codex state) mid-word when it does not fit; the help overlay and the `n` prompt are worded for 34 columns; `CWD_FLASH_MAX` is 60. | The default is `WIDTH_DEFAULT` (28), exactly `RAIL_MIN`, so it keeps the age rail. The kind word, and `codex`, are dropped whole when they do not fit, and from 27 columns a Codex state is never cut. Every help binding and prompt hint fits the default's 26 inner columns. `CWD_FLASH_MAX` is 40, the largest measured bound that keeps the arm flash whole in the 4-row carve at 28, `[codex!]` marker included. The `d` flash for a session with an open pane fits one line at 28, and the open flashes name the session by its label. Fixed flashes of 29 to 34 columns, such as `dispatched background session` and `restarted 2 sidebars, 3 panes`, wrap to two rows at 28 through §6.8's carve. |

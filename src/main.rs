@@ -49,7 +49,7 @@ pub struct Cli {
     pub session: String,
 
     /// Pinned sidebar width in columns
-    #[arg(long, default_value_t = 34, global = true)]
+    #[arg(long, default_value_t = WIDTH_DEFAULT, global = true)]
     pub width: u16,
 
     /// Use the light palette (the default)
@@ -121,6 +121,10 @@ pub fn validate_socket_name(s: &str) -> Result<String, String> {
 /// unusable sidebar (SPEC §1.1).
 pub const WIDTH_MIN: u16 = 20;
 pub const WIDTH_MAX: u16 = 120;
+/// The narrowest width whose rows still carry the age rail. Pinned to
+/// `ui::RAIL_MIN` here rather than in `ui`, which must not import `main`.
+pub const WIDTH_DEFAULT: u16 = 28;
+const _: () = assert!(WIDTH_DEFAULT as usize >= ui::RAIL_MIN);
 
 /// `--interval` floor and ceiling. Not in SPEC §1.1, but `--interval 0` would
 /// spawn `claude agents --json` in a tight loop against the operator's live
@@ -850,7 +854,7 @@ mod tests {
     fn cli_parses_the_documented_surface() {
         let cli = Cli::try_parse_from(["ccmux"]).expect("bare launcher");
         assert_eq!(cli.session, "ccmux");
-        assert_eq!(cli.width, 34);
+        assert_eq!(cli.width, 28);
         assert!(!cli.light);
         assert!(cli.socket.is_none());
         assert!(cli.cmd.is_none());
@@ -1315,6 +1319,15 @@ mod tests {
             README.contains("the only verb that can **delete** a session"),
             "README no longer says what IS unique to Ctrl-x"
         );
+    }
+
+    /// The flags table is where an operator learns the default width; it must
+    /// name the one the binary uses.
+    #[test]
+    fn the_readme_flags_table_names_the_default_width() {
+        const README: &str = include_str!("../README.md");
+        let row = format!("| `--width <COLS>` | `{WIDTH_DEFAULT}` |");
+        assert!(README.contains(&row), "README's flags table does not say {row}");
     }
 
     /// The README's glyph table is what an operator reads to find out what a

@@ -215,9 +215,8 @@ fn slots(area: Rect) -> Slots {
 /// §6.8's amendment always described. WITHOUT one — every height below 12 — it
 /// used to be nothing at all, so the message fell back to `draw_footer`'s
 /// one-line `truncate_end`. That is survivable for a flash; it is not
-/// survivable for `Ctrl+X`'s armed warning, the longest line ccmux produces and
-/// the only one whose TAIL carries the consequence ("and its worktree — cannot
-/// be undone"). Below 12 rows the block is carved out of the bottom of the
+/// survivable for `Ctrl+X`'s armed warning, a long line and the only one whose
+/// TAIL carries the consequence ("and its worktree — cannot be undone"). Below 12 rows the block is carved out of the bottom of the
 /// list instead, capped so the header and at least one session row always
 /// survive. The carve is transient — it stands only while a message is too wide
 /// to fit, which for the armed warning is at most `CX_WINDOW` — and it changes
@@ -313,7 +312,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Help => draw_help(f, area, app, &p),
         Mode::Logs => draw_logs(f, area, app.logs.as_ref(), &p),
-        Mode::Prompt(kind) => draw_prompt(f, area, *kind, app.prompt.as_ref(), &p),
+        Mode::Prompt(kind) => draw_prompt(f, area, *kind, app.prompt.as_ref(), app.home.as_deref(), &p),
         Mode::Normal | Mode::Filter => {}
     }
 }
@@ -473,8 +472,9 @@ const GAP: usize = 1;
 const NUM_W: usize = 3;
 /// The gutter and the right margin exist at or above this width.
 const MARGIN_MIN: usize = 20;
-/// The age rail exists at or above this width.
-const RAIL_MIN: usize = 28;
+/// The age rail exists at or above this width. `main.rs` pins the default
+/// width to it at compile time.
+pub(crate) const RAIL_MIN: usize = 28;
 /// Detail labels are right-flushed into columns 1..4.
 const LABEL_W: usize = 4;
 /// `LABEL_W + 2` — detail values start on column 7.
@@ -825,8 +825,9 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 /// word right-flushed to the rail.
 ///
 /// The `· pane N` suffix is gone: it cost 9 columns to restate what the row's
-/// own `▌`+digit gutter says at every width the gutter exists, and reclaiming
-/// them is what stops the id line truncating at the default 34 columns.
+/// own `▌`+digit gutter says at every width the gutter exists. The kind word
+/// is the next to go: at the 28-column default it is dropped whole whenever it
+/// would be cut, so the kind word is never cut.
 fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let w = area.width as usize;
     if w == 0 || area.height == 0 {
@@ -914,15 +915,24 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
 
     // The status word is redundant with the row's own status glyph; the 8-hex
     // short id is stated nowhere else in the UI. So when the two cannot both
-    // fit, the status yields and the id survives.
+    // fit, the status yields and the id survives. The kind word yields before
+    // either, and whole: nearly every listed Claude row is `background`, and a
+    // Codex row already sits under the Codex heading, so `bac…` or `codex
+    // unloa…` would spend columns on a word that says nothing.
     let body = format!("{short} {kind}");
+    let fit = |room: usize| if display_width(&body) <= room { body.clone() } else { short.clone() };
     let st = truncate_end(&status, 8);
     let sw = display_width(&st);
     let mut l2 = vec![label("id")];
     if sess.provider == Provider::Codex {
-        l2.push(Span::styled(truncate_end(&format!("{body} {status}"), budget), Style::default().fg(p.gray)));
-    } else if budget >= sw + 1 + MIN_BODY {
-        let left = truncate_end(&body, budget - sw - 1);
+        // `codex` yields first, so from 27 columns the state is never cut:
+        // `systemError` and `unknown` both draw a `?` on the row, and this
+        // line is the only place they differ.
+        let full = format!("{body} {status}");
+        let line = if display_width(&full) <= budget { full } else { format!("{short} {status}") };
+        l2.push(Span::styled(truncate_end(&line, budget), Style::default().fg(p.gray)));
+    } else if budget >= sw + 1 + if sess.id.is_some() { MIN_BODY } else { display_width(&short) } {
+        let left = truncate_end(&fit(budget - sw - 1), budget - sw - 1);
         let used = VALUE_COL + display_width(&left);
         l2.push(Span::styled(left, Style::default().fg(p.gray)));
         let stop = w.saturating_sub(m + sw);
@@ -932,7 +942,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         l2.push(Span::styled(st, Style::default().fg(p.gray)));
     } else {
         l2.push(Span::styled(
-            truncate_end(&body, budget),
+            truncate_end(&fit(budget), budget),
             Style::default().fg(p.gray),
         ));
     }
@@ -991,22 +1001,20 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
 
 /// Whole key/label pairs, greedily filled from column 1. A pair is never split,
 /// which is what stops the footer clipping mid-word to `x cl…`. `j/k move` is
-/// deliberately absent — it is the one hint a TUI user never needs told, and
-/// dropping it is what makes three whole pairs fit at the default 34 columns.
+/// deliberately absent — it is the one hint a TUI user never needs told.
 /// Footer hint pairs, most-wanted first: `draw_footer` fits whole pairs from
 /// the left and stops at the first one that will not fit, so the order is the
-/// priority order. `d/u hide` sits fourth — above `C-x stop`, which announces
-/// its own second half in the footer the moment it fires — because `d` is the
-/// one key here that makes a row vanish on a single press, and the pair names
-/// its own undo. At the default 34 columns the budget runs out after `x close`
-/// and no fourth pair renders at all, so a narrow sidebar discovers `d` through
-/// `?` and the README, exactly as it already discovers `C-x`.
+/// priority order. At the 28-column default two pairs fit, `⏎ open  o/s split`;
+/// `x close` joins them at 34 columns, and nothing past it renders below a
+/// wider sidebar still. `d/u hide` sits fifth — above `C-x stop`, which
+/// announces its own second half in the footer the moment it fires — because
+/// `d` is the one key here that makes a row vanish on a single press, and the
+/// pair names its own undo. A narrow sidebar discovers `x`, `t`, `d` and `C-x`
+/// through `?` and the README.
 ///
-/// `t tab` is inserted FOURTH rather than beside `o/s split`, so the 34-column
-/// footer is unchanged: `x close` is the verb that acts on what is already on
-/// screen, and evicting it to advertise a new one would be a bad trade at the
-/// default width. `t` is discovered through `?` and the README, on the same
-/// precedent `d/u hide` and `C-x stop` already set.
+/// `t tab` is inserted FOURTH rather than beside `o/s split`, so it never
+/// evicts `x close`: that is the verb that acts on what is already on screen,
+/// and advertising a new one at its expense would be a bad trade.
 const HINTS: &[(&str, &str)] = &[
     ("⏎", "open"),
     ("o/s", "split"),
@@ -1019,9 +1027,9 @@ const HINTS: &[(&str, &str)] = &[
     ("/", "filter"),
     // LAST, deliberately. `R` is an upgrade verb pressed once after a
     // `cargo install`, not a working verb, so it must not evict a pair an
-    // operator uses every minute. At the 34-column default it never renders,
-    // and is discovered through `?` and the README exactly as `t` and `C-x`
-    // already are.
+    // operator uses every minute. At the default width (and at 34) it never
+    // renders, and is discovered through `?` and the README exactly as `t`
+    // and `C-x` already are.
     ("R", "restart"),
 ];
 /// Pinned to the rail at every width that can hold it.
@@ -1157,7 +1165,7 @@ const KEYS: &[(&str, &str)] = &[
     ("j / Down", "next session"),
     ("k / Up", "previous session"),
     ("g / G", "first / last"),
-    ("Ctrl-d/u", "half page down / up"),
+    ("Ctrl-d/u", "half page down/up"),
     ("Tab", "next group"),
     ("S-Tab", "previous group"),
     ("Enter", "open or jump to pane"),
@@ -1166,11 +1174,11 @@ const KEYS: &[(&str, &str)] = &[
     ("t", "open in a new tab"),
     ("x", "close pane (agent lives)"),
     ("Ctrl-x", "stop session"),
-    // Sized to survive the 34-column overlay uncut: the escalation's
+    // Sized to survive the default 28-column overlay uncut: the escalation's
     // CONSEQUENCE is the half an operator must be able to read, and the
     // two-second window is stated where it is actionable — the footer warning
-    // that stands while it is open.
-    ("Ctrl-x ×2", "delete it + worktree"),
+    // that stands while it is open. `C-x` as on Codex's `C-x ×2` line below.
+    ("C-x ×2", "delete + worktree"),
     ("n", "new background session"),
     ("L", "logs for this session"),
     ("d", "hide row (pane stays)"),
@@ -1183,7 +1191,7 @@ const KEYS: &[(&str, &str)] = &[
     ("q", "quit sidebar"),
     ("Esc", "cancel window/filter"),
     ("Ctrl-c", "quit from any mode"),
-    ("▌N", "open in tab N (blank: here)"),
+    ("▌N", "in tab N (blank: here)"),
 ];
 
 const CODEX_KEYS: &[(&str, &str)] = &[
@@ -1201,7 +1209,7 @@ const CODEX_KEYS: &[(&str, &str)] = &[
     ("map", "records launch target"),
     ("", "/resume /new /fork"),
     ("", "change TUI, not map"),
-    ("enter", "parked: resume launch"),
+    ("enter", "resume parked launch"),
     ("C-x ×2", "archive ○/◇ thread"),
     ("L", "logs: Codex TUI"),
 ];
@@ -1228,6 +1236,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     let w = body.width as usize;
     let two_col = w >= 30;
     let key_w = 10usize;
+    // The last non-blank key's width, so a blank-key continuation row hangs
+    // under that entry's action in the one-column form, as two columns align it.
+    let mut lead = 0usize;
     let all: Vec<Line> = KEYS
         .iter()
         .chain(if app.codex_enabled() { CODEX_KEYS } else { &[] }.iter())
@@ -1244,10 +1255,17 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
                     ),
                 ])
             } else {
+                let key = if k.is_empty() {
+                    " ".repeat(lead)
+                } else {
+                    lead = display_width(k);
+                    (*k).to_string()
+                };
+                let used = display_width(&key);
                 Line::from(vec![
-                    Span::styled((*k).to_string(), Style::default().fg(p.yellow)),
+                    Span::styled(key, Style::default().fg(p.yellow)),
                     Span::styled(
-                        truncate_end(&format!(" {a}"), w.saturating_sub(display_width(k))),
+                        truncate_end(&format!(" {a}"), w.saturating_sub(used)),
                         Style::default().fg(p.fg),
                     ),
                 ])
@@ -1303,7 +1321,7 @@ fn draw_logs(f: &mut Frame, area: Rect, logs: Option<&LogsView>, p: &Palette) {
     f.render_widget(Paragraph::new(lines), body);
 }
 
-fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prompt>, p: &Palette) {
+fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prompt>, home: Option<&str>, p: &Palette) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1388,6 +1406,10 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
                     }
                 }
             }
+        } else if label.trim_end() == "cwd" {
+            // Unfocused, the cwd keeps its identifying tail (`~/…/ccmux`), as
+            // the detail block shows one; the raw text returns on focus.
+            spans.push(Span::styled(shorten_cwd(&value, home, budget), value_style));
         } else {
             spans.push(Span::styled(truncate_end(&value, budget), value_style));
         }
@@ -1401,11 +1423,11 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
     let armed = prompt.map(|pr| pr.pending_create.is_some()).unwrap_or(false);
     let on_cwd = prompt.map(|pr| pr.focus == 0).unwrap_or(false);
     let hint = if armed {
-        " ⏎ create cwd + run   Esc: cancel"
+        " ⏎ create cwd + run"
     } else if on_cwd {
-        " Tab: complete dir   ⏎ run"
+        " Tab: complete dir  ⏎ run"
     } else {
-        " Tab: cwd   ⏎ run   Esc: cancel"
+        " Tab: cwd  ⏎ run  Esc: ✕"
     };
     lines.push(Line::from(Span::styled(
         truncate_end(hint, w),
@@ -1683,6 +1705,7 @@ mod tests {
 
     const SIZES: &[(u16, u16)] = &[
         (20, 8),
+        (28, 76),
         (30, 24),
         (34, 76),
         (40, 76),
@@ -1693,6 +1716,9 @@ mod tests {
         (2, 2),
         (34, 12),
         (34, 11),
+        (28, 12),
+        (28, 11),
+        (27, 24),
         (19, 6),
         (6, 4),
         (120, 1),
@@ -1941,6 +1967,11 @@ mod tests {
         assert!(row.contains("1h"), "wide name ate the age column: {row:?}");
         assert!(row.contains('3'), "wide name ate the pane badge: {row:?}");
         assert!(row.contains('▌'), "wide name ate the open marker: {row:?}");
+
+        // The default sits exactly on RAIL_MIN, and still draws the age.
+        let rows = rows_at(&app, crate::WIDTH_DEFAULT, 24);
+        let row = rows.iter().find(|r| r.contains('回')).cloned().unwrap_or_default();
+        assert!(row.contains("1h"), "the default lost the age rail: {row:?}");
     }
 
     #[test]
@@ -1991,22 +2022,21 @@ mod tests {
         assert_eq!(app.sessions.len(), 6, "the poll is untouched");
     }
 
-    /// The `?` overlay is where a narrow sidebar discovers `d`, so both halves
-    /// of the pair have to be in it.
-    /// The `?` overlay is where the binding is discovered, and the 34-column
+    /// The `?` overlay is where the binding is discovered, and the default
     /// sidebar is the width it is discovered at. Both halves must render uncut
-    /// there — a clipped `delete it + workt…` is the one truncation in this
+    /// there — a clipped `delete + workt…` is the one truncation in this
     /// overlay that costs the operator the consequence.
     #[test]
     fn the_help_overlay_documents_ctrl_x_and_what_the_second_press_takes() {
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
         app.help_lines = help_line_count(false);
-        for w in [60u16, 34] {
+        for w in [60u16, 34, crate::WIDTH_DEFAULT] {
             let rows = rows_at(&app, w, 40).join("\n");
             assert!(rows.contains("Ctrl-x"), "w={w}: {rows}");
             assert!(rows.contains("stop session"), "w={w}: {rows}");
-            assert!(rows.contains("delete it + worktree"), "w={w}: {rows}");
+            assert!(rows.contains("C-x ×2"), "w={w}: {rows}");
+            assert!(rows.contains("delete + worktree"), "w={w}: {rows}");
             assert!(!rows.contains("stop session (confirm)"), "w={w}: {rows}");
         }
     }
@@ -2044,10 +2074,50 @@ mod tests {
 
     /// REGRESSION. §6.8's overflow wrap used to need the detail block, which
     /// `slots` only allocates at height >= 12. Below that the armed warning —
-    /// the longest line ccmux produces, and the only one whose TAIL carries the
+    /// a long line, and the only one whose TAIL carries the
     /// consequence — fell back to a one-line `truncate_end` and the operator
     /// was left looking at a loaded irreversible verb whose warning said
     /// neither what it takes nor that it cannot be undone.
+    /// The same guarantee at the 28-column default, for every label width up
+    /// to `LABEL_MAX`: the warning wraps to three lines there too, so its tail
+    /// survives from h = 5. The `[codex!]` marker takes the front of the first
+    /// line, and with a full-width label that makes a fourth, so while Codex is
+    /// degraded the tail needs h = 6.
+    #[test]
+    fn the_armed_warning_keeps_its_tail_at_the_default_width() {
+        use crate::app::providers::{FailureCategory, Health};
+        let names: Vec<String> = (1..=14)
+            .map(|n| "a".repeat(n))
+            .chain(["kronos/options-features".to_string()])
+            .collect();
+        for name in &names {
+            for degraded in [false, true] {
+                let mut app = app_with(many(3));
+                if degraded {
+                    app.codex.settings.url = "ws://localhost:8965".into();
+                    app.diagnostics.codex.health = Health::Degraded(
+                        FailureCategory::Codex(crate::codex::CodexFailureKind::Connection),
+                        "connection refused".into(),
+                    );
+                }
+                app.stop_arm = Some(crate::app::StopArm {
+                    provider: Provider::Claude,
+                    session_id: "uuid-0001".into(),
+                    short_id: "1c45d64f".into(),
+                    name: name.clone(),
+                    at: Instant::now(),
+                });
+                for h in (if degraded { 6u16 } else { 5 })..=12 {
+                    let rows = rows_at(&app, crate::WIDTH_DEFAULT, h);
+                    let flat = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+                    assert!(flat.contains("Ctrl+X again: delete"), "{name} degraded={degraded} h={h}: {flat:?}");
+                    assert!(flat.contains("worktree — cannot be undone"), "{name} degraded={degraded} h={h}: {flat:?}");
+                    assert!(rows[0].contains("ccmux"), "h={h}: header lost: {:?}", rows[0]);
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_armed_warning_survives_a_sidebar_too_short_for_a_detail_block() {
         let mut app = app_with(many(3));
@@ -2075,8 +2145,8 @@ mod tests {
         }
 
         // h == 4 cannot hold all three lines without carving the list away
-        // entirely, which the cap forbids. It still says what delete TAKES,
-        // which the one-line truncation it replaced did not.
+        // entirely, which the cap forbids. At 34 it still says what delete
+        // TAKES, which the one-line truncation it replaced did not.
         let flat = rows_at(&app, 34, 4).join(" ");
         assert!(flat.contains("worktree"), "{flat:?}");
 
@@ -2098,13 +2168,15 @@ mod tests {
         let mut app = app_with(many(3));
         app.mode = Mode::Help;
         app.help_lines = help_line_count(false);
-        for w in [34u16, 60] {
+        for w in [34u16, 60, crate::WIDTH_DEFAULT] {
             let rows = rows_at(&app, w, 40).join("\n");
             assert!(rows.contains("cancel window/filter"), "w={w}: {rows}");
-            assert!(!rows.contains("Esc       clear filter"), "w={w}: {rows}");
+            assert!(!rows.contains("clear filter"), "w={w}: {rows}");
         }
     }
 
+    /// The `?` overlay is where a narrow sidebar discovers `d`, so both halves
+    /// of the pair have to be in it.
     #[test]
     fn the_help_overlay_documents_dismiss_and_undo() {
         let mut app = app_with(many(3));
@@ -2115,11 +2187,44 @@ mod tests {
         assert!(rows.contains("undo the last hide"), "{rows}");
 
         // The `d` line has to survive the narrow overlay too: at the default
-        // 34-column sidebar the action column is `w - key_w`, and losing the
+        // 28-column sidebar the overlay is one column, and losing the
         // "(pane stays)" half is losing the only warning that `d` on a session
         // with an open pane leaves that pane with no row to reach it from.
-        let narrow = rows_at(&app, 34, 40).join("\n");
-        assert!(narrow.contains("hide row (pane stays)"), "{narrow}");
+        for w in [34u16, crate::WIDTH_DEFAULT] {
+            let narrow = rows_at(&app, w, 40).join("\n");
+            assert!(narrow.contains("hide row (pane stays)"), "w={w}: {narrow}");
+        }
+    }
+
+    /// The default width renders the one-column overlay, and every binding in
+    /// it must be whole there — with Codex's lines too. A continuation row
+    /// (blank key) hangs under the action it continues.
+    #[test]
+    fn the_help_overlay_renders_every_binding_whole_at_the_default_width() {
+        let w = crate::WIDTH_DEFAULT;
+        for codex in [false, true] {
+            let mut app = app_with(many(3));
+            app.mode = Mode::Help;
+            if codex {
+                app.codex.settings.url = "ws://localhost".into();
+            }
+            app.help_lines = help_line_count(codex);
+            let rows = rows_at(&app, w, 80);
+            let all = rows.join("\n");
+            assert!(!all.contains('…'), "codex={codex}: {all}");
+            if codex {
+                let col = |needle: &str| {
+                    let line = rows.iter().find(|r| r.contains(needle)).expect(needle);
+                    line[..line.find(needle).unwrap()].chars().count()
+                };
+                assert_eq!(col("not loaded in server"), col("last outcome unknown"), "{all}");
+                assert_eq!(col("close pane; work stays"), col("on server"), "{all}");
+                assert_eq!(col("creates Claude session"), col("new Codex: Codex TUI"), "{all}");
+                assert_eq!(col("records launch target"), col("/resume /new /fork"), "{all}");
+                // A continuation of a continuation keeps the same column.
+                assert_eq!(col("records launch target"), col("change TUI, not map"), "{all}");
+            }
+        }
     }
 
     #[test]
@@ -2153,7 +2258,7 @@ mod tests {
     }
 
     /// `Ctrl+X`'s delete flash grew a pane count (§8.2). With it the line is
-    /// ~50 columns, over the 34-column default, so it has to wrap through the
+    /// ~50 columns, over the default width, so it has to wrap through the
     /// same overflow path as the arm hint — and every word has to survive,
     /// because the tail is the half that says what happened to the panes.
     #[test]
@@ -2162,11 +2267,11 @@ mod tests {
         // Verbatim from `App::run_delete`.
         const FLASH: &str = "deleted bt/reg-update + worktree · closed 2 panes";
         assert!(
-            display_width(FLASH) > 34,
+            display_width(FLASH) > crate::WIDTH_DEFAULT as usize,
             "fixture is no longer over-width, so it proves nothing: {FLASH:?}"
         );
         app.message = Some((FLASH.into(), MsgLevel::Warn));
-        let rows = rows_at(&app, 34, 24);
+        let rows = rows_at(&app, crate::WIDTH_DEFAULT, 24);
         let tail = rows[20..].join(" ");
         let flat = tail.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
@@ -2447,10 +2552,10 @@ mod tests {
     }
 
     /// The row that most deserves attention is the first one on screen, its
-    /// header is the first header, and at the default 34 columns the grid it
-    /// sits on is byte-for-byte the grid every other row sits on.
+    /// header is the first header, and at the default width — and at 34 — the
+    /// grid it sits on is byte-for-byte the grid every other row sits on.
     #[test]
-    fn a_blocked_row_leads_the_list_and_keeps_the_thirty_four_column_grid() {
+    fn a_blocked_row_leads_the_list_and_keeps_the_grid() {
         let mut blocked = sess(1, Kind::Background, Status::Waiting, Some(State::Blocked));
         blocked.name = "client statement automation".into();
         blocked.started_at = 0; // OLDEST: the group must outrank the age
@@ -2462,18 +2567,20 @@ mod tests {
         assert!(matches!(app.rows[1], Row::Session { idx: 1 }));
 
         let p = Palette::dark();
-        let cols = line_cols(&session_line(&app, &app.sessions[1], false, 34, &p));
-        assert_eq!(cols.len(), 34, "the row is not 34 columns wide");
-        // The gutter is unchanged: marker, badge, glyph, space.
-        assert_eq!(cols[2], '▲', "the glyph must sit on column 3 like every other");
-        assert_eq!(cols[3], ' ');
-        assert_eq!(cols[4], 'c', "the name still starts on column 5");
-        assert_eq!(cols[33], ' ', "column W is still the margin");
-        assert_eq!(cols[31..33].iter().collect::<String>(), "1h", "the age still ends on W-1");
-        // The header above it is 34 columns too, and says Blocked.
-        let h = line_cols(&group_header_line(Group::Blocked, 1, 34, &p));
-        assert_eq!(h.len(), 34);
-        assert_eq!(h[0..11].iter().collect::<String>(), " ── Blocked");
+        for w in [crate::WIDTH_DEFAULT as usize, 34] {
+            let cols = line_cols(&session_line(&app, &app.sessions[1], false, w, &p));
+            assert_eq!(cols.len(), w, "the row is not {w} columns wide");
+            // The gutter is unchanged: marker, badge, glyph, space.
+            assert_eq!(cols[2], '▲', "w={w}: the glyph must sit on column 3 like every other");
+            assert_eq!(cols[3], ' ');
+            assert_eq!(cols[4], 'c', "w={w}: the name still starts on column 5");
+            assert_eq!(cols[w - 1], ' ', "w={w}: column W is still the margin");
+            assert_eq!(cols[w - 3..w - 1].iter().collect::<String>(), "1h", "w={w}: the age still ends on W-1");
+            // The header above it is as wide, and says Blocked.
+            let h = line_cols(&group_header_line(Group::Blocked, 1, w, &p));
+            assert_eq!(h.len(), w);
+            assert_eq!(h[0..11].iter().collect::<String>(), " ── Blocked");
+        }
 
         // The glyph is painted yellow, and nothing else on the row is.
         let line = session_line(&app, &app.sessions[1], false, 34, &p);
@@ -2546,6 +2653,41 @@ mod tests {
         app.prompt = Some(prompt(0, Some("/home/dev/projects")));
         let d = dump(&app);
         assert!(d.contains("create cwd"), "an armed offer must be visible in the hint: {d:?}");
+    }
+
+    /// At the default width the prompt has 26 inner columns. Every hint state
+    /// must be whole there, and the unfocused cwd must keep the component that
+    /// says WHERE the session will run, not the `/home/...` prefix every path
+    /// shares.
+    #[test]
+    fn the_prompt_fits_the_default_width() {
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        app.mode = Mode::Prompt(PromptKind::NewBackground);
+        let cwd = "/home/dev/projects/shared/Foundation";
+        for (focus, pending, hint) in [
+            (1, None, "Tab: cwd  ⏎ run  Esc: ✕"),
+            (0, None, "Tab: complete dir  ⏎ run"),
+            (0, Some(cwd), "⏎ create cwd + run"),
+        ] {
+            app.prompt = Some(Prompt {
+                kind: PromptKind::NewBackground,
+                fields: vec![cwd.into(), "task text".into()],
+                focus,
+                cursor: 0,
+                pending_create: pending.map(str::to_string),
+            });
+            let rows = rows_at(&app, crate::WIDTH_DEFAULT, 24);
+            let line = rows.iter().find(|r| r.contains(hint)).unwrap_or_else(|| panic!("{hint}: {rows:#?}"));
+            assert!(!line.contains('…'), "{line:?}");
+        }
+        app.prompt.as_mut().expect("prompt").focus = 1;
+        let rows = rows_at(&app, crate::WIDTH_DEFAULT, 24).join("\n");
+        assert!(rows.contains("cwd  ~/…/Foundation"), "{rows}");
+
+        // Tab completion leaves a trailing `/`; the name must survive it.
+        app.prompt.as_mut().expect("prompt").fields[0] = "/home/dev/projects/price-sanitize-pipeline/".into();
+        let rows = rows_at(&app, crate::WIDTH_DEFAULT, 24).join("\n");
+        assert!(rows.contains("cwd  price-sanitize-pip…"), "{rows}");
     }
 
     /// The focused field's visible window is a display-column walk back from
@@ -2868,8 +3010,8 @@ mod tests {
     }
 
     /// The badge names a TAB, and says nothing when the answer is "you are
-    /// already looking at it". At the default 34 columns, with the whole grid
-    /// asserted column by column.
+    /// already looking at it". At 34 columns, with the whole grid asserted
+    /// column by column; the gutter does not depend on the width.
     #[test]
     fn the_tab_badge_is_blank_here_and_a_digit_elsewhere() {
         let p = Palette::light();
@@ -2943,12 +3085,26 @@ mod tests {
         // rail: the dot is still on column W-1.
         app.filter = "session number 1".into();
         app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
-        for w in [20u16, 26, 34, 40] {
+        for w in [20u16, 26, crate::WIDTH_DEFAULT, 34, 40] {
             let row = rows_at(&app, w, 24)[0].clone();
             let cols: Vec<char> = row.chars().collect();
             assert_eq!(cols[w as usize - 2], '●', "w={w}: {row:?}");
             assert_eq!(cols[w as usize - 1], ' ', "w={w}: {row:?}");
         }
+
+        // At the default, a two-digit count beside the chip takes the narrow
+        // rung — the count without its noun — and the rail is untouched.
+        let mut wide = app_with(many(14));
+        wide.own_pane = PaneId::parse("%1");
+        wide.own_window = crate::tmux::WindowId::parse("@2");
+        wide.panes = app.panes.clone();
+        wide.tabs = app.tabs.clone();
+        let w = crate::WIDTH_DEFAULT as usize;
+        let row = rows_at(&wide, crate::WIDTH_DEFAULT, 24)[0].clone();
+        assert!(row.starts_with(" ccmux  tab 2  14 "), "{row:?}");
+        let cols: Vec<char> = row.chars().collect();
+        assert_eq!(cols[w - 2], '●', "{row:?}");
+        assert_eq!(cols[w - 1], ' ', "{row:?}");
     }
 
     /// REGRESSION. The chip used to read `tab {window_index}/{window count}`,
@@ -3016,10 +3172,14 @@ mod tests {
         assert!(dump.contains("restart ccmux + agents"), "{dump}");
 
         // The label survives the 34-column overlay uncut: the key column is 10
-        // wide and the body 32, which leaves 22 for a 22-column label.
+        // wide and the body 32, which leaves 22 for a 22-column label. At the
+        // 28-column default the overlay is one column, `R` + space + label in 24
+        // of 26.
         app.mode = Mode::Help;
-        let narrow = rows_at(&app, 34, 34).join("\n");
-        assert!(narrow.contains("restart ccmux + agents"), "{narrow}");
+        for w in [34u16, crate::WIDTH_DEFAULT] {
+            let narrow = rows_at(&app, w, 34).join("\n");
+            assert!(narrow.contains("restart ccmux + agents"), "w={w}: {narrow}");
+        }
     }
 
     /// Column 1 is the marker's, not the selection's: an open row keeps its
@@ -3229,7 +3389,7 @@ mod tests {
     /// The id line's two facts, and which one loses. The status word is
     /// redundant with the row's own glyph; the 8-hex short id is stated nowhere
     /// else, so below `MIN_BODY` the status yields and the id survives. HEAD
-    /// truncated the status away at the default 34 columns.
+    /// once truncated the status away at 34 columns.
     #[test]
     fn the_detail_id_line_keeps_the_status_word_on_the_rail() {
         let mut app = app_with(vec![sess(
@@ -3253,16 +3413,53 @@ mod tests {
             "the status word must end on column W-1: {id:?}"
         );
 
+        // At the 28-column default the kind no longer fits beside the status,
+        // so it is dropped whole — never `bac…` — and the rail is unchanged.
+        let w = crate::WIDTH_DEFAULT as usize;
+        let id = rows_at(&app, crate::WIDTH_DEFAULT, 24)
+            .into_iter()
+            .find(|r| r.trim_start().starts_with("id"))
+            .expect("id line");
+        let cols: Vec<char> = id.chars().collect();
+        assert_eq!(cols[..14].iter().collect::<String>(), "  id  00000001", "{id:?}");
+        assert_eq!(cols[w - 1], ' ', "column W must be the margin: {id:?}");
+        assert_eq!(cols[w - 8..w - 1].iter().collect::<String>(), "stopped", "{id:?}");
+        assert!(!id.contains('…') && !id.contains("bac"), "the kind is dropped whole: {id:?}");
+
         let id = rows_at(&app, 20, 24)
             .into_iter()
             .find(|r| r.trim_start().starts_with("id"))
             .expect("id line");
         assert!(id.contains("00000001"), "the short id must survive: {id:?}");
         assert!(!id.contains("stopped"), "the status word must yield: {id:?}");
+        assert!(!id.contains('…') && !id.contains("bac"), "the kind is dropped whole: {id:?}");
 
         // The `· pane N` suffix is gone; the gutter states the pane index.
         let all = rows_at(&app, 34, 24).join(" ");
         assert!(!all.contains("pane"), "the detail pane suffix is gone: {all:?}");
+    }
+
+    /// A row with no short id has only its `—` to keep in the id column, so the
+    /// kind yields before the status there too, at every width.
+    #[test]
+    fn an_id_less_row_drops_its_kind_before_its_status() {
+        let mut app = app_with(vec![sess(
+            1,
+            Kind::Background,
+            Status::Unknown(String::new()),
+            Some(State::Stopped),
+        )]);
+        app.sessions[0].id = None;
+        app.selected = 1;
+        for w in [20u16, 24, crate::WIDTH_DEFAULT, 34] {
+            let id = rows_at(&app, w, 24)
+                .into_iter()
+                .find(|r| r.trim_start().starts_with("id"))
+                .expect("id line");
+            assert!(id.contains('—'), "w={w}: {id:?}");
+            assert!(id.contains("stopped"), "w={w}: the status must outlast the kind: {id:?}");
+            assert!(!id.contains('…'), "w={w}: {id:?}");
+        }
     }
 
     /// A pair is never split. HEAD clipped mid-word to `x cl…` at the default

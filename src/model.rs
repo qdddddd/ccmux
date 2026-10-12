@@ -647,6 +647,16 @@ pub fn shorten_cwd(cwd: &str, home: Option<&str>, max: usize) -> String {
         return s;
     }
 
+    // A trailing `/` — the shape Tab completion leaves — is not a component:
+    // eliding against it kept an empty final name and rendered a bare `~/…/`.
+    let trimmed = s.trim_end_matches('/');
+    if !trimmed.is_empty() && trimmed.len() < s.len() {
+        s = trimmed.to_string();
+        if display_width(&s) <= max {
+            return s;
+        }
+    }
+
     let parts: Vec<&str> = s.split('/').collect();
     let keep_root = parts.first() == Some(&"~");
     let root = if keep_root { "~/" } else { "" };
@@ -1281,6 +1291,19 @@ mod tests {
         assert_eq!(shorten_cwd("/home/devxx/a", Some("/home/dev"), 24), "/home/devxx/a");
         // no home given
         assert_eq!(shorten_cwd("/home/dev/a", None, 24), "/home/dev/a");
+
+        // A trailing slash — what Tab completion leaves — keeps the final name.
+        assert_eq!(
+            shorten_cwd("/home/dev/projects/price-sanitize-pipeline/", Some("/home/dev"), 19),
+            "price-sanitize-pip…"
+        );
+        assert_eq!(
+            shorten_cwd("/home/dev/projects/shared/Foundation/", Some("/home/dev"), 24),
+            "~/…/shared/Foundation"
+        );
+        assert_eq!(shorten_cwd("/data/warehouse/nightly-update-jobs/", None, 19), "nightly-update-jobs");
+        assert_eq!(shorten_cwd("/home/dev/ccmux/", Some("/home/dev"), 24), "~/ccmux/");
+        assert_eq!(shorten_cwd("/", None, 24), "/");
     }
 
     #[test]

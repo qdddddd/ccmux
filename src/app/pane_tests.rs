@@ -240,6 +240,30 @@ fn codex_tab_seeds_v2_before_sidebar_and_propagates_only_nonsecret_settings() {
     });
 }
 
+/// The open flashes name the session the way every other flash does,
+/// through `session_label`: an unbounded name pushed `in pane N` / `in tab N`
+/// off the default sidebar.
+#[test]
+fn the_open_flashes_bound_a_long_name_to_the_label_width() {
+    const LONG: &str = "Update Clash and Sync Codex profiles across machines";
+    let label = model::truncate_end(LONG, LABEL_MAX);
+    assert!(label.ends_with('…'), "the fixture must be over-long: {label}");
+    with_sidebar(|a, _| {
+        a.sessions[0].name = LONG.into();
+        a.rebuild_rows();
+        press(a, 'o');
+        let msg = a.message.as_ref().unwrap().0.clone();
+        assert!(msg.starts_with(&format!("opened {label}")), "{msg}");
+        assert!(!msg.contains(LONG), "{msg}");
+    });
+    with_sidebar(|a, _| {
+        a.sessions[0].name = LONG.into();
+        a.rebuild_rows();
+        press(a, 't');
+        assert_eq!(a.message.as_ref().unwrap().0, format!("opened {label} in tab 2"));
+    });
+}
+
 #[test]
 fn x_closes_live_parked_and_shell_codex_panes_without_touching_the_thread() {
     for latch in ["", "1", "shell"] {
