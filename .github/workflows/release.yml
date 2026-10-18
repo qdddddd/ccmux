@@ -43,6 +43,10 @@ jobs:
           rustup default "$RUST"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Ad-hoc sign
+        # The linker signs arm64 builds itself but leaves x86_64 unsigned.
+        if: runner.os == 'macOS'
+        run: codesign --force -s - target/${{ matrix.target }}/release/ccmux
       - name: Test
         # The x86_64 macOS binary cannot run on the arm64 runner without Rosetta.
         if: matrix.target != 'x86_64-apple-darwin' && inputs.test != false
