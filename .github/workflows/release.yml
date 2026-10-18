@@ -1,0 +1,94 @@
+name: release
+
+# Builds the release tarballs for a tag and attaches them to its GitHub
+# release, creating the release if it does not exist yet. Assets the release
+# already has are left untouched, so re-running on a published tag only fills
+# in what is missing. SHA256SUMS is always rebuilt from every tarball.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v0.2.1"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  RUST: "1.98.1"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST" --profile minimal --target ${{ matrix.target }}
+          rustup default "$RUST"
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Test
+        # The x86_64 macOS binary cannot run on the arm64 runner without Rosetta.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ccmux
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+      - name: Package
+        # GNU tar here for every platform: fixed owner, mode and mtime (the
+        # tagged commit's time) keep the tarballs reproducible.
+        run: |
+          mt=$(git log -1 --format=%ct)
+          mkdir -p dist
+          for dir in bin/*/; do
+            target=$(basename "$dir")
+            tar --owner=0 --group=0 --numeric-owner --mode=0755 --mtime="@$mt" \
+              -C "$dir" -cf - ccmux | gzip -9n > "dist/ccmux-$TAG-$target.tar.gz"
+          done
+          ls -l dist
+      - name: Create the release if missing
+        run: gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "$TAG" --notes ""
+      - name: Upload missing tarballs and rebuild SHA256SUMS
+        run: |
+          have=$(gh release view "$TAG" --json assets -q '.assets[].name')
+          for f in dist/*.tar.gz; do
+            name=$(basename "$f")
+            if grep -qxF "$name" <<<"$have"; then
+              echo "keep existing $name"
+              rm "$f"
+            else
+              gh release upload "$TAG" "$f"
+            fi
+          done
+          mkdir -p sums
+          gh release download "$TAG" -p '*.tar.gz' -D sums
+          (cd sums && sha256sum *.tar.gz | tee SHA256SUMS)
+          gh release upload "$TAG" sums/SHA256SUMS --clobber
