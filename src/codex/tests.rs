@@ -1625,6 +1625,9 @@ fn local_server(
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD (macOS) hands the accepted socket the listener's
+                    // non-blocking flag; Linux does not. Serve it blocking.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                     stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
                     serve(stream);
@@ -1737,7 +1740,14 @@ fn production_connector_tries_the_next_prepared_address_after_refusal() {
     let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     // Keep the port reserved on .1; no suite listener binds .2. Dropping a
     // listener to fabricate refusal lets another parallel test reuse its port.
-    let refused = SocketAddr::from(([127, 0, 0, 2], reserved.local_addr().unwrap().port()));
+    // macOS routes only 127.0.0.1 on lo0, so .2 hangs there instead of
+    // refusing; `::1` refuses on both, and no suite listener binds it.
+    let port = reserved.local_addr().unwrap().port();
+    let refused = if cfg!(target_os = "macos") {
+        SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))
+    } else {
+        SocketAddr::from(([127, 0, 0, 2], port))
+    };
     let (address, server) = local_server(|mut stream| {
         read_upgrade(&mut stream);
         stream.write_all(b"HTTP/1.1 401 Denied\r\nContent-Length: 0\r\n\r\n").unwrap();

@@ -1607,7 +1607,8 @@ fn a_settle_that_archives_nothing_protects_the_rest_of_the_codex_window() {
         let armed_at = a.stop_arm.as_ref().unwrap().at;
         press_inside_the_window(&mut a, armed_at, 780);
         assert!(a.pending_delete.is_some(), "{outcome}");
-        sleep_until(armed_at + Duration::from_millis(780) + CX_SETTLE + Duration::from_millis(5));
+        // From the press as it landed: a loaded runner can wake it late.
+        sleep_until(a.pending_delete.as_ref().unwrap().at + CX_SETTLE + Duration::from_millis(5));
         assert!(with_inventory(|_| Ok(String::new()), || a.tick_stop_arm()));
         assert!(message(&a).contains("not archived") || message(&a).starts_with("archive failed: "),
             "{outcome}: {}", message(&a));
