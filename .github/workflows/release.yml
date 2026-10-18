@@ -12,6 +12,10 @@ on:
       tag:
         description: "Existing tag to build, e.g. v0.2.1"
         required: true
+      test:
+        description: "Run the test suite before building"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -41,7 +45,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Test
         # The x86_64 macOS binary cannot run on the arm64 runner without Rosetta.
-        if: matrix.target != 'x86_64-apple-darwin'
+        if: matrix.target != 'x86_64-apple-darwin' && inputs.test != false
         run: cargo test --release --locked --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
