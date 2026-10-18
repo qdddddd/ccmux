@@ -118,7 +118,7 @@ Names have no provider prefix. `◇` means unloaded; it does not establish
 the last turn's outcome. `a` hides unloaded Codex rows along with the
 Claude Completed group.
 
-`Enter/o/s/t` open the official Codex TUI; `x` closes a pane while work
+`Enter/v/s/t` open the official Codex TUI; `x` closes a pane while work
 stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
 as usual; `r` also reloads credentials and DNS. On an idle (`○`) or unloaded
 (`◇`) Codex row, press `Ctrl-x` twice within 2 s to archive it. The first
@@ -165,7 +165,7 @@ are listed above.
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
 | `Tab` / `Shift-Tab` | Next / previous group |
 | `Enter` | Jump to the session's pane, or open it in a vertical split |
-| `o` / `s` | Open in a side-by-side / stacked split |
+| `v` / `s` | Open in a side-by-side / stacked split. With two or more panes beside the sidebar, pick which one to split |
 | `t` | Open in a new tab |
 | `x` | Close the session's pane. The agent keeps running |
 | `Ctrl-x` | Claude: stop, then delete on a second press. Codex: archive eligible `○`/`◇` rows on a second press |
@@ -181,7 +181,14 @@ are listed above.
 | `Esc` | Cancel a pending delete/archive, or clear the filter |
 | `Ctrl-c` | Quit from any mode |
 
-`o` and `s` follow vim's naming: `o` puts panes side by side, `s` stacks them.
+`v` and `s` follow vim's naming: `v` (`:vsplit`) puts panes side by side, `s`
+stacks them. When the sidebar's window has two or more other panes, `v` and `s`
+work like nvim-tree's window picker: each pane gets a letter on its border
+(`A`, `B`, …) and the footer reads `pick pane A–C  Esc: ✕`. Press a letter to
+split that pane; `Esc` or any other key cancels. With one other pane or none,
+they split straight away, as they do in a zoomed window. `Enter` never asks:
+it splits the active pane, or, when the sidebar itself is active, the rightmost
+other pane of its window.
 
 Inside the overlays, `j`/`k`, `Ctrl-d`/`Ctrl-u` and `g`/`G` scroll. In the
 `n` prompt, `Tab` moves between the task and cwd fields and `Enter` submits.
@@ -218,8 +225,8 @@ pane stays open. Hidden rows are kept for the life of the tmux session.
 The sidebar keeps its width. ccmux checks it on every poll and resizes it only
 when it is wrong, so a split or a manual resize heals on the next tick.
 
-`o`, `s` and `x` spread the panes ccmux opened evenly along the split axis. A
-window mixing `o` and `s` panes is a tree, and is left as you built it. Panes
+`v`, `s` and `x` spread the panes ccmux opened evenly along the split axis. A
+window mixing `v` and `s` panes is a tree, and is left as you built it. Panes
 are never re-evened on a timer, so a border you drag stays put.
 
 A zoomed pane (`prefix z`) stays zoomed. The automatic resizing above pauses
@@ -339,7 +346,7 @@ stall the sidebar for longer than that.
 ## Degraded mode
 
 `ccmux sidebar` also runs outside tmux. The list, filtering, `n`, `L`,
-`d` and `u` work, and so does `Ctrl-x` on Claude rows. `Enter`, `o`, `s`, `t`,
+`d` and `u` work, and so does `Ctrl-x` on Claude rows. `Enter`, `v`, `s`, `t`,
 `x`, `R` and `Ctrl-x` on Codex rows refuse with a message.
 
 ## Development

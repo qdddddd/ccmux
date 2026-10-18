@@ -343,7 +343,7 @@ fn the_footer_says_archive_only_while_a_codex_row_is_selected() {
     assert_eq!(on_claude.selected_session().unwrap().provider, Provider::Claude);
     assert_eq!(on_codex.selected_session().unwrap().provider, Provider::Codex);
 
-    let pairs = "⏎ open  o/s split  x close  t tab  d/u hide  C-x stop  n new  L logs  / filter  R restart";
+    let pairs = "⏎ open  v/s split  x close  t tab  d/u hide  C-x stop  n new  L logs  / filter  R restart";
     assert!(rows_at(&only, 120, 24)[23].starts_with(pairs));
     assert!(rows_at(&on_codex, 120, 24)[23].starts_with(&pairs.replace("C-x stop", "C-x archive")));
     for w in 0..=120u16 {

@@ -387,8 +387,10 @@ impl App {
 
     /// Opening uses non-secret settings even when polling or credentials fail.
     /// A known unsafe resolution remains refused until a successful reload.
-    pub(super) fn refuse_codex_open(&mut self) -> bool {
-        if !self.selected_session().is_some_and(|s| s.provider == Provider::Codex) {
+    /// `provider` is the session being opened, which a caller resolves first:
+    /// a pick's target need not be the row the cursor is on.
+    pub(super) fn refuse_codex_open(&mut self, provider: Provider) -> bool {
+        if provider != Provider::Codex {
             return false;
         }
         let settings = &self.codex.settings;

@@ -313,7 +313,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Help => draw_help(f, area, app, &p),
         Mode::Logs => draw_logs(f, area, app.logs.as_ref(), &p),
         Mode::Prompt(kind) => draw_prompt(f, area, *kind, app.prompt.as_ref(), app.home.as_deref(), &p),
-        Mode::Normal | Mode::Filter => {}
+        Mode::Normal | Mode::Filter | Mode::PickPane => {}
     }
 }
 
@@ -988,7 +988,7 @@ fn footer_message(app: &App, p: &Palette) -> Option<(String, Color)> {
 }
 
 fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)> {
-    if w == 0 || app.mode == Mode::Filter {
+    if w == 0 || matches!(app.mode, Mode::Filter | Mode::PickPane) {
         return None;
     }
     if app.message.is_none() && app.arm_hint().is_none() { return None; }
@@ -1004,7 +1004,7 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
 /// deliberately absent — it is the one hint a TUI user never needs told.
 /// Footer hint pairs, most-wanted first: `draw_footer` fits whole pairs from
 /// the left and stops at the first one that will not fit, so the order is the
-/// priority order. At the 28-column default two pairs fit, `⏎ open  o/s split`;
+/// priority order. At the 28-column default two pairs fit, `⏎ open  v/s split`;
 /// `x close` joins them at 34 columns, and nothing past it renders below a
 /// wider sidebar still. `d/u hide` sits fifth — above `C-x stop`, which
 /// announces its own second half in the footer the moment it fires — because
@@ -1012,12 +1012,12 @@ fn overflow_message(app: &App, w: usize, p: &Palette) -> Option<(String, Color)>
 /// pair names its own undo. A narrow sidebar discovers `x`, `t`, `d` and `C-x`
 /// through `?` and the README.
 ///
-/// `t tab` is inserted FOURTH rather than beside `o/s split`, so it never
+/// `t tab` is inserted FOURTH rather than beside `v/s split`, so it never
 /// evicts `x close`: that is the verb that acts on what is already on screen,
 /// and advertising a new one at its expense would be a bad trade.
 const HINTS: &[(&str, &str)] = &[
     ("⏎", "open"),
-    ("o/s", "split"),
+    ("v/s", "split"),
     ("x", "close"),
     ("t", "tab"),
     ("d/u", "hide"),
@@ -1034,6 +1034,28 @@ const HINTS: &[(&str, &str)] = &[
 ];
 /// Pinned to the rail at every width that can hold it.
 const HELP_HINT: &str = "? help";
+
+/// The pick footer: the label range and the way out, in the longest form
+/// that fits `budget` — measured, not eyeballed, in
+/// `the_pick_hint_fits_every_sidebar_width`. `pick pane A–C  Esc: ✕` is the
+/// prompt's hint grammar and fits the default 28 columns; below that, and
+/// behind a `[codex!]` marker, the words go before the range does.
+fn pick_hint(app: &App, budget: usize) -> String {
+    let range = app
+        .pick
+        .as_ref()
+        .and_then(|pk| Some((pk.labels.first()?.0, pk.labels.last()?.0)))
+        .map(|(a, b)| format!("{a}–{b}"))
+        .unwrap_or_default();
+    [
+        format!("pick pane {range}  Esc: ✕"),
+        format!("pick {range}  Esc: ✕"),
+        format!("{range}  Esc: ✕"),
+    ]
+    .into_iter()
+    .find(|hint| display_width(hint) <= budget)
+    .unwrap_or(range)
+}
 
 fn footer_prefix(app: &App) -> &'static str {
     if app.codex_error().is_some() { "[codex!] " } else { "" }
@@ -1059,6 +1081,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         let text = format!("/{}▏", app.filter);
         f.render_widget(
             Paragraph::new(footer_spans(app, &text, p.yellow, w, p)),
+            area,
+        );
+        return;
+    }
+    // 1b. So does a `v`/`s` pick: the labels are on the pane borders, and
+    //     this line says what they are and how to back out (§8.4).
+    if app.mode == Mode::PickPane {
+        let budget = w.saturating_sub(display_width(footer_prefix(app)));
+        f.render_widget(
+            Paragraph::new(footer_spans(app, &pick_hint(app, budget), p.yellow, w, p)),
             area,
         );
         return;
@@ -1169,8 +1201,11 @@ const KEYS: &[(&str, &str)] = &[
     ("Tab", "next group"),
     ("S-Tab", "previous group"),
     ("Enter", "open or jump to pane"),
-    ("o", "open in vertical split"),
+    ("v", "open in vertical split"),
     ("s", "open in horizontal split"),
+    // §8.4's picker, stated once for both split keys. Worded to the default
+    // overlay's 26 columns, like every other row here.
+    ("", "2+ panes: press a label"),
     ("t", "open in a new tab"),
     ("x", "close pane (agent lives)"),
     ("Ctrl-x", "stop session"),
@@ -1200,7 +1235,7 @@ const CODEX_KEYS: &[(&str, &str)] = &[
     ("◇", "not loaded in server"),
     ("", "last outcome unknown"),
     ("Enter", "open/jump Codex TUI"),
-    ("o/s/t", "open Codex TUI"),
+    ("v/s/t", "open Codex TUI"),
     ("x", "close pane; work stays"),
     ("", "on server"),
     ("R", "Codex panes skipped"),
@@ -1576,6 +1611,8 @@ mod tests {
             mode: Mode::Normal,
             prompt: None,
             logs: None,
+            pick: None,
+            pick_healed: true,
             map: PaneMap::default(),
             map_dirty: false,
             sidebar_pane: None,
@@ -1738,6 +1775,7 @@ mod tests {
             Mode::Help,
             Mode::Logs,
             Mode::Prompt(PromptKind::NewBackground),
+            Mode::PickPane,
         ] {
             base.mode = mode.clone();
             base.prompt = match &mode {
@@ -1753,6 +1791,7 @@ mod tests {
                 }),
                 _ => None,
             };
+            base.pick = (mode == Mode::PickPane).then(pick_fixture);
             base.logs = if mode == Mode::Logs {
                 Some(LogsView {
                     title: "prediction analysis ab_1_2_cd".into(),
@@ -1767,6 +1806,53 @@ mod tests {
         base.mode = Mode::Normal;
         base.prompt = None;
         base.logs = None;
+        base.pick = None;
+    }
+
+    /// A three-pane pick, labels `A`–`C`.
+    fn pick_fixture() -> crate::app::PanePick {
+        let pid = |s: &str| crate::tmux::PaneId::parse(s).expect("pane id");
+        crate::app::PanePick {
+            dir: crate::tmux::SplitDir::Vertical,
+            provider: Provider::Claude,
+            session_id: "fixture".into(),
+            anchor: pid("%1"),
+            window: crate::tmux::WindowId::parse("@1").expect("window id"),
+            labels: vec![('A', pid("%2")), ('B', pid("%3")), ('C', pid("%4"))],
+        }
+    }
+
+    /// §8.4: the pick footer is whole at every sidebar width `--width` allows
+    /// (20..), with and without the `[codex!]` marker in front of it, and the
+    /// label range is never what gets cut. At the default it is the full
+    /// prompt-style hint.
+    #[test]
+    fn the_pick_hint_fits_every_sidebar_width() {
+        let mut app = app_with(many(3));
+        app.mode = Mode::PickPane;
+        app.pick = Some(pick_fixture());
+        app.message = Some(("a flash the hint must not lose to".into(), MsgLevel::Info));
+        let footer = |app: &App, w: u16| rows_at(app, w, 24)[23].trim_end().to_string();
+        assert_eq!(footer(&app, crate::WIDTH_DEFAULT).trim(), "pick pane A–C  Esc: ✕");
+        for w in 20..=40u16 {
+            let line = footer(&app, w);
+            assert!(!line.contains('…'), "w={w}: {line:?}");
+            assert!(line.contains("A–C  Esc: ✕"), "w={w}: {line:?}");
+        }
+        // The overflow carve stays shut: the hint owns the one footer row.
+        assert!(overflow_message(&app, 20, &Palette::dark()).is_none());
+
+        app.codex.settings.url = "ws://localhost:8965".into();
+        app.diagnostics.codex.health = crate::app::providers::Health::Degraded(
+            crate::app::providers::FailureCategory::Codex(crate::codex::CodexFailureKind::Connection),
+            "connection refused".into(),
+        );
+        assert!(!footer_prefix(&app).is_empty(), "the fixture must raise the marker");
+        for w in 20..=40u16 {
+            let line = footer(&app, w);
+            assert!(!line.contains('…'), "w={w}: {line:?}");
+            assert!(line.contains("A–C"), "w={w}: {line:?}");
+        }
     }
 
     #[test]
@@ -3468,10 +3554,10 @@ mod tests {
     fn the_footer_fills_whole_pairs_and_pins_the_help_key() {
         let app = app_with(many(3));
         for (w, want) in [
-            (44u16, "⏎ open  o/s split  x close  t tab"),
+            (44u16, "⏎ open  v/s split  x close  t tab"),
             // `t tab` sits FOURTH, so the 34-column footer is unchanged by it.
-            (34, "⏎ open  o/s split  x close"),
-            (28, "⏎ open  o/s split"),
+            (34, "⏎ open  v/s split  x close"),
+            (28, "⏎ open  v/s split"),
             (20, "⏎ open"),
         ] {
             let f = rows_at(&app, w, 24)[23].clone();

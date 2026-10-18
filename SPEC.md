@@ -270,12 +270,12 @@ The sidebar stays leftmost, full height, exactly 34 columns throughout.
 
 ### 1.4 Spreading the content panes evenly
 
-`split-window` HALVES its target, so successive `o` presses give progressively
+`split-window` HALVES its target, so successive `v` presses give progressively
 narrower panes: on a 120x40 window with a 34-column sidebar, four of them leave
 `34 42 21 20 …`. After a split or a kill — and at **no other time** — ccmux
 re-lays the window so the panes it opened share the axis that was split.
 
-- `o` (`SplitDir::Vertical`, tmux `-h`) puts panes side by side, so it divides
+- `v` (`SplitDir::Vertical`, tmux `-h`) puts panes side by side, so it divides
   **width**. `s` (`SplitDir::Horizontal`, tmux `-v`) stacks them, so it divides
   **height**. The sidebar spans the window's full height and is never part of a
   height division, only of a width division.
@@ -286,7 +286,7 @@ re-lays the window so the panes it opened share the axis that was split.
   what tmux's own `even-horizontal` does. Remainder-to-one-pane looks the same
   at three panes and absurd at eight, where it would leave seven panes of 9
   columns beside one of 15.
-- **Only a clean row or a clean column is evened.** A mix of `o` and `s` builds
+- **Only a clean row or a clean column is evened.** A mix of `v` and `s` builds
   a tree, where "even along the axis" has no single meaning; `select-layout
   tiled` and evening the top-level groups both move panes the operator placed
   on purpose, so a tree is a **no-op**.
@@ -303,7 +303,7 @@ re-lays the window so the panes it opened share the axis that was split.
   layout uneven are the only ones that even it.
 - **Never through a zoom**, for the reason in §1.3: `select-layout` clears
   `#{window_zoomed_flag}` exactly as `resize-pane` does. A split un-zooms the
-  window before ccmux looks, so `o` and `s` still even; a kill does not, so
+  window before ccmux looks, so `v` and `s` still even; a kill does not, so
   closing one pane no longer un-zooms another.
 
 The geometry is written as ONE tmux layout string through `select-layout`,
@@ -327,16 +327,20 @@ checked anyway, and a window that fails the check is one more no-op.
 Verified on tmux 3.4 (120x40 window, sidebar pinned to 34):
 
 ```
-o o o o     34 85 / 34 42 42 / 34 28 28 27 / 34 21 21 20 20   (widths)
+v v v v     34 85 / 34 42 42 / 34 28 28 27 / 34 21 21 20 20   (widths)
 x           34 28 28 27
 5 ticks     34 28 28 27   (unchanged)
 
-o s s s s   40 40 / 40 20 19 / 40 13 13 12 / 40 10 9 9 9 / 40 8 7 7 7 7  (heights)
+v s s s s   40 40 / 40 20 19 / 40 13 13 12 / 40 10 9 9 9 / 40 8 7 7 7 7  (heights)
 x           40 10 9 9 9
 5 ticks     40 10 9 9 9   (unchanged)
 
-o o s       sidebar 34 | 42 | 42 over (20, 19)  — a tree, left exactly as built
+v v s       sidebar 34 | 42 | 42 over (20, 19)  — a tree, left exactly as built
 ```
+
+Measured through `act_open`, the deterministic `split_anchor` placement. From
+the third `v` on, the keypress asks which pane to split first (§8.4); the
+evening that follows the split is the same.
 
 The first number of each heights row is the sidebar, which spans the window's
 full height throughout and is never given a share of it.
@@ -600,6 +604,10 @@ pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
 // must not inherit — a value on a window would make every pane in it read as
 // detached.
 pub const OPT_PANE_DETACHED: &str = "@ccmux_detached";
+// §8.4's picker: a candidate's label (PANE-scoped, set only while a pick is up)
+// and the window-level border options it displaced (WINDOW-scoped, JSON).
+pub const OPT_PANE_PICK: &str = "@ccmux_pick";
+pub const OPT_PICK_SAVED: &str = "@ccmux_pick_saved";
 pub const EMPTY_MAP_JSON: &str = r#"{"v":1,"panes":{}}"#;
 
 /// A validated tmux window id in `@N` form. An IDENTITY, never a target: no
@@ -925,6 +933,20 @@ pub fn save_tab_hidden(session: &str, pane: &PaneId, window: &WindowId, log: &Hi
 pub fn write_tab_map_uncached(session: &str, pane: &PaneId, map: &PaneMap)
     -> Result<(), TmuxError>;
 
+// ── The `v` / `s` pane picker (§8.4) ────────────────────────────────────────
+
+/// Save `anchor`'s window-level border options, turn the border line on, and
+/// put each label on its pane. R2-gated against one enumeration; every pane
+/// must be in the anchor's window.
+pub fn show_pick_labels(session: &str, anchor: &PaneId, labels: &[(char, PaneId)])
+    -> Result<(), TmuxError>;
+/// Unset every label in `window` and on each of `labelled` still in the
+/// session, and restore exactly what `show_pick_labels` saved, through any
+/// live pane of `window`. Also the startup heal (`labelled` empty). The
+/// `WindowId` only filters one `list-panes -s`; every `-t` is a pane from it.
+pub fn clear_pick_labels(session: &str, window: &WindowId, labelled: &[PaneId])
+    -> Result<(), TmuxError>;
+
 // ── The dismissal log (§11.3) ───────────────────────────────────────────────
 
 /// One dismissal (`add: true`) or restoration (`add: false`), stamped so every
@@ -1239,6 +1261,9 @@ pub enum Mode {
     Prompt(PromptKind),
     Help,
     Logs,
+    /// `v`/`s` labelled two or more panes; the next key picks one (§8.4).
+    /// Its state is `App::pick: Option<PanePick>`.
+    PickPane,
 }
 
 /// What a keypress resolved to. Returned by `App::on_key` so the event loop can
@@ -1281,6 +1306,8 @@ pub struct App {
     pub mode: Mode,
     pub prompt: Option<Prompt>,
     pub logs: Option<LogsView>,
+    pub pick: Option<PanePick>,   // `Some` exactly while mode == PickPane (§8.4)
+    pub pick_healed: bool,        // the once-per-process heal has run (§8.4)
 
     // tmux
     pub map: PaneMap,
@@ -1745,7 +1772,7 @@ anything.
 inherits it) and it certainly exists. The session's cwd is deliberately not used: `restart::plan`
 rebuilds the same template from a `PaneEntry` carrying only a short id, so a
 landing directory read off `model::Session` would differ depending on whether
-the pane came from `o`/`s`/`t` or from `R`; and a background session's real
+the pane came from `v`/`s`/`t` or from `R`; and a background session's real
 directory is a `.claude/worktrees/…` checkout the daemon owns, which is not
 somewhere to drop an operator while an agent is live in it.
 
@@ -1771,7 +1798,7 @@ The section number is kept so §5.5 does not move.
 
 | Event | Map change |
 |---|---|
-| `o` / `s` / `Enter`-opens a background session | insert `{new_pane -> entry}`; `map_dirty = true` |
+| `v` / `s` / `Enter`-opens a background session | insert `{new_pane -> entry}`; `map_dirty = true` |
 | `x` closes a pane | `map.remove(pane)`; `map_dirty = true` |
 | pane disappears (user killed it, or `claude attach` exited and the pane closed) | dropped by `reconcile` |
 | `Ctrl+X` stops a session | no map change; its pane stays until the operator closes it |
@@ -2083,6 +2110,9 @@ explicit-`r` exception; armed warnings and transient messages still wrap.
 Priority order — the first applicable wins:
 
 1. `Mode::Filter` → `/<buffer>▏`, `p.yellow`
+   `Mode::PickPane` → `pick pane A–C  Esc: ✕`, `p.yellow` — the label range
+   and the way out, shortened word by word (`pick A–C  Esc: ✕`, `A–C  Esc: ✕`,
+   `A–C`) until it fits, so the range is never what gets cut (§8.4)
 2. `Ctrl+X`'s delete window is open → the §8.2 warning in `p.red`. Above the
    message on purpose: it is the line that says what the NEXT keypress does, and
    an unrelated flash must not be able to take it off screen while the verb is
@@ -2091,7 +2121,7 @@ Priority order — the first applicable wins:
    (Info `p.green`, Warn `p.yellow`, Error `p.red`), auto-clearing after 4 s
 4. `poll_error` present → `agents: <msg>` in `p.red` (truncated to width)
 5. otherwise → the hint line in `p.dim`, truncated from the right as needed:
-   `⏎ open  o/s split  x close  t tab  d/u hide  C-x stop  n new  ? help`
+   `⏎ open  v/s split  x close  t tab  d/u hide  C-x stop  n new  ? help`
 
 2–4 share one source (`ui::footer_message`), so the wrap of §6.8's amendment
 applies to all three: a line wider than the sidebar takes over the detail block
@@ -2187,8 +2217,9 @@ skipping empty groups; `a` hides Completed and Codex Unloaded rows.
 | `Tab` | jump to the first row of the next non-empty group | no |
 | `BackTab` (`Shift-Tab`) | previous non-empty group | no |
 | `Enter` | **open or jump** — §8.3; a pane you have detached from is not a jump target | no |
-| `o` | open in a **vertical** split (vim `:vsplit`, side by side, tmux `-h`) | no |
-| `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`) | no |
+| `v` | open in a **vertical** split (vim `:vsplit`, side by side, tmux `-h`); with two or more panes beside the sidebar, pick which one to split (§8.4) | no |
+| `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`); picks like `v` | no |
+| `o` | deliberately unbound since `v` replaced it — pressing it does nothing (§8.4) | no |
 | `t` | open in a **new tab** — a window with its own sidebar — and go there (§8.10) | no |
 | `x` | close the pane showing a session — the agent keeps running (§8.5) | no |
 | `Ctrl-x` | **stop the session**, immediately; again within 2 s **deletes** it and its worktree (§8.2) | **YES** (§8.2) |
@@ -2203,8 +2234,8 @@ skipping empty groups; `a` hides Completed and Codex Unloaded rows.
 | `q` | quit the sidebar (sessions and panes untouched) | no |
 | `Esc` | clear the filter if one is active, otherwise quit (§8.8) | no |
 
-`o` and `s` are named for vim's geometry, and `SplitDir::tmux_flag()` is where
-the vim→tmux word inversion is resolved exactly once. `o` = vertical =
+`v` and `s` are named for vim's geometry, and `SplitDir::tmux_flag()` is where
+the vim→tmux word inversion is resolved exactly once. `v` = vertical =
 side-by-side = `-h`. `s` = horizontal = stacked = `-v`. Do not re-derive this
 anywhere else.
 
@@ -2452,12 +2483,12 @@ if let Some(pane) = app.pane_of(sel.session_id):   # ATTACHED panes only
     tmux::select_pane(session, pane)          # jump to the existing pane
     flash "jumped to pane <index>"
 else:
-    act_open(SplitDir::Vertical)              # identical to `o`
+    act_open(SplitDir::Vertical)              # `split_anchor` placement, never the §8.4 picker
 ```
 
 Jumping rather than re-splitting is a UX preference, not a correctness
 requirement — double-attach is legal (PROBE-FINDINGS §3). If the operator wants
-a second view of the same session, `o` and `s` always split unconditionally.
+a second view of the same session, `v` and `s` always open a new pane.
 
 `pane_of`, not `pane_of_any`: a pane whose attach has exited (§5.3) takes the
 `else` branch and gets a fresh pane. Jumping the operator into the shell they
@@ -2478,15 +2509,15 @@ nothing on a tick.
 session, `pane_of_any` answers the same either way, and its flash says only what
 is true of both cases (§8.5).
 
-### 8.4 `o` / `s` — opening into a split
+### 8.4 `v` / `s` — opening into a split
 
 ```
 act_open(dir):
   1. degraded          -> flash "not inside tmux — open unavailable" (Warn); return
   2. sel = selected_session() or return
   3. !sel.is_attachable() -> flash "no short id — cannot open this session" (Warn); return
-  4. anchor = split_anchor()
-  5. cmd  = agents::attach_pane_cmd(sel.id)
+  4. cmd  = agents::attach_pane_cmd(sel.id)
+  5. anchor = split_anchor()
   6. pane = tmux::split(session, anchor, dir, cmd)?
   7. map.insert(pane, PaneEntry { session_id, short_id, name, opened_at: now_ms })
      map_dirty = true; save_map now (do not wait for the tick)
@@ -2507,6 +2538,91 @@ act_open(dir):
 
 Focus stays in the sidebar (`split -d`) so the operator can open several
 sessions in a row without leaving the list.
+
+**AMENDMENT (Appendix B): `v` replaces `o`, and `v`/`s` pick the pane to
+split** — nvim-tree's window picker (`pick_win_id`,
+`lua/nvim-tree/actions/node/open-file.lua`) over the panes of the sidebar's
+window. `act_open` above is unchanged and is what `Enter` (§8.3) runs; the keys
+run `act_open_pick`:
+
+```
+act_open_pick(dir):
+  1. every refusal of act_open steps 1-3, the §12.8 Codex refusal, a provider
+     conflict, and attach_pane_cmd — so a refusal is a flash, never a picker
+  2. refresh_panes()
+  3. candidates = panes of sidebar_window() except the sidebar, by pane_index
+     (split_anchor's scoping)
+  4. len <= 1, or the window is zoomed -> anchor = split_anchor(); act_open
+     steps 6-9; return
+     (with one candidate split_anchor names it, as nvim-tree returns its
+     only window without asking; a zoomed window draws no borders, so its
+     labels could never show, and the split un-zooms it anyway)
+  5. len > 36 -> flash "<n> panes — too many to label" (Warn); return
+  6. labels = A..Z then 1..9, 0, dealt in candidate order
+  7. tmux::show_pick_labels(session, sidebar, labels)
+     on Err -> clear_pick_labels(window, labels); flash "pick failed: <msg>"
+     (Error); return
+  8. mode = PickPane; pick = { dir, provider, session_id, anchor, window, labels }
+     the flash slot is cleared: the §6.8 pick hint owns the footer
+
+key_pick(key):            # every key, first thing: end_pick() clears the labels
+  label (either case) -> re-resolve the session by (provider, session_id)
+                         among the VISIBLE rows
+                         gone -> flash "session left the list — nothing opened"
+                         re-run step 1's guards on THAT session (the Codex
+                         refusal included, never the cursor's row), then
+                         act_open steps 6-9
+                         with the labelled pane as the anchor
+  anything else       -> flash "pick cancelled" (Info); nothing opened
+```
+
+The labels are cleared BEFORE the split, so `even_content` and the pin read the
+window's normal geometry. Every exit — label, cancel, `tick`, `shutdown` (which
+`Ctrl-c` reaches without passing `key_pick`) — goes through `end_pick`.
+
+**How a label is shown.** The window options `pane-border-status top` and
+`pane-border-format #{?#{@ccmux_pick},#[reverse]#[bold] #{@ccmux_pick} #[default],}`,
+plus the pane user option `@ccmux_pick <label>` on each candidate; the sidebar
+has none, so its border stays blank. The style is two `#[…]` blocks because a
+comma inside `#{?…}` separates its branches: `#[reverse,bold]` there prints
+nothing. Verified on tmux 3.4 by expanding the format against each pane
+(`display -p`): `#[reverse]#[bold] A #[default]` on a candidate, empty on the
+sidebar. A window already drawing a border line (`top` or `bottom`, read
+with `show-options -wA`) keeps its status and only the format is swapped.
+Turning the status on costs the panes one row while the labels are up;
+unsetting restores the geometry exactly.
+
+**Restore exactly.** `show_pick_labels` reads the WINDOW-LEVEL values
+(`show-options -w`, no `-g`; a window with no override shows nothing) and
+writes them to the window user option `@ccmux_pick_saved` BEFORE the first
+border write. `clear_pick_labels` re-sets a saved value, `set -wu` where there
+was none — the global value is never written down as a window override — then
+unsets every `@ccmux_pick` in the window and the record. It is addressed by the
+pick's WINDOW and label list, not its anchor: the anchor may have died or moved
+(`break-pane`) by the time a tick cancels, so the window options are reached
+through any pane still in the labelled window, and a labelled pane that moved
+out is unset wherever it now is. A record already
+present at show time belongs to a pick that was never cleared, so the window's
+current values are not re-read over the originals.
+
+**Crash hygiene.** A sidebar that dies with labels up leaves the record
+behind. The window's own next sidebar runs `clear_pick_labels` once, on the
+first tick that resolves it as the window's sidebar (`heal_pick_once`); an `R`
+gets this for free, because the image it `exec`s is a fresh process. A
+hand-launched second sidebar adopts the real one and does not heal.
+
+**While picking, each tick** recomputes the candidates (step 3) and cancels —
+labels cleared, `panes changed — pick cancelled` — when the set differs from
+the labelled one, or the sidebar's window or anchor is not the one labelled. A
+failed enumeration cancels nothing.
+
+**R2.** `show_pick_labels` checks the anchor and every labelled pane against
+ONE `list-panes -s` and requires them all in the anchor's window, before any
+write. `clear_pick_labels` makes ONE `list-panes -s` and only ever targets a
+pane from it: the panes of the labelled window, and the labelled panes still
+in the session. A `WindowId` filters that listing and is never a `-t` (R1). The only real tmux
+options either writes are the two border options, through a helper that
+refuses any other name.
 
 ### 8.5 `x` — close pane (safe for background sessions only)
 
@@ -2676,7 +2792,7 @@ daemon-owned, and closing its pane never touched it.
     is the table. Two populations: every cursor move (`j` `k` `↓` `↑` `g` `G`
     `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`), **including one that hits the end of the
     list and moves nothing**, and every verb that acts on the row under the
-    cursor (`Enter` `o` `s` `t` `x` `Ctrl-x` `L` `d` `u`). Not `n` (it arms the
+    cursor (`Enter` `v` `s` `t` `x` `Ctrl-x` `L` `d` `u`). Not `n` (it arms the
     next one), not `r` (the refresh that lands this one), not `/` or `a` (view
     toggles, answered below). Cancelling on the resulting MOVE was wrong twice
     over: `select_prev` on the top row and `select_next` on the bottom one find
@@ -2742,6 +2858,8 @@ table.
 - `Mode::Logs` — `j`/`k`/`Ctrl-d`/`Ctrl-u`/`g`/`G` scroll; `q`/`Esc` closes.
 - `Mode::Prompt` — text editing; `Enter` submits; `Esc` cancels.
 - `Mode::Filter` — text editing; `Enter` commits; `Esc` clears.
+- `Mode::PickPane` — a label (either case) opens beside that pane; any other
+  key, `Esc` included, cancels. Either way the labels come down first (§8.4).
 
 `Ctrl-c` quits from **any** mode, immediately, without confirming and without
 touching a session — the sidebar owns no agent state, so there is nothing to
@@ -2765,7 +2883,7 @@ lose.
 9. refresh_panes; pin_sidebar; flash "opened <label> in tab <index>" (Info)
 ```
 
-Guards 1-3 mirror `o`/`s` exactly, and all four refusals happen before any tmux
+Guards 1-3 mirror `v`/`s` exactly, and all four refusals happen before any tmux
 command is issued.
 
 **Steps 5-7 are ordered by necessity, not by style.** The Claude pane is created
@@ -2806,7 +2924,7 @@ Step 8 moves the client, and it is the ONLY thing that does. It rides on the
 existing R2-gated `select_pane`, which has always issued `select-window -t
 <pane>` before `select-pane`, so no new capability is added. Focus lands on the
 Claude pane, matching `Enter`'s jump — with `t` the operator is leaving for the
-session they asked for, where `o`/`s` keep them driving the list.
+session they asked for, where `v`/`s` keep them driving the list.
 
 There is deliberately **no close-tab verb and no `kill-window` anywhere in the
 crate**. A tab ends when its last pane does, which tmux already handles, and
@@ -3322,7 +3440,7 @@ taken inside `finish_restart` — a fresh read in a fresh process, so a tab that
 appeared or healed since the last tick is seen. For **this** window, `self.map`,
 not the snapshot of `@ccmux_tab_map` that read returns: the in-memory map is
 what this process writes and the option is a lagging shadow of it, and `act_open`
-inserts, refreshes, and only THEN saves — so straight after an `o` the snapshot
+inserts, refreshes, and only THEN saves — so straight after a `v` the snapshot
 provably lacks the pane just opened. Planning from the shadow left that pane
 running the `claude` binary the operator had just replaced while the footer
 counted it as restarted. This does not widen ownership: every entry in
@@ -3390,7 +3508,7 @@ existing Claude success/error and row-retention policies below remain.
 - Footer shows `agents: <msg>` in red; header indicator turns red.
 - `fail_streak >= 3` → interval widens to 10 s (§4.2).
 - Any success clears `poll_error` and resets `fail_streak`.
-- Verbs that need fresh data (`Enter`, `o`, `s`, `Ctrl-x`) still act on the
+- Verbs that need fresh data (`Enter`, `v`, `s`, `Ctrl-x`) still act on the
   stale list. `Ctrl-x`'s delete re-validates the CAPTURED short id against
   `app.sessions` (§8.2), so a stale entry fails closed with
   `session <id> is gone — not deleted`.
@@ -3421,7 +3539,7 @@ operator can bootstrap from zero sessions.
 
 Unavoidable: the poll is up to 2.5 s stale.
 
-- **`Enter`/`o`/`s`** — ccmux splits the pane anyway; `claude attach <id>` fails
+- **`Enter`/`v`/`s`** — ccmux splits the pane anyway; `claude attach <id>` fails
   inside it. The pane command keeps the pane alive and says so:
   `[ccmux] attach exited (rc=1). resume: claude attach <id>`
   above §3.3's prompt, where enter retries the attach, `s` gives a shell and `q`
@@ -3454,7 +3572,7 @@ refuses `not inside tmux — archive unavailable`.
     (dispatch is pure `claude --bg`, no tmux involved), `Ctrl-x` (pure
     `claude stop` / `claude rm`).
   - Refuses with `flash("not inside tmux — <verb> unavailable", Warn)`:
-    `Enter`, `o`, `s`, `x`.
+    `Enter`, `v`, `s`, `x`.
   - `PaneMap` is held in memory only; `load_map`/`save_map` are skipped.
   - Header indicator is a yellow `○`.
   This is what makes `ccmux sidebar` runnable standalone for development without
@@ -3478,7 +3596,7 @@ the CLI omits `id`, so a **listed** row can reach it.
 
 | Verb | Behaviour with no short id |
 |---|---|
-| `Enter` / `o` / `s` | refused: `no short id — cannot open this session`. There is no `claude attach` without one, so a split would have nothing to run |
+| `Enter` / `v` / `s` | refused: `no short id — cannot open this session`. There is no `claude attach` without one, so a split would have nothing to run |
 | `x` | unaffected — it targets the *pane*, and `pane_of` is keyed on `session_id`, not on the short id |
 | `Ctrl-x` | refused: `no short id — cannot stop this session` (§8.2 step 1). No window opens, so the delete is unreachable too |
 | `L` | refused: `no short id — no logs for this session` |
@@ -3625,7 +3743,8 @@ while the operator is using it, and never against `agents` or `dev`.
    no second window, no second sidebar.
 3. From inside it, re-run → prints `already inside session 'ccmux-test-a'`,
    exit 0.
-4. `o` three times, then `s` → sidebar still exactly 28 cols (§1.3's verified
+4. `v` three times, then `s`, answering each picker with `A` (§8.4) → sidebar
+   still exactly 28 cols (§1.3's verified
    geometry table was recorded at `--width 34`: compare the invariant, or run
    this step with `--width 34` to compare the numbers).
 5. `x` on an open session → pane closes; the session stays in the list; the next
@@ -3879,7 +3998,7 @@ Codex uses ONE configured app-server endpoint per ccmux workspace. Local
 defaults enable it when the default token file exists (§12.2); an explicit
 empty URL disables it.
 v1 adds listing, grouping, filtering, navigation, `a`, `d/u`, `r`,
-`Enter/o/s/t` remote attach, `x`, and the two-press guarded archive in §12.8.
+`Enter/v/s/t` remote attach, `x`, and the two-press guarded archive in §12.8.
 The official Codex TUI owns every other conversation mutation. The sidebar
 owns its pane and dismissal records.
 
@@ -4787,7 +4906,7 @@ and every Claude call. `n` and `R` remain global verbs.
 | Verb | Codex behavior / exact footer text |
 |---|---|
 | `Enter` | refresh pane inventory, jump to an attached matching launch record, else open with §12.7 |
-| `o/s` | unconditional new vertical/horizontal split with §12.7; retain §8.4 geometry/focus rules |
+| `v/s` | new vertical/horizontal split with §12.7, through §8.4's picker when two or more panes are beside the sidebar; retain §8.4 geometry/focus rules |
 | `t` | new tab with §12.7; pre-write a v2 map containing its Codex entry before starting its sidebar, then propagate §12.2 settings |
 | `x` | close one mapped live pane, including a parked pane, through the existing R2-gated kill path; `closed pane <index>[ in tab <N>] — Codex work stays on server` |
 | `d` | append a Codex dismissal; no RPC or immediate tmux write |
@@ -4956,7 +5075,7 @@ pub struct PaneMap {
 that an unrecognized fragment is not rewritten. An old sidebar reading
 ANOTHER tab's v2 map sees empty and does not write that option, but loses
 cross-tab visibility of ALL its records, including Claude panes. It shows no
-open marker/badge for them, and `Enter`/`o` can open duplicate Claude panes
+open marker/badge for them, and `Enter`/`v` can open duplicate Claude panes
 instead of finding the existing ones. An old-image `R` also omits those
 records from `Plan::held`, losing that map-derived protection against its
 headless-agent restart pass; other restart guards still apply.
@@ -5180,7 +5299,7 @@ refines the contract; it does not turn unrun experiments into live findings.
   protect a mixed v2 window from an older OWNER adopting it as empty and
   overwriting it on its first map change. Old other-tab readers leave that
   option untouched but cannot see even its Claude panes: markers/badges are
-  missing, `Enter`/`o` may duplicate panes, and an old-image `R` lacks their
+  missing, `Enter`/`v` may duplicate panes, and an old-image `R` lacks their
   `Plan::held` protection. Other restart guards still apply. §12.9 pins both
   mixed-version limits; test them with fixtures, not a live upgrade experiment.
 - **UNMEASURED:** desktop or differently versioned cross-runtime writers.
@@ -5326,7 +5445,7 @@ have these tests; existing Claude tests remain authoritative except for
   provider, malformed Codex full ID, and unsupported versions fail closed.
   Exercise legacy and tab-map readers. Simulate both old-reader roles:
   another-tab reader leaves v2 untouched but sees none of its Claude panes,
-  loses their marker/badge, can open duplicates through `Enter`/`o`, and
+  loses their marker/badge, can open duplicates through `Enter`/`v`, and
   contributes none of those records to old `R`'s `Plan::held`. An old OWNER
   adopts empty and loses that mixed window's records on its first map change.
   A Claude-only window survives old-owner adoption. Different-provider lookup
@@ -5347,7 +5466,7 @@ have these tests; existing Claude tests remain authoritative except for
   routing in the lower-level façade too. With ONLY Codex rows visible,
   `n` opens a Claude prompt using the sidebar's local cwd; submitting it
   sends no Codex ID, provider decoration, or Codex-derived cwd to dispatch.
-  `Enter/o/s/t/x` retain ownership/focus rules and the seeded-map ordering.
+  `Enter/v/s/t/x` retain ownership/focus rules and the seeded-map ordering.
   Snapshot the remote wrapper with hostile path/name inputs, literal command
   substitution, no token bytes, validated latch target, parked retry to the
   launch ID, rc propagation, and explicit-only shell handoff. `R` plans no
@@ -5729,3 +5848,4 @@ behaviour, the pin is superseded by this appendix.
 | §5.5 | `PaneEntry::name` is stored verbatim. | Truncated to 80 columns, and a failed `@ccmux_map` write is flashed once and clears `map_dirty` instead of being reissued every tick. tmux rejects a `set-option` value over ~16 KB. |
 | §8.2 | A suppressed press flashes `too fast — press Ctrl+X again`. The open window's warning outranks it, so a refused second press changed nothing on screen, and the flash surfaced only once the window had lapsed, inviting a press that re-arms a Completed row or stops a running one. A press inside the settle was said not to consume the window. | A suppressed press flashes `too fast — press ignored`. While a window is open its warning becomes `too fast — Ctrl+X: delete <label> + worktree — cannot be undone` for the rest of that window. A press that cancels a settling delete says `too fast — delete cancelled` and closes the window with it, and a window that lapses after a refusal says `delete window closed — nothing deleted`. No Claude refusal names a next press. `CX_MIN_GAP` and `CX_SETTLE` are unchanged. |
 | §1.1, §6, §6.5, §6.7, §8.2, §8.6, §10.1, §10.2, §12.6 | `--width` defaults to 34 and §6 targets 30–40 columns. The id line cuts its kind word (and a Codex state) mid-word when it does not fit; the help overlay and the `n` prompt are worded for 34 columns; `CWD_FLASH_MAX` is 60. | The default is `WIDTH_DEFAULT` (28), exactly `RAIL_MIN`, so it keeps the age rail. The kind word, and `codex`, are dropped whole when they do not fit, and from 27 columns a Codex state is never cut. Every help binding and prompt hint fits the default's 26 inner columns. `CWD_FLASH_MAX` is 40, the largest measured bound that keeps the arm flash whole in the 4-row carve at 28, `[codex!]` marker included. The `d` flash for a session with an open pane fits one line at 28, and the open flashes name the session by its label. Fixed flashes of 29 to 34 columns, such as `dispatched background session` and `restarted 2 sidebars, 3 panes`, wrap to two rows at 28 through §6.8's carve. |
+| §1.4, §3.2, §3.5, §5.3, §5.5, §6.8, §8.1, §8.3, §8.4, §8.6, §8.9, §8.10, §8.11, §9.1, §9.4, §9.5, §9.7, §10.2, §12.1, §12.8, §12.9, §12.10, §12.11 | `o` opens in a vertical split and `s` in a horizontal one, always beside `split_anchor()`. | `v` (vim `:vsplit`) replaces `o`, which is unbound. With two or more panes beside the sidebar in its window, `v` and `s` work like nvim-tree's window picker: every guard runs first, each candidate gets a label (`A`–`Z`, then `1`–`9`, `0`) on its border through `pane-border-status`/`pane-border-format` and the pane option `@ccmux_pick`, and the next key opens beside the labelled pane or cancels. The window-level border options are saved to `@ccmux_pick_saved` before the first write and restored exactly; a sidebar that dies mid-pick is healed by the window's next sidebar. With one candidate or none, and always for `Enter`, placement is `split_anchor()` as before. |

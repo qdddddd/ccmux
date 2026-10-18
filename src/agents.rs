@@ -826,7 +826,7 @@ fn attach_cmd(
 /// deliberately NOT used: `restart::plan` rebuilds this exact string from a
 /// `PaneEntry` that carries only a short id, so a landing directory read off
 /// `model::Session` would differ depending on whether the pane came from
-/// `o`/`s`/`t` or from `R` — and a background session's real directory is a
+/// `v`/`s`/`t` or from `R` — and a background session's real directory is a
 /// `.claude/worktrees/…` checkout the daemon owns, which is not somewhere to
 /// drop an operator with a live agent in it.
 fn claude_attach_cmd(id: &str) -> String {

@@ -330,6 +330,38 @@ pub enum Mode {
     Prompt(PromptKind),
     Help,
     Logs,
+    /// `v`/`s` with two or more panes to open beside: labels are on the pane
+    /// borders and the next key picks one (§8.4). Its state is `App::pick`.
+    PickPane,
+}
+
+/// Labels for `v`/`s`'s pane picker, in the order candidates receive them —
+/// nvim-tree's `window_picker.chars` default shape: letters first, then the
+/// digit row. A window with more candidates than this is refused, as
+/// nvim-tree refuses one with more windows than chars.
+const PICK_CHARS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+
+/// An open `v`/`s` pick (§8.4): what a label key will open, where, and which
+/// labels are on screen.
+///
+/// The session is held by IDENTITY, not as a row: a tick can rebuild the list
+/// while the labels are up, so the pick re-resolves it — and re-runs every
+/// `act_open` guard — at the moment a label is pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanePick {
+    pub dir: SplitDir,
+    pub provider: Provider,
+    pub session_id: String,
+    /// The pane the window-scoped border options were written through: the
+    /// sidebar, or the first candidate when the sidebar is unresolved. Only
+    /// `show_pick_labels` and the tick's comparison use it; the clear goes by
+    /// `window`, because the anchor can die or move first.
+    pub anchor: PaneId,
+    /// The window the labels are in. A tick that finds the sidebar's window
+    /// changed cancels the pick.
+    pub window: WindowId,
+    /// `(label, pane)`, in `#{pane_index}` order.
+    pub labels: Vec<(char, PaneId)>,
 }
 
 /// What a keypress resolved to. Returned by `App::on_key` so the event loop can
@@ -481,6 +513,11 @@ pub struct App {
     pub mode: Mode,
     pub prompt: Option<Prompt>,
     pub logs: Option<LogsView>,
+    /// `Some` exactly while `mode` is `Mode::PickPane`.
+    pub pick: Option<PanePick>,
+    /// The once-per-process heal of a window whose previous sidebar died with
+    /// picker labels up has been attempted (`heal_pick_once`).
+    pub pick_healed: bool,
 
     /// MY window's fragment of the shared dismissal log — the only thing this
     /// process ever writes to `@ccmux_tab_hidden`. `hidden` above is the FOLD
@@ -744,6 +781,8 @@ impl App {
             mode: Mode::Normal,
             prompt: None,
             logs: None,
+            pick: None,
+            pick_healed: false,
 
             map: PaneMap::new(),
             map_dirty: false,
@@ -843,6 +882,8 @@ impl App {
     ///   1. now_ms = Utc::now().timestamp_millis()
     ///   2. panes = list_panes_in_session(tmux_session)   [skipped when degraded]
     ///   3. map.reconcile(&panes) -> map_dirty |= changed
+    ///      3a. cancel a `v`/`s` pick whose pane set changed, and heal once a
+    ///      window a dead sidebar left labelled (§8.4)
     ///      3b. read the visibility pair off my own pane's row and open or
     ///      close the poll gate — `observe_watchers`, which must run AFTER the
     ///      inventory it reads and BEFORE the poll it gates
@@ -871,6 +912,10 @@ impl App {
 
         // 2 + 3 (+ §5.3 step 5)
         self.refresh_panes();
+        // §8.4: an open pick dies with the pane set it labelled, and a window
+        // a dead sidebar left labelled is healed once.
+        self.tick_pick();
+        self.heal_pick_once();
 
         // 3b
         self.observe_watchers();
@@ -1027,7 +1072,8 @@ impl App {
 
     /// True while something owns or covers the footer, so a warning posted now
     /// would not be read. `Help`, `Logs` and `Prompt` all render over the WHOLE
-    /// sidebar rect (§6.7), and `Filter` owns the footer line itself.
+    /// sidebar rect (§6.7), and `Filter` and `PickPane` own the footer line
+    /// itself.
     fn footer_is_covered(&self) -> bool {
         !matches!(self.mode, Mode::Normal) || self.arm_hint().is_some()
     }
@@ -1404,9 +1450,10 @@ impl App {
             Mode::Prompt(_) => self.key_prompt(key),
             Mode::Help => self.key_help(key),
             Mode::Logs => self.key_logs(key),
+            Mode::PickPane => self.key_pick(key),
         };
         // §8.2: `Ctrl+X`'s window belongs to the list in Normal mode. Anything
-        // that leaves Normal — `/`, `n`, `?`, `L` — or quits closes it, because
+        // that leaves Normal — `/`, `n`, `?`, `L`, a `v`/`s` pick — or quits closes it, because
         // the footer that carries the warning is no longer the thing on screen
         // and the operator's attention has moved with it. One place, so no
         // handler can forget. Provider crossings close either provider's arm;
@@ -1795,46 +1842,138 @@ impl App {
 
     // ── verbs (each is one keymap entry's whole effect) ──────────────────────
 
-    /// `o` (Vertical / tmux `-h`) and `s` (Horizontal / tmux `-v`). SPEC §8.4.
+    /// Open the selected session in a split of `split_anchor()` — the
+    /// deterministic placement (§8.4). `Enter` opens through here, and so do
+    /// `v` and `s` when the window has at most one pane to open beside; with
+    /// two or more they pick first (`act_open_pick`).
     pub fn act_open(&mut self, dir: SplitDir) {
-        if self.degraded {
-            self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
-            return;
-        }
-        if self.refuse_codex_open() { return; }
-        let Some(sel) = self.selected_session().cloned() else {
+        let Some((sel, cmd)) = self.open_guards(None) else {
             return;
         };
+        let Some(anchor) = self.split_anchor() else {
+            self.flash("no pane to split — sidebar unmapped", MsgLevel::Error);
+            return;
+        };
+        self.open_into(&sel, &cmd, &anchor, dir);
+    }
+
+    /// `v` (Vertical / tmux `-h`) and `s` (Horizontal / tmux `-v`). SPEC §8.4.
+    ///
+    /// nvim-tree's `pick_win_id`, over the panes of the sidebar's window: no
+    /// candidate or one candidate opens exactly as `act_open` does — with one,
+    /// `split_anchor` names that pane — and two or more put a label on each
+    /// pane's border and wait for the next key (`key_pick`).
+    ///
+    /// EVERY GUARD RUNS FIRST, so a refusal is a flash and never a picker the
+    /// operator has to dismiss before learning the verb could not run. The
+    /// inventory is re-read after the guards and before counting: a label on a
+    /// pane that closed since the last tick would name nothing, and a pane
+    /// opened since would have none.
+    pub fn act_open_pick(&mut self, dir: SplitDir) {
+        let Some((sel, cmd)) = self.open_guards(None) else {
+            return;
+        };
+        self.refresh_panes();
+        // A zoomed window draws no pane borders, so its labels would never
+        // show; split as `Enter` does instead (the split un-zooms anyway).
+        let Some((anchor, window, candidates)) = self.pick_scope()
+            .filter(|(a, _, c)| c.len() >= 2 && !tmux::window_zoomed(&self.panes, a)) else {
+            let Some(anchor) = self.split_anchor() else {
+                self.flash("no pane to split — sidebar unmapped", MsgLevel::Error);
+                return;
+            };
+            self.open_into(&sel, &cmd, &anchor, dir);
+            return;
+        };
+        let Some(labels) = pick_labels(&candidates) else {
+            self.flash(format!("{} panes — too many to label", candidates.len()), MsgLevel::Warn);
+            return;
+        };
+        if let Err(e) = tmux::show_pick_labels(&self.tmux_session, &anchor, &labels) {
+            // Restores whatever the partial write displaced; the startup heal
+            // is the backstop if even this fails.
+            let labelled: Vec<PaneId> = labels.iter().map(|(_, p)| p.clone()).collect();
+            let _ = tmux::clear_pick_labels(&self.tmux_session, &window, &labelled);
+            self.flash(format!("pick failed: {}", tmux_msg(&e)), MsgLevel::Error);
+            return;
+        }
+        // The hint owns the footer while the labels are up, as the filter line
+        // does; a flash still counting down would only be clipped behind it.
+        self.message = None;
+        self.msg_deadline = None;
+        self.pick = Some(PanePick {
+            dir,
+            provider: sel.provider,
+            session_id: sel.session_id.clone(),
+            anchor,
+            window,
+            labels,
+        });
+        self.mode = Mode::PickPane;
+    }
+
+    /// Every refusal `act_open` makes before it touches tmux, in its order:
+    /// degraded, the Codex configuration, a session to open, a short id, a
+    /// provider conflict, and an attach command that can be built. Flashes the
+    /// refusal and returns `None`; otherwise the session and its command.
+    ///
+    /// `target` is `None` for the selected row, or the identity a pick captured
+    /// — which is re-resolved against the CURRENT visible rows, because a tick
+    /// may have dropped or hidden the session, and moved the cursor, while the
+    /// labels were up. Every later guard, the Codex one included, checks the
+    /// RESOLVED session, never whatever row the cursor is on now.
+    fn open_guards(&mut self, target: Option<(Provider, &str)>) -> Option<(Session, String)> {
+        if self.degraded {
+            self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
+            return None;
+        }
+        let sel = match target {
+            None => self.selected_session().cloned()?,
+            Some((provider, session_id)) => {
+                let found = self.rows.iter().find_map(|r| match r {
+                    Row::Session { idx } => self.sessions.get(*idx)
+                        .filter(|s| s.provider == provider && s.session_id == session_id),
+                    _ => None,
+                }).cloned();
+                let Some(found) = found else {
+                    self.flash("session left the list — nothing opened", MsgLevel::Warn);
+                    return None;
+                };
+                found
+            }
+        };
+        if self.refuse_codex_open(sel.provider) { return None; }
         if sel.provider == Provider::Claude && !sel.is_attachable() {
             // §9.7: `claude attach` takes the 8-hex short id, so without one a
             // split would have nothing to run. Rare but reachable on a listed
             // row: `parse_sessions` honours an explicit `kind: "background"`
             // even when the CLI omitted `id`.
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
-            return;
+            return None;
         }
+        if self.pane_provider_conflict(sel.provider, &sel.session_id) {
+            self.flash("provider conflict in pane map", MsgLevel::Warn);
+            return None;
+        }
+        let codex = if sel.provider == Provider::Codex { self.codex.settings.config().ok() } else { None };
+        match agents::attach_pane_cmd(&sel, codex.as_ref()) {
+            Ok(cmd) => Some((sel, cmd)),
+            Err(e) => {
+                self.flash(agents_msg(&e), MsgLevel::Warn);
+                None
+            }
+        }
+    }
+
+    /// The split and everything after it, shared by `act_open` and a pick:
+    /// split `anchor`, record the pane, persist, even, pin, and say where it
+    /// went.
+    fn open_into(&mut self, sel: &Session, cmd: &str, anchor: &PaneId, dir: SplitDir) {
         let provider = sel.provider;
         let session_id = sel.session_id.clone();
         let short_id = sel.id.clone().unwrap_or_default();
         let name = sel.name.clone();
-        if self.pane_provider_conflict(provider, &session_id) {
-            self.flash("provider conflict in pane map", MsgLevel::Warn);
-            return;
-        }
-
-        let Some(anchor) = self.split_anchor() else {
-            self.flash("no pane to split — sidebar unmapped", MsgLevel::Error);
-            return;
-        };
-        let codex = if provider == Provider::Codex { self.codex.settings.config().ok() } else { None };
-        let cmd = match agents::attach_pane_cmd(&sel, codex.as_ref()) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                self.flash(agents_msg(&e), MsgLevel::Warn);
-                return;
-            }
-        };
-        match tmux::split(&self.tmux_session, &anchor, dir, &cmd) {
+        match tmux::split(&self.tmux_session, anchor, dir, cmd) {
             Ok(pane) => {
                 let recorded = self.map.insert(
                     &pane,
@@ -1858,14 +1997,14 @@ impl App {
                 // exists in a freshly enumerated list.
                 self.refresh_panes();
                 self.save_map_now();
-                // §1.4: `o` built a row, `s` a column — even that axis, then
+                // §1.4: `v` built a row, `s` a column — even that axis, then
                 // pin. The pin is a no-op afterwards because `even_content`
                 // laid the sidebar out at the width it is about to ask for.
                 self.even_content(Some(dir.shape()), Force::No);
                 self.pin_sidebar();
                 // `session_label`, as every other flash names a session: an
                 // unbounded name pushed `in pane N` off the default sidebar.
-                let label = session_label(&sel);
+                let label = session_label(sel);
                 match self.pane_index_of(&pane) {
                     Some(i) => self.flash(format!("opened {label} in pane {i}"), MsgLevel::Info),
                     None => self.flash(format!("opened {label}"), MsgLevel::Info),
@@ -1895,10 +2034,10 @@ impl App {
             self.flash("not inside tmux — tabs unavailable", MsgLevel::Warn);
             return;
         }
-        if self.refuse_codex_open() { return; }
         let Some(sel) = self.selected_session().cloned() else {
             return;
         };
+        if self.refuse_codex_open(sel.provider) { return; }
         if sel.provider == Provider::Claude && !sel.is_attachable() {
             self.flash("no short id — cannot open this session", MsgLevel::Warn);
             return;
@@ -1992,7 +2131,7 @@ impl App {
     /// clear the flag — so the flash says so rather than leaving it to be
     /// discovered.
     ///
-    /// EVENS BEFORE IT PINS, the same order `o` and `x` use: the layout string
+    /// EVENS BEFORE IT PINS, the same order `v` and `x` use: the layout string
     /// carries the sidebar cell at exactly the width the pin then asserts, so
     /// the pin lands on a window already the right shape instead of fighting
     /// it. A window whose panes form a tree is left alone by the even pass
@@ -3518,7 +3657,7 @@ impl App {
     /// `@ccmux_tab_map` is a lagging shadow of it, and `self.tabs` is a
     /// snapshot of that shadow taken at some earlier tick. `act_open` inserts
     /// into `self.map`, then refreshes, and only THEN writes — so immediately
-    /// after an `o` or an `s` the snapshot provably lacks the pane that was
+    /// after a `v` or an `s` the snapshot provably lacks the pane that was
     /// just opened. Planning from it silently skips that pane: it keeps running
     /// the `claude` binary the operator just replaced, while the footer counts
     /// it as restarted. Reading `self.map` for my own window makes the freshest
@@ -3926,7 +4065,7 @@ impl App {
     /// previous process had opened orphaned from every map and unclosable by
     /// `x`. `migrate_legacy` right below already had the correct shape.
     ///
-    /// Adoption MERGES rather than replaces, so an `o` or a `d` pressed in the
+    /// Adoption MERGES rather than replaces, so a `v` or a `d` pressed in the
     /// ticks before the enumeration resolved is not thrown away by the
     /// adoption that finally succeeds. In the ordinary case both sides are
     /// empty and a merge is a replace.
@@ -4276,7 +4415,7 @@ impl App {
         };
         // §1.4 yields to the zoom for the same reason §1.3 does, and reads a
         // snapshot both call sites have just refreshed: a split un-zooms the
-        // window before this runs, so `o`/`s` still even; a kill does not, so
+        // window before this runs, so `v`/`s` still even; a kill does not, so
         // closing one pane no longer un-zooms another. See `tmux::window_zoomed`.
         //
         // `Force::Yes` is `=` and only `=`: the gate exists to stop writes the
@@ -4437,6 +4576,8 @@ impl App {
     /// it by leaving the loop a different way. Deliberately NOT called from
     /// `act_quit`: the keypress path must stay free of tmux commands.
     pub fn shutdown(&mut self) {
+        // §8.4: `Ctrl-c` quits from a pick without passing `key_pick`.
+        self.end_pick();
         self.save_map_now();
         self.save_hidden_now();
     }
@@ -4461,7 +4602,7 @@ impl App {
     /// every window, but `pane_left`, `pane_index` and `pane_active` are
     /// per-window values: unfiltered, step 1 matches the active pane of some
     /// other window and step 2's `max_by_key` happily returns a pane the
-    /// operator cannot see, so `o`/`s`/`Enter` opens Claude into a window they
+    /// operator cannot see, so `v`/`s`/`Enter` opens Claude into a window they
     /// are not looking at.
     fn split_anchor(&self) -> Option<PaneId> {
         let scoped = match self.sidebar_window() {
@@ -4479,6 +4620,85 @@ impl App {
             // pane OF THAT WINDOW.
             None => tmux::leftmost_pane(&scoped),
         }
+    }
+
+    /// The `v`/`s` picker's view of the sidebar's window (§8.4): the pane its
+    /// window options are addressed through, the window's id, and the
+    /// candidates — every pane of the window but the sidebar, in
+    /// `#{pane_index}` order. Scoped exactly as `split_anchor` is, so the
+    /// picker can never offer a pane in a window the operator is not looking
+    /// at. `None` when the window has no panes at all.
+    fn pick_scope(&self) -> Option<(PaneId, WindowId, Vec<PaneId>)> {
+        let mut scoped = tmux::panes_in_window(&self.panes, self.sidebar_window()?);
+        scoped.sort_by_key(|p| p.index);
+        let window = scoped.first()?.window_id.clone();
+        let sidebar = self.sidebar_pane.as_ref().filter(|sb| scoped.iter().any(|p| &p.id == *sb));
+        let candidates: Vec<PaneId> =
+            scoped.iter().filter(|p| Some(&p.id) != sidebar).map(|p| p.id.clone()).collect();
+        let anchor = sidebar.cloned().or_else(|| candidates.first().cloned())?;
+        Some((anchor, window, candidates))
+    }
+
+    /// Step 3a of `tick`: cancel an open pick whose labels no longer describe
+    /// the window — a labelled pane closed, a pane opened that has no label,
+    /// or the sidebar's window is not the one labelled. Compared as SETS: a
+    /// pane renumbered by a close elsewhere still wears the right label.
+    ///
+    /// A failed enumeration is no evidence of anything (`panes_fresh`), so it
+    /// cancels nothing.
+    fn tick_pick(&mut self) {
+        let Some(pick) = &self.pick else { return };
+        if !self.panes_fresh {
+            return;
+        }
+        let labelled: BTreeSet<&PaneId> = pick.labels.iter().map(|(_, p)| p).collect();
+        let same = self.pick_scope().is_some_and(|(anchor, window, candidates)| {
+            anchor == pick.anchor && window == pick.window && candidates.iter().collect::<BTreeSet<_>>() == labelled
+        });
+        if !same {
+            self.end_pick();
+            self.flash("panes changed — pick cancelled", MsgLevel::Info);
+        }
+    }
+
+    /// Take the labels down and leave pick mode. Every way out of a pick comes
+    /// through here — a label, a cancel, a tick that found the panes changed,
+    /// and `shutdown` — so none of them can leave a window labelled.
+    ///
+    /// A failed clear is not flashed: the next sidebar start heals the window
+    /// from its saved record (`heal_pick_once`), and the flash this would
+    /// replace — the open, or the cancel — is the one the operator needs.
+    fn end_pick(&mut self) -> Option<PanePick> {
+        if self.mode == Mode::PickPane {
+            self.mode = Mode::Normal;
+        }
+        let pick = self.pick.take()?;
+        // By the pick's WINDOW and label list, not its anchor: the anchor may
+        // be dead or in another window by now, and either is why a tick ends
+        // a pick.
+        let labelled: Vec<PaneId> = pick.labels.iter().map(|(_, p)| p.clone()).collect();
+        let _ = tmux::clear_pick_labels(&self.tmux_session, &pick.window, &labelled);
+        Some(pick)
+    }
+
+    /// Heal, once per process, a window whose previous sidebar died with
+    /// labels up: `@ccmux_pick_saved` still holds the border options it
+    /// displaced (§8.4). Runs from `tick` once identity has resolved, and only
+    /// in the window's OWN sidebar — a second, hand-launched sidebar adopts the
+    /// real one as `sidebar_pane` and must not clear a pick that one has open.
+    /// An `R` re-runs it for free: the image it `exec`s is a fresh process.
+    fn heal_pick_once(&mut self) {
+        if self.pick_healed || self.degraded || self.pick.is_some() {
+            return;
+        }
+        let (Some(me), Some(sb)) = (self.own_pane.clone(), self.sidebar_pane.clone()) else {
+            return; // retry once identity resolves
+        };
+        self.pick_healed = true;
+        if me == sb
+            && let Some(window) = self.pane_window(&sb) {
+                let _ = tmux::clear_pick_labels(&self.tmux_session, &window, &[]);
+            }
     }
 
     /// Move focus to a pane ccmux itself opened, in ANY tab. The only jump
@@ -4591,14 +4811,15 @@ impl App {
                 self.act_enter();
                 Action::Redraw
             }
-            // vim geometry: `o` = :vsplit = side by side = tmux -h.
-            KeyCode::Char('o') => {
-                self.act_open(SplitDir::Vertical);
+            // vim geometry: `v` = :vsplit = side by side = tmux -h. Both
+            // split keys pick the pane to split when there is a choice (§8.4).
+            KeyCode::Char('v') => {
+                self.act_open_pick(SplitDir::Vertical);
                 Action::Redraw
             }
             // `s` = :split = stacked = tmux -v.
             KeyCode::Char('s') => {
-                self.act_open(SplitDir::Horizontal);
+                self.act_open_pick(SplitDir::Horizontal);
                 Action::Redraw
             }
             // `t` = a new TAB. Unbound until now; `c` stays deleted.
@@ -4896,6 +5117,32 @@ impl App {
         }
     }
 
+    /// §8.4: the key after `v`/`s` labelled the panes. The labels come down
+    /// FIRST — before the split, so `even_content` and the pin see the
+    /// window's normal geometry rather than one with a border row in it.
+    /// A label (either case) opens beside that pane; `Esc` or any other key
+    /// cancels, as nvim-tree's picker does on any invalid key.
+    fn key_pick(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(pick) = self.end_pick() else {
+            return Action::Redraw;
+        };
+        let chosen = match key.code {
+            KeyCode::Char(c) if !ctrl => {
+                pick.labels.iter().find(|(l, _)| l.eq_ignore_ascii_case(&c)).map(|(_, p)| p.clone())
+            }
+            _ => None,
+        };
+        let Some(pane) = chosen else {
+            self.flash("pick cancelled", MsgLevel::Info);
+            return Action::Redraw;
+        };
+        if let Some((sel, cmd)) = self.open_guards(Some((pick.provider, &pick.session_id))) {
+            self.open_into(&sel, &cmd, &pane, pick.dir);
+        }
+        Action::Redraw
+    }
+
     fn key_logs(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(mut v) = self.logs.clone() else {
@@ -4947,7 +5194,7 @@ enum Force {
 ///     found no row still happened as far as the operator is concerned: `k` on
 ///     the top row and `j` on the bottom one never reach `set_selected`, and
 ///     `Tab` returns early when `rows` carries no headers at all.
-///   * THE VERBS THAT ACT ON THE SELECTED ROW — `Enter` `o` `s` `t` `x`
+///   * THE VERBS THAT ACT ON THE SELECTED ROW — `Enter` `v` `s` `t` `x`
 ///     `Ctrl-x` `L` `d` `u`. Pressing one is a decision about the row that is
 ///     under the cursor NOW, and a jump firing between that decision and the
 ///     next keypress makes ccmux act on a row the operator never chose.
@@ -4978,13 +5225,22 @@ fn claims_the_cursor(key: KeyEvent) -> bool {
         KeyCode::Tab | KeyCode::BackTab => true,
 
         KeyCode::Enter => true,
-        KeyCode::Char('o') | KeyCode::Char('s') | KeyCode::Char('t') => true,
+        KeyCode::Char('v') | KeyCode::Char('s') | KeyCode::Char('t') => true,
         KeyCode::Char('x') => true,
         KeyCode::Char('L') => true,
         KeyCode::Char('d') | KeyCode::Char('u') => true,
 
         _ => false,
     }
+}
+
+/// `PICK_CHARS` dealt to `candidates` in order, or `None` when there are more
+/// candidates than labels (§8.4).
+fn pick_labels(candidates: &[PaneId]) -> Option<Vec<(char, PaneId)>> {
+    if candidates.len() > PICK_CHARS.chars().count() {
+        return None;
+    }
+    Some(PICK_CHARS.chars().zip(candidates.iter().cloned()).collect())
 }
 
 /// Char-index insert. Byte offsets are derived from `char_indices`, so a CJK or
@@ -5186,6 +5442,10 @@ mod tests {
             mode: Mode::Normal,
             prompt: None,
             logs: None,
+            pick: None,
+            // Not mid-startup, like `own_state_loaded`: a test whose subject
+            // is the heal clears this itself.
+            pick_healed: true,
             map: PaneMap::default(),
             map_dirty: false,
             sidebar_pane: None,
@@ -5287,9 +5547,13 @@ mod tests {
     /// It is NOT a back door around R1-R3 — production code cannot reach it,
     /// `-L LIVE_SOCKET` is hard-coded, and the session name is a constant.
     fn live_raw(args: &[&str]) -> String {
+        // `-f /dev/null`: the server this starts loads no operator config, so
+        // nothing in it (a plugin, a hook, a border option) can reach into a
+        // throwaway server or make an assertion pass by accident.
         let out = std::process::Command::new("tmux")
             .arg("-L")
             .arg(LIVE_SOCKET)
+            .args(["-f", "/dev/null"])
             .args(args)
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
@@ -5407,19 +5671,19 @@ mod tests {
         tmux::set_socket(Some(LIVE_SOCKET));
         assert_eq!(tmux::socket().as_deref(), Some(LIVE_SOCKET), "throwaway socket only");
 
-        // ── `o`: four content panes, widths evened ──────────────────────────
+        // ── `v`: four content panes, widths evened ──────────────────────────
         let mut a = live_app();
-        println!("\n== `o` (SplitDir::Vertical) — widths, 120x40 window, sidebar 34 ==");
+        println!("\n== `v` (SplitDir::Vertical) — widths, 120x40 window, sidebar 34 ==");
         println!("start           : {:?}", live_widths(&mut a));
         let rows = live_session_rows(&a);
         for (n, row) in rows.iter().take(4).enumerate() {
             a.selected = *row;
             a.act_open(SplitDir::Vertical);
-            println!("after o #{}      : {:?}", n + 1, live_widths(&mut a));
+            println!("after v #{}      : {:?}", n + 1, live_widths(&mut a));
         }
         let evened = live_widths(&mut a);
         assert_eq!(evened[0], 34, "sidebar keeps its pinned width");
-        assert_spread_is_at_most_one("`o` widths", &evened[1..]);
+        assert_spread_is_at_most_one("`v` widths", &evened[1..]);
 
         // ── `x`: kill one, survivors re-evened ──────────────────────────────
         a.selected = rows[1];
@@ -5451,7 +5715,7 @@ mod tests {
         // ── `s`: four content panes, heights evened ─────────────────────────
         let mut a = live_app();
         println!("\n== `s` (SplitDir::Horizontal) — heights, 120x40 window ==");
-        // One `o` first, because `s` pressed while the sidebar is ALONE splits
+        // One `v` first, because `s` pressed while the sidebar is ALONE splits
         // the sidebar itself (`split_anchor` step 3) and leaves it stacked, not
         // a full-height left edge. §1.4 correctly declines to lay that out —
         // see the mixed-tree phase below — and it is the same pane the operator
@@ -5459,7 +5723,7 @@ mod tests {
         let rows = live_session_rows(&a);
         a.selected = rows[0];
         a.act_open(SplitDir::Vertical);
-        println!("start (one o)   : {:?}", live_heights(&mut a));
+        println!("start (one v)   : {:?}", live_heights(&mut a));
         for (n, row) in rows.iter().skip(1).take(4).enumerate() {
             a.selected = *row;
             a.act_open(SplitDir::Horizontal);
@@ -5482,9 +5746,9 @@ mod tests {
         assert_eq!(live_heights(&mut a), before, "the per-tick pin is a no-op on an even layout");
         assert_eq!(live_widths(&mut a)[0], 34, "sidebar keeps its pinned width");
 
-        // ── mixed `o` + `s`: the tree is left exactly as the operator built it
+        // ── mixed `v` + `s`: the tree is left exactly as the operator built it
         let mut a = live_app();
-        println!("\n== mixed `o` then `s` — the tree is left alone ==");
+        println!("\n== mixed `v` then `s` — the tree is left alone ==");
         let rows = live_session_rows(&a);
         a.selected = rows[0];
         a.act_open(SplitDir::Vertical);
@@ -5492,7 +5756,7 @@ mod tests {
         a.act_open(SplitDir::Vertical);
         a.refresh_panes();
         let row = a.panes.iter().map(|p| (p.left, p.width, p.top, p.height)).collect::<Vec<_>>();
-        println!("two o           : {row:?}");
+        println!("two v           : {row:?}");
         a.selected = rows[2];
         a.act_open(SplitDir::Horizontal);
         a.refresh_panes();
@@ -5663,6 +5927,67 @@ mod tests {
         let healed = live_widths(&mut a);
         println!("after unzoom    : {healed:?}");
         assert_eq!(healed[0], 34, "the pin heals a manual resize as soon as the zoom is gone");
+
+        live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
+    }
+
+    /// §8.4 end to end: `v` with two panes beside the sidebar labels them,
+    /// a label opens beside THAT pane, and the window comes back with no
+    /// border override and evened widths.
+    ///
+    /// Run with:
+    ///   cargo test -- --ignored --nocapture live_v_picks
+    ///
+    /// Same socket caveat as the other live tests: run it by name.
+    #[test]
+    #[ignore = "mutates a tmux server; run by name (see the doc comment)"]
+    fn live_v_picks_the_labelled_pane_and_restores_the_window() {
+        tmux::set_socket(Some(LIVE_SOCKET));
+        assert_eq!(tmux::socket().as_deref(), Some(LIVE_SOCKET), "throwaway socket only");
+
+        let mut a = live_app();
+        let rows = live_session_rows(&a);
+        for row in rows.iter().take(2) {
+            a.selected = *row;
+            a.act_open(SplitDir::Vertical);
+        }
+        let sb = a.sidebar_pane.clone().expect("sidebar");
+        let overrides = || live_raw(&["show-options", "-w", "-t", sb.as_str()]);
+        let before = overrides(); // `new-session -n` leaves `automatic-rename off`
+        println!("\n== `v` picks — 120x40 window, sidebar 34 ==");
+        println!("start           : {:?}", live_widths(&mut a));
+
+        a.selected = rows[2];
+        assert_eq!(a.on_key(press('v')), Action::Redraw);
+        assert_eq!(a.mode, Mode::PickPane, "{:?}", a.message);
+        let labels = a.pick.as_ref().expect("pick").labels.clone();
+        assert_eq!(labels.iter().map(|(c, _)| *c).collect::<String>(), "AB");
+        let shown = live_raw(&["list-panes", "-t", sb.as_str(), "-F", "#{pane_id}=#{@ccmux_pick}"]);
+        let want = format!("{sb}=\n{}=A\n{}=B", labels[0].1, labels[1].1);
+        assert_eq!(shown, want, "labels on the two content panes, none on the sidebar");
+        assert_eq!(live_raw(&["show-options", "-w", "-qv", "-t", sb.as_str(), "pane-border-status"]), "top");
+        // What each border line prints: the format expanded per pane.
+        let fmt = live_raw(&["show-options", "-w", "-qv", "-t", sb.as_str(), "pane-border-format"]);
+        let printed = |p: &PaneId| live_raw(&["display", "-p", "-t", p.as_str(), &fmt]);
+        assert_eq!(printed(&labels[0].1), "#[reverse]#[bold] A #[default]");
+        assert_eq!(printed(&labels[1].1), "#[reverse]#[bold] B #[default]");
+        assert_eq!(printed(&sb), "", "the sidebar's border stays blank");
+
+        // `a`, lowercase: the leftmost content pane, which is NOT where
+        // `split_anchor` would put it (the rightmost).
+        let (_, target) = labels[0].clone();
+        a.on_key(press('a'));
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(overrides(), before, "no border override left behind");
+        a.refresh_panes();
+        let idx = |p: &PaneId| a.panes.iter().find(|i| &i.id == p).map(|i| i.index).expect("live");
+        let opened = a.map.panes.keys().filter_map(|k| PaneId::parse(k)).max_by_key(PaneId::num).expect("opened");
+        assert_eq!(idx(&opened), idx(&target) + 1, "opened beside the labelled pane");
+        let widths = live_widths(&mut a);
+        println!("after v, a      : {widths:?}");
+        assert_eq!(widths[0], 34, "sidebar keeps its pinned width");
+        assert_spread_is_at_most_one("widths after a pick", &widths[1..]);
+        assert!(a.panes.iter().all(|p| p.top == 0 && p.height == 40), "border row gone: {:?}", a.panes);
 
         live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
     }
@@ -7130,7 +7455,7 @@ mod tests {
     /// `is_attachable` is a LIVE gate, not a leftover of the interactive era:
     /// `parse_sessions` honours an explicit `kind: "background"` even when the
     /// CLI omits `id`, so such a row is listed and has no id to hand `claude`.
-    /// `S`, `Enter` and `o` must all refuse it without shelling out.
+    /// `S`, `Enter` and `v` must all refuse it without shelling out.
     #[test]
     fn a_listed_row_with_no_short_id_refuses_every_id_verb() {
         let mut a = app();
@@ -7149,9 +7474,9 @@ mod tests {
         assert!(a.stop_arm.is_none(), "a refused verb must not arm");
         assert!(agents::test_spawn::calls().is_empty());
 
-        // `Enter` and `o` refuse BEFORE any tmux call: there is no map entry
+        // `Enter` and `v` refuse BEFORE any tmux call: there is no map entry
         // and no pane, so a fallthrough would shell out at `split`.
-        for k in [KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), press('o')] {
+        for k in [KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), press('v')] {
             a.message = None;
             assert_eq!(a.on_key(k), Action::Redraw);
             let (text, level) = a.message.clone().unwrap_or_default_msg();
@@ -7219,7 +7544,7 @@ mod tests {
         }
     }
 
-    /// `t` refuses exactly where `o`/`s` do, and refuses BEFORE issuing any
+    /// `t` refuses exactly where `v`/`s` do, and refuses BEFORE issuing any
     /// tmux command — which is what lets this run hermetically.
     #[test]
     fn t_refuses_a_session_with_no_short_id_and_outside_tmux() {
@@ -7496,7 +7821,7 @@ mod tests {
         assert!(a.hidden_dirty, "the dismissal log was written from an empty base");
 
         // The next tick's `list-windows` succeeds. Adoption MERGES: the stored
-        // state arrives, and the `o` and `d` pressed while it was failing are
+        // state arrives, and the `v` and `d` pressed while it was failing are
         // still there.
         let mut stored = tab("@1", 1, Some("%1"));
         stored.map.insert(&PaneId::parse("%7").expect("id"), entry("bbbbbbbb-uuid"));
@@ -7511,7 +7836,7 @@ mod tests {
         a.adopt_own_state();
         assert!(a.own_state_loaded);
         assert_eq!(a.map.panes.len(), 2, "stored AND interim: {:?}", a.map.panes);
-        assert!(a.map.get(&PaneId::parse("%2").expect("id")).is_some(), "the interim `o`");
+        assert!(a.map.get(&PaneId::parse("%2").expect("id")).is_some(), "the interim `v`");
         assert!(a.map.get(&PaneId::parse("%7").expect("id")).is_some(), "the stored entry");
         assert_eq!(a.map.v, 1, "the adopted map carries the current schema version");
         assert_eq!(a.hidden_log.ops.len(), 1, "the stored dismissal survived");
@@ -9015,7 +9340,7 @@ mod tests {
     /// verb that acts on the row under the cursor has committed to that row.
     #[test]
     fn the_keys_that_claim_the_cursor_are_the_moves_and_the_row_verbs() {
-        for c in ['j', 'k', 'g', 'G', 'o', 's', 't', 'x', 'L', 'd', 'u'] {
+        for c in ['j', 'k', 'g', 'G', 'v', 's', 't', 'x', 'L', 'd', 'u'] {
             assert!(claims_the_cursor(press(c)), "{c} claims the cursor");
         }
         for code in [KeyCode::Down, KeyCode::Up, KeyCode::Tab, KeyCode::BackTab, KeyCode::Enter] {
@@ -10783,7 +11108,7 @@ mod tests {
     ///
     /// `%6` was opened moments ago: `act_open` put it in `self.map` and the
     /// `@ccmux_tab_map` snapshot in `self.tabs` has not caught up — which is
-    /// the guaranteed state right after an `o`, since `act_open` refreshes
+    /// the guaranteed state right after a `v`, since `act_open` refreshes
     /// before it saves. Planning from the snapshot left `%6` running the
     /// `claude` binary the operator had just replaced while the footer counted
     /// it as restarted. The in-memory map is the authoritative record and is

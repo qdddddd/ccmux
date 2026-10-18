@@ -16,7 +16,7 @@
 //!     targeted a foreign session — `focus_foreign_pane`, for the §5.4 jump to
 //!     an interactive session — is gone along with the jump itself.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -1135,7 +1135,7 @@ pub fn rightmost_pane_excluding(panes: &[PaneInfo], sidebar: &PaneId) -> Option<
 
 // ── Even layout: spreading the content panes along one axis (§1.4) ──────────
 //
-// `split-window` HALVES its target, so a fourth `o` on a 120-column window
+// `split-window` HALVES its target, so a fourth `v` on a 120-column window
 // leaves `34 42 21 20`. Evening it afterwards with a sequence of
 // `resize-pane -x` calls does work — right to left, twice, because a single
 // pass does not settle — but it costs one command per pane per pass and it
@@ -1165,14 +1165,14 @@ pub fn layout_checksum(layout: &str) -> u16 {
 /// The geometry the non-sidebar panes of ONE window form.
 ///
 /// Only two shapes divide cleanly along a single axis: a row (side by side)
-/// and a column (stacked). A mix of `o` and `s` builds a TREE, where "even
+/// and a column (stacked). A mix of `v` and `s` builds a TREE, where "even
 /// along the axis" has no single meaning, and both plausible readings —
 /// `select-layout tiled`, or evening the top-level groups — move panes the
 /// operator deliberately placed. `Ragged` is therefore a no-op, not a
 /// best-effort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentShape {
-    /// Side by side, each full height. `o` geometry: even the WIDTHS.
+    /// Side by side, each full height. `v` geometry: even the WIDTHS.
     Row,
     /// Stacked, each the full content width. `s` geometry: even the HEIGHTS.
     Column,
@@ -1184,7 +1184,7 @@ pub enum ContentShape {
 impl SplitDir {
     /// The shape a split in this direction leaves behind when it lands in a
     /// window that held one content pane, or already held that shape. This is
-    /// the whole of the `o`-vs-`s` axis choice: `o` (`Vertical`, tmux `-h`)
+    /// the whole of the `v`-vs-`s` axis choice: `v` (`Vertical`, tmux `-h`)
     /// puts panes side by side and so divides WIDTH; `s` (`Horizontal`, tmux
     /// `-v`) stacks them and so divides HEIGHT.
     pub fn shape(self) -> ContentShape {
@@ -1299,7 +1299,7 @@ pub fn even_shares(total: u16, n: usize) -> Option<Vec<u16>> {
 ///
 /// `#{pane_index}` IS a pane's position in that list, so "every cell reaches
 /// the pane it was drawn for" is exactly "the emitted order increases in
-/// `index`". Every window ccmux can build satisfies that already — `o`, `s`,
+/// `index`". Every window ccmux can build satisfies that already — `v`, `s`,
 /// the `-b` sidebar heal and a split of a middle pane all leave pane-list order
 /// equal to visual order — but nothing in tmux enforces it, and the cost of
 /// being wrong is not a cosmetic one: the sidebar cell is emitted first, so a
@@ -1320,7 +1320,7 @@ fn cells_follow_pane_list_order(sidebar: &PaneInfo, ordered_content: &[&PaneInfo
 /// The `<checksum>,<layout>` string that spreads the content panes of one
 /// window evenly along their axis, with the sidebar at exactly `sidebar_cols`.
 ///
-/// `want` is `Some(shape)` on the split path — `o` must have produced a row and
+/// `want` is `Some(shape)` on the split path — `v` must have produced a row and
 /// `s` a column, and a split that produced neither built a tree the operator
 /// gets to keep. On the kill path it is `None`: whatever clean shape the
 /// survivors form is the one to even.
@@ -1589,6 +1589,201 @@ pub fn write_tab_map_uncached(
     let json = serde_json::to_string(map)
         .map_err(|e| TmuxError::Parse(format!("cannot serialize pane map: {e}")))?;
     set_window_option_at(session, pane, OPT_TAB_MAP, &json)
+}
+
+// ── The `v` / `s` pane picker (§8.4) ────────────────────────────────────────
+//
+// nvim-tree's window picker writes a letter into each candidate window's
+// statusline. A tmux pane's nearest equivalent is its border status line, so
+// the picker shows its labels there: `pane-border-status top` plus a
+// `pane-border-format` that prints a pane's `@ccmux_pick` reversed and bold,
+// and prints nothing on a pane without one. Verified on tmux 3.4 by expanding
+// the format against each pane (`display -p`, also asserted by
+// `live_pick_labels_restore_options_and_geometry_and_heal`).
+//
+// Both border options are WINDOW options the operator may have set themselves,
+// so they are displaced, never assumed: the window-LEVEL values are read
+// (`show-options -w` without `-g` — a window with no override shows nothing),
+// saved, and restored exactly — re-set when there was a value, `-u` when there
+// was none, so the global value is never written down as a window override.
+// Turning the border status on costs the top row of panes one row while the
+// labels are up; unsetting it restores the geometry exactly (verified: 50x29
+// -> 50x30).
+//
+// The saved values live in a window user option for the whole time the labels
+// are up, so a sidebar that dies mid-pick leaves behind exactly what the next
+// one needs to heal the window (`clear_pick_labels`, run once at startup).
+
+/// PANE-scoped: the label `v`/`s` shows on a candidate pane's border. Set only
+/// while a pick is on screen; `clear_pick_labels` unsets every one.
+pub const OPT_PANE_PICK: &str = "@ccmux_pick";
+/// WINDOW-scoped: the border options a pick displaced, as `PickSaved` JSON.
+/// Present exactly while a pick is on screen — or after a sidebar died
+/// mid-pick, which is what makes it healable.
+pub const OPT_PICK_SAVED: &str = "@ccmux_pick_saved";
+/// The two real tmux options the picker may write. The ONLY non-`@` options
+/// any helper in this file sets after session creation; `set_border_option`
+/// refuses every other name.
+const BORDER_STATUS: &str = "pane-border-status";
+const BORDER_FORMAT: &str = "pane-border-format";
+/// Prints a pane's label, reversed and bold, and nothing at all on a pane
+/// that has none — so the sidebar's own border stays blank.
+/// The style is two `#[...]` blocks, never `#[reverse,bold]`: inside a
+/// `#{?…}` conditional that comma is the true/false separator, so the label
+/// would print as nothing (verified on 3.4: the true branch expands to
+/// `#[reverse` and the false branch to `bold] … #[default],`).
+const PICK_BORDER_FMT: &str = "#{?#{@ccmux_pick},#[reverse]#[bold] #{@ccmux_pick} #[default],}";
+const PICK_SAVED_VERSION: u32 = 1;
+
+/// What a pick displaced, written before the first border write.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PickSaved {
+    v: u32,
+    /// Did the pick turn `pane-border-status` on? False when the window
+    /// already showed borders (top or bottom): the status is then left alone
+    /// and only the format is swapped, so it must not be "restored" either.
+    status_touched: bool,
+    /// Window-level `pane-border-status` before the pick; `None` = no override.
+    status: Option<String>,
+    /// Window-level `pane-border-format` before the pick; `None` = no override.
+    format: Option<String>,
+}
+
+/// The WINDOW-LEVEL value of `name` for `pane`'s window, `None` when the
+/// window has no override. Two reads, because `-v` alone cannot tell an unset
+/// option from one set to the empty string; without `-v` an unset option
+/// prints nothing and a set one prints its name (verified on 3.4).
+///
+/// Read-only, and only ever called by the gated helpers below.
+fn window_level(pane: &PaneId, name: &str) -> Result<Option<String>, TmuxError> {
+    if tmux(&["show-options", "-w", "-q", "-t", pane.as_str(), name])?.is_empty() {
+        return Ok(None);
+    }
+    tmux(&["show-options", "-w", "-qv", "-t", pane.as_str(), name]).map(Some)
+}
+
+/// Set (`Some`) or unset (`None`) one of the two border options at WINDOW
+/// level. Refuses any other name. Private: its callers have already passed
+/// `pane` through the R2 gate.
+fn set_border_option(pane: &PaneId, name: &str, value: Option<&str>) -> Result<(), TmuxError> {
+    if name != BORDER_STATUS && name != BORDER_FORMAT {
+        return Err(TmuxError::BadTarget(format!("not a picker border option: {name:?}")));
+    }
+    match value {
+        Some(v) => tmux(&["set-option", "-w", "-t", pane.as_str(), name, v]),
+        None => tmux(&["set-option", "-w", "-u", "-t", pane.as_str(), name]),
+    }
+    .map(|_| ())
+}
+
+/// Put `labels` on the borders of their panes (§8.4). `anchor` is any pane of
+/// the same window — the sidebar — and addresses the window options.
+///
+/// R2-gated with ONE enumeration for every pane involved, not one per pane:
+/// the anchor and each labelled pane must be live in `session`, and all in the
+/// anchor's window, because the border options are per window. Fails closed
+/// before any write.
+///
+/// Idempotent across a crash: when `@ccmux_pick_saved` is already present the
+/// window's current border values are a previous pick's, not the operator's,
+/// so they are NOT re-read — the saved originals stand and only the labels
+/// are written.
+///
+/// A failure part-way leaves the window partly labelled; the caller runs
+/// `clear_pick_labels`, which restores from the saved record.
+pub fn show_pick_labels(session: &str, anchor: &PaneId, labels: &[(char, PaneId)]) -> Result<(), TmuxError> {
+    let live = list_panes_in_session(session)?;
+    let window_of = |p: &PaneId| live.iter().find(|i| &i.id == p).map(|i| i.window_id.clone());
+    let Some(window) = window_of(anchor) else {
+        return Err(TmuxError::BadTarget(format!("pane {anchor} is not in tmux session {session:?}")));
+    };
+    for (_, pane) in labels {
+        if window_of(pane).as_ref() != Some(&window) {
+            return Err(TmuxError::BadTarget(format!("pane {pane} is not in the picker's window")));
+        }
+    }
+
+    let saved = match window_level(anchor, OPT_PICK_SAVED)?.as_deref().and_then(parse_pick_saved) {
+        Some(saved) => saved,
+        None => {
+            let effective = tmux(&["show-options", "-wA", "-qv", "-t", anchor.as_str(), BORDER_STATUS])?;
+            let saved = PickSaved {
+                v: PICK_SAVED_VERSION,
+                // `top`/`bottom` already draw a border line to put a label in.
+                status_touched: !matches!(effective.as_str(), "top" | "bottom"),
+                status: window_level(anchor, BORDER_STATUS)?,
+                format: window_level(anchor, BORDER_FORMAT)?,
+            };
+            let json = serde_json::to_string(&saved)
+                .map_err(|e| TmuxError::Parse(format!("cannot serialize picker state: {e}")))?;
+            // Saved BEFORE the first border write, so there is no moment at
+            // which the window is changed and the originals are unrecorded.
+            tmux(&["set-option", "-w", "-t", anchor.as_str(), OPT_PICK_SAVED, &json])?;
+            saved
+        }
+    };
+    if saved.status_touched {
+        set_border_option(anchor, BORDER_STATUS, Some("top"))?;
+    }
+    set_border_option(anchor, BORDER_FORMAT, Some(PICK_BORDER_FMT))?;
+    for (label, pane) in labels {
+        tmux(&["set-option", "-p", "-t", pane.as_str(), OPT_PANE_PICK, &label.to_string()])?;
+    }
+    Ok(())
+}
+
+/// Take every picker label off `window` and restore the border options a
+/// pick displaced. Also the HEAL: run once at sidebar startup, it repairs a
+/// window whose sidebar died mid-pick. A no-op on a window with nothing to
+/// clear beyond its reads.
+///
+/// Addressed by the pick's WINDOW, not by the pane it was shown through: that
+/// pane may have died or moved to another window since (`break-pane`), and
+/// the window that holds the labels is the one to restore. R1 still holds —
+/// the `WindowId` only FILTERS one `list_panes_in_session`, and every `-t` is
+/// a pane from that same listing, so the R2 proof covers each write.
+///
+/// `labelled` is the pick's own label list, unset wherever those panes now
+/// are in the session — a labelled pane moved out of the window keeps its
+/// option otherwise. Every pane still in `window` is unset too, which is all
+/// the heal (no label list) needs. A pane that dies between the listing and
+/// its unset is skipped — its option went with it — and never stops the
+/// restore. A window with no live pane left took its options with it.
+pub fn clear_pick_labels(session: &str, window: &WindowId, labelled: &[PaneId]) -> Result<(), TmuxError> {
+    let live = list_panes_in_session(session)?;
+    let in_window: Vec<&PaneId> = live.iter().filter(|p| &p.window_id == window).map(|p| &p.id).collect();
+    let mut unset: BTreeSet<&PaneId> = in_window.iter().copied().collect();
+    unset.extend(labelled.iter().filter(|p| live.iter().any(|i| &i.id == *p)));
+    for pane in unset {
+        let _ = tmux(&["set-option", "-p", "-u", "-t", pane.as_str(), OPT_PANE_PICK]);
+    }
+    let Some(anchor) = in_window.first().copied() else {
+        return Ok(());
+    };
+    let Some(raw) = window_level(anchor, OPT_PICK_SAVED)? else {
+        return Ok(());
+    };
+    match parse_pick_saved(&raw) {
+        Some(saved) => {
+            if saved.status_touched {
+                set_border_option(anchor, BORDER_STATUS, saved.status.as_deref())?;
+            }
+            set_border_option(anchor, BORDER_FORMAT, saved.format.as_deref())?;
+        }
+        // Only ccmux writes this option, so an unreadable value is a future
+        // build's. Its originals cannot be recovered; dropping both window
+        // overrides falls back to the operator's global config, which is
+        // where a border setting nearly always lives.
+        None => {
+            set_border_option(anchor, BORDER_STATUS, None)?;
+            set_border_option(anchor, BORDER_FORMAT, None)?;
+        }
+    }
+    tmux(&["set-option", "-w", "-u", "-t", anchor.as_str(), OPT_PICK_SAVED]).map(|_| ())
+}
+
+fn parse_pick_saved(raw: &str) -> Option<PickSaved> {
+    serde_json::from_str::<PickSaved>(raw).ok().filter(|s| s.v == PICK_SAVED_VERSION)
 }
 
 // ── The pane map ────────────────────────────────────────────────────────────
@@ -2312,7 +2507,7 @@ mod tests {
     }
 
     /// Sidebar 34 wide, then three content panes side by side, mid-halving:
-    /// the state a third `o` leaves behind on a 120x40 window.
+    /// the state a third `v` leaves behind on a 120x40 window.
     fn row_window() -> Vec<PaneInfo> {
         vec![
             geo("%0", 1, 0, 0, 34, 40),
@@ -2421,7 +2616,7 @@ mod tests {
         assert_eq!(content_shape(&row_window(), &sb()), ContentShape::Row);
         assert_eq!(content_shape(&column_window(), &sb()), ContentShape::Column);
 
-        // A mix of `o` and `s`: %1 alone on the left, %2 over %3 on the right.
+        // A mix of `v` and `s`: %1 alone on the left, %2 over %3 on the right.
         // Neither axis divides this, so it is a tree and it stays one.
         let mixed = vec![
             geo("%0", 1, 0, 0, 34, 40),
@@ -2601,14 +2796,14 @@ mod tests {
         assert!(even_layout(&column_window(), &sb(), 34, None).is_some());
     }
 
-    /// `o` divides width, `s` divides height, and neither key ever evens the
+    /// `v` divides width, `s` divides height, and neither key ever evens the
     /// other axis: a split that produced the wrong shape built a tree.
     #[test]
     fn even_layout_divides_the_axis_the_key_asked_for() {
         assert_eq!(SplitDir::Vertical.shape(), ContentShape::Row);
         assert_eq!(SplitDir::Horizontal.shape(), ContentShape::Column);
 
-        // `s` landing in a row, and `o` landing in a column: both no-ops.
+        // `s` landing in a row, and `v` landing in a column: both no-ops.
         assert_eq!(
             even_layout(&row_window(), &sb(), 34, Some(SplitDir::Horizontal.shape())),
             None
@@ -2638,7 +2833,7 @@ mod tests {
         assert_eq!(even_layout(&one, &sb(), 34, Some(ContentShape::Row)), None);
         // No panes at all.
         assert_eq!(even_layout(&[], &sb(), 34, None), None);
-        // A tree the operator built with a mix of `o` and `s`.
+        // A tree the operator built with a mix of `v` and `s`.
         let mixed = vec![
             geo("%0", 1, 0, 0, 34, 40),
             geo("%1", 2, 35, 0, 42, 40),
@@ -3527,6 +3722,136 @@ mod tests {
         // cleanup: only ever this socket's server
         let _ = tmux(&["kill-session", "-t", "=ccmux-test-live:"]);
         assert!(!has_session(sess));
+        set_socket(None);
+    }
+
+    /// The §8.4 picker's labels against a real tmux server: shown, cleared,
+    /// the operator's window-level border options and the pane geometry put
+    /// back exactly, and a window a dead sidebar left labelled healed.
+    ///
+    /// Run with:
+    ///   cargo test -- --ignored --nocapture live_pick_labels
+    ///
+    /// Its own socket, `ccmux-pickfix`, started with `-f /dev/null` so the
+    /// global border options are tmux's defaults and no operator config can
+    /// make the assertions pass or fail. Same process-global socket caveat as
+    /// `live_round_trip`: run it by name.
+    #[test]
+    #[ignore = "mutates a tmux server; run by name (see the doc comment)"]
+    fn live_pick_labels_restore_options_and_geometry_and_heal() {
+        const SOCK: &str = "ccmux-pickfix";
+        const SESS: &str = "ccmux-pick-test";
+        // Raw, for the two things the crate has no helper for: a server
+        // started with `-f /dev/null` at a fixed size, and reading options
+        // back without going through the code under test.
+        let raw = |args: &[&str]| -> String {
+            let out = Command::new("tmux")
+                .args(["-L", SOCK, "-f", "/dev/null"])
+                .args(args)
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .output()
+                .expect("tmux");
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        };
+        raw(&["kill-server"]);
+        raw(&["new-session", "-d", "-s", SESS, "-x", "120", "-y", "40", "--", "sleep", "600"]);
+        set_socket(Some(SOCK));
+        assert_eq!(socket().as_deref(), Some(SOCK), "throwaway socket only");
+
+        let sidebar = list_panes_in_session(SESS).expect("list")[0].id.clone();
+        let cmd = sh_join(&["sleep", "600"]);
+        let p1 = split(SESS, &sidebar, SplitDir::Vertical, &cmd).expect("split 1");
+        let p2 = split(SESS, &p1, SplitDir::Vertical, &cmd).expect("split 2");
+        let geometry = || {
+            let mut g: Vec<_> = list_panes_in_session(SESS)
+                .expect("list")
+                .into_iter()
+                .map(|p| (p.id, p.left, p.top, p.width, p.height))
+                .collect();
+            g.sort();
+            g
+        };
+        let window_opts = || raw(&["show-options", "-w", "-t", sidebar.as_str()]);
+        let labels = || raw(&["list-panes", "-t", sidebar.as_str(), "-F", "#{pane_id}=#{@ccmux_pick}"]);
+        let before = geometry();
+        assert_eq!(window_opts(), "", "a fresh window has no overrides");
+        let picks = [('A', p1.clone()), ('B', p2.clone())];
+        let win = list_panes_in_session(SESS).expect("list")[0].window_id.clone();
+        let both = [p1.clone(), p2.clone()];
+
+        // ── no window-level override: on, then back to inheriting ───────────
+        show_pick_labels(SESS, &sidebar, &picks).expect("show");
+        assert_eq!(raw(&["show-options", "-w", "-qv", "-t", sidebar.as_str(), BORDER_STATUS]), "top");
+        assert_eq!(labels(), format!("{sidebar}=\n{p1}=A\n{p2}=B"));
+        // What the border line actually PRINTS, by expanding the format the
+        // window now has against each pane: the label on a candidate, and
+        // nothing on the sidebar.
+        let fmt = raw(&["show-options", "-w", "-qv", "-t", sidebar.as_str(), BORDER_FORMAT]);
+        assert_eq!(raw(&["display", "-p", "-t", p1.as_str(), &fmt]), "#[reverse]#[bold] A #[default]");
+        assert_eq!(raw(&["display", "-p", "-t", p2.as_str(), &fmt]), "#[reverse]#[bold] B #[default]");
+        assert_eq!(raw(&["display", "-p", "-t", sidebar.as_str(), &fmt]), "");
+        let shown = geometry();
+        println!("labelled  : {shown:?}");
+        assert_ne!(shown, before, "the border row costs the panes a row");
+        clear_pick_labels(SESS, &win, &both).expect("clear");
+        assert_eq!(window_opts(), "", "nothing written down as a window override");
+        assert_eq!(labels(), format!("{sidebar}=\n{p1}=\n{p2}="));
+        assert_eq!(geometry(), before, "geometry restored exactly");
+
+        // ── the operator's own window-level values come back verbatim ───────
+        raw(&["set-option", "-w", "-t", sidebar.as_str(), BORDER_STATUS, "bottom"]);
+        raw(&["set-option", "-w", "-t", sidebar.as_str(), BORDER_FORMAT, "mine #{pane_index}"]);
+        let theirs = window_opts();
+        let theirs_geometry = geometry();
+        show_pick_labels(SESS, &sidebar, &picks).expect("show over overrides");
+        assert_eq!(raw(&["show-options", "-w", "-qv", "-t", sidebar.as_str(), BORDER_STATUS]), "bottom");
+        assert_eq!(geometry(), theirs_geometry, "an existing border line is reused, not moved");
+        clear_pick_labels(SESS, &win, &both).expect("clear over overrides");
+        assert_eq!(window_opts(), theirs);
+        raw(&["set-option", "-w", "-u", "-t", sidebar.as_str(), BORDER_STATUS]);
+        raw(&["set-option", "-w", "-u", "-t", sidebar.as_str(), BORDER_FORMAT]);
+
+        // ── a sidebar dies mid-pick; its successor re-shows, then heals ─────
+        raw(&["set-option", "-w", "-t", sidebar.as_str(), BORDER_FORMAT, "kept"]);
+        let theirs = window_opts();
+        show_pick_labels(SESS, &sidebar, &picks).expect("show, then die");
+        show_pick_labels(SESS, &sidebar, &picks[..1]).expect("re-show over a stale pick");
+        assert!(window_opts().contains(OPT_PICK_SAVED), "the record outlives the process");
+        clear_pick_labels(SESS, &win, &[]).expect("heal");
+        assert_eq!(window_opts(), theirs, "the ORIGINALS, not the first pick's values");
+        assert_eq!(labels(), format!("{sidebar}=\n{p1}=\n{p2}="));
+        assert_eq!(geometry(), before);
+        // Healing a clean window is a no-op.
+        clear_pick_labels(SESS, &win, &[]).expect("heal a clean window");
+        assert_eq!(window_opts(), theirs);
+
+        // ── R2: a pane outside the session fails closed, before any write ───
+        let ghost = PaneId::parse("%99999").expect("id");
+        assert!(matches!(show_pick_labels(SESS, &sidebar, &[('A', ghost.clone())]), Err(TmuxError::BadTarget(_))));
+        // A window and labels with nothing live in this session reach nothing.
+        let elsewhere = WindowId::parse("@99999").expect("id");
+        clear_pick_labels(SESS, &elsewhere, std::slice::from_ref(&ghost)).expect("nothing to clear");
+        assert_eq!(window_opts(), theirs);
+        raw(&["set-option", "-w", "-u", "-t", sidebar.as_str(), BORDER_FORMAT]);
+
+        // ── the anchor and a labelled pane leave the window mid-pick ────────
+        // `break-pane` moves a pane to a window of its own, as an operator
+        // might while the labels are up. The clear still restores the
+        // labelled window, through a pane still in it, and still takes the
+        // label off the pane that left.
+        show_pick_labels(SESS, &sidebar, &picks).expect("show, then move");
+        raw(&["break-pane", "-d", "-s", sidebar.as_str()]);
+        raw(&["break-pane", "-d", "-s", p2.as_str()]);
+        let moved = list_panes_in_session(SESS).expect("list");
+        assert!(moved.iter().all(|p| p.id == p1 || p.window_id != win), "both left the window");
+        clear_pick_labels(SESS, &win, &both).expect("clear after the move");
+        assert_eq!(raw(&["show-options", "-w", "-t", p1.as_str()]), "", "the labelled window restored");
+        for p in [&sidebar, &p1, &p2] {
+            assert_eq!(raw(&["display", "-p", "-t", p.as_str(), "#{@ccmux_pick}"]), "", "{p} unlabelled");
+        }
+
+        raw(&["kill-server"]);
         set_socket(None);
     }
 
