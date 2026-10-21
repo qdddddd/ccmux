@@ -120,43 +120,29 @@ Claude Completed group.
 
 `Enter/v/s/t` open the official Codex TUI; `x` closes a pane while work
 stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
-as usual; `r` also reloads credentials and DNS. On an idle (`○`) or unloaded
-(`◇`) Codex row, press `Ctrl-x` twice within 2 s to archive it. The first
-press sends no RPC. ccmux refuses running, blocked, error/unknown, or mapped
-pane rows, and refuses when it cannot read the tmux pane maps. The second
-press re-reads the pane maps and the server status. It archives only if the
-server still reports the state the row shows: an unloaded row that the
-server now reports idle has been opened by some other client, and is refused.
-`L` still refuses. `n` always creates a Claude session, using the sidebar's
-local cwd when Codex is selected. `R` skips Codex panes.
+as usual; `r` also reloads credentials and DNS. `Ctrl-x` stops the current
+Codex turn, including one waiting for approval. Press it again within 2 s
+to permanently delete the thread and close its ccmux panes. Idle and unloaded
+threads need no stop; the first press offers deletion directly. The second
+press checks that the thread is still idle or unloaded before deleting it.
+`L` still refuses. In the Codex section, `n` opens a new Codex session form
+with the selected session's cwd and an empty task field. Submitting starts
+the task in the background and selects its row when it appears. Elsewhere,
+`n` creates a Claude session. `R` skips Codex panes.
 
 After `/quit` in the Codex TUI, the pane parks: Enter resumes, `s` opens a
 shell, `q` closes it. The pane map records the **launch target**.
 `/resume`, `/new` and `/fork` can change the TUI's thread without
 changing that record: sidebar Enter/`x` still refer to the original launch,
-and a parked retry returns to it. The Codex TUI owns every other thread
-mutation.
+and a parked retry returns to it.
 
-Archive is a soft delete: turns stay intact, and while the archived thread
-still exists the official client can undo it. Either run
-`codex unarchive <id> --remote ws://127.0.0.1:8965 --remote-auth-token-env CODEX_REMOTE_TOKEN`
-with that environment variable set, or resume the archived ID and choose
-**Unarchive and resume**. The thread reappears in the sidebar on a later poll.
-Recovery is not guaranteed: Codex Desktop's **Delete all archived** action
-permanently deletes archived threads, and how long Codex keeps them otherwise
-has not been measured. ccmux has no unarchive key.
-
-The fresh read and archive are separate RPCs. Another client can start a turn
-between them, and that turn would be aborted. ccmux cannot detect an idle TUI
-attached outside its pane maps; archiving leaves that TUI silent and its next
-message fails `thread not found`. A standalone non-remote Codex process is
-also invisible between turns. Mid-turn, its writer lock refused archive in the
-measured probes; between turns remains a risk.
+Codex deletion uses `thread/delete` and cannot be undone. The working
+directory is kept. As with Claude, the first press keeps the conversation
+available to resume; only the second press deletes it.
 
 ## Keys
 
-The stop, delete and logs keys below apply to Claude rows; Codex differences
-are listed above.
+Stop and delete work for both providers; Codex differences are listed above.
 
 | Key | Action |
 |---|---|
@@ -168,7 +154,7 @@ are listed above.
 | `v` / `s` | Open in a side-by-side / stacked split. With two or more panes beside the sidebar, pick which one to split |
 | `t` | Open in a new tab |
 | `x` | Close the session's pane. The agent keeps running |
-| `Ctrl-x` | Claude: stop, then delete on a second press. Codex: archive eligible `○`/`◇` rows on a second press |
+| `Ctrl-x` | Stop; press again within 2 s to delete the session and close its panes |
 | `n` | Dispatch a new background session |
 | `L` | Show the session's logs |
 | `d` / `u` | Hide the row from the list / undo the last hide |
@@ -178,7 +164,7 @@ are listed above.
 | `R` | Restart ccmux and idle agents after an upgrade |
 | `?` | Help |
 | `q` | Quit the sidebar. Sessions and panes are untouched |
-| `Esc` | Cancel a pending delete/archive, or clear the filter |
+| `Esc` | Cancel a pending delete, or clear the filter |
 | `Ctrl-c` | Quit from any mode |
 
 `v` and `s` follow vim's naming: `v` (`:vsplit`) puts panes side by side, `s`
@@ -313,17 +299,16 @@ v2 pane map, including Claude pane records, and strip Codex dismissal tags.
   A second press within 2 s runs `claude rm`, which deletes the session and
   its git worktree. `claude rm` refuses a worktree with uncommitted or
   unpushed work.
-- On an eligible Codex row, the first `Ctrl-x` only arms a two-second window.
-  The second performs a fresh status read and one soft archive. It never calls
-  `thread/delete` or `turn/interrupt`, and never retries an uncertain result.
+- On a Codex row, the first `Ctrl-x` interrupts an active turn and arms a
+  two-second window. The second performs a fresh status read, permanently
+  deletes the stopped thread, and closes its mapped panes.
 - The footer names the session while the delete window is open.
   Moving between Claude rows does **not** close it; a second press on another
-  row deletes nothing. Selecting a Codex row closes it. A Codex archive window
+  row deletes nothing. Selecting a Codex row closes it. A Codex delete window
   closes on any row move, provider change or repeated press, and further
   presses until its 2 s would have ended only say
-  `archive window closed — nothing archived`. A press within 750 ms of the
-  previous one is ignored, and the footer says so; a held key deletes or
-  archives nothing.
+  `delete window closed — nothing deleted`. A press within 750 ms of the
+  previous one is ignored, and the footer says so; a held key deletes nothing.
 - A delete closes the panes parked on that session, but not a pane you turned
   into a shell with `s`.
 - `R` also runs `claude stop` and `claude respawn`, only on idle or done agents,
@@ -374,7 +359,7 @@ CCMUX_CODEX_LIVE_TOKEN_FILE=$HOME/.config/agents/codex-serve.token \
 cargo test codex::live_tests:: -- --ignored --nocapture --test-threads=1
 ```
 
-They create, name and archive only the threads they start themselves, use a
+They create, name and remove only the threads they start themselves, use a
 private tmux server, and never touch the default one. Without the variables
 they refuse to run rather than falling back to your Codex configuration.
 

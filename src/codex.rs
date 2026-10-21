@@ -1,5 +1,4 @@
-//! App-server observations and the guarded archive operation (SPEC §12). No
-//! daemon, session, turn, or thread is created here. Preparation owns
+//! App-server observations and session start/stop/delete operations. Preparation owns
 //! DNS/credential IO; each wire operation owns one connection and one deadline.
 
 use std::{
@@ -25,6 +24,7 @@ use tungstenite::{
 use crate::model::{CodexMeta, CodexStatus, Kind, Provider, Session, State, Status, valid_codex_id};
 
 pub const POLL_TIMEOUT: Duration = Duration::from_millis(1000);
+const ACTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HISTORY_DAYS: i64 = 7;
 const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const MAX_TOKEN: u64 = 16 * 1024;
@@ -110,10 +110,8 @@ pub struct CodexObservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArchiveOutcome {
-    /// `updated_at` is the fresh read's `updatedAt`: the value the local
-    /// tombstone recognizes a lagging copy of the archived thread by.
-    Archived { updated_at: i64 },
+pub enum DeleteOutcome {
+    Deleted,
     StateChanged,
 }
 
@@ -477,7 +475,11 @@ enum Method<'a> {
     Loaded(Option<&'a str>),
     History(Option<&'a str>),
     Read(&'a str),
-    Archive(&'a str),
+    Delete(&'a str),
+    Turns(&'a str),
+    Interrupt(&'a str, &'a str),
+    Start(&'a str),
+    StartTurn(&'a str, &'a str),
 }
 
 impl Method<'_> {
@@ -494,13 +496,23 @@ impl Method<'_> {
                 "modelProviders":[], "useStateDbOnly":true
             })),
             Self::Read(id) => ("thread/read", json!({"threadId":id,"includeTurns":false})),
-            Self::Archive(id) => ("thread/archive", json!({"threadId":id})),
+            Self::Delete(id) => ("thread/delete", json!({"threadId":id})),
+            Self::Turns(id) => ("thread/turns/list", json!({
+                "threadId":id, "limit":1, "sortDirection":"desc", "itemsView":"notLoaded"
+            })),
+            Self::Interrupt(id, turn) => ("turn/interrupt", json!({"threadId":id,"turnId":turn})),
+            Self::Start(cwd) => ("thread/start", json!({"cwd":cwd})),
+            Self::StartTurn(id, task) => ("turn/start", json!({
+                "threadId":id, "input":[{"type":"text","text":task}]
+            })),
         }
     }
 
     fn rejection(&self) -> &'static str {
         match self {
-            Self::Archive(_) => "codex archive RPC rejected",
+            Self::Delete(_) => "codex delete RPC rejected",
+            Self::Interrupt(_, _) => "codex stop RPC rejected",
+            Self::Start(_) | Self::StartTurn(_, _) => "codex start RPC rejected",
             _ => "codex read-only RPC rejected",
         }
     }
@@ -814,14 +826,63 @@ fn page(value: &Value) -> Result<Page<'_>, CodexError> {
 }
 
 impl CodexClient {
+    fn session_action<T>(
+        &mut self, clock: &dyn Clock, connector: &mut impl Connector,
+        action: impl FnOnce(&mut Rpc<'_>) -> Result<T, CodexError>,
+    ) -> Result<T, CodexError> {
+        let deadline = Deadline { clock, end: clock.now() + ACTION_TIMEOUT };
+        let transport = connector.connect(&self.prepared, deadline)?;
+        let mut rpc = Rpc { transport, deadline, next_id: 0, attempted: false };
+        rpc.request(Method::Initialize)?.get("userAgent").and_then(Value::as_str)
+            .ok_or_else(CodexError::protocol)?;
+        rpc.initialized()?;
+        let result = action(&mut rpc)?;
+        rpc.transport.close()?;
+        deadline.check()?;
+        Ok(result)
+    }
+
+    fn stop_with(&mut self, id: &str, clock: &dyn Clock, connector: &mut impl Connector)
+        -> Result<(), CodexError>
+    {
+        if !valid_codex_id(id) { return Err(CodexError::protocol()); }
+        self.session_action(clock, connector, |rpc| {
+            let value = rpc.request(Method::Read(id))?;
+            let row = value.get("thread").ok_or_else(CodexError::protocol)?;
+            if thread_id(row) != Some(id) { return Err(CodexError::protocol()); }
+            match row["status"]["type"].as_str() {
+                Some("idle" | "notLoaded") => return Ok(()),
+                Some("active") => {},
+                _ => return Err(CodexError::new(CodexFailureKind::Protocol, "codex state unknown — not stopped")),
+            }
+            let turns = rpc.request(Method::Turns(id))?;
+            let turn = turns["data"].as_array().and_then(|turns| turns.first())
+                .ok_or_else(CodexError::protocol)?;
+            // History status can lag the live thread status; use it only for the turn ID.
+            let turn_id = turn["id"].as_str().ok_or_else(CodexError::protocol)?;
+            rpc.request(Method::Interrupt(id, turn_id))?;
+            Ok(())
+        })
+    }
+
+    fn start_with(&mut self, cwd: &str, task: &str, clock: &dyn Clock, connector: &mut impl Connector)
+        -> Result<String, CodexError>
+    {
+        self.session_action(clock, connector, |rpc| {
+            let value = rpc.request(Method::Start(cwd))?;
+            let id = value.get("thread").and_then(thread_id).ok_or_else(CodexError::protocol)?;
+            rpc.request(Method::StartTurn(id, task))?;
+            Ok(id.to_owned())
+        })
+    }
+
     pub fn replace_prepared(&mut self, prepared: CodexClient) {
         // The workspace endpoint is fixed (§12.2); the caller re-prepares its
         // same effective config. Replacement carries no observations over.
         self.prepared = prepared.prepared;
     }
 
-    /// Forget provider-local metadata for a thread removed by an archive.
-    /// A later unarchive is rediscovered from the authoritative history list.
+    /// Forget provider-local metadata for a deleted thread.
     pub fn forget(&mut self, id: &str) {
         self.exclusions.remove(id);
         self.attempted.remove(id);
@@ -836,12 +897,12 @@ impl CodexClient {
         self.poll_with(now_ms, &clock, &mut TcpConnector)
     }
 
-    pub fn archive(&mut self, id: &str, expected: &CodexStatus) -> Result<ArchiveOutcome, CodexError> {
+    pub fn delete(&mut self, id: &str, expected: &CodexStatus) -> Result<DeleteOutcome, CodexError> {
         let clock = MonotonicClock(Instant::now());
-        let result = self.archive_with(id, expected, &clock, &mut TcpConnector);
+        let result = self.delete_with(id, expected, &clock, &mut TcpConnector);
         result.map_err(|mut error| {
             if error.diagnostic.kind == CodexFailureKind::Timeout {
-                error.diagnostic.message = "codex archive timed out after 1000 ms".into();
+                error.diagnostic.message = "codex delete timed out after 1000 ms".into();
             }
             error
         })
@@ -851,9 +912,9 @@ impl CodexClient {
     /// `idle` for an Idle row or `notLoaded` for an Unloaded one passes:
     /// `notLoaded` -> `idle` is the one visible sign that a client outside
     /// ccmux attached since the poll, and an attached TUI breaks silently.
-    fn archive_with(
+    fn delete_with(
         &mut self, id: &str, expected: &CodexStatus, clock: &dyn Clock, connector: &mut impl Connector,
-    ) -> Result<ArchiveOutcome, CodexError> {
+    ) -> Result<DeleteOutcome, CodexError> {
         if !valid_codex_id(id) { return Err(CodexError::protocol()); }
         let deadline = Deadline::new(clock);
         let transport = connector.connect(&self.prepared, deadline)?;
@@ -868,14 +929,13 @@ impl CodexClient {
         let eligible = thread_id(row) == Some(id) && matches!((expected, tag),
             (CodexStatus::Idle, Some("idle")) | (CodexStatus::NotLoaded, Some("notLoaded")));
         let outcome = if eligible {
-            let updated_at = timestamp(row, "updatedAt").ok_or_else(CodexError::protocol)?;
-            let result = rpc.request(Method::Archive(id))?;
+            let result = rpc.request(Method::Delete(id))?;
             if !result.as_object().is_some_and(serde_json::Map::is_empty) {
                 return Err(CodexError::protocol());
             }
-            ArchiveOutcome::Archived { updated_at }
+            DeleteOutcome::Deleted
         } else {
-            ArchiveOutcome::StateChanged
+            DeleteOutcome::StateChanged
         };
         deadline.check()?;
         rpc.transport.close()?;
@@ -1000,14 +1060,33 @@ impl CodexClient {
     }
 }
 
-/// Prepare a fresh client, then perform the read-before-archive transaction.
+/// Prepare a fresh client, then perform the read-before-delete transaction.
 /// Preparation may do DNS and credential IO; the connection, initialize,
-/// fresh read, optional archive, and close share one 1000 ms deadline.
-pub fn archive(config: &CodexConfig, id: &str, expected: &CodexStatus)
-    -> Result<ArchiveOutcome, CodexDiagnostic>
+/// fresh read, optional delete, and close share one 1000 ms deadline.
+pub fn delete(config: &CodexConfig, id: &str, expected: &CodexStatus)
+    -> Result<DeleteOutcome, CodexDiagnostic>
 {
     let mut client = prepare(config).map_err(|error| error.diagnostic().clone())?;
-    client.archive(id, expected).map_err(|error| error.diagnostic().clone())
+    client.delete(id, expected).map_err(|error| error.diagnostic().clone())
+}
+
+pub fn stop(config: &CodexConfig, id: &str) -> Result<(), CodexDiagnostic> {
+    let mut client = prepare(config).map_err(|error| error.diagnostic().clone())?;
+    client.stop_with(id, &MonotonicClock(Instant::now()), &mut TcpConnector)
+        .map_err(|error| action_diagnostic(error, "codex stop timed out after 10 s"))
+}
+
+pub fn start(config: &CodexConfig, cwd: &str, task: &str) -> Result<String, CodexDiagnostic> {
+    let mut client = prepare(config).map_err(|error| error.diagnostic().clone())?;
+    client.start_with(cwd, task, &MonotonicClock(Instant::now()), &mut TcpConnector)
+        .map_err(|error| action_diagnostic(error, "codex start timed out after 10 s"))
+}
+
+fn action_diagnostic(mut error: CodexError, timeout: &str) -> CodexDiagnostic {
+    if error.diagnostic.kind == CodexFailureKind::Timeout {
+        error.diagnostic.message = timeout.into();
+    }
+    error.diagnostic
 }
 
 #[cfg(test)]

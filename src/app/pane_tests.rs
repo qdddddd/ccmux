@@ -831,16 +831,16 @@ fn degraded_tmux_refusals_win_over_codex_configuration_errors() {
             key(a, code);
             assert_eq!(a.message.as_ref().unwrap().0, format!("not inside tmux — {verb} unavailable"));
         }
-        a.codex_archive = |_, _, _| panic!("degraded archive reached the RPC");
+        a.codex_delete = |_, _, _| panic!("degraded delete reached the RPC");
         a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
-        assert_eq!(a.message.as_ref().unwrap().0, "not inside tmux — archive unavailable");
+        assert_eq!(a.message.as_ref().unwrap().0, "not inside tmux — delete unavailable");
         assert!(a.stop_arm.is_none());
         assert!(server.borrow().calls.is_empty());
     });
 }
 
 #[test]
-fn codex_archive_arm_and_unbound_keys_have_no_external_effects() {
+fn codex_delete_arm_and_unbound_keys_have_no_external_effects() {
     with_sidebar(|a, server| {
         agents::test_spawn::reset();
         for short in [None, Some("display-only")] {
@@ -849,7 +849,7 @@ fn codex_archive_arm_and_unbound_keys_have_no_external_effects() {
             // Codex disarm intentionally guards its unexpired window.
             a.cx_last_press = None;
             a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
-            assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to archive Codex task");
+            assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to delete Codex task");
             assert!(a.stop_arm.is_some());
             a.disarm_ctrl_x();
             press(a, 'L');
@@ -862,15 +862,15 @@ fn codex_archive_arm_and_unbound_keys_have_no_external_effects() {
     });
 }
 
-static ARCHIVES: AtomicUsize = AtomicUsize::new(0);
+static DELETES: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
-fn archive_rereads_every_tab_before_the_rpc() {
+fn delete_closes_the_codex_pane_in_another_tab() {
     with_sidebar(|a, server| {
-        ARCHIVES.store(0, Ordering::SeqCst);
-        a.codex_archive = |_, _, _| {
-            ARCHIVES.fetch_add(1, Ordering::SeqCst);
-            Ok(crate::codex::ArchiveOutcome::Archived { updated_at: 1 })
+        DELETES.store(0, Ordering::SeqCst);
+        a.codex_delete = |_, _, _| {
+            DELETES.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::codex::DeleteOutcome::Deleted)
         };
         let row = a.sessions[0].clone();
         let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
@@ -882,9 +882,9 @@ fn archive_rereads_every_tab_before_the_rpc() {
         a.on_key(ctrl_x);
         a.pending_delete.as_mut().expect("the stale inventory let the second press through").at -= CX_SETTLE;
         assert!(a.tick_stop_arm());
-        assert_eq!(ARCHIVES.load(Ordering::SeqCst), 0, "archived under a TUI attached in tab 2");
-        assert_eq!(a.message.as_ref().unwrap().0, "close its pane first (x) — not archived");
-        assert!(server.borrow().calls("list-windows").len() == 1);
+        assert_eq!(DELETES.load(Ordering::SeqCst), 1);
+        assert_eq!(a.message.as_ref().unwrap().0, "deleted Codex task · closed 1 pane");
+        assert_eq!(server.borrow().calls("kill-pane").len(), 1);
     });
 }
 
@@ -918,16 +918,16 @@ fn moving_from_a_claude_delete_window_to_codex_disarms_it() {
 }
 
 #[test]
-fn n_with_only_codex_rows_submits_claude_from_the_local_directory() {
+fn n_with_only_codex_rows_submits_codex_from_the_selected_directory() {
     with_sidebar(|a, server| {
-        a.dispatch = |provider, cwd, task| {
-            assert_eq!(provider, Provider::Claude);
+        a.sessions[0].cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+        a.codex_start = |_, cwd, task| {
             assert_eq!(cwd, std::env::current_dir().unwrap().to_str().unwrap());
             assert_eq!(task, "fixture task");
-            Ok(None)
+            Ok(row().session_id)
         };
         press(a, 'n');
-        assert_eq!(a.prompt.as_ref().unwrap().kind, PromptKind::NewBackground);
+        assert_eq!(a.prompt.as_ref().unwrap().kind, PromptKind::NewCodex);
         a.on_paste("fixture task");
         key(a, KeyCode::Enter);
         assert_eq!(a.mode, Mode::Normal);

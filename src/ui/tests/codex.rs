@@ -179,13 +179,13 @@ fn codex_help_is_opt_in_and_matches_scroll_geometry() {
     }
     let enabled = rows_at(&app, 34, 60).join("\n");
     assert!(enabled.contains("not loaded in server"));
-    assert!(enabled.contains("creates Claude session"));
+    assert!(enabled.contains("new Codex session"));
     assert!(enabled.contains("records launch target"));
     assert!(enabled.contains("open Codex TUI"));
     assert!(enabled.contains("Codex panes skipped"));
     assert!(enabled.contains("change TUI, not map"));
     assert!(enabled.contains("resume parked launch"));
-    assert!(CODEX_KEYS.contains(&("C-x ×2", "archive ○/◇ thread")));
+    assert!(CODEX_KEYS.contains(&("C-x ×2", "delete + panes")));
     assert!(!enabled.contains("pane actions unavailable"));
     assert_eq!(help_line_count(true), help_line_count(false) + CODEX_KEYS.len());
 }
@@ -331,7 +331,7 @@ fn claude_only_list_matches_the_pre_codex_group_baseline() {
 }
 
 #[test]
-fn the_footer_says_archive_only_while_a_codex_row_is_selected() {
+fn the_footer_says_stop_for_both_providers() {
     let claude = sess(1, Kind::Background, Status::Busy, Some(State::Working));
     let codex = codex_row(crate::model::CodexStatus::Idle, Status::Idle, None);
     let only = app_with(vec![claude.clone()]);
@@ -345,17 +345,10 @@ fn the_footer_says_archive_only_while_a_codex_row_is_selected() {
 
     let pairs = "⏎ open  v/s split  x close  t tab  d/u hide  C-x stop  n new  L logs  / filter  R restart";
     assert!(rows_at(&only, 120, 24)[23].starts_with(pairs));
-    assert!(rows_at(&on_codex, 120, 24)[23].starts_with(&pairs.replace("C-x stop", "C-x archive")));
+    assert!(rows_at(&on_codex, 120, 24)[23].starts_with(pairs));
     for w in 0..=120u16 {
         let claude_footer = rows_at(&only, w, 24)[23].clone();
         assert_eq!(rows_at(&on_claude, w, 24)[23], claude_footer, "w={w}");
-        let codex_footer = rows_at(&on_codex, w, 24)[23].clone();
-        assert!(!codex_footer.contains("stop"), "w={w}: {codex_footer:?}");
-        // Whole pairs only: the longer label drops out with everything after it.
-        if !codex_footer.contains("C-x archive") {
-            assert!(!codex_footer.contains("n new"), "w={w}: {codex_footer:?}");
-            let before = claude_footer.split("  C-x stop").next().unwrap().trim_end();
-            assert!(codex_footer.starts_with(before) || !claude_footer.contains("C-x"), "w={w}");
-        }
+        assert_eq!(rows_at(&on_codex, w, 24)[23], claude_footer, "w={w}");
     }
 }

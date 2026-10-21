@@ -17,7 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agents::{self, AgentsError};
-use crate::codex::{ArchiveOutcome, CodexConfig, CodexDiagnostic};
+use crate::codex::{DeleteOutcome, CodexConfig, CodexDiagnostic};
 use crate::model::{self, Group, ParseError, Provider, Row, Session};
 use crate::restart::{self, Role};
 use crate::tmux::{
@@ -132,9 +132,9 @@ const CX_SETTLE: Duration = Duration::from_millis(180);
 /// reopen that overlap.
 const _: () = assert!(CX_SETTLE.as_millis() < CX_MIN_GAP.as_millis());
 /// The first eligible Codex press's flash and footer hint, followed by a label.
-const CODEX_INVITATION: &str = "Ctrl-x again to archive ";
-/// A Codex window that closed without archiving. It invites no further press.
-const CODEX_CLOSED: &str = "archive window closed — nothing archived";
+const CODEX_INVITATION: &str = "Ctrl-x again to delete ";
+/// A Codex window that closed without deleting. It invites no further press.
+const CODEX_CLOSED: &str = "delete window closed — nothing deleted";
 /// A Claude press refused by `CX_MIN_GAP`. It names no next press: whether
 /// one would delete depends on a window this flash cannot see, and while one
 /// is open its warning carries the refusal instead (`arm_hint`).
@@ -180,7 +180,7 @@ pub enum MsgLevel {
 ///
 /// Every field is CAPTURED at that first press. The second press hands
 /// Claude hands `short_id` to `claude rm`; Codex addresses `session_id` in its
-/// guarded archive transaction. Neither provider can retarget from the cursor.
+/// guarded delete transaction. Neither provider can retarget from the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopArm {
     pub provider: Provider,
@@ -274,7 +274,9 @@ const JUMP_POLLS: u32 = 8;
 /// can produce.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingJump {
-    /// The 8-hex short id `claude --bg` printed. Matched against `Session::id`,
+    pub provider: Provider,
+    /// Claude's 8-hex short id, or the full thread ID returned by Codex.
+    /// The Claude id is matched against `Session::id`,
     /// because that is the only identifier the dispatch gets back; the cursor
     /// is then driven with the row's `session_id`, which is what `key_at`
     /// returns and what `reanchor_selection` searches for. THE KEY MISMATCH is
@@ -297,6 +299,16 @@ enum KillRefused {
 pub enum PromptKind {
     /// `n` — two fields: 0 = cwd, 1 = task text.
     NewBackground,
+    NewCodex,
+}
+
+impl PromptKind {
+    fn provider(self) -> Provider {
+        match self {
+            Self::NewBackground => Provider::Claude,
+            Self::NewCodex => Provider::Codex,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -578,7 +590,7 @@ pub struct App {
     pub cx_refused: bool,
     /// A qualifying second press, waiting out `CX_SETTLE`; see the constant.
     pub pending_delete: Option<PendingDelete>,
-    /// The end of a Codex window that closed without archiving. Until then
+    /// The end of a Codex window that closed without deleting. Until then
     /// the repeat guard refuses every press (`protect_after_codex_disarm`),
     /// and this selects wording that does not invite another one.
     pub codex_closed_until: Option<Instant>,
@@ -592,10 +604,11 @@ pub struct App {
     pub msg_deadline: Option<Instant>,
     pub poll_error: Option<String>,
     pub codex: CodexPoll,
-    /// Seam for the only Codex mutation. Production opens a fresh guarded RPC
-    /// transaction; hermetic tests must install an explicit recorder.
-    pub codex_archive: fn(&CodexConfig, &str, &model::CodexStatus)
-        -> Result<ArchiveOutcome, CodexDiagnostic>,
+    /// Codex session operations; tests install explicit recorders.
+    pub codex_stop: fn(&CodexConfig, &str) -> Result<(), CodexDiagnostic>,
+    pub codex_start: fn(&CodexConfig, &str, &str) -> Result<String, CodexDiagnostic>,
+    pub codex_delete: fn(&CodexConfig, &str, &model::CodexStatus)
+        -> Result<DeleteOutcome, CodexDiagnostic>,
     pub diagnostics: Diagnostics,
     pub fail_streak: u32,
     pub last_poll: Instant,
@@ -809,7 +822,9 @@ impl App {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
-            codex_archive: crate::codex::archive,
+            codex_stop: crate::codex::stop,
+            codex_start: crate::codex::start,
+            codex_delete: crate::codex::delete,
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
@@ -1547,16 +1562,6 @@ impl App {
         self.open.get(session_id).filter(|o| o.provider == provider).map(|o| o.pane.clone())
     }
 
-    /// Any persisted launch record, live inventory or not. Archive refuses on
-    /// the record itself because an attached Codex TUI receives no archive
-    /// notice and otherwise fails only when the operator next submits text.
-    fn has_mapped_pane(&self, provider: Provider, session_id: &str) -> bool {
-        self.open.get(session_id).is_some_and(|open| open.provider == provider)
-            || !self.map.panes_for_session(provider, session_id).is_empty()
-            || self.tabs.iter().any(|tab|
-                !tab.map.panes_for_session(provider, session_id).is_empty())
-    }
-
     /// A provider disagreement is not an invitation to create another pane.
     /// Use the same own-map authority as rebuild_open and delete's pane list.
     fn pane_provider_conflict(&self, provider: Provider, session_id: &str) -> bool {
@@ -1733,7 +1738,10 @@ impl App {
         // path leaves `self.sessions` untouched — so this is exactly "the poll
         // this tick spawned came back with a list". A failing CLI refutes
         // nothing and is charged nothing.
-        let answered = polled && self.poll_error.is_none();
+        let answered = polled && match jump.provider {
+            Provider::Claude => self.poll_error.is_none(),
+            Provider::Codex => matches!(self.diagnostics.codex.health, providers::Health::Healthy),
+        };
 
         // THE KEY MISMATCH resolved: `--bg` named it by short id, the cursor is
         // keyed by uuid. Everything past here is the ordinary `selected_key` /
@@ -1741,7 +1749,10 @@ impl App {
         let listed = self
             .sessions
             .iter()
-            .find(|s| s.provider == Provider::Claude && s.id.as_deref() == Some(jump.short_id.as_str()))
+            .find(|s| s.provider == jump.provider && match jump.provider {
+                Provider::Claude => s.id.as_deref() == Some(jump.short_id.as_str()),
+                Provider::Codex => s.session_id == jump.short_id,
+            })
             .map(|s| (s.session_id.clone(), session_label(s)));
 
         if let Some((session_id, label)) = listed {
@@ -2361,14 +2372,14 @@ impl App {
     /// `x`; a sidebar is skipped and never counted, and so is a pane the
     /// operator has taken to the `s` shell (`panes_showing`). Degraded mode
     /// has no panes to close and touches no tmux.
-    fn close_panes_of(&mut self, session_id: &str) -> usize {
+    fn close_panes_of(&mut self, provider: Provider, session_id: &str) -> usize {
         if self.degraded {
             return 0;
         }
         // The inventory can be a `tick_interval` old: this runs from the
         // event-loop tick, not from a keypress that just refreshed.
         self.refresh_panes();
-        let targets = self.panes_showing(session_id);
+        let targets = self.panes_showing(provider, session_id);
         let mut closed = 0usize;
         let mut killed_here = false;
         for pane in &targets {
@@ -2406,17 +2417,17 @@ impl App {
     /// verb exists for. With no inventory nothing can be told apart and the
     /// map is taken as read; `close_panes_of` refreshes first, and a refresh
     /// that failed leaves R2 refusing every kill anyway.
-    fn panes_showing(&self, session_id: &str) -> Vec<PaneId> {
-        if self.pane_provider_conflict(Provider::Claude, session_id) {
+    fn panes_showing(&self, provider: Provider, session_id: &str) -> Vec<PaneId> {
+        if self.pane_provider_conflict(provider, session_id) {
             return Vec::new();
         }
         let mine = self.own_window.as_ref();
-        let mut out = self.map.panes_for_session(Provider::Claude, session_id);
+        let mut out = self.map.panes_for_session(provider, session_id);
         for tab in &self.tabs {
             if Some(&tab.window) == mine {
                 continue;
             }
-            out.extend(tab.map.panes_for_session(Provider::Claude, session_id));
+            out.extend(tab.map.panes_for_session(provider, session_id));
         }
         out.sort_by_key(PaneId::num);
         out.dedup();
@@ -2426,10 +2437,10 @@ impl App {
         out
     }
 
-    // ── `Ctrl+X` — Claude stop/delete; Codex guarded archive (§8.2/§12) ────
+    // ── `Ctrl+X` — Claude stop/delete; Codex guarded delete (§8.2/§12) ────
 
-    /// THE `Ctrl+X` entry point. Claude stops then deletes; Codex locally arms
-    /// then runs the guarded archive transaction. Both share one repeat guard.
+    /// `Ctrl+X` stops the selected session, then deletes on a second press.
+    /// Both providers share the existing repeat guard.
     ///
     /// Every press stamps `cx_last_press` before anything else can return, so
     /// the burst / auto-repeat guard can never be skipped by an early exit —
@@ -2526,7 +2537,7 @@ impl App {
             return;
         };
         if sel.provider == Provider::Codex {
-            self.archive_and_arm(&sel);
+            self.stop_codex_and_arm(&sel);
             return;
         }
         if !sel.is_attachable() {
@@ -2584,15 +2595,24 @@ impl App {
         self.stop_arm = Some(arm);
     }
 
-    /// Codex first press: local safety checks, then an in-memory arm only.
-    fn archive_and_arm(&mut self, session: &Session) {
-        if let Some(reason) = self.codex_archive_refusal(session) {
+    /// Stop an active Codex turn, then offer deletion of the captured thread.
+    fn stop_codex_and_arm(&mut self, session: &Session) {
+        if let Some(reason) = self.codex_delete_refusal(session, true) {
             self.flash(reason, MsgLevel::Warn);
             // A double tap on a refused row is a burst against this press's
-            // stamp; it must say the archive window closed, not fall back to
+            // stamp; it must say the delete window closed, not fall back to
             // Claude's burst wording (§12.8).
             self.extend_codex_closed(Instant::now() + CX_MIN_GAP);
             return;
+        }
+        if matches!(session.codex.as_ref().map(|meta| &meta.runtime), Some(model::CodexStatus::Active { .. })) {
+            let result = self.codex.settings.config()
+                .and_then(|config| (self.codex_stop)(&config, &session.session_id));
+            if let Err(error) = result {
+                self.flash(format!("stop failed: {}", error.message), MsgLevel::Error);
+                return;
+            }
+            self.act_force_refresh();
         }
         let label = session_label(session);
         self.open_window(StopArm {
@@ -2605,39 +2625,37 @@ impl App {
         self.flash(format!("{CODEX_INVITATION}{label}"), MsgLevel::Warn);
     }
 
-    fn codex_archive_refusal(&self, session: &Session) -> Option<&'static str> {
+    fn codex_delete_refusal(&self, session: &Session, stopping: bool) -> Option<&'static str> {
         // §9.5's wording: outside tmux no pane map was ever read, so "no
         // mapped pane" below would be a guess.
         if self.degraded {
-            return Some("not inside tmux — archive unavailable");
+            return Some("not inside tmux — delete unavailable");
         }
         let settings = &self.codex.settings;
         if !settings.enabled() || settings.config().is_err()
             || !settings.token_file.is_absolute() || settings.bin.is_empty()
         {
-            return Some("codex not configured — archive unavailable");
+            return Some("codex not configured — delete unavailable");
         }
         if self.codex.open_rejected {
-            return Some("codex localhost resolved outside loopback — archive unavailable");
+            return Some("codex localhost resolved outside loopback — delete unavailable");
         }
-        if matches!(session.state, Some(model::State::Working | model::State::Blocked)) {
-            return Some("running — not archived");
+        if !stopping && matches!(session.state, Some(model::State::Working | model::State::Blocked)) {
+            return Some("running — not deleted");
         }
         let runtime = session.codex.as_ref().map(|meta| &meta.runtime);
         if matches!(session.status, model::Status::Unknown(_))
             || matches!(runtime, Some(model::CodexStatus::SystemError | model::CodexStatus::Unknown(_)))
-            || !matches!(runtime, Some(model::CodexStatus::Idle | model::CodexStatus::NotLoaded))
+            || !(matches!(runtime, Some(model::CodexStatus::Idle | model::CodexStatus::NotLoaded))
+                || stopping && matches!(runtime, Some(model::CodexStatus::Active { .. })))
         {
-            return Some("state unknown — not archived");
+            return Some("state unknown — not deleted");
         }
         // Fail closed on the inventory, as `R` does: an unread `list-panes`
         // or `list-windows` leaves the maps stale or, in a fresh image,
         // empty, and an empty map is not evidence that no pane is attached.
         if !self.panes_fresh || !self.tabs_fresh {
-            return Some("pane map unavailable — not archived");
-        }
-        if self.has_mapped_pane(Provider::Codex, &session.session_id) {
-            return Some("close its pane first (x) — not archived");
+            return Some("pane map unavailable — not deleted");
         }
         None
     }
@@ -2670,28 +2688,25 @@ impl App {
             // the list did, and hides the recovery, which is to clear the
             // filter (or press `a`) and press `Ctrl+X` twice on the stopped
             // row — a first press there arms without stopping anything.
-            let consequence = if arm.provider == Provider::Codex {
-                "nothing archived"
-            } else { "nothing deleted" };
             let msg = if self.is_visible(&arm.session_id) {
-                format!("moved off {label} — {consequence}")
+                format!("moved off {label} — nothing deleted")
             } else if arm.provider == Provider::Codex {
-                format!("{label} left the list — not archived")
+                format!("{label} left the list — not deleted")
             } else {
                 format!("{label} left the list — nothing deleted")
             };
             self.flash(msg, MsgLevel::Warn);
-            if arm.provider == Provider::Codex { self.end_codex_window_unarchived(&arm); }
+            if arm.provider == Provider::Codex { self.end_codex_window_without_delete(&arm); }
             return;
         }
         if arm.provider == Provider::Codex {
             let Some(selected) = selected.as_ref() else {
-                self.end_codex_window_unarchived(&arm);
+                self.end_codex_window_without_delete(&arm);
                 return;
             };
-            if let Some(reason) = self.codex_archive_refusal(selected) {
+            if let Some(reason) = self.codex_delete_refusal(selected, false) {
                 self.flash(reason, MsgLevel::Warn);
-                self.end_codex_window_unarchived(&arm);
+                self.end_codex_window_without_delete(&arm);
                 return;
             }
         }
@@ -2742,7 +2757,7 @@ impl App {
             return;
         }
         if arm.provider == Provider::Codex {
-            self.run_codex_archive(arm);
+            self.run_codex_delete(arm);
             return;
         }
         let label = model::truncate_end(&arm.name, LABEL_MAX);
@@ -2764,7 +2779,7 @@ impl App {
                 // `enter` cannot work. Close them — all of them, across tabs.
                 // A STOP leaves its pane parked on purpose (resume is valid
                 // there); only a delete gets this far.
-                let closed = self.close_panes_of(&arm.session_id);
+                let closed = self.close_panes_of(Provider::Claude, &arm.session_id);
                 let mut msg = format!("deleted {label} + worktree");
                 match closed {
                     0 => {}
@@ -2790,13 +2805,13 @@ impl App {
         self.stamp_ctrl_x(Instant::now());
     }
 
-    fn run_codex_archive(&mut self, arm: StopArm) {
+    fn run_codex_delete(&mut self, arm: StopArm) {
         let label = model::truncate_end(&arm.name, LABEL_MAX);
         let target = self.sessions.iter().find(|session| session.provider == Provider::Codex
             && session.session_id == arm.session_id).cloned();
         let Some(target) = target else {
-            self.flash(format!("{label} left the list — not archived"), MsgLevel::Warn);
-            self.end_codex_window_unarchived(&arm);
+            self.flash(format!("{label} left the list — not deleted"), MsgLevel::Warn);
+            self.end_codex_window_without_delete(&arm);
             return;
         };
         // FRESH INVENTORY, for `act_enter`'s reason: the tab maps are as old
@@ -2804,16 +2819,16 @@ impl App {
         // thread since. A failed read clears a fresh flag, which the refusal
         // below turns into a refusal.
         self.refresh_panes();
-        if let Some(reason) = self.codex_archive_refusal(&target) {
+        if let Some(reason) = self.codex_delete_refusal(&target, false) {
             self.flash(reason, MsgLevel::Warn);
-            self.end_codex_window_unarchived(&arm);
+            self.end_codex_window_without_delete(&arm);
             return;
         }
         let config = match self.codex.settings.config() {
             Ok(config) => config,
             Err(error) => {
-                self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
-                self.end_codex_window_unarchived(&arm);
+                self.flash(format!("delete failed: {}", error.message), MsgLevel::Warn);
+                self.end_codex_window_without_delete(&arm);
                 self.act_force_refresh();
                 return;
             }
@@ -2821,33 +2836,39 @@ impl App {
         // The row's runtime as re-checked just now; the fresh read must agree.
         let expected = target.codex.as_ref().map(|meta| meta.runtime.clone())
             .unwrap_or(model::CodexStatus::Unknown(String::new()));
-        match (self.codex_archive)(&config, &arm.session_id, &expected) {
-            Ok(ArchiveOutcome::Archived { updated_at }) => {
-                self.codex.archived(&arm.session_id, updated_at);
+        match (self.codex_delete)(&config, &arm.session_id, &expected) {
+            Ok(DeleteOutcome::Deleted) => {
+                let closed = self.close_panes_of(Provider::Codex, &arm.session_id);
+                self.codex.deleted(&arm.session_id);
                 self.sessions.retain(|session| session.provider != Provider::Codex
                     || session.session_id != arm.session_id);
                 self.rebuild_rows();
-                self.flash(format!("archived {label}"), MsgLevel::Info);
+                let suffix = match closed {
+                    0 => String::new(),
+                    1 => " · closed 1 pane".into(),
+                    n => format!(" · closed {n} panes"),
+                };
+                self.flash(format!("deleted {label}{suffix}"), MsgLevel::Info);
                 self.act_force_refresh();
             }
-            // Neither ending archived anything, and the forced poll below may
+            // Neither ending deleted anything, and the forced poll below may
             // drop the row and put the cursor on a Claude neighbour: protect
             // the rest of the window before that poll runs.
-            Ok(ArchiveOutcome::StateChanged) => {
-                self.flash("state changed — not archived", MsgLevel::Warn);
-                self.end_codex_window_unarchived(&arm);
+            Ok(DeleteOutcome::StateChanged) => {
+                self.flash("state changed — not deleted", MsgLevel::Warn);
+                self.end_codex_window_without_delete(&arm);
                 self.act_force_refresh();
             }
             Err(error) => {
-                self.flash(format!("archive failed: {}", error.message), MsgLevel::Warn);
-                self.end_codex_window_unarchived(&arm);
+                self.flash(format!("delete failed: {}", error.message), MsgLevel::Warn);
+                self.end_codex_window_without_delete(&arm);
                 self.act_force_refresh();
             }
         }
         self.stamp_ctrl_x(Instant::now());
     }
 
-    /// Close the delete/archive window and drop anything settling in it.
+    /// Close the delete window and drop anything settling in it.
     /// Called on every departure from Normal mode, on `q`, and on `Esc`.
     pub fn disarm_ctrl_x(&mut self) {
         let arm = self.stop_arm.as_ref().or_else(||
@@ -2872,7 +2893,7 @@ impl App {
         self.extend_codex_closed(end);
     }
 
-    /// EVERY ending of a Codex window that archived nothing — a refused
+    /// EVERY ending of a Codex window that deleted nothing — a refused
     /// second press, a settle refusal, a configuration error, StateChanged,
     /// an RPC failure, a row that left — ends here. Any of them can leave the
     /// cursor on a Claude neighbour (the forced poll may drop the row), so each
@@ -2880,7 +2901,7 @@ impl App {
     /// non-inviting wording for as long as the guard stamped now refuses. A
     /// slow RPC can outlast the window itself; the `now + CX_MIN_GAP` half
     /// covers a press buffered during it.
-    fn end_codex_window_unarchived(&mut self, arm: &StopArm) {
+    fn end_codex_window_without_delete(&mut self, arm: &StopArm) {
         self.protect_after_codex_disarm(arm);
         let now = Instant::now();
         self.stamp_ctrl_x(now);
@@ -2904,7 +2925,7 @@ impl App {
     }
 
     /// The first Codex press flashes its invitation for `MSG_TTL`, twice the
-    /// window. When the window closes without archiving, the footer falls
+    /// window. When the window closes without deleting, the footer falls
     /// back to that flash while the cursor may already sit on a Claude row,
     /// so the invitation is replaced by a line that invites nothing.
     fn close_codex_invitation(&mut self) {
@@ -2917,12 +2938,12 @@ impl App {
     ///
     /// It names the session because the cursor may otherwise move while the
     /// window is open. Claude describes irreversible worktree deletion; Codex
-    /// describes its reversible server archive.
+    /// describes permanent thread deletion.
     pub fn arm_hint(&self) -> Option<String> {
         let arm = self.stop_arm.as_ref()?;
         let label = model::truncate_end(&arm.name, LABEL_MAX);
         if arm.provider == Provider::Codex {
-            Some(format!("{CODEX_INVITATION}{label}"))
+            Some(format!("{CODEX_INVITATION}{label} — cannot be undone"))
         } else {
             if self.cx_refused {
                 // Says the last press did not count. At five rows and up it
@@ -3714,7 +3735,7 @@ impl App {
         };
 
         match p.kind {
-            PromptKind::NewBackground => {
+            PromptKind::NewBackground | PromptKind::NewCodex => {
                 let task = p.fields.get(1).cloned().unwrap_or_default();
                 let task = task.trim().to_string();
                 if task.is_empty() {
@@ -3808,7 +3829,14 @@ impl App {
     /// `created` carries the `~`-shortened path when this submit mkdir'd it,
     /// so the flash names what now exists on disk even if dispatch then fails.
     fn dispatch_and_close(&mut self, cwd: &str, task: &str, created: Option<String>) {
-        match (self.dispatch)(Provider::Claude, cwd, task) {
+        let provider = self.prompt.as_ref().map_or(Provider::Claude, |p| p.kind.provider());
+        let result = match provider {
+            Provider::Claude => (self.dispatch)(provider, cwd, task).map_err(|error| agents_msg(&error)),
+            Provider::Codex => self.codex.settings.config()
+                .and_then(|config| (self.codex_start)(&config, cwd, task))
+                .map(Some).map_err(|error| error.message),
+        };
+        match result {
             Ok(short_id) => {
                 self.prompt = None;
                 self.mode = Mode::Normal;
@@ -3826,6 +3854,7 @@ impl App {
                 // CLI's banner could not be parsed, and then this is exactly the
                 // old behaviour — flash, refresh, cursor untouched.
                 self.pending_jump = short_id.map(|short_id| PendingJump {
+                    provider,
                     short_id,
                     polls_left: JUMP_POLLS,
                 });
@@ -3837,10 +3866,10 @@ impl App {
                 self.disarm_create();
                 match created {
                     Some(c) => self.flash(
-                        format!("created {c}, but dispatch failed: {}", agents_msg(&e)),
+                        format!("created {c}, but dispatch failed: {e}"),
                         MsgLevel::Error,
                     ),
-                    None => self.flash(format!("dispatch failed: {}", agents_msg(&e)), MsgLevel::Error),
+                    None => self.flash(format!("dispatch failed: {e}"), MsgLevel::Error),
                 }
             }
         }
@@ -4724,7 +4753,6 @@ impl App {
     fn open_prompt(&mut self, kind: PromptKind) {
         let cwd = self
             .selected_session()
-            .filter(|s| s.provider == Provider::Claude)
             .map(|s| s.cwd.clone())
             .or_else(|| {
                 std::env::current_dir()
@@ -4733,11 +4761,11 @@ impl App {
             })
             .unwrap_or_default();
         let fields = match kind {
-            PromptKind::NewBackground => vec![cwd, String::new()],
+            PromptKind::NewBackground | PromptKind::NewCodex => vec![cwd, String::new()],
         };
         // §8.6: the task field starts empty and is focused.
         let focus: usize = match kind {
-            PromptKind::NewBackground => 1,
+            PromptKind::NewBackground | PromptKind::NewCodex => 1,
         };
         let cursor = fields.get(focus).map(|s| s.chars().count()).unwrap_or(0);
         self.prompt = Some(Prompt {
@@ -4832,7 +4860,9 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('n') => {
-                self.open_prompt(PromptKind::NewBackground);
+                let codex = self.selected_session().is_some_and(|s| s.provider == Provider::Codex)
+                    || matches!(self.rows.get(self.selected), Some(Row::Header { group: Group::Codex, .. }));
+                self.open_prompt(if codex { PromptKind::NewCodex } else { PromptKind::NewBackground });
                 Action::Redraw
             }
             KeyCode::Char('L') => {
@@ -4899,12 +4929,8 @@ impl App {
                 // an open delete window. It takes precedence over the filter:
                 // one is a view, the other is a loaded verb.
                 if self.stop_arm.is_some() || self.pending_delete.is_some() {
-                    let codex = self.stop_arm.as_ref().or_else(||
-                        self.pending_delete.as_ref().map(|pending| &pending.target))
-                        .is_some_and(|arm| arm.provider == Provider::Codex);
                     self.disarm_ctrl_x();
-                    self.flash(if codex { "archive window closed" } else { "delete window closed" },
-                        MsgLevel::Info);
+                    self.flash("delete window closed", MsgLevel::Info);
                 } else if self.filter.is_empty() {
                     self.flash("press q to quit", MsgLevel::Info);
                 } else {
@@ -5475,7 +5501,9 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
-            codex_archive: |_, _, _| panic!("unit test reached codex archive RPC"),
+            codex_stop: |_, _| panic!("unit test reached codex stop RPC"),
+            codex_start: |_, _, _| panic!("unit test reached codex start RPC"),
+            codex_delete: |_, _, _| panic!("unit test reached codex delete RPC"),
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: BTreeSet::new(),
@@ -12546,7 +12574,7 @@ mod tests {
         assert_eq!(a.pane_of(Provider::Codex, id), Some(pid("%2")));
         assert_eq!(a.pane_of_any(Provider::Claude, id), None);
         assert!(!a.is_open(Provider::Claude, id));
-        assert!(a.panes_showing(id).is_empty(), "Claude delete cannot close a Codex pane");
+        assert!(a.panes_showing(Provider::Claude, id).is_empty(), "Claude delete cannot close a Codex pane");
         let mut row = bg("456789ab", "claude", State::Working);
         row.session_id = id.into();
         load(&mut a, vec![row]);

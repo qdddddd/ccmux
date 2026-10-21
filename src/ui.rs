@@ -1126,12 +1126,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     // at all; below that the pinned help key is the whole footer.
     if w >= MARGIN_MIN {
         let budget = w - m - hw - 1; // the rail, plus at least one blank column
-        // `C-x` archives on a Codex row (§12.8). Only the label changes, so a
-        // Claude row, and a Claude-only list, keeps its footer byte for byte;
-        // the longer label fits or drops as a whole pair like any other.
-        let codex = app.selected_session().is_some_and(|s| s.provider == Provider::Codex);
         for &(key, text) in HINTS {
-            let text = if codex && key == "C-x" { "archive" } else { text };
             let pair = display_width(key) + 1 + display_width(text);
             let want = if used == 0 { pair } else { used + 2 + pair };
             if want > budget {
@@ -1239,13 +1234,13 @@ const CODEX_KEYS: &[(&str, &str)] = &[
     ("x", "close pane; work stays"),
     ("", "on server"),
     ("R", "Codex panes skipped"),
-    ("n", "creates Claude session"),
-    ("", "new Codex: Codex TUI"),
+    ("n", "new Codex session"),
     ("map", "records launch target"),
     ("", "/resume /new /fork"),
     ("", "change TUI, not map"),
     ("enter", "resume parked launch"),
-    ("C-x ×2", "archive ○/◇ thread"),
+    ("C-x", "stop current turn"),
+    ("C-x ×2", "delete + panes"),
     ("L", "logs: Codex TUI"),
 ];
 
@@ -1362,9 +1357,10 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
     }
     let title = match kind {
         PromptKind::NewBackground => " new background session ",
+        PromptKind::NewCodex => " new Codex session ",
     };
     let labels: &[&str] = match kind {
-        PromptKind::NewBackground => &["cwd ", "task"],
+        PromptKind::NewBackground | PromptKind::NewCodex => &["cwd ", "task"],
     };
 
     let want_h = (labels.len() as u16).saturating_add(5);
@@ -1639,7 +1635,9 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
-            codex_archive: |_, _, _| panic!("render test reached codex archive RPC"),
+            codex_stop: |_, _| panic!("render test reached codex stop RPC"),
+            codex_start: |_, _, _| panic!("render test reached codex start RPC"),
+            codex_delete: |_, _, _| panic!("render test reached codex delete RPC"),
             diagnostics: Default::default(),
             fail_streak: 0,
             drift_seen: std::collections::BTreeSet::new(),
@@ -2305,7 +2303,7 @@ mod tests {
                 };
                 assert_eq!(col("not loaded in server"), col("last outcome unknown"), "{all}");
                 assert_eq!(col("close pane; work stays"), col("on server"), "{all}");
-                assert_eq!(col("creates Claude session"), col("new Codex: Codex TUI"), "{all}");
+                assert!(all.contains("new Codex session"), "{all}");
                 assert_eq!(col("records launch target"), col("/resume /new /fork"), "{all}");
                 // A continuation of a continuation keeps the same column.
                 assert_eq!(col("records launch target"), col("change TUI, not map"), "{all}");
