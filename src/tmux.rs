@@ -49,7 +49,8 @@ pub const OPT_TAB_SIDEBAR: &str = "@ccmux_tab_sidebar";
 pub const OPT_TAB_MAP: &str = "@ccmux_tab_map";
 pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
 
-/// PANE-scoped, and the only ccmux option that is not written by ccmux: the
+/// PANE-scoped, and one of two ccmux options not written by ccmux (the other
+/// is `OPT_PANE_JUMP_FROM`): the
 /// attach pane's own command line sets it to `1` on the way out, just before it
 /// `exec`s the operator's shell (`agents::attach_pane_cmd`). ccmux only ever
 /// READS it, through `PANE_FMT`.
@@ -73,6 +74,19 @@ pub const OPT_PANE_DETACHED: &str = "@ccmux_detached";
 pub const LATCH_PARKED: &str = "1";
 /// `OPT_PANE_DETACHED`'s value once the pane has become the operator's shell.
 pub const LATCH_SHELL: &str = "shell";
+
+/// PANE-scoped, set on a SIDEBAR pane, and the second ccmux option not written
+/// by ccmux: the operator's "focus the sidebar" tmux binding records the pane
+/// it was pressed in, just before its `select-pane` moves focus here, e.g.
+///
+/// ```text
+/// bind e run-shell 'sb="#{@ccmux_tab_sidebar}"; [ -n "$sb" ] && tmux set -p -t "$sb" @ccmux_jump_from "#{pane_id}" \; select-pane -t "$sb"'
+/// ```
+///
+/// The sidebar reads and unsets it on focus-in (`take_jump_from`) and puts the
+/// cursor on that pane's row. A focus-in with no value — a mouse click, a
+/// window switch, the terminal regaining OS focus — leaves the cursor alone.
+pub const OPT_PANE_JUMP_FROM: &str = "@ccmux_jump_from";
 
 /// The empty `@ccmux_map` value. Still written once at session creation, and
 /// re-written by the legacy migration, purely so `main.rs`'s "this session is
@@ -1549,6 +1563,19 @@ fn set_window_option_at(
 /// read-modify-write to lose and every writer converges on the same answer.
 pub fn set_tab_sidebar(session: &str, pane: &PaneId) -> Result<(), TmuxError> {
     set_window_option_at(session, pane, OPT_TAB_SIDEBAR, pane.as_str())
+}
+
+/// Read and unset `sidebar`'s `@ccmux_jump_from` (see `OPT_PANE_JUMP_FROM`).
+/// `None` when it is unset or does not hold a pane id. Unset either way, so a
+/// value is consumed by exactly one focus-in.
+pub fn take_jump_from(session: &str, sidebar: &PaneId) -> Result<Option<PaneId>, TmuxError> {
+    assert_in_session(sidebar, session)?;
+    let raw = tmux(&["show-options", "-p", "-qv", "-t", sidebar.as_str(), OPT_PANE_JUMP_FROM])?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    tmux(&["set-option", "-p", "-u", "-t", sidebar.as_str(), OPT_PANE_JUMP_FROM])?;
+    Ok(PaneId::parse(raw.trim()))
 }
 
 /// Serialize and write `@ccmux_tab_map` for `pane`'s window, skipping the write
@@ -3535,6 +3562,45 @@ mod tests {
         ));
         assert!(matches!(full_argv(&["kill-pane", "-t"]), Err(TmuxError::BadTarget(_))));
         assert!(full_argv(&["list-panes", "-t", "=ccmux:", "-s"]).is_ok());
+    }
+
+    /// Read, then unset, on the sidebar pane itself; an unset option is read
+    /// only, and a pane outside the session is never touched.
+    #[test]
+    fn take_jump_from_reads_and_unsets_the_sidebar_pane_option() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let run = |stored: &'static str, sidebar: &str| {
+            let log = Rc::new(RefCell::new(Vec::<String>::new()));
+            let seen = log.clone();
+            let got = test_commands::with(
+                move |argv| {
+                    let args = if argv.first().is_some_and(|a| a == "-L") { &argv[2..] } else { argv };
+                    seen.borrow_mut().push(args.join(" "));
+                    match args[0].as_str() {
+                        "list-panes" => Ok("%3\t1\t0\t0\t28\t24\t1\t1\t@0\t1\t1\t1\t0\t".into()),
+                        "show-options" => Ok(stored.into()),
+                        "set-option" => Ok(String::new()),
+                        other => panic!("unscripted tmux command {other}"),
+                    }
+                },
+                || take_jump_from("ccmux", &PaneId::parse(sidebar).unwrap()),
+            );
+            (got, log.borrow().clone())
+        };
+
+        let (got, log) = run("%7", "%3");
+        assert_eq!(got.unwrap(), PaneId::parse("%7"));
+        assert!(log.contains(&"show-options -p -qv -t %3 @ccmux_jump_from".to_string()), "{log:?}");
+        assert!(log.contains(&"set-option -p -u -t %3 @ccmux_jump_from".to_string()), "{log:?}");
+
+        let (got, log) = run("", "%3");
+        assert_eq!(got.unwrap(), None);
+        assert!(!log.iter().any(|c| c.starts_with("set-option")), "{log:?}");
+
+        let (got, log) = run("%7", "%9");
+        assert!(got.is_err(), "a pane outside the session fails the gate");
+        assert!(!log.iter().any(|c| !c.starts_with("list-panes")), "{log:?}");
     }
 
     #[test]

@@ -23,7 +23,8 @@ use std::time::Duration;
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    KeyEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -443,6 +444,7 @@ fn restore_terminal() {
     let _ = execute!(
         io::stdout(),
         DisableBracketedPaste,
+        DisableFocusChange,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     );
@@ -478,8 +480,9 @@ fn run_sidebar(cli: &Cli, interval_ms: u64, codex: &settings::CodexSettings) -> 
     let mut stdout = io::stdout();
     // Bracketed paste is MANDATORY, not a nicety: without it a paste into the
     // focused sidebar is delivered as individual key events and executed as
-    // §8.1 keymap verbs — `S`+`y` alone stops a running agent.
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+    // §8.1 keymap verbs — `S`+`y` alone stops a running agent. Focus change
+    // reporting is what lets `@ccmux_jump_from` move the cursor on focus-in.
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange) {
         let _ = disable_raw_mode();
         return Err(e).context("cannot enter the alternate screen");
     }
@@ -506,7 +509,9 @@ fn run_sidebar(cli: &Cli, interval_ms: u64, codex: &settings::CodexSettings) -> 
                     }
                     HandoffStep::FinishRestart => app.finish_restart(),
                     HandoffStep::DrainInput => {
-                        let _ = drain_pending_input();
+                        if let Ok(true) = drain_pending_input() {
+                            app.on_focus_gained();
+                        }
                     }
                 });
             }
@@ -614,8 +619,8 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                     // re-stamps its own clock so a replayed `Ctrl+X` reads as
                     // the burst it is; this drops the whole replay, including
                     // the keys that are not `Ctrl+X`.
-                    if started.elapsed() >= SLOW_KEY {
-                        drain_pending_input()?;
+                    if started.elapsed() >= SLOW_KEY && drain_pending_input()? {
+                        needs_draw |= app.on_focus_gained() == Action::Redraw;
                     }
                     match action {
                         Action::Quit => break,
@@ -655,6 +660,11 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
                         needs_draw = true;
                     }
                 }
+                Event::FocusGained => {
+                    if app.on_focus_gained() == Action::Redraw {
+                        needs_draw = true;
+                    }
+                }
                 Event::Resize(..) => needs_draw = true,
                 _ => {}
             }
@@ -669,13 +679,13 @@ fn event_loop(terminal: &mut Tui, app: &mut app::App) -> anyhow::Result<()> {
 fn timed_tick(
     app: &mut app::App,
     mut now: impl FnMut() -> std::time::Instant,
-    mut drain: impl FnMut() -> anyhow::Result<()>,
+    mut drain: impl FnMut() -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
     let started = now();
     app.tick();
     let ended = now();
     if ended.saturating_duration_since(started) >= SLOW_KEY { app.note_blocking_tick(ended); }
-    if ended.saturating_duration_since(started) >= SLOW_TICK { drain()?; }
+    if ended.saturating_duration_since(started) >= SLOW_TICK && drain()? { app.on_focus_gained(); }
     Ok(())
 }
 
@@ -798,7 +808,7 @@ fn exec_command(p: &restart::Pending, codex: &settings::CodexSettings) -> std::p
 /// a dead pane.
 fn resume_terminal(terminal: &mut Tui) -> anyhow::Result<()> {
     enable_raw_mode().context("cannot re-enter raw mode after a failed restart")?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
+    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange)
         .context("cannot re-enter the alternate screen after a failed restart")?;
     let _ = terminal.hide_cursor();
     terminal.clear().context("cannot redraw after a failed restart")?;
@@ -814,11 +824,14 @@ fn restart_failed(app: &mut app::App, err: &io::Error) {
 
 /// Discard every input event already queued. Called after a tick or keypress
 /// that blocked long enough for the tty to buffer input aimed at a frozen UI.
-fn drain_pending_input() -> anyhow::Result<()> {
+/// True when a focus-in was among them: the caller still owes it
+/// `App::on_focus_gained`, or `@ccmux_jump_from` would wait for the next one.
+fn drain_pending_input() -> anyhow::Result<bool> {
+    let mut focused = false;
     while event::poll(Duration::ZERO)? {
-        let _ = event::read()?;
+        focused |= matches!(event::read()?, Event::FocusGained);
     }
-    Ok(())
+    Ok(focused)
 }
 
 #[cfg(test)]
@@ -1546,7 +1559,7 @@ mod tests {
             timed_tick(&mut app, || CLOCK.with(Cell::get), || {
                 EVENTS.with(|e| e.borrow_mut().push("drain"));
                 KEYS.with(|k| k.borrow_mut().clear());
-                Ok(())
+                Ok(false)
             }).unwrap();
             KEYS.with(|k| assert!(k.borrow().is_empty(), "{launch}: buffered input survived"));
             EVENTS.with(|e| assert_eq!(*e.borrow(), ["frame", "claude poll", "prepare", "drain"]));
@@ -1590,7 +1603,7 @@ mod tests {
             }
             timed_tick(&mut app, || CLOCK.with(Cell::get), || {
                 DRAINS.with(|d| d.set(d.get() + 1));
-                Ok(())
+                Ok(false)
             }).unwrap();
             let end = CLOCK.with(Cell::get);
             assert_eq!(DRAINS.with(Cell::get), 0, "{step} ms is under SLOW_TICK");

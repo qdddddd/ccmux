@@ -1474,18 +1474,73 @@ impl App {
         // handler can forget. Provider crossings close either provider's arm;
         // a Codex arm also closes as soon as navigation leaves its captured
         // row. Claude keeps its long-standing second-press refusal semantics.
+        if self.mode != Mode::Normal || self.should_quit || self.arm_crossed() {
+            self.disarm_ctrl_x();
+        }
+        action
+    }
+
+    /// Has the cursor left what an armed `Ctrl+X` captured? See `on_key`.
+    fn arm_crossed(&self) -> bool {
         let selected = self.selected_session();
-        let crossed = self.stop_arm.as_ref().or_else(||
+        self.stop_arm.as_ref().or_else(||
             self.pending_delete.as_ref().map(|pending| &pending.target))
             .is_some_and(|arm| {
                 selected.is_some_and(|row| row.provider != arm.provider)
                     || (arm.provider == Provider::Codex
                         && selected.is_none_or(|row| row.session_id != arm.session_id))
-            });
-        if self.mode != Mode::Normal || self.should_quit || crossed {
+            })
+    }
+
+    /// The terminal reported focus-in. When the operator's tmux binding left
+    /// `@ccmux_jump_from` on this pane (`tmux::OPT_PANE_JUMP_FROM`), put the
+    /// cursor on the row of the pane focus came from.
+    pub fn on_focus_gained(&mut self) -> Action {
+        if self.degraded {
+            return Action::None;
+        }
+        let Some(me) = self.own_pane.clone() else {
+            return Action::None;
+        };
+        match tmux::take_jump_from(&self.tmux_session, &me) {
+            Ok(Some(from)) if self.select_pane_row(&from) => Action::Redraw,
+            _ => Action::None,
+        }
+    }
+
+    /// Move the cursor to the row of the session ccmux opened in `pane`. Only
+    /// in Normal mode, and only when that row is on screen; true when the
+    /// cursor moved. An armed `Ctrl+X` the move crosses is closed, as a key
+    /// move would close it.
+    pub fn select_pane_row(&mut self, pane: &PaneId) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        // This window's map first; a pane moved here from another tab keeps
+        // its entry in that tab's map, as `rebuild_open` also reads it.
+        let Some(entry) = self.map.panes.get(pane.as_str()).or_else(|| {
+            self.tabs
+                .iter()
+                .filter(|t| Some(&t.window) != self.own_window.as_ref())
+                .find_map(|t| t.map.panes.get(pane.as_str()))
+        }) else {
+            return false;
+        };
+        let Some(i) = (0..self.rows.len()).find(|&i| match self.rows.get(i) {
+            Some(Row::Session { idx }) => self.sessions.get(*idx).is_some_and(|s| {
+                s.provider == entry.provider && s.session_id == entry.session_id
+            }),
+            _ => false,
+        }) else {
+            return false;
+        };
+        // The operator just claimed the cursor, as a key move would.
+        self.cancel_pending_jump();
+        self.set_selected(i);
+        if self.arm_crossed() {
             self.disarm_ctrl_x();
         }
-        action
+        true
     }
 
     /// One bracketed-paste event's text.
@@ -7535,6 +7590,74 @@ mod tests {
         assert_eq!(a.pane_of(Provider::Claude, "1c45d64f-uuid"), Some(bg_pane));
         assert_eq!(a.pane_of(Provider::Claude, "nobody"), None);
         assert!(!a.is_open(Provider::Claude, "nobody"));
+    }
+
+    /// `@ccmux_jump_from` names a pane of this window; the cursor lands on the
+    /// row of the session ccmux opened there, and nowhere when it cannot.
+    #[test]
+    fn select_pane_row_lands_on_the_session_opened_in_that_pane() {
+        let mut a = app();
+        a.sessions = vec![
+            bg("aaaaaaaa", "one", State::Working),
+            bg("bbbbbbbb", "two", State::Working),
+            bg("cccccccc", "three", State::Working),
+        ];
+        let pane = PaneId::parse("%25").expect("valid pane id");
+        a.map.insert(
+            &pane,
+            PaneEntry {
+                provider: Provider::Claude,
+                session_id: "bbbbbbbb-uuid".into(),
+                short_id: "bbbbbbbb".into(),
+                name: "two".into(),
+                opened_at: 0,
+            },
+        );
+        a.rebuild_rows();
+        a.select_first();
+        let first = a.selected_key.clone();
+        assert_ne!(first.as_deref(), Some("bbbbbbbb-uuid"));
+
+        let shell = PaneId::parse("%26").expect("valid pane id");
+        assert!(!a.select_pane_row(&shell), "a pane ccmux did not open names no row");
+        assert_eq!(a.selected_key, first);
+
+        a.mode = Mode::Help;
+        assert!(!a.select_pane_row(&pane), "only Normal mode moves the cursor");
+        assert_eq!(a.selected_key, first);
+        a.mode = Mode::Normal;
+
+        a.pending_jump = Some(PendingJump {
+            provider: Provider::Claude,
+            short_id: "e44654bf".into(),
+            polls_left: JUMP_POLLS,
+        });
+        assert!(a.select_pane_row(&pane));
+        assert_eq!(a.selected_key.as_deref(), Some("bbbbbbbb-uuid"));
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("two"));
+        assert_eq!(a.pending_jump, None, "the jump claims the cursor from `n`'s intent");
+
+        // A pane moved here from another tab keeps its entry in that tab's map.
+        let moved = PaneId::parse("%31").expect("valid pane id");
+        let mut other = tab("@9", 2, Some("%30"));
+        other.map.insert(
+            &moved,
+            PaneEntry {
+                provider: Provider::Claude,
+                session_id: "cccccccc-uuid".into(),
+                short_id: "cccccccc".into(),
+                name: "three".into(),
+                opened_at: 0,
+            },
+        );
+        a.tabs.push(other);
+        assert!(a.select_pane_row(&moved));
+        assert_eq!(a.selected_key.as_deref(), Some("cccccccc-uuid"));
+
+        a.select_first();
+        a.filter = "three".into();
+        a.rebuild_rows();
+        assert!(!a.select_pane_row(&pane), "a row the filter hides is not on screen");
     }
 
     // ── tabs ────────────────────────────────────────────────────────────────

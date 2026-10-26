@@ -1514,6 +1514,7 @@ loop {
                 Action::Redraw => needs_draw = true,
                 Action::None   => {}
             },
+            Event::FocusGained => if app.on_focus_gained() == Action::Redraw { needs_draw = true },
             Event::Resize(..) => needs_draw = true,
             _ => {}
         }
@@ -1524,6 +1525,22 @@ disable_raw_mode; LeaveAlternateScreen; terminal.show_cursor()
 
 `KeyEventKind::Press` filtering is mandatory — without it, Windows-style
 key-repeat/release events double every keystroke.
+
+**Focus-in jump.** The sidebar enables focus change reporting
+(`EnableFocusChange`; tmux forwards it with `focus-events on`). On
+`FocusGained`, `App::on_focus_gained` reads and unsets the PANE option
+`@ccmux_jump_from` on its own pane (`tmux::take_jump_from`, R2-gated). The
+operator's tmux binding sets it to `#{pane_id}` of the pane the key was pressed
+in, BEFORE its `select-pane`, so the value is in place when focus-in arrives.
+`select_pane_row` resolves that pane through this window's map and moves the
+cursor to its session's row — Normal mode only, visible rows only, closing a
+`Ctrl+X` arm the move crosses as a key move would. No value means no move, so
+a mouse click, a window switch, or the terminal regaining OS focus never
+disturbs the cursor. Like `@ccmux_detached`, ccmux never writes this option;
+it only reads and unsets it. The map lookup falls back to other tabs' maps for
+a pane moved into this window, and the move cancels `n`'s pending jump. A
+`drain_pending_input` that discards a `FocusGained` reports it, and its caller
+still runs `on_focus_gained`. `restore_terminal` disables the reporting again.
 
 ### 4.2 Polling policy — pinned, so nobody invents a thread
 
@@ -2952,7 +2969,7 @@ THE IMAGE THAT PRESSES `R` KILLS NOTHING.
 4. pending_restart = { exe }; return Action::Restart
 5. main::event_loop, in this order and no other:
        drain buffered input   (type-ahead would survive the exec)
-       restore_terminal()     (leave the alt screen, drop raw mode, drop paste)
+       restore_terminal()     (leave the alt screen, drop raw mode, drop paste + focus reporting)
        app.shutdown()         (the deferred @ccmux_tab_map / @ccmux_tab_hidden writes)
        exec(exe, argv[1..], CCMUX_RESTART=<this pid>)
 6. exec returns only on FAILURE: re-enter raw mode + the alt screen, then flash
