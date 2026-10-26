@@ -194,6 +194,21 @@ Inside the overlays, `j`/`k`, `Ctrl-d`/`Ctrl-u` and `g`/`G` scroll. In the
 `n` prompt, `Tab` moves between the task and cwd fields and `Enter` submits.
 Pasted text is never run as keys.
 
+To jump from a session's pane to the sidebar with the cursor on that
+session's row, bind a key in `~/.tmux.conf` that records the pane it was
+pressed in before focusing the sidebar. tmux only tells the sidebar it gained
+focus with `focus-events` on, which is off by default; after turning it on,
+re-attach running clients.
+
+```tmux
+set -g focus-events on
+bind e run-shell 'sb="#{@ccmux_tab_sidebar}"; [ -n "$sb" ] && tmux set -p -t "$sb" @ccmux_jump_from "#{pane_id}" \; select-pane -t "$sb" || tmux display-message "no ccmux sidebar in this window"'
+```
+
+The cursor stays put when the pane holds no ccmux session, when the row is
+hidden by `/` or `a`, or outside the list (an overlay or prompt is open).
+Focusing the sidebar any other way leaves the cursor alone.
+
 ## The list
 
 Claude rows list only background sessions: those started with `claude --bg` or `n`.
