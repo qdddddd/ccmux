@@ -70,9 +70,9 @@ struct Script {
     rpc_errors: BTreeSet<String>,
     response_ids: BTreeMap<String, Value>,
     read_costs: BTreeMap<String, Duration>,
-    archive_result: Value,
-    archive_ids: Vec<String>,
-    archive_cost: Duration,
+    delete_result: Value,
+    delete_ids: Vec<String>,
+    delete_cost: Duration,
     incoming: VecDeque<(Duration, Value)>,
     ahead: Vec<Value>,
     sent: Vec<Value>,
@@ -92,7 +92,7 @@ impl Default for Script {
             history: BTreeMap::from([(String::new(), response_page(vec![], None))]),
             reads: BTreeMap::new(), rpc_errors: BTreeSet::new(),
             response_ids: BTreeMap::new(), read_costs: BTreeMap::new(),
-            archive_result:json!({}), archive_ids:Vec::new(), archive_cost:Duration::ZERO,
+            delete_result:json!({}), delete_ids:Vec::new(), delete_cost:Duration::ZERO,
             incoming: VecDeque::new(), ahead: Vec::new(), sent: Vec::new(), read_ids: Vec::new(),
             connect_cost: Duration::ZERO, send_cost: Duration::ZERO, receive_cost: Duration::ZERO,
             read_cost: Duration::ZERO, close_cost: Duration::ZERO, closes: 0,
@@ -147,12 +147,16 @@ impl Transport for FakeTransport {
                 cost += script.read_costs.get(id).copied().unwrap_or(script.read_cost);
                 script.reads.get(id).cloned().map(|thread| json!({"thread":thread}))
             }
-            "thread/archive" => {
+            "thread/delete" => {
                 let id = value["params"]["threadId"].as_str().unwrap();
-                script.archive_ids.push(id.into());
-                cost += script.archive_cost;
-                Some(script.archive_result.clone())
+                script.delete_ids.push(id.into());
+                cost += script.delete_cost;
+                Some(script.delete_result.clone())
             }
+            "thread/turns/list" => Some(json!({"data":[{"id":"turn-1","status":"inProgress"}]})),
+            "turn/interrupt" => Some(json!({})),
+            "thread/start" => Some(json!({"thread":thread(1)})),
+            "turn/start" => Some(json!({"turn":{"id":"turn-1","status":"inProgress"}})),
             _ => panic!("request outside RPC allowlist"),
         };
         let response_id = script.response_ids.get(method).unwrap_or(&value["id"]);
@@ -186,13 +190,35 @@ fn poll(script: Script) -> (CodexObservation, Rc<RefCell<Script>>) {
     (result, connector.script)
 }
 
-fn archive(script: Script, thread_id: &str, expected: &CodexStatus)
-    -> (Result<ArchiveOutcome, CodexError>, Rc<RefCell<Script>>)
+fn delete(script: Script, thread_id: &str, expected: &CodexStatus)
+    -> (Result<DeleteOutcome, CodexError>, Rc<RefCell<Script>>)
 {
     let clock = FakeClock::default();
     let mut connector = FakeConnector::new(&clock, script);
-    let result = client().archive_with(thread_id, expected, &clock, &mut connector);
+    let result = client().delete_with(thread_id, expected, &clock, &mut connector);
     (result, connector.script)
+}
+
+#[test]
+fn start_and_stop_use_the_session_protocol_with_literal_task_text() {
+    let clock = FakeClock::default();
+    let mut connector = FakeConnector::new(&clock, Script::default());
+    let task = "review `code`; $(literal)\nkeep the text";
+    assert_eq!(client().start_with("/fixture/work", task, &clock, &mut connector).unwrap(), id(1));
+    let sent = connector.script.borrow().sent.clone();
+    assert_eq!(sent[2]["params"], json!({"cwd":"/fixture/work"}));
+    assert_eq!(sent[3]["params"], json!({"threadId":id(1),"input":[{"type":"text","text":task}]}));
+
+    let mut script = Script::default();
+    let mut active = thread(1);
+    active["status"] = json!({"type":"active","activeFlags":[]});
+    script.reads.insert(id(1), active);
+    let mut connector = FakeConnector::new(&clock, script);
+    client().stop_with(&id(1), &clock, &mut connector).unwrap();
+    let sent = &connector.script.borrow().sent;
+    assert_eq!(sent[3]["method"], "thread/turns/list");
+    assert_eq!(sent[4]["method"], "turn/interrupt");
+    assert_eq!(sent[4]["params"], json!({"threadId":id(1),"turnId":"turn-1"}));
 }
 
 fn fleet(rows: Vec<Value>, loaded: Vec<String>) -> Script {
@@ -710,7 +736,7 @@ fn initialize_order_and_exact_read_only_method_parameters() {
 }
 
 #[test]
-fn archive_uses_one_fresh_read_and_exactly_one_mutation() {
+fn delete_uses_one_fresh_read_and_exactly_one_mutation() {
     for (status, expected) in [(json!({"type":"idle"}), CodexStatus::Idle),
         (json!({"type":"notLoaded"}), CodexStatus::NotLoaded)]
     {
@@ -718,10 +744,10 @@ fn archive_uses_one_fresh_read_and_exactly_one_mutation() {
         row["status"] = status;
         let mut script = Script::default();
         script.reads.insert(id(1), row);
-        let (result, script) = archive(script, &id(1), &expected);
-        assert_eq!(result.unwrap(), ArchiveOutcome::Archived { updated_at: NOW / 1000 * 1000 });
+        let (result, script) = delete(script, &id(1), &expected);
+        assert_eq!(result.unwrap(), DeleteOutcome::Deleted);
         let script = script.borrow();
-        assert_eq!(script.archive_ids, vec![id(1)]);
+        assert_eq!(script.delete_ids, vec![id(1)]);
         assert_eq!(script.closes, 1);
         assert_eq!(script.sent, vec![
             json!({"id":0,"method":"initialize","params":{
@@ -730,14 +756,14 @@ fn archive_uses_one_fresh_read_and_exactly_one_mutation() {
             json!({"method":"initialized","params":{}}),
             json!({"id":"ccmux-1","method":"thread/read",
                 "params":{"threadId":id(1),"includeTurns":false}}),
-            json!({"id":"ccmux-2","method":"thread/archive",
+            json!({"id":"ccmux-2","method":"thread/delete",
                 "params":{"threadId":id(1)}}),
         ]);
     }
 }
 
 #[test]
-fn every_non_idle_fresh_status_refuses_before_archive() {
+fn every_non_idle_fresh_status_refuses_before_delete() {
     for status in [
         json!({"type":"active","activeFlags":[]}),
         json!({"type":"active","activeFlags":["waitingOnApproval"]}),
@@ -752,50 +778,50 @@ fn every_non_idle_fresh_status_refuses_before_archive() {
             row["status"] = status.clone();
             let mut script = Script::default();
             script.reads.insert(id(1), row);
-            let (result, script) = archive(script, &id(1), &expected);
-            assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged, "{status}");
-            assert!(script.borrow().archive_ids.is_empty(), "{status}");
+            let (result, script) = delete(script, &id(1), &expected);
+            assert_eq!(result.unwrap(), DeleteOutcome::StateChanged, "{status}");
+            assert!(script.borrow().delete_ids.is_empty(), "{status}");
             assert_eq!(script.borrow().closes, 1);
         }
     }
 }
 
 #[test]
-fn archive_errors_timeouts_and_invalid_success_are_never_success() {
+fn delete_errors_timeouts_and_invalid_success_are_never_success() {
     let mut rpc_error = Script::default();
     rpc_error.reads.insert(id(1), thread(1));
-    rpc_error.rpc_errors.insert("thread/archive".into());
-    let (result, script) = archive(rpc_error, &id(1), &CodexStatus::Idle);
+    rpc_error.rpc_errors.insert("thread/delete".into());
+    let (result, script) = delete(rpc_error, &id(1), &CodexStatus::Idle);
     assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Protocol);
-    assert_eq!(script.borrow().archive_ids, vec![id(1)]);
+    assert_eq!(script.borrow().delete_ids, vec![id(1)]);
 
     let mut timeout = Script::default();
     timeout.reads.insert(id(1), thread(1));
-    timeout.archive_cost = POLL_TIMEOUT;
-    let (result, script) = archive(timeout, &id(1), &CodexStatus::Idle);
+    timeout.delete_cost = POLL_TIMEOUT;
+    let (result, script) = delete(timeout, &id(1), &CodexStatus::Idle);
     assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
-    assert_eq!(script.borrow().archive_ids, vec![id(1)]);
+    assert_eq!(script.borrow().delete_ids, vec![id(1)]);
 
     let mut malformed = Script::default();
     malformed.reads.insert(id(1), thread(1));
-    malformed.archive_result = json!({"unexpected":true});
-    assert_eq!(archive(malformed, &id(1), &CodexStatus::Idle).0.unwrap_err().diagnostic.kind,
+    malformed.delete_result = json!({"unexpected":true});
+    assert_eq!(delete(malformed, &id(1), &CodexStatus::Idle).0.unwrap_err().diagnostic.kind,
         CodexFailureKind::Protocol);
 }
 
 #[test]
-fn archive_connection_ignores_requests_and_broadcast_notifications() {
+fn delete_connection_ignores_requests_and_broadcast_notifications() {
     let mut script = Script::default();
     script.reads.insert(id(1), thread(1));
     script.ahead = vec![
         json!({"id":"approval","method":"item/commandExecution/requestApproval",
             "params":{"command":SECRET}}),
-        json!({"method":"thread/archived","params":{"threadId":id(1)}}),
+        json!({"method":"thread/deleted","params":{"threadId":id(1)}}),
         json!({"method":"thread/status/changed","params":{"threadId":id(1),
             "status":{"type":"notLoaded"}}}),
     ];
-    let (result, script) = archive(script, &id(1), &CodexStatus::Idle);
-    assert!(matches!(result.unwrap(), ArchiveOutcome::Archived { .. }));
+    let (result, script) = delete(script, &id(1), &CodexStatus::Idle);
+    assert!(matches!(result.unwrap(), DeleteOutcome::Deleted));
     let sent = &script.borrow().sent;
     assert_eq!(sent.len(), 4);
     assert!(sent.iter().all(|value| value.get("method").is_some()));
@@ -803,7 +829,7 @@ fn archive_connection_ignores_requests_and_broadcast_notifications() {
 }
 
 #[test]
-fn archive_requires_the_fresh_status_to_match_the_row() {
+fn delete_requires_the_fresh_status_to_match_the_row() {
     // notLoaded -> idle is a client attaching outside ccmux since the poll;
     // idle -> notLoaded is the server's idle unload. Both refuse.
     for (fresh, row_showed) in [("idle", CodexStatus::NotLoaded), ("notLoaded", CodexStatus::Idle)] {
@@ -811,71 +837,60 @@ fn archive_requires_the_fresh_status_to_match_the_row() {
         row["status"] = json!({"type":fresh});
         let mut script = Script::default();
         script.reads.insert(id(1), row);
-        let (result, script) = archive(script, &id(1), &row_showed);
-        assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged, "{fresh}");
+        let (result, script) = delete(script, &id(1), &row_showed);
+        assert_eq!(result.unwrap(), DeleteOutcome::StateChanged, "{fresh}");
         let script = script.borrow();
         assert_eq!(script.read_ids, vec![id(1)]);
-        assert!(script.archive_ids.is_empty(), "{fresh}: archive sent against a changed row");
+        assert!(script.delete_ids.is_empty(), "{fresh}: delete sent against a changed row");
         assert_eq!(script.closes, 1);
     }
 }
 
 #[test]
-fn a_fresh_read_of_another_thread_is_a_state_change_not_an_archive() {
+fn a_fresh_read_of_another_thread_is_a_state_change_not_a_delete() {
     let mut script = Script::default();
     script.reads.insert(id(1), thread(2));
-    let (result, script) = archive(script, &id(1), &CodexStatus::Idle);
-    assert_eq!(result.unwrap(), ArchiveOutcome::StateChanged);
-    assert!(script.borrow().archive_ids.is_empty());
+    let (result, script) = delete(script, &id(1), &CodexStatus::Idle);
+    assert_eq!(result.unwrap(), DeleteOutcome::StateChanged);
+    assert!(script.borrow().delete_ids.is_empty());
 }
 
 #[test]
-fn a_fresh_read_without_updated_at_is_never_archived() {
-    let mut row = thread(1);
-    row.as_object_mut().unwrap().remove("updatedAt");
-    let mut script = Script::default();
-    script.reads.insert(id(1), row);
-    let (result, script) = archive(script, &id(1), &CodexStatus::Idle);
-    assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Protocol);
-    assert!(script.borrow().archive_ids.is_empty());
-}
-
-#[test]
-fn the_fresh_read_and_the_archive_share_one_deadline() {
+fn the_fresh_read_and_the_delete_share_one_deadline() {
     // Each half fits a fresh 1000 ms budget; together they do not.
     let mut split = Script::default();
     split.reads.insert(id(1), thread(1));
     split.read_cost = Duration::from_millis(600);
-    split.archive_cost = Duration::from_millis(600);
-    let (result, script) = archive(split, &id(1), &CodexStatus::Idle);
+    split.delete_cost = Duration::from_millis(600);
+    let (result, script) = delete(split, &id(1), &CodexStatus::Idle);
     assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
-    assert_eq!(script.borrow().archive_ids, vec![id(1)], "the late answer is never success");
+    assert_eq!(script.borrow().delete_ids, vec![id(1)], "the late answer is never success");
 
     // A read that uses the budget up, or a slow connect plus a read that
-    // fits alone, never sends the archive.
+    // fits alone, never sends the delete.
     for (connect, read) in [(0, 1000), (500, 600)] {
         let mut slow = Script::default();
         slow.reads.insert(id(1), thread(1));
         slow.connect_cost = Duration::from_millis(connect);
         slow.read_cost = Duration::from_millis(read);
-        let (result, script) = archive(slow, &id(1), &CodexStatus::Idle);
+        let (result, script) = delete(slow, &id(1), &CodexStatus::Idle);
         assert_eq!(result.unwrap_err().diagnostic.kind, CodexFailureKind::Timeout);
-        assert!(script.borrow().archive_ids.is_empty(), "archive sent after the deadline");
+        assert!(script.borrow().delete_ids.is_empty(), "delete sent after the deadline");
     }
 }
 
 #[test]
-fn archive_rejects_invalid_addresses_without_connecting() {
+fn delete_rejects_invalid_addresses_without_connecting() {
     let clock = FakeClock::default();
     let mut connector = FakeConnector::new(&clock, Script::default());
-    let error = client().archive_with("not-a-thread", &CodexStatus::Idle, &clock, &mut connector)
+    let error = client().delete_with("not-a-thread", &CodexStatus::Idle, &clock, &mut connector)
         .unwrap_err();
     assert_eq!(error.diagnostic.kind, CodexFailureKind::Protocol);
     assert!(connector.script.borrow().sent.is_empty());
 }
 
 #[test]
-fn forgetting_an_archived_id_clears_only_its_poll_bookkeeping() {
+fn forgetting_a_deleted_id_clears_only_its_poll_bookkeeping() {
     let mut client = client();
     client.exclusions.insert(id(1), Exclusion::Custom);
     client.exclusions.insert(id(2), Exclusion::SubAgent);

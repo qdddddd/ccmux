@@ -4011,6 +4011,21 @@ the reviewed corrections, and describes the implemented branch contract.
 
 ### 12.1 Scope and ownership (§§2, 3.3, 8, 10.3)
 
+**Session actions update (2026-10-21):** This paragraph supersedes the
+archive-only and Claude-only creation rules below, including their acceptance
+criteria. Codex `Ctrl-x` interrupts an active turn with `turn/interrupt`, using
+`thread/read` and the latest `thread/turns/list` entry to address it. Idle and
+unloaded rows arm directly. The second press permanently removes the captured
+thread through `thread/delete` after the existing fresh idle/unloaded check,
+then closes its mapped panes through the shared provider-aware pane cleanup.
+Mapped panes no longer refuse deletion. The existing repeat/window protections
+remain. Deleted IDs are suppressed until a complete poll omits them; there is
+no unarchive action. In the Codex section, `n` captures Codex in the existing
+cwd/task form, prefills the selected cwd, and sends `thread/start` followed by
+`turn/start`. It uses server defaults and selects the returned full thread ID
+on a later poll. Other sections keep Claude creation. Start/stop RPCs have a
+10-second deadline; polling and deletion retain their one-second deadline.
+
 Codex uses ONE configured app-server endpoint per ccmux workspace. Local
 defaults enable it when the default token file exists (§12.2); an explicit
 empty URL disables it.

@@ -45,12 +45,8 @@ pub struct CodexPoll {
     pub idle_streak: u32,
     fingerprint: Option<u64>,
     rows: BTreeMap<String, Session>,
-    /// Successful local archives, keyed to the fresh read's `updatedAt`.
-    /// `thread/read` remains valid after archive and a lagging loaded-list row
-    /// must not resurrect the just-removed row, so the ID stays suppressed
-    /// until a complete observation omits it or the authoritative
-    /// `archived:false` history lists it with a different `updatedAt`.
-    archived: BTreeMap<String, i64>,
+    /// Suppress lagging rows after deletion until a complete observation omits them.
+    deleted: BTreeSet<String>,
     pub prepare: fn(&CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic>,
 }
 
@@ -61,7 +57,7 @@ impl Default for CodexPoll {
             prepare_error: None, open_rejected: false, last_attempt: None,
             force: false, startup: true, reload: false, fail_streak: 0,
             idle_streak: 0, fingerprint: None, rows: BTreeMap::new(),
-            archived: BTreeMap::new(), prepare,
+            deleted: BTreeSet::new(), prepare,
         }
     }
 }
@@ -108,21 +104,9 @@ impl CodexPoll {
     }
 
     fn apply(&mut self, observation: &CodexObservation) {
-        // Rediscovery. Archive leaves `updatedAt` unchanged and drops the ID
-        // from `archived:false` history at once; unarchive bumps it. A history
-        // row with another `updatedAt` is the thread back, complete poll or
-        // not. A loaded-list/read row with the archived value stays hidden.
-        for row in &observation.sessions {
-            if observation.history_metadata_ids.contains(&row.session_id)
-                && self.archived.get(&row.session_id).is_some_and(|archived_at|
-                    row.codex.as_ref().map(|meta| meta.updated_at) != Some(*archived_at))
-            {
-                self.archived.remove(&row.session_id);
-            }
-        }
         let mut fresh = BTreeMap::new();
         for row in &observation.sessions {
-            if self.archived.contains_key(&row.session_id) { continue; }
+            if self.deleted.contains(&row.session_id) { continue; }
             let mut row = row.clone();
             if !observation.history_metadata_ids.contains(&row.session_id)
                 && let Some(old) = self.rows.get(&row.session_id)
@@ -134,7 +118,7 @@ impl CodexPoll {
         if observation.complete {
             let observed: BTreeSet<_> = observation.sessions.iter()
                 .map(|row| row.session_id.as_str()).collect();
-            self.archived.retain(|id, _| observed.contains(id.as_str()));
+            self.deleted.retain(|id| observed.contains(id.as_str()));
             self.rows = fresh;
             let sessions: Vec<_> = self.rows.values().cloned().collect();
             let fp = codex::fingerprint(&sessions);
@@ -154,9 +138,9 @@ impl CodexPoll {
         self.idle_streak = 0;
     }
 
-    pub(super) fn archived(&mut self, id: &str, updated_at: i64) {
+    pub(super) fn deleted(&mut self, id: &str) {
         self.rows.remove(id);
-        self.archived.insert(id.to_owned(), updated_at);
+        self.deleted.insert(id.to_owned());
         if let Some(client) = &mut self.client { client.forget(id); }
     }
 }
@@ -250,8 +234,10 @@ impl App {
 
     pub(super) fn poll_providers(&mut self) -> bool {
         let claude = self.poll_step(self.agents_poll);
-        self.poll_codex();
-        claude
+        let codex = self.poll_codex();
+        if self.pending_jump.as_ref().is_some_and(|jump| jump.provider == Provider::Codex) {
+            codex
+        } else { claude }
     }
 
     pub fn poll_codex(&mut self) -> bool {

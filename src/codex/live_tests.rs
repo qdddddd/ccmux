@@ -1077,20 +1077,20 @@ fn not_rewound(before: &Value, after: &Value) -> Result<()> {
     Ok(())
 }
 
-fn archived_everywhere(h: &Harness<'_>, id: &str) -> Result<()> {
+fn deleted_everywhere(h: &Harness<'_>, id: &str) -> Result<()> {
     let mut rpc = h.rpc(Duration::from_secs(30))?;
     let wait = rpc.wait.scoped(Duration::from_secs(15));
-    wait.until(&format!("thread {id} archived, absent from active history, and unloaded"), || {
+    wait.until(&format!("thread {id} absent from history and loaded threads"), || {
         let (archived, _) = rpc.history(true, true, 100)?;
         let (active, _) = rpc.history(true, false, 100)?;
         let loaded = rpc.loaded(100)?.0.contains(id);
-        let row = rpc.read(id)?;
         let snapshot = json!({"id":id,"archived":archived.contains_key(id),
-            "active":active.contains_key(id),"loaded":loaded,"status":row.get("status")});
-        let ready = archived.contains_key(id) && !active.contains_key(id) && !loaded
-            && row["status"]["type"] == "notLoaded";
+            "active":active.contains_key(id),"loaded":loaded});
+        let ready = !archived.contains_key(id) && !active.contains_key(id) && !loaded;
         Ok((ready.then_some(()), snapshot))
     })?;
+    // The fixture has been permanently removed; archive cleanup has no target.
+    h.registry.borrow_mut().threads.remove(id);
     rpc.close()
 }
 
@@ -1107,32 +1107,32 @@ fn waiting_approval(rpc: &mut LiveRpc<'_>, id: &str) -> Result<Value> {
 
 #[test]
 #[ignore = "opt-in owned Codex threads; see SPEC §12.11"]
-fn live_archive_idle_loaded_thread() {
+fn live_delete_idle_loaded_thread() {
     run(CASE_TIMEOUT, |h| {
         let mut creator = h.creator()?;
         let id = creator.materialize(&h.name("archive-idle"))?;
         creator.thread_state(&id, "idle", true)?;
         creator.close()?;
-        ensure!(matches!(h.client.archive(&id, &CodexStatus::Idle).map_err(live_error)?,
-            ArchiveOutcome::Archived { .. }),
+        ensure!(matches!(h.client.delete(&id, &CodexStatus::Idle).map_err(live_error)?,
+            DeleteOutcome::Deleted),
             "idle archive did not report success");
-        archived_everywhere(h, &id)?;
+        deleted_everywhere(h, &id)?;
         h.record(json!({"event":"archive_idle_pass","id":id}))
     });
 }
 
 #[test]
 #[ignore = "opt-in owned Codex threads; see SPEC §12.11"]
-fn live_archive_not_loaded_thread() {
+fn live_delete_not_loaded_thread() {
     run(CASE_TIMEOUT, |h| {
         let mut creator = h.creator()?;
         let id = creator.materialize(&h.name("archive-unloaded"))?;
         creator.close()?;
         h.unloaded_fixture(&id)?;
-        ensure!(matches!(h.client.archive(&id, &CodexStatus::NotLoaded).map_err(live_error)?,
-            ArchiveOutcome::Archived { .. }),
+        ensure!(matches!(h.client.delete(&id, &CodexStatus::NotLoaded).map_err(live_error)?,
+            DeleteOutcome::Deleted),
             "notLoaded archive did not report success");
-        archived_everywhere(h, &id)?;
+        deleted_everywhere(h, &id)?;
         h.record(json!({"event":"archive_unloaded_pass","id":id}))
     });
 }
@@ -1148,8 +1148,8 @@ fn live_archive_gate_refuses_active_turn_until_it_completes() {
         let mut observer = h.rpc(Duration::from_secs(30))?;
         observer.thread_state(&id, "active", true)?;
         observer.close()?;
-        ensure!(h.client.archive(&id, &CodexStatus::Idle).map_err(live_error)?
-            == ArchiveOutcome::StateChanged, "active thread passed the archive gate");
+        ensure!(h.client.delete(&id, &CodexStatus::Idle).map_err(live_error)?
+            == DeleteOutcome::StateChanged, "active thread passed the archive gate");
         creator.created_progress(&id, &turn, false)?;
         creator.close()?;
         let mut observer = h.rpc(Duration::from_secs(30))?;
@@ -1172,8 +1172,8 @@ fn live_archive_gate_preserves_pending_approval_until_declined() {
         let mut observer = h.rpc(Duration::from_secs(30))?;
         waiting_approval(&mut observer, &id)?;
         observer.close()?;
-        ensure!(h.client.archive(&id, &CodexStatus::Idle).map_err(live_error)?
-            == ArchiveOutcome::StateChanged, "waiting approval passed the archive gate");
+        ensure!(h.client.delete(&id, &CodexStatus::Idle).map_err(live_error)?
+            == DeleteOutcome::StateChanged, "waiting approval passed the archive gate");
         let mut observer = h.rpc(Duration::from_secs(30))?;
         waiting_approval(&mut observer, &id)?;
         observer.close()?;

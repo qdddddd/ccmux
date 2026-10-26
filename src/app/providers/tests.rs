@@ -8,10 +8,12 @@ use std::rc::Rc;
 #[derive(Default)]
 struct Script {
     calls: Vec<&'static str>,
-    archive_ids: Vec<String>,
-    archive_expected: Vec<CodexStatus>,
-    archive_delay: Duration,
-    archive_results: VecDeque<Result<codex::ArchiveOutcome, CodexDiagnostic>>,
+    delete_ids: Vec<String>,
+    delete_expected: Vec<CodexStatus>,
+    delete_delay: Duration,
+    delete_results: VecDeque<Result<codex::DeleteOutcome, CodexDiagnostic>>,
+    stop_ids: Vec<String>,
+    starts: Vec<(String, String)>,
     observations: VecDeque<CodexObservation>,
     prepare_error: Option<CodexDiagnostic>,
     reload_error: Option<CodexDiagnostic>,
@@ -49,19 +51,19 @@ fn fake_prepare(_: &CodexConfig) -> Result<Box<dyn PollClient>, CodexDiagnostic>
     })
 }
 
-fn fake_archive(_: &CodexConfig, id: &str, expected: &CodexStatus)
-    -> Result<codex::ArchiveOutcome, CodexDiagnostic>
+fn fake_delete(_: &CodexConfig, id: &str, expected: &CodexStatus)
+    -> Result<codex::DeleteOutcome, CodexDiagnostic>
 {
     let delay = SCRIPT.with(|state| {
         let mut script = state.borrow_mut();
-        script.calls.push("archive");
-        script.archive_ids.push(id.into());
-        script.archive_expected.push(expected.clone());
-        script.archive_delay
+        script.calls.push("delete");
+        script.delete_ids.push(id.into());
+        script.delete_expected.push(expected.clone());
+        script.delete_delay
     });
     std::thread::sleep(delay); // a real block, like the RPC it stands in for
-    SCRIPT.with(|state| state.borrow_mut().archive_results.pop_front()
-        .unwrap_or(Ok(codex::ArchiveOutcome::Archived { updated_at: 20 })))
+    SCRIPT.with(|state| state.borrow_mut().delete_results.pop_front()
+        .unwrap_or(Ok(codex::DeleteOutcome::Deleted)))
 }
 
 fn configured() -> App {
@@ -70,7 +72,15 @@ fn configured() -> App {
     a.codex.settings.url = "ws://127.0.0.1:8965".into();
     a.codex.settings.token_file = "/never-read-test-token".into();
     a.codex.prepare = fake_prepare;
-    a.codex_archive = fake_archive;
+    a.codex_delete = fake_delete;
+    a.codex_stop = |_, id| {
+        SCRIPT.with(|s| s.borrow_mut().stop_ids.push(id.into()));
+        Ok(())
+    };
+    a.codex_start = |_, cwd, task| {
+        SCRIPT.with(|s| s.borrow_mut().starts.push((cwd.into(), task.into())));
+        Ok(row(2, CodexStatus::Idle).session_id)
+    };
     a.agents_poll = || {
         SCRIPT.with(|s| s.borrow_mut().calls.push("claude poll"));
         Ok(payload(vec![claude()]))
@@ -377,22 +387,18 @@ fn provider_rows_replace_only_on_their_own_complete_observation() {
 }
 
 #[test]
-fn codex_archive_local_refusals_never_arm_or_call_rpc() {
-    let mut cases = Vec::new();
-    cases.push((row(1, CodexStatus::Active { flags: vec![] }), "running — not archived"));
-    let mut blocked = row(1, CodexStatus::Active { flags: vec!["waitingOnApproval".into()] });
-    blocked.status = Status::Waiting;
-    blocked.state = Some(State::Blocked);
-    cases.push((blocked, "running — not archived"));
-    cases.push((row(1, CodexStatus::SystemError), "state unknown — not archived"));
-    cases.push((row(1, CodexStatus::Unknown("future".into())), "state unknown — not archived"));
+fn codex_delete_local_refusals_never_arm_or_call_rpc() {
+    let cases = [
+        (row(1, CodexStatus::SystemError), "state unknown — not deleted"),
+        (row(1, CodexStatus::Unknown("future".into())), "state unknown — not deleted"),
+    ];
     for (row, message) in cases {
         let mut a = configured();
         show(&mut a, vec![row]);
         ctrl_x(&mut a);
         assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
         assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)), Some((message, MsgLevel::Warn)));
-        assert!(!calls().contains(&"archive"));
+        assert!(!calls().contains(&"delete"));
     }
 
     let mut a = configured();
@@ -400,21 +406,38 @@ fn codex_archive_local_refusals_never_arm_or_call_rpc() {
     show(&mut a, vec![row(1, CodexStatus::Idle)]);
     ctrl_x(&mut a);
     assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
-        Some(("codex not configured — archive unavailable", MsgLevel::Warn)));
-    assert!(a.stop_arm.is_none() && !calls().contains(&"archive"));
+        Some(("codex not configured — delete unavailable", MsgLevel::Warn)));
+    assert!(a.stop_arm.is_none() && !calls().contains(&"delete"));
 
     let mut a = configured();
     let target = row(1, CodexStatus::Idle);
     mapped_in_another_tab(&mut a, &target);
     show(&mut a, vec![target]);
     ctrl_x(&mut a);
-    assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
-        Some(("close its pane first (x) — not archived", MsgLevel::Warn)));
-    assert!(a.stop_arm.is_none() && !calls().contains(&"archive"));
+    assert!(a.stop_arm.is_some() && !calls().contains(&"delete"));
 }
 
 #[test]
-fn codex_archive_needs_two_presses_then_removes_and_suppresses_the_row() {
+fn codex_ctrl_x_stops_working_and_blocked_turns_then_deletes() {
+    for flags in [vec![], vec!["waitingOnApproval".into()]] {
+        let mut a = configured();
+        let mut target = row(1, CodexStatus::Active { flags: flags.clone() });
+        if !flags.is_empty() { target.state = Some(State::Blocked); }
+        let id = target.session_id.clone();
+        show(&mut a, vec![target]);
+        ctrl_x(&mut a);
+        assert_eq!(SCRIPT.with(|s| s.borrow().stop_ids.clone()), std::slice::from_ref(&id));
+        assert!(a.stop_arm.is_some() && !calls().contains(&"delete"));
+        show(&mut a, vec![row(1, CodexStatus::Idle)]);
+        age_ctrl_x(&mut a);
+        ctrl_x(&mut a);
+        settle_ctrl_x(&mut a);
+        assert_eq!(SCRIPT.with(|s| s.borrow().delete_ids.clone()), [id]);
+    }
+}
+
+#[test]
+fn codex_delete_needs_two_presses_then_removes_and_suppresses_the_row() {
     let mut a = configured();
     let target = row(1, CodexStatus::Idle);
     let id = target.session_id.clone();
@@ -424,36 +447,36 @@ fn codex_archive_needs_two_presses_then_removes_and_suppresses_the_row() {
     ctrl_x(&mut a);
     assert_eq!(a.stop_arm.as_ref().map(|arm| (arm.provider, arm.session_id.as_str())),
         Some((Provider::Codex, id.as_str())), "message: {:?}", a.message);
-    assert!(!calls().contains(&"archive"));
-    assert_eq!(a.arm_hint().as_deref(), Some("Ctrl-x again to archive task 1"));
+    assert!(!calls().contains(&"delete"));
+    assert_eq!(a.arm_hint().as_deref(), Some("Ctrl-x again to delete task 1 — cannot be undone"));
 
     age_ctrl_x(&mut a);
     ctrl_x(&mut a);
     assert!(a.stop_arm.is_none() && a.pending_delete.is_some());
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
     settle_ctrl_x(&mut a);
-    assert_eq!(SCRIPT.with(|s| s.borrow().archive_ids.clone()), vec![id.clone()]);
+    assert_eq!(SCRIPT.with(|s| s.borrow().delete_ids.clone()), vec![id.clone()]);
     assert!(a.sessions.is_empty() && a.rows.is_empty());
     assert_eq!(a.message.as_ref().map(|m| (&*m.0, m.1)),
-        Some(("archived task 1", MsgLevel::Info)));
+        Some(("deleted task 1", MsgLevel::Info)));
     assert!(a.codex.force);
 
-    // A lagging loaded/read path may still return the archived Thread. The
+    // A lagging loaded/read path may still return the deleted Thread. The
     // local tombstone keeps it out until a complete authoritative union omits
-    // it, after which a later unarchive can be rediscovered.
+    // it; a complete poll clears the temporary suppression.
     poll(&mut a, vec![target.clone()], false);
     assert!(a.sessions.is_empty());
     poll(&mut a, vec![target.clone()], true);
     assert!(a.sessions.is_empty());
     poll(&mut a, vec![target.clone()], true);
-    assert!(a.sessions.is_empty(), "a second lagging complete poll resurrected the archive");
+    assert!(a.sessions.is_empty(), "a second lagging complete poll resurrected the delete");
     poll(&mut a, vec![], true);
     poll(&mut a, vec![target], true);
     assert_eq!(a.sessions.len(), 1);
 }
 
 #[test]
-fn successful_archive_forgets_metadata_in_the_prepared_poll_client() {
+fn successful_delete_forgets_metadata_in_the_prepared_poll_client() {
     let mut a = configured();
     let target = row(1, CodexStatus::Idle);
     poll(&mut a, vec![target], true);
@@ -464,38 +487,38 @@ fn successful_archive_forgets_metadata_in_the_prepared_poll_client() {
     ctrl_x(&mut a);
     settle_ctrl_x(&mut a);
 
-    assert_eq!(calls(), ["prepare", "codex poll", "archive", "forget"]);
+    assert_eq!(calls(), ["prepare", "codex poll", "delete", "forget"]);
 }
 
 #[test]
-fn codex_archive_revalidates_and_reports_failure_without_success() {
+fn codex_delete_revalidates_and_reports_failure_without_success() {
     for outcome in [
-        Ok(codex::ArchiveOutcome::StateChanged),
+        Ok(codex::DeleteOutcome::StateChanged),
         Err(CodexDiagnostic { kind:CodexFailureKind::Timeout,
-            message:"codex archive timed out after 1000 ms".into() }),
+            message:"codex delete timed out after 1000 ms".into() }),
     ] {
         let mut a = configured();
         let target = row(1, CodexStatus::NotLoaded);
         show(&mut a, vec![target]);
-        SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(outcome.clone()));
+        SCRIPT.with(|s| s.borrow_mut().delete_results.push_back(outcome.clone()));
         ctrl_x(&mut a);
         age_ctrl_x(&mut a);
         ctrl_x(&mut a);
         settle_ctrl_x(&mut a);
-        assert_eq!(SCRIPT.with(|s| s.borrow().archive_ids.len()), 1);
+        assert_eq!(SCRIPT.with(|s| s.borrow().delete_ids.len()), 1);
         assert_eq!(a.sessions.len(), 1);
         let (message, level) = a.message.clone().unwrap();
         assert_eq!(level, MsgLevel::Warn);
         match outcome {
-            Ok(_) => assert_eq!(message, "state changed — not archived"),
-            Err(_) => assert_eq!(message, "archive failed: codex archive timed out after 1000 ms"),
+            Ok(_) => assert_eq!(message, "state changed — not deleted"),
+            Err(_) => assert_eq!(message, "delete failed: codex delete timed out after 1000 ms"),
         }
         assert!(a.codex.force);
     }
 }
 
 #[test]
-fn codex_archive_window_disarms_on_retarget_modes_and_repeat_bursts() {
+fn codex_delete_window_disarms_on_retarget_modes_and_repeat_bursts() {
     // Row disappearance followed by a Claude neighbour must never reach stop.
     agents::test_spawn::reset();
     let mut a = configured();
@@ -513,7 +536,7 @@ fn codex_archive_window_disarms_on_retarget_modes_and_repeat_bursts() {
     ctrl_x(&mut a);
     assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
     assert!(agents::test_spawn::calls().is_empty());
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
 
     // Mode departure uses the shared disarm path.
     let mut a = configured();
@@ -530,7 +553,7 @@ fn codex_archive_window_disarms_on_retarget_modes_and_repeat_bursts() {
     ctrl_x(&mut a);
     ctrl_x(&mut a);
     assert!(a.pending_delete.is_none());
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
 
     // Vanishing during the settle interval cancels before the RPC seam.
     let mut a = configured();
@@ -543,24 +566,24 @@ fn codex_archive_window_disarms_on_retarget_modes_and_repeat_bursts() {
     a.rebuild_rows();
     assert!(a.pending_delete.is_none());
     assert!(!a.tick_stop_arm());
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
 }
 
 #[test]
-fn codex_archive_window_expires_and_rechecks_row_and_pane_state() {
+fn codex_delete_window_expires_and_rechecks_row_and_pane_state() {
     let mut a = configured();
     show(&mut a, vec![row(1, CodexStatus::Idle), row(2, CodexStatus::NotLoaded)]);
     ctrl_x(&mut a);
     key(&mut a, KeyCode::Char('j'));
     assert!(a.stop_arm.is_none(), "moving to another Codex row disarms");
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
 
     let mut a = configured();
     show(&mut a, vec![row(1, CodexStatus::Idle)]);
     ctrl_x(&mut a);
     a.stop_arm.as_mut().unwrap().at -= CX_WINDOW + Duration::from_millis(1);
     assert!(a.tick_stop_arm());
-    assert!(a.stop_arm.is_none() && !calls().contains(&"archive"));
+    assert!(a.stop_arm.is_none() && !calls().contains(&"delete"));
 
     let mut a = configured();
     let mut target = row(1, CodexStatus::Idle);
@@ -572,8 +595,8 @@ fn codex_archive_window_expires_and_rechecks_row_and_pane_state() {
     show(&mut a, vec![target]);
     age_ctrl_x(&mut a);
     ctrl_x(&mut a);
-    assert_eq!(a.message.as_ref().unwrap().0, "running — not archived");
-    assert!(a.pending_delete.is_none() && !calls().contains(&"archive"));
+    assert_eq!(a.message.as_ref().unwrap().0, "running — not deleted");
+    assert!(a.pending_delete.is_none() && !calls().contains(&"delete"));
 
     let mut a = configured();
     let target = row(1, CodexStatus::NotLoaded);
@@ -585,8 +608,7 @@ fn codex_archive_window_expires_and_rechecks_row_and_pane_state() {
     });
     age_ctrl_x(&mut a);
     ctrl_x(&mut a);
-    assert_eq!(a.message.as_ref().unwrap().0, "close its pane first (x) — not archived");
-    assert!(a.pending_delete.is_none() && !calls().contains(&"archive"));
+    assert!(a.pending_delete.is_some() && !calls().contains(&"delete"));
 }
 
 #[test]
@@ -849,10 +871,34 @@ fn codex_navigation_filter_completed_dismiss_undo_and_new_are_local() {
     assert!(a.selected_session().is_some());
     key(&mut a, KeyCode::Char('n'));
     let prompt = a.prompt.as_ref().unwrap();
-    assert_eq!(prompt.kind, PromptKind::NewBackground);
-    assert_eq!(prompt.fields[0], std::env::current_dir().unwrap().to_string_lossy());
+    assert_eq!(prompt.kind, PromptKind::NewCodex);
+    assert_eq!(prompt.fields[0], r.cwd);
     assert!(prompt.pending_create.is_none());
     assert_eq!(calls(), ["prepare", "codex poll"]);
+}
+
+#[test]
+fn n_in_codex_section_starts_codex_and_selects_the_new_thread() {
+    for header in [false, true] {
+        let mut a = configured();
+        let mut target = row(1, CodexStatus::Idle);
+        target.cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
+        let cwd = target.cwd.clone();
+        show(&mut a, vec![target]);
+        if header { a.selected = 0; }
+        key(&mut a, KeyCode::Char('n'));
+        let prompt = a.prompt.as_mut().unwrap();
+        assert_eq!(prompt.kind, PromptKind::NewCodex);
+        assert_eq!(prompt.fields[0], cwd);
+        prompt.fields[1] = "build the feature".into();
+        a.act_submit_prompt();
+        assert_eq!(SCRIPT.with(|s| s.borrow().starts.clone()), [(cwd, "build the feature".into())]);
+        assert_eq!(a.mode, Mode::Normal);
+        poll(&mut a, vec![row(2, CodexStatus::Idle)], true);
+        a.rebuild_rows();
+        a.tick_pending_jump(false);
+        assert_eq!(a.selected_session().unwrap().session_id, row(2, CodexStatus::Idle).session_id);
+    }
 }
 
 #[test]
@@ -863,7 +909,7 @@ fn logs_refuses_while_ctrl_x_only_arms_without_external_io() {
     key(&mut a, KeyCode::Char('L'));
     assert_eq!(a.message.as_ref().unwrap().0, "Codex logs unavailable in v1 — use the Codex TUI");
     a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
-    assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to archive task 1");
+    assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to delete task 1");
     assert!(a.stop_arm.is_some() && a.pending_delete.is_none() && a.logs.is_none());
     assert_eq!(calls(), ["prepare", "codex poll"]);
     a.degraded = true;
@@ -1066,12 +1112,12 @@ fn codex_ctrl_x_closes_a_claude_delete_window_before_returning_to_claude() {
     assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
     a.cx_last_press = Some(Instant::now() - Duration::from_secs(1));
     a.on_key(ctrl_x);
-    assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to archive task 1");
+    assert_eq!(a.message.as_ref().unwrap().0, "Ctrl-x again to delete task 1");
     assert!(a.stop_arm.as_ref().is_some_and(|arm| arm.provider == Provider::Codex));
     assert!(a.pending_delete.is_none());
     key(&mut a, KeyCode::Char('k'));
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
-    assert!(a.stop_arm.is_none(), "crossing back to Claude disarms the archive");
+    assert!(a.stop_arm.is_none(), "crossing back to Claude disarms the delete");
     a.cx_last_press = Some(Instant::now() - Duration::from_secs(1));
     a.on_key(ctrl_x);
     assert_eq!(agents::test_spawn::joined(), ["stop 12345678", "stop 12345678"]);
@@ -1216,18 +1262,12 @@ fn tab_and_backtab_cycle_five_groups_and_skip_hidden_empty_groups() {
 
 #[test]
 fn a_codex_refusal_stamps_the_burst_guard_before_its_row_disappears() {
-    let mut blocked = row(1, CodexStatus::Active { flags: vec!["waitingOnApproval".into()] });
-    blocked.status = Status::Waiting;
-    blocked.state = Some(State::Blocked);
     type Setup = fn(&mut App, &Session);
-    let cases: [(Session, Setup, &str); 7] = [
-        (row(1, CodexStatus::Active { flags: vec![] }), |_, _| {}, "running — not archived"),
-        (blocked, |_, _| {}, "running — not archived"),
-        (row(1, CodexStatus::SystemError), |_, _| {}, "state unknown — not archived"),
-        (row(1, CodexStatus::Unknown("future".into())), |_, _| {}, "state unknown — not archived"),
-        (row(1, CodexStatus::Idle), mapped_in_another_tab, "close its pane first (x) — not archived"),
-        (row(1, CodexStatus::Idle), |a, _| a.degraded = true, "not inside tmux — archive unavailable"),
-        (row(1, CodexStatus::NotLoaded), |a, _| a.tabs_fresh = false, "pane map unavailable — not archived"),
+    let cases: [(Session, Setup, &str); 4] = [
+        (row(1, CodexStatus::SystemError), |_, _| {}, "state unknown — not deleted"),
+        (row(1, CodexStatus::Unknown("future".into())), |_, _| {}, "state unknown — not deleted"),
+        (row(1, CodexStatus::Idle), |a, _| a.degraded = true, "not inside tmux — delete unavailable"),
+        (row(1, CodexStatus::NotLoaded), |a, _| a.tabs_fresh = false, "pane map unavailable — not deleted"),
     ];
     for (target, setup, refusal) in cases {
         let mut a = beside_working_claude(target.clone());
@@ -1252,20 +1292,20 @@ fn closed_window_refuses_paced_presses(close: fn(&mut App), presses: &[u64]) {
     let mut a = beside_working_claude(row(1, CodexStatus::Idle));
     ctrl_x(&mut a);
     let armed_at = a.stop_arm.as_ref().unwrap().at;
-    assert!(screen(&a).contains("again to archive"));
+    assert!(screen(&a).contains("again to delete"));
     close(&mut a);
     assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
-    assert!(!screen(&a).contains("again to archive"), "{}", screen(&a));
+    assert!(!screen(&a).contains("again to delete"), "{}", screen(&a));
     for &offset in presses {
         sleep_until(armed_at + Duration::from_millis(offset));
         ctrl_x(&mut a);
         assert!(armed_at.elapsed() < CX_WINDOW, "the press at {offset} ms left the window");
         assert!(agents::test_spawn::joined().is_empty(), "the press at {offset} ms stopped Claude");
         assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
-        assert!(!screen(&a).contains("again to archive"));
+        assert!(!screen(&a).contains("again to delete"));
     }
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
 }
 
 fn vanish(a: &mut App) {
@@ -1310,14 +1350,14 @@ fn no_closed_codex_window_leaves_its_invitation_on_screen() {
     for (name, close) in closes {
         let mut a = beside_working_claude(row(1, CodexStatus::Idle));
         ctrl_x(&mut a);
-        assert!(screen(&a).contains("Ctrl-x again to archive task 1"), "{name}");
+        assert!(screen(&a).contains("Ctrl-x again to delete task 1"), "{name}");
         close(&mut a);
         assert_eq!(a.mode, Mode::Normal, "{name}");
         assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "{name}");
         let drawn = screen(&a);
-        assert!(!drawn.contains("again to archive"), "{name}: {drawn}");
+        assert!(!drawn.contains("again to delete"), "{name}: {drawn}");
         assert!(drawn.contains(CODEX_CLOSED), "{name}: {drawn}");
-        assert!(agents::test_spawn::joined().is_empty() && !calls().contains(&"archive"), "{name}");
+        assert!(agents::test_spawn::joined().is_empty() && !calls().contains(&"delete"), "{name}");
     }
 }
 
@@ -1328,17 +1368,17 @@ fn a_repeat_burst_closes_a_codex_window_for_its_remainder() {
     ctrl_x(&mut a);
     let armed_at = a.stop_arm.as_ref().unwrap().at;
     ctrl_x(&mut a);
-    assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "a burst kept the archive window");
+    assert!(a.stop_arm.is_none() && a.pending_delete.is_none(), "a burst kept the delete window");
     assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
     for offset in [800, 1600] {
         sleep_until(armed_at + Duration::from_millis(offset));
         ctrl_x(&mut a);
         assert!(armed_at.elapsed() < CX_WINDOW, "the press at {offset} ms left the window");
         assert!(a.stop_arm.is_none() && a.pending_delete.is_none(),
-            "the press at {offset} ms after a burst reopened or confirmed the archive");
+            "the press at {offset} ms after a burst reopened or confirmed the delete");
         assert_eq!(a.message.as_ref().unwrap().0, CODEX_CLOSED);
     }
-    assert!(!calls().contains(&"archive") && agents::test_spawn::joined().is_empty());
+    assert!(!calls().contains(&"delete") && agents::test_spawn::joined().is_empty());
 }
 
 fn history(sessions: Vec<Session>, complete: bool) -> CodexObservation {
@@ -1354,15 +1394,15 @@ fn poll_history(a: &mut App, rows: Vec<Session>, complete: bool) {
     assert!(a.poll_codex());
 }
 
-fn archive_selected(a: &mut App) {
+fn delete_selected(a: &mut App) {
     ctrl_x(a);
     age_ctrl_x(a);
     ctrl_x(a);
     settle_ctrl_x(a);
-    assert!(a.message.as_ref().unwrap().0.starts_with("archived "), "{:?}", a.message);
+    assert!(a.message.as_ref().unwrap().0.starts_with("deleted "), "{:?}", a.message);
 }
 
-fn unarchived(n: u64) -> Session {
+fn stale_history_row(n: u64) -> Session {
     let mut row = row(n, CodexStatus::NotLoaded);
     row.codex.as_mut().unwrap().updated_at = 99;
     row
@@ -1373,12 +1413,12 @@ fn codex_names(a: &App) -> Vec<String> {
 }
 
 #[test]
-fn codex_archive_fails_closed_without_a_readable_pane_inventory() {
+fn codex_delete_fails_closed_without_a_readable_pane_inventory() {
     type Break = fn(&mut App);
     let cases: [(Break, &str); 3] = [
-        (|a| a.degraded = true, "not inside tmux — archive unavailable"),
-        (|a| a.panes_fresh = false, "pane map unavailable — not archived"),
-        (|a| a.tabs_fresh = false, "pane map unavailable — not archived"),
+        (|a| a.degraded = true, "not inside tmux — delete unavailable"),
+        (|a| a.panes_fresh = false, "pane map unavailable — not deleted"),
+        (|a| a.tabs_fresh = false, "pane map unavailable — not deleted"),
     ];
     for (broken, refusal) in cases {
         // First press.
@@ -1399,7 +1439,7 @@ fn codex_archive_fails_closed_without_a_readable_pane_inventory() {
         ctrl_x(&mut a);
         assert_eq!(a.message.as_ref().unwrap().0, refusal);
         assert!(a.pending_delete.is_none());
-        assert!(!calls().contains(&"archive"), "{refusal}");
+        assert!(!calls().contains(&"delete"), "{refusal}");
     }
 
     // Settle: outside tmux the refresh reads nothing at all.
@@ -1410,12 +1450,12 @@ fn codex_archive_fails_closed_without_a_readable_pane_inventory() {
     ctrl_x(&mut a);
     a.degraded = true;
     settle_ctrl_x(&mut a);
-    assert_eq!(a.message.as_ref().unwrap().0, "not inside tmux — archive unavailable");
-    assert!(!calls().contains(&"archive"));
+    assert_eq!(a.message.as_ref().unwrap().0, "not inside tmux — delete unavailable");
+    assert!(!calls().contains(&"delete"));
 }
 
 #[test]
-fn a_failed_settle_inventory_refresh_refuses_the_archive() {
+fn a_failed_settle_inventory_refresh_refuses_the_delete() {
     type Answer = fn(&str) -> Result<String, crate::tmux::TmuxError>;
     let failures: [Answer; 2] = [
         |_| Err(crate::tmux::TmuxError::NotFound("list-panes failed".into())),
@@ -1432,14 +1472,14 @@ fn a_failed_settle_inventory_refresh_refuses_the_archive() {
         assert!(a.pending_delete.is_some());
         a.pending_delete.as_mut().unwrap().at -= CX_SETTLE;
         assert!(with_inventory(answer, || a.tick_stop_arm()));
-        assert_eq!(a.message.as_ref().unwrap().0, "pane map unavailable — not archived");
-        assert!(!calls().contains(&"archive"));
+        assert_eq!(a.message.as_ref().unwrap().0, "pane map unavailable — not deleted");
+        assert!(!calls().contains(&"delete"));
         assert_eq!(a.sessions.len(), 1);
     }
 }
 
 #[test]
-fn the_archive_seam_receives_the_runtime_of_the_row_rechecked_at_settle() {
+fn the_delete_seam_receives_the_runtime_of_the_row_rechecked_at_settle() {
     for (armed, settled) in [
         (CodexStatus::NotLoaded, CodexStatus::NotLoaded),
         (CodexStatus::Idle, CodexStatus::Idle),
@@ -1454,7 +1494,7 @@ fn the_archive_seam_receives_the_runtime_of_the_row_rechecked_at_settle() {
         ctrl_x(&mut a);
         show(&mut a, vec![row(1, settled.clone())]);
         settle_ctrl_x(&mut a);
-        assert_eq!(SCRIPT.with(|s| s.borrow().archive_expected.clone()), vec![settled]);
+        assert_eq!(SCRIPT.with(|s| s.borrow().delete_expected.clone()), vec![settled]);
     }
 }
 
@@ -1468,20 +1508,20 @@ fn the_settle_rechecks_the_row_before_the_rpc() {
     assert!(a.pending_delete.is_some());
     show(&mut a, vec![row(1, CodexStatus::Active { flags: vec![] })]);
     settle_ctrl_x(&mut a);
-    assert_eq!(a.message.as_ref().unwrap().0, "running — not archived");
-    assert!(!calls().contains(&"archive"));
+    assert_eq!(a.message.as_ref().unwrap().0, "running — not deleted");
+    assert!(!calls().contains(&"delete"));
     assert_eq!(a.sessions.len(), 1);
 }
 
 #[test]
-fn a_press_buffered_during_a_slow_archive_reads_as_a_burst() {
+fn a_press_buffered_during_a_slow_delete_reads_as_a_burst() {
     let mut a = beside_working_claude(row(1, CodexStatus::Idle));
-    SCRIPT.with(|s| s.borrow_mut().archive_delay = Duration::from_millis(900));
+    SCRIPT.with(|s| s.borrow_mut().delete_delay = Duration::from_millis(900));
     ctrl_x(&mut a);
     age_ctrl_x(&mut a);
     ctrl_x(&mut a);
     settle_ctrl_x(&mut a);
-    assert_eq!(a.message.as_ref().unwrap().0, "archived task 1");
+    assert_eq!(a.message.as_ref().unwrap().0, "deleted task 1");
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
     // The press the operator made at the frozen screen.
     ctrl_x(&mut a);
@@ -1490,39 +1530,39 @@ fn a_press_buffered_during_a_slow_archive_reads_as_a_burst() {
 }
 
 #[test]
-fn an_unarchive_after_an_incomplete_forced_poll_is_rediscovered() {
+fn a_deleted_thread_stays_hidden_even_if_stale_history_has_a_new_timestamp() {
     let mut a = configured();
     show(&mut a, vec![row(1, CodexStatus::Idle)]);
-    archive_selected(&mut a);
+    delete_selected(&mut a);
     poll(&mut a, vec![], false);
-    poll_history(&mut a, vec![unarchived(1)], true);
-    assert_eq!(codex_names(&a), ["task 1"]);
-    poll_history(&mut a, vec![unarchived(1)], true);
-    assert_eq!(codex_names(&a), ["task 1"]);
+    poll_history(&mut a, vec![stale_history_row(1)], true);
+    assert!(codex_names(&a).is_empty());
+    poll_history(&mut a, vec![stale_history_row(1)], true);
+    assert!(codex_names(&a).is_empty());
 }
 
 #[test]
-fn a_persistently_incomplete_fleet_still_rediscovers_an_unarchived_thread() {
+fn a_persistently_incomplete_fleet_keeps_deleted_threads_hidden() {
     let mut a = configured();
     let other = row(2, CodexStatus::Idle);
     show(&mut a, vec![row(1, CodexStatus::Idle), other.clone()]);
-    archive_selected(&mut a);
+    delete_selected(&mut a);
     assert_eq!(codex_names(&a), ["task 2"]);
     for _ in 0..3 { poll_history(&mut a, vec![other.clone()], false); }
-    poll_history(&mut a, vec![other.clone(), unarchived(1)], false);
-    assert_eq!(codex_names(&a), ["task 1", "task 2"]);
-    for _ in 0..2 { poll_history(&mut a, vec![other.clone(), unarchived(1)], false); }
-    assert_eq!(codex_names(&a), ["task 1", "task 2"]);
+    poll_history(&mut a, vec![other.clone(), stale_history_row(1)], false);
+    assert_eq!(codex_names(&a), ["task 2"]);
+    for _ in 0..2 { poll_history(&mut a, vec![other.clone(), stale_history_row(1)], false); }
+    assert_eq!(codex_names(&a), ["task 2"]);
 }
 
 #[test]
-fn a_lagging_copy_of_an_archived_thread_stays_hidden() {
+fn a_lagging_copy_of_a_deleted_thread_stays_hidden() {
     let mut a = configured();
     let target = row(1, CodexStatus::Idle);
     show(&mut a, vec![target.clone()]);
-    archive_selected(&mut a);
+    delete_selected(&mut a);
     // The loaded-list/read path, and even a history row, still carrying the
-    // archived `updatedAt`.
+    // deleted `updatedAt`.
     poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
     poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
     poll_history(&mut a, vec![target.clone()], true);
@@ -1538,28 +1578,28 @@ fn a_lagging_copy_of_an_archived_thread_stays_hidden() {
 }
 
 #[test]
-fn only_a_confirmed_archive_hides_a_thread() {
+fn only_a_confirmed_delete_hides_a_thread() {
     for outcome in [
-        Ok(codex::ArchiveOutcome::StateChanged),
+        Ok(codex::DeleteOutcome::StateChanged),
         Err(error(CodexFailureKind::Timeout)),
         Err(error(CodexFailureKind::Protocol)),
     ] {
         let mut a = configured();
         show(&mut a, vec![row(1, CodexStatus::Idle)]);
-        SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(outcome.clone()));
+        SCRIPT.with(|s| s.borrow_mut().delete_results.push_back(outcome.clone()));
         ctrl_x(&mut a);
         age_ctrl_x(&mut a);
         ctrl_x(&mut a);
         settle_ctrl_x(&mut a);
-        assert_eq!(SCRIPT.with(|s| s.borrow().archive_ids.len()), 1);
+        assert_eq!(SCRIPT.with(|s| s.borrow().delete_ids.len()), 1);
         for _ in 0..2 {
             poll(&mut a, vec![row(1, CodexStatus::Active { flags: vec![] })], true);
-            assert_eq!(codex_names(&a), ["task 1"], "{outcome:?} hid a thread that was not archived");
+            assert_eq!(codex_names(&a), ["task 1"], "{outcome:?} hid a thread that was not deleted");
         }
     }
 }
 
-// ── Every Codex window ending that archived nothing protects the neighbour ──
+// ── Every Codex window ending that deleted nothing protects the neighbour ──
 //
 // A second review of the fixes found the same class again: the window could
 // also end through a refused second press, a settle-time StateChanged or
@@ -1585,21 +1625,21 @@ fn a_refused_second_press_protects_the_rest_of_the_codex_window() {
     a.rebuild_rows();
     assert!(a.stop_arm.is_some(), "a row that stays visible does not disarm");
     press_inside_the_window(&mut a, armed_at, 800);
-    assert_eq!(message(&a), "running — not archived");
+    assert_eq!(message(&a), "running — not deleted");
     assert!(a.stop_arm.is_none() && a.pending_delete.is_none());
     vanish(&mut a);
     assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
     press_inside_the_window(&mut a, armed_at, 1600);
     assert!(agents::test_spawn::joined().is_empty(), "stopped {:?}", agents::test_spawn::joined());
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
 }
 
 #[test]
-fn a_settle_that_archives_nothing_protects_the_rest_of_the_codex_window() {
+fn a_settle_that_deletes_nothing_protects_the_rest_of_the_codex_window() {
     for outcome in ["state-changed", "timeout", "protocol"] {
         let mut a = beside_working_claude(row(1, CodexStatus::Idle));
-        SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(match outcome {
-            "state-changed" => Ok(codex::ArchiveOutcome::StateChanged),
+        SCRIPT.with(|s| s.borrow_mut().delete_results.push_back(match outcome {
+            "state-changed" => Ok(codex::DeleteOutcome::StateChanged),
             "timeout" => Err(error(CodexFailureKind::Timeout)),
             _ => Err(error(CodexFailureKind::Protocol)),
         }));
@@ -1610,7 +1650,7 @@ fn a_settle_that_archives_nothing_protects_the_rest_of_the_codex_window() {
         // From the press as it landed: a loaded runner can wake it late.
         sleep_until(a.pending_delete.as_ref().unwrap().at + CX_SETTLE + Duration::from_millis(5));
         assert!(with_inventory(|_| Ok(String::new()), || a.tick_stop_arm()));
-        assert!(message(&a).contains("not archived") || message(&a).starts_with("archive failed: "),
+        assert!(message(&a).contains("not deleted") || message(&a).starts_with("delete failed: "),
             "{outcome}: {}", message(&a));
         vanish(&mut a);
         assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
@@ -1626,12 +1666,12 @@ fn a_state_change_then_a_hidden_unload_stops_nothing() {
     let mut a = beside_working_claude(row(1, CodexStatus::Idle));
     key(&mut a, KeyCode::Char('a'));
     assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
-    SCRIPT.with(|s| s.borrow_mut().archive_results.push_back(Ok(codex::ArchiveOutcome::StateChanged)));
+    SCRIPT.with(|s| s.borrow_mut().delete_results.push_back(Ok(codex::DeleteOutcome::StateChanged)));
     ctrl_x(&mut a);
     let armed_at = a.stop_arm.as_ref().unwrap().at;
     press_inside_the_window(&mut a, armed_at, 800);
     settle_ctrl_x(&mut a);
-    assert_eq!(message(&a), "state changed — not archived");
+    assert_eq!(message(&a), "state changed — not deleted");
     // The thread unloaded; `a` hides it and the cursor falls to Claude.
     poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
     a.rebuild_rows();
@@ -1642,10 +1682,10 @@ fn a_state_change_then_a_hidden_unload_stops_nothing() {
 
 #[test]
 fn a_double_tapped_codex_refusal_never_invites_another_press() {
-    let mut a = beside_working_claude(row(1, CodexStatus::Active { flags: vec![] }));
+    let mut a = beside_working_claude(row(1, CodexStatus::SystemError));
     ctrl_x(&mut a);
     let t0 = Instant::now();
-    assert_eq!(message(&a), "running — not archived");
+    assert_eq!(message(&a), "state unknown — not deleted");
     sleep_until(t0 + Duration::from_millis(200));
     ctrl_x(&mut a);
     assert_eq!(message(&a), CODEX_CLOSED);
@@ -1673,12 +1713,12 @@ fn the_closed_wording_lasts_as_long_as_the_guard_a_refused_press_set() {
 }
 
 #[test]
-fn a_slow_failed_archive_keeps_a_buffered_press_uninvited() {
+fn a_slow_failed_delete_keeps_a_buffered_press_uninvited() {
     let mut a = beside_working_claude(row(1, CodexStatus::Idle));
     SCRIPT.with(|s| {
         let mut s = s.borrow_mut();
-        s.archive_results.push_back(Err(error(CodexFailureKind::Timeout)));
-        s.archive_delay = Duration::from_millis(1000);
+        s.delete_results.push_back(Err(error(CodexFailureKind::Timeout)));
+        s.delete_delay = Duration::from_millis(1000);
     });
     ctrl_x(&mut a);
     let armed_at = a.stop_arm.as_ref().unwrap().at;
@@ -1702,10 +1742,10 @@ fn a_tap_buffered_behind_a_blocking_tick_is_not_a_second_press() {
     std::thread::sleep(Duration::from_millis(900));
     a.note_blocking_tick(Instant::now());
     ctrl_x(&mut a);
-    assert!(a.pending_delete.is_none(), "a double tap scheduled the archive");
+    assert!(a.pending_delete.is_none(), "a double tap scheduled the delete");
     sleep_until(armed_at + Duration::from_millis(900) + CX_SETTLE + Duration::from_millis(5));
     with_inventory(|_| Ok(String::new()), || a.tick_stop_arm());
-    assert!(!calls().contains(&"archive"));
+    assert!(!calls().contains(&"delete"));
     assert_eq!(message(&a), CODEX_CLOSED);
 }
 
@@ -1721,7 +1761,7 @@ fn a_blocking_tick_without_a_codex_window_stamps_nothing() {
 fn a_lagging_loaded_read_with_a_new_updated_at_is_not_a_rediscovery() {
     let mut a = configured();
     show(&mut a, vec![row(1, CodexStatus::Idle)]);
-    archive_selected(&mut a);
+    delete_selected(&mut a);
     let mut lagging = row(1, CodexStatus::NotLoaded);
     lagging.codex.as_mut().unwrap().updated_at = 99;
     // Plain `poll`: the row is not in the archived:false history.
@@ -1734,9 +1774,9 @@ fn a_lagging_loaded_read_with_a_new_updated_at_is_not_a_rediscovery() {
 }
 
 #[test]
-fn an_archived_polled_row_stays_gone_after_an_incomplete_poll() {
+fn a_deleted_polled_row_stays_gone_after_an_incomplete_poll() {
     let mut a = beside_working_claude(row(1, CodexStatus::Idle));
-    archive_selected(&mut a);
+    delete_selected(&mut a);
     assert!(codex_names(&a).is_empty());
     poll(&mut a, vec![], false);
     assert!(codex_names(&a).is_empty(), "the cached row came back after an incomplete poll");
