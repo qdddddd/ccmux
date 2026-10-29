@@ -995,6 +995,10 @@ impl App {
                 self.note_drift(&payload.sessions);
                 let codex_rows: Vec<_> = self.sessions.iter()
                     .filter(|s| s.provider == Provider::Codex).cloned().collect();
+                let before: BTreeMap<String, String> = self.sessions.iter()
+                    .filter(|s| s.provider == Provider::Claude)
+                    .filter_map(|s| Some((s.id.clone()?, s.session_id.clone())))
+                    .collect();
                 self.sessions = payload
                     .sessions
                     .into_iter()
@@ -1005,7 +1009,11 @@ impl App {
                 self.poll_error = None;
                 self.fail_streak = 0;
                 self.note_idle();
+                self.carry_renames(&before);
                 self.reconcile_hidden(Provider::Claude, complete);
+                if self.relink_maps() {
+                    self.rebuild_open();
+                }
             }
             Err(e) => {
                 self.note_claude_failure(&e);
@@ -4040,6 +4048,7 @@ impl App {
         self.resolve_identity();
         self.adopt_own_state();
         self.migrate_legacy();
+        self.relink_maps();
         // MY window's map only — the thing I write. Entries for panes in other
         // tabs are read from their own windows' copies, never reconciled here.
         if self.map.reconcile(&self.panes) {
@@ -4131,6 +4140,61 @@ impl App {
     /// `WindowId::num()` of my tab — the origin stamp on every op I mint.
     fn own_org(&self) -> u64 {
         self.own_window.as_ref().map(WindowId::num).unwrap_or(0)
+    }
+
+    /// After `/clear` in an attached pane, re-key every pane map's entry for
+    /// that agent to its new session id (`PaneMap::relink`). My own map is
+    /// written back; other tabs' copies are re-read every tick, so relinking
+    /// them in memory keeps `open` right until their own sidebar writes theirs.
+    /// True when any map changed, so `open` needs rebuilding.
+    fn relink_maps(&mut self) -> bool {
+        let mut current: BTreeMap<String, String> = BTreeMap::new();
+        let mut ambiguous: BTreeSet<String> = BTreeSet::new();
+        for s in self.sessions.iter().filter(|s| s.provider == Provider::Claude) {
+            let Some(short) = s.id.clone() else { continue };
+            if current.insert(short.clone(), s.session_id.clone()).is_some_and(|old| old != s.session_id) {
+                ambiguous.insert(short);
+            }
+        }
+        current.retain(|short, _| !ambiguous.contains(short));
+        let mut any = false;
+        for tab in &mut self.tabs {
+            any |= tab.map.relink(&current);
+        }
+        if self.map.relink(&current) {
+            self.map_dirty = true;
+            any = true;
+        }
+        any
+    }
+
+    /// The rest of what `/clear` re-keys: an agent listed under the same short
+    /// id with a new session id keeps the cursor and its dismissal. `before`
+    /// is the previous poll's Claude short id -> session id.
+    fn carry_renames(&mut self, before: &BTreeMap<String, String>) {
+        let renames: Vec<(String, String)> = self
+            .sessions
+            .iter()
+            .filter(|s| s.provider == Provider::Claude)
+            .filter_map(|s| {
+                let old = before.get(s.id.as_deref()?)?;
+                (*old != s.session_id && !self.sessions.iter().any(|t| &t.session_id == old))
+                    .then(|| (old.clone(), s.session_id.clone()))
+            })
+            .collect();
+        for (old, new) in renames {
+            if self.selected_key.as_deref() == Some(old.as_str()) {
+                self.selected_key = Some(new.clone());
+            }
+            if self.hidden.provider_of(&old) == Some(Provider::Claude)
+                && self.hidden.dismiss_for(Provider::Claude, &new)
+            {
+                let (seq, org) = (self.next_seq(), self.own_org());
+                self.hidden_log.push(HiddenOp { provider: Provider::Claude, id: new.clone(), add: true, seq, org });
+                self.hidden_absent.remove(&new);
+                self.hidden_dirty = true;
+            }
+        }
     }
 
     /// Read my window's stored map and dismissal fragment — ONCE.
@@ -7590,6 +7654,72 @@ mod tests {
         assert_eq!(a.pane_of(Provider::Claude, "1c45d64f-uuid"), Some(bg_pane));
         assert_eq!(a.pane_of(Provider::Claude, "nobody"), None);
         assert!(!a.is_open(Provider::Claude, "nobody"));
+    }
+
+    /// `/clear` in an attached pane: the next poll lists the agent under the
+    /// same short id with a new session id, and the pane stays the row's.
+    #[test]
+    fn a_poll_after_clear_relinks_the_pane_to_the_new_session_id() {
+        let mut a = app();
+        let pane = PaneId::parse("%20").expect("valid pane id");
+        a.map.insert(
+            &pane,
+            PaneEntry {
+                provider: Provider::Claude,
+                session_id: "65e02820-uuid".into(),
+                short_id: "65e02820".into(),
+                name: "uc-prod".into(),
+                opened_at: 0,
+            },
+        );
+        let mut cleared = bg("65e02820", "uc-prod", State::Working);
+        cleared.session_id = "6b7cfbaf-uuid".into();
+        a.apply_poll(Ok(model::Payload { sessions: vec![cleared], ..Default::default() }));
+        assert_eq!(a.pane_of(Provider::Claude, "6b7cfbaf-uuid"), Some(pane));
+        assert!(a.map_dirty, "the relinked map is written back");
+    }
+
+    /// The cursor and a dismissal follow the agent through `/clear`, and a
+    /// pane found only in another tab's map is reported open the same poll.
+    #[test]
+    fn clear_keeps_the_cursor_the_dismissal_and_other_tabs_panes() {
+        let mut a = app();
+        let rows = |cleared: &str, state: State| {
+            let mut c = bg("65e02820", "uc-prod", state);
+            c.session_id = cleared.into();
+            vec![bg("aaaaaaaa", "one", State::Working), c, bg("cccccccc", "three", State::Working)]
+        };
+        a.apply_poll(Ok(model::Payload { sessions: rows("65e02820-uuid", State::Working), ..Default::default() }));
+        a.rebuild_rows();
+        a.selected_key = Some("65e02820-uuid".into());
+        a.reanchor_selection();
+        a.hidden.dismiss_for(Provider::Claude, "cccccccc-uuid");
+
+        let moved = PaneId::parse("%31").expect("valid pane id");
+        let mut other = tab("@9", 2, Some("%30"));
+        other.map.insert(
+            &moved,
+            PaneEntry {
+                provider: Provider::Claude,
+                session_id: "65e02820-uuid".into(),
+                short_id: "65e02820".into(),
+                name: "uc-prod".into(),
+                opened_at: 0,
+            },
+        );
+        a.tabs.push(other);
+
+        // `/clear`: new session id, and a group change that moves the row.
+        let mut after = rows("6b7cfbaf-uuid", State::Blocked);
+        after[2].session_id = "c1eaed00-uuid".into();
+        a.apply_poll(Ok(model::Payload { sessions: after, ..Default::default() }));
+        a.rebuild_rows();
+        assert_eq!(a.selected_key.as_deref(), Some("6b7cfbaf-uuid"), "the cursor stays on the agent");
+        assert_eq!(a.selected_session().map(|s| s.name.as_str()), Some("uc-prod"));
+        assert_eq!(a.hidden.provider_of("c1eaed00-uuid"), Some(Provider::Claude), "the dismissal follows the agent");
+        assert!(!a.is_visible("c1eaed00-uuid"));
+        assert_eq!(a.pane_of(Provider::Claude, "6b7cfbaf-uuid"), Some(moved));
+        assert!(!a.map_dirty, "another tab's map is never written from here");
     }
 
     /// `@ccmux_jump_from` names a pane of this window; the cursor lands on the

@@ -1741,6 +1741,14 @@ at exactly two tmux calls (`list-panes`, `resize-pane`).
       //   screen, both are panes ccmux opened, and the operator must still be
       //   able to close them with `x`.
 3. app.map_dirty |= changed
+      // also, before step 2 and after every successful Claude poll:
+      // `relink_maps` re-keys any Claude entry whose short id the poll now
+      // lists under a different session_id. `/clear` in an attached pane keeps
+      // the short id that pane's `claude attach <short_id>` runs but starts a
+      // new UUID; without this the row loses its pane. Other tabs' copies are
+      // relinked in memory only; each sidebar writes back its own map. The
+      // poll also carries the old -> new id (same short id, previous poll vs
+      // this one) to `selected_key` and to a dismissal (`carry_renames`).
 4. app.panes = live
 5. if app.sidebar_pane is absent from `live`:
       app.sidebar_pane = tmux::get_user_option(session, "@ccmux_sidebar")

@@ -1978,6 +1978,35 @@ impl PaneMap {
         out
     }
 
+    /// Re-point Claude entries at the session their short id now names.
+    /// `current` maps a listed Claude short id to its `session_id`.
+    ///
+    /// `/clear` inside an attached pane keeps the agent's short id — the one
+    /// the pane's `claude attach <short_id>` runs — but starts a new session
+    /// UUID, so the entry still describes the pane and only its key is stale.
+    /// Entries without a short id, or whose new id would be a provider
+    /// conflict, are left alone. Returns true when anything changed.
+    pub fn relink(&mut self, current: &BTreeMap<String, String>) -> bool {
+        let mut changed = false;
+        let keys: Vec<String> = self.panes.keys().cloned().collect();
+        for key in keys {
+            let Some(entry) = self.panes.get(&key) else { continue };
+            if entry.provider != Provider::Claude || entry.short_id.is_empty() {
+                continue;
+            }
+            let Some(now) = current.get(&entry.short_id) else { continue };
+            if *now == entry.session_id || self.provider_conflict(Provider::Claude, now) {
+                continue;
+            }
+            let now = now.clone();
+            if let Some(entry) = self.panes.get_mut(&key) {
+                entry.session_id = now;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Drop entries whose pane id is not in `live`. Entries whose *Claude
     /// session* has vanished are KEPT as long as the pane exists — the pane is
     /// still on screen showing its exit notice and must remain closable.
@@ -3177,6 +3206,33 @@ mod tests {
         assert_eq!(m.pane_for_session(Provider::Claude, "uuid-b"), PaneId::parse("%3"));
         assert_eq!(m.pane_for_session(Provider::Claude, "uuid-missing"), None);
         assert!(m.panes_for_session(Provider::Claude, "uuid-missing").is_empty());
+    }
+
+    /// `/clear` keeps the short id and replaces the session UUID.
+    #[test]
+    fn relink_rekeys_a_claude_entry_by_its_short_id() {
+        let mut m = PaneMap::new();
+        let cleared = PaneId::parse("%20").expect("id");
+        m.insert(&cleared, entry("65e02820-old"));
+        m.insert(&PaneId::parse("%21").expect("id"), entry("aaaaaaaa-same"));
+        let mut no_short = entry("bbbbbbbb-old");
+        no_short.short_id.clear();
+        m.insert(&PaneId::parse("%22").expect("id"), no_short);
+
+        let current: BTreeMap<String, String> = [
+            ("65e02820", "6b7cfbaf-new"),
+            ("aaaaaaaa", "aaaaaaaa-same"),
+            ("bbbbbbbb", "bbbbbbbb-new"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert!(m.relink(&current));
+        assert_eq!(m.pane_for_session(Provider::Claude, "6b7cfbaf-new").as_ref(), Some(&cleared));
+        assert_eq!(m.get(&cleared).map(|e| e.short_id.as_str()), Some("65e02820"));
+        assert_eq!(m.pane_for_session(Provider::Claude, "aaaaaaaa-same"), PaneId::parse("%21"));
+        assert_eq!(m.pane_for_session(Provider::Claude, "bbbbbbbb-old"), PaneId::parse("%22"), "no short id, no relink");
+        assert!(!m.relink(&current), "idempotent");
     }
 
     #[test]
