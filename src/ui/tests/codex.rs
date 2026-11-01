@@ -255,12 +255,7 @@ fn codex_group_counts_only_visible_rows_and_preserves_state_contrast() {
             };
             assert_eq!(name_tier(s, &p), want);
         }
-        app.on_key(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char('a'),
-            crossterm::event::KeyModifiers::NONE));
-        assert_eq!(app.rows[0], Row::Header { group: Group::Codex, count: 7 });
-        let drawn = rows_at(&app, 34, 24);
-        assert_eq!(drawn[1].trim(), "── Codex                       7");
-        assert!(!drawn.join("\n").contains('◇'));
+        assert!(drawn.join("\n").contains('◇'));
         assert!(drawn.join("\n").contains('▲'));
     }
 }

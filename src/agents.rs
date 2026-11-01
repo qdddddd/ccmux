@@ -266,8 +266,7 @@ fn check_status(out: &std::process::Output) -> Result<(), AgentsError> {
 
 /// `claude agents --json --all`.
 /// ALWAYS passes `--all`: without it completed sessions are omitted and the
-/// Completed group can never populate. Hiding completed rows is a UI concern
-/// (the `a` key), not a fetch concern.
+/// Completed group can never populate.
 /// Measured cost 0.21s (PROBE-FINDINGS §1).
 ///
 /// §9.3: an exit-0 `[]` is a **valid empty result**, not an error — it returns

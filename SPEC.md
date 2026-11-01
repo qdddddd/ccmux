@@ -2229,7 +2229,12 @@ Vim-native. `KeyEventKind::Press` only. Unbound keys return `Action::None`.
 ### 8.1 Normal mode
 
 **AMENDED BY §§12.6, 12.8:** Tab/Shift-Tab include the fifth Codex group,
-skipping empty groups; `a` hides Completed and Codex Unloaded rows.
+skipping empty groups.
+
+**AMENDMENT — `a` removed.** The Completed-group toggle is gone: the
+Completed group and Codex Unloaded rows are always listed, `build_rows`
+takes no visibility flag, and `a` is unbound in Normal mode. Only `/` and
+`d` hide rows. Earlier passages that describe `a` are history.
 
 | Key | Action | Destructive? |
 |---|---|---|
@@ -2252,7 +2257,6 @@ skipping empty groups; `a` hides Completed and Codex Unloaded rows.
 | `n` | dispatch a new background session with a typed task; the cursor follows it onto its row once it is listed, but it is not opened | no |
 | `L` | show `claude logs` for this session (ANSI-stripped) | no |
 | `/` | enter filter mode | no |
-| `a` | toggle visibility of the Completed group | no |
 | `r` | force refresh **and** re-assert the layout (§1.3, §1.4) | no |
 | `R` | **restart ccmux in place** — this sidebar, every other tab's sidebar, every ccmux-opened Claude pane, and every agent with a **live worker** that is neither working, blocked nor already stopped, whether or not it has a pane, keeping every window, pane and layout (§8.11) | no |
 | `?` | help overlay | no |
@@ -4072,6 +4076,16 @@ Add these global CLI options, accepted by the launcher and `sidebar`:
 | no new binary flag | `CCMUX_CODEX_BIN` | `codex`; one executable, not shell text |
 | no new flag | `CCMUX_CODEX_IMPORTS` | `hide`; exactly `show` lists Claude-transcript imports |
 
+**Unprompted threads are hidden.** `codex --remote` without `resume` starts
+a thread on startup, and the server keeps it loaded after that client quits,
+with no name, no preview and no history row: a row with nothing to open. A
+loaded thread read through `thread/read` that is idle with a blank `name` and
+`preview`, and whose `updatedAt` is inside the history window, is skipped.
+The state DB holds a thread once it has a user message, so history would
+have returned a prompted one; a history row, or a read row older than the
+window, is never skipped. A skip is not a cached exclusion: the thread is
+read again every poll, and a name, a preview or a non-idle status lists it.
+
 **Claude-transcript imports are hidden by default.** Codex Desktop imports
 Claude Code conversations as threads. They record no `model` and no
 `reasoningEffort` — every thread a Codex client works in records both — and
@@ -4713,14 +4727,12 @@ rank inside Codex with a purple `?`. The name and cwd occupy the existing
 other two detail lines. Preserve full unknown status/flag values in the
 provider-labelled drift warning.
 
-`a` keeps the finished-work visibility toggle: when `show_completed` is
-false, omit the entire Claude Completed group AND only the Unloaded rows
-inside Codex. Leave all other Codex rows visible, including idle/error rows.
-Apply this before header counts and navigation; a now-empty Codex group has
-no header or spacer. This filter does not assert the unloaded turn's outcome.
+Unloaded rows are always listed (§8.1 amendment: `a` removed); `◇` does not
+assert the unloaded turn's outcome. A Codex group emptied by `/` or `d` has
+no header or spacer.
 
 Show Codex-specific help additions only when Codex is enabled. Explain the
-last Codex group with blocked rows first, `a` also toggling `◇` rows,
+last Codex group with blocked rows first,
 unloaded as “not loaded in this server; Enter resumes; last-turn outcome
 unknown”, and the launch-target map limitation (§12.7).
 Say “n creates a Claude session; create Codex threads in the Codex TUI”.
@@ -4958,12 +4970,11 @@ and every Claude call. `n` and `R` remain global verbs.
 | `R` | global ccmux/Claude restart under the rules below; never a Codex restart |
 | navigation, `/`, `?`, `q/Esc` | existing behavior, including Codex rows and provider-specific help |
 | `Tab` / `Shift-Tab` | cycle non-empty groups in Blocked, Working, Idle, Completed, Codex order, forward/reverse, wrapping |
-| `a` | toggle Completed and Codex Unloaded visibility (§12.6); other Codex rows stay |
 | `c`, `S`, other unbound keys | remain unbound; no new aliases |
 
 Navigation walks the visible header/row list, never a fixed four-element
 array. Tab lands on the first visible Codex row (blocked first if present).
-Filter/dismiss/`a` can empty that group; both directions skip it as they
+Filter/dismiss can empty that group; both directions skip it as they
 already skip any other empty group. Claude-only navigation is unchanged.
 
 `n` always creates a Claude session, whatever the selection. With a Codex
@@ -5378,9 +5389,8 @@ have these tests; existing Claude tests remain authoritative except for
   Within Codex, assert blocked-first and Unloaded-last even with opposing
   ages, then newest-first and full-ID ascending ties in every rank; input
   order must not affect the result. Test Tab/Shift-Tab through five groups,
-  wrapping and skipping groups emptied by filters, dismissals, or `a`.
-  `a` removes Completed and Codex Unloaded only, with visible-row header
-  counts; toggling restores them. An empty Codex group adds no header/spacer.
+  wrapping and skipping groups emptied by filters or dismissals. Header
+  counts are visible rows. An empty Codex group adds no header/spacer.
   Keep a pre-change Claude-only list snapshot byte-identical, with Codex
   either OFF or enabled with no eligible rows.
 - **Source branches:** exercise all five eligible strings and current

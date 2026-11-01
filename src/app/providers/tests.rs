@@ -862,9 +862,7 @@ fn codex_navigation_filter_completed_dismiss_undo_and_new_are_local() {
         assert!(a.selected_session().is_some());
     }
     a.filter.clear();
-    key(&mut a, KeyCode::Char('a'));
-    assert!(a.selected_session().is_none());
-    key(&mut a, KeyCode::Char('a'));
+    a.rebuild_rows();
     key(&mut a, KeyCode::Char('d'));
     assert_eq!(a.hidden.provider_of(&r.session_id), Some(Provider::Codex));
     key(&mut a, KeyCode::Char('u'));
@@ -1206,7 +1204,7 @@ fn runtime_delivery_settles_before_a_pending_drift_warning_takes_the_slot() {
 }
 
 #[test]
-fn tab_and_backtab_cycle_five_groups_and_skip_hidden_empty_groups() {
+fn tab_and_backtab_cycle_five_groups_and_skip_empty_ones() {
     let mut a = configured();
     a.sessions = [Some(State::Blocked), Some(State::Working), None, Some(State::Done)]
         .into_iter().enumerate().map(|(i, state)| Session {
@@ -1228,32 +1226,24 @@ fn tab_and_backtab_cycle_five_groups_and_skip_hidden_empty_groups() {
         key(&mut a, KeyCode::BackTab);
         assert_eq!(a.selected_session().unwrap().session_id, target);
     }
-    key(&mut a, KeyCode::Char('a'));
-    for target in ["claude-1", "claude-2", &blocked.session_id, "claude-0"] {
+    // A group dismissals empty is skipped.
+    a.hidden.dismiss_for(Provider::Codex, &blocked.session_id);
+    a.hidden.dismiss_for(Provider::Codex, &unloaded.session_id);
+    a.rebuild_rows();
+    a.select_first();
+    for target in ["claude-1", "claude-2", "claude-3", "claude-0"] {
         key(&mut a, KeyCode::Tab);
         assert_eq!(a.selected_session().unwrap().session_id, target);
     }
-    key(&mut a, KeyCode::BackTab);
-    assert_eq!(a.selected_session().unwrap().session_id, blocked.session_id);
-    assert!(a.rows.iter().any(|r| matches!(r, model::Row::Header { group: model::Group::Codex, count: 1 })));
-    key(&mut a, KeyCode::Char('d')); // Only an unloaded Codex row remains, hidden by a.
-    assert!(!a.rows.iter().any(|r| matches!(r, model::Row::Header { group: model::Group::Codex, .. })));
-    a.select_first();
-    key(&mut a, KeyCode::BackTab);
-    assert_eq!(a.selected_session().unwrap().session_id, "claude-2");
-    key(&mut a, KeyCode::Char('u'));
-    a.select_first();
-    key(&mut a, KeyCode::BackTab);
-    assert_eq!(a.selected_session().unwrap().session_id, blocked.session_id);
-    key(&mut a, KeyCode::Char('a'));
-    assert!(a.rows.iter().any(|r| matches!(r, model::Row::Header { group: model::Group::Codex, count: 2 })));
+    a.hidden = Default::default();
     a.filter = unloaded.session_id;
     a.rebuild_rows();
     for code in [KeyCode::Tab, KeyCode::BackTab] {
         key(&mut a, code);
         assert_eq!(a.selected_session().unwrap().state, Some(State::Unloaded));
     }
-    key(&mut a, KeyCode::Char('a'));
+    a.filter = "no-such-row".into();
+    a.rebuild_rows();
     assert!(a.rows.is_empty());
     for code in [KeyCode::Tab, KeyCode::BackTab] { key(&mut a, code); }
     assert!(a.selected_session().is_none());
@@ -1662,9 +1652,8 @@ fn a_settle_that_deletes_nothing_protects_the_rest_of_the_codex_window() {
 }
 
 #[test]
-fn a_state_change_then_a_hidden_unload_stops_nothing() {
+fn a_state_change_then_an_unload_stops_nothing() {
     let mut a = beside_working_claude(row(1, CodexStatus::Idle));
-    key(&mut a, KeyCode::Char('a'));
     assert_eq!(a.selected_session().unwrap().provider, Provider::Codex);
     SCRIPT.with(|s| s.borrow_mut().delete_results.push_back(Ok(codex::DeleteOutcome::StateChanged)));
     ctrl_x(&mut a);
@@ -1672,10 +1661,10 @@ fn a_state_change_then_a_hidden_unload_stops_nothing() {
     press_inside_the_window(&mut a, armed_at, 800);
     settle_ctrl_x(&mut a);
     assert_eq!(message(&a), "state changed — not deleted");
-    // The thread unloaded; `a` hides it and the cursor falls to Claude.
+    // The thread unloaded; the row stays, now ◇.
     poll(&mut a, vec![row(1, CodexStatus::NotLoaded)], true);
     a.rebuild_rows();
-    assert_eq!(a.selected_session().unwrap().provider, Provider::Claude);
+    assert_eq!(a.selected_session().unwrap().state, Some(State::Unloaded));
     press_inside_the_window(&mut a, armed_at, 1700);
     assert!(agents::test_spawn::joined().is_empty(), "stopped {:?}", agents::test_spawn::joined());
 }

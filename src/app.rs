@@ -506,10 +506,9 @@ pub struct App {
 
     // view state
     pub filter: String,
-    pub show_completed: bool,
     /// Sessions dismissed with `d`, oldest first — the newest is what `u`
     /// restores. A VIEW filter only: it is passed to `model::build_rows`
-    /// alongside `filter` and `show_completed` and touches nothing else. The
+    /// alongside `filter` and touches nothing else. The
     /// agents keep running and `claude` is never told.
     pub hidden: HiddenSet,
     /// Set by `d`, `u` and reconciliation; flushed to `@ccmux_hidden` by the
@@ -784,7 +783,6 @@ impl App {
             help_lines: 0,
 
             filter: String::new(),
-            show_completed: true,
             hidden: HiddenSet::new(),
             hidden_dirty: false,
             hidden_absent: std::collections::BTreeSet::new(),
@@ -979,7 +977,7 @@ impl App {
                 // `model::parse_sessions` — the parser's job is to report what
                 // the CLI actually said, and its tests assert exactly that.
                 // Filtering here also keeps `Kind` out of `build_rows`, so the
-                // view filters (`/`, `a`, `d`) never have to know about it, and
+                // view filters (`/`, `d`) never have to know about it, and
                 // the header's `total` counts what ccmux actually manages.
                 //
                 // Deliberately NOT folded into `complete`: that flag means "the
@@ -1785,7 +1783,7 @@ impl App {
     ///
     /// Runs AFTER `rebuild_rows`, because both questions it asks are about the
     /// rebuilt list: is the session listed at all (`sessions`), and does it have
-    /// a ROW (`is_visible` — `/`, `a` and `d` all decide that).
+    /// a ROW (`is_visible` — `/` and `d` both decide that).
     ///
     /// Four ways out, and only two of them spend the intent: the cursor moves,
     /// or the operator is told why it cannot. "Not listed yet" costs a poll off
@@ -1825,7 +1823,7 @@ impl App {
                 self.reanchor_selection();
                 return;
             }
-            // `/` or `a` is hiding it. Clearing the operator's filter to chase
+            // `/` is hiding it. Clearing the operator's filter to chase
             // a row they did not ask to see would be a far bigger surprise than
             // a cursor that stayed put, so say so instead — the precedent `u`
             // set with `restored X — filtered out`.
@@ -2733,8 +2731,8 @@ impl App {
         // Moving off the row cancels the window rather than re-arming on the
         // new row. Re-arming would stop whatever is now selected, and the row
         // most likely to be selected is the neighbour the cursor fell to when
-        // the just-stopped session moved into Completed and `a` had that group
-        // hidden. Two deliberate presses would then stop an innocent agent.
+        // the just-stopped session moved into Completed and re-sorted. Two
+        // deliberate presses would then stop an innocent agent.
         // Cancelling costs one keypress and can stop nothing.
         let selected = self.selected_session().cloned();
         let same = selected.as_ref()
@@ -2744,13 +2742,13 @@ impl App {
             // Two different things bring us here and the operator can only act
             // on one of them. Either the cursor MOVED off a row that is still
             // on screen — `k`, or `Tab` — or the row itself LEFT the list while
-            // the cursor stood still: `a` hides Completed, or a `/` filter
-            // matches the worktree path that `claude stop` just reverted to the
-            // parent directory, and the forced refresh drops the row. Saying
-            // "moved off" for the second case blames the operator for something
-            // the list did, and hides the recovery, which is to clear the
-            // filter (or press `a`) and press `Ctrl+X` twice on the stopped
-            // row — a first press there arms without stopping anything.
+            // the cursor stood still: a `/` filter matches the worktree path
+            // that `claude stop` just reverted to the parent directory, and the
+            // forced refresh drops the row. Saying "moved off" for the second
+            // case blames the operator for something the list did, and hides
+            // the recovery, which is to clear the filter and press `Ctrl+X`
+            // twice on the stopped row — a first press there arms without
+            // stopping anything.
             let msg = if self.is_visible(&arm.session_id) {
                 format!("moved off {label} — nothing deleted")
             } else if arm.provider == Provider::Codex {
@@ -3087,7 +3085,7 @@ impl App {
     /// The cursor follows the restored session WHEN IT IS ON SCREEN, so the
     /// undo is visible even when polls re-sorted the list in between.
     ///
-    /// When `/` or `a` still hides the restored row there is nothing to follow,
+    /// When `/` still hides the restored row there is nothing to follow,
     /// and pointing `selected_key` at a key `reanchor_selection` cannot find
     /// would hand the cursor to `reanchor_selection`'s nearest-index fallback —
     /// i.e. park it on an unrelated session, and leave it there after the
@@ -3125,7 +3123,7 @@ impl App {
             // right (the next reconcile drops the id), but the name is no
             // longer ours to state, so name it by its id head instead.
             .unwrap_or_else(|| short_id_of(&id));
-        // `/` or `a` may have changed since the dismissal, in which case the
+        // `/` may have changed since the dismissal, in which case the
         // row is back in the model but still off screen. Saying so is the
         // difference between "undo worked" and "u does nothing".
         if visible {
@@ -4001,7 +3999,6 @@ impl App {
         self.rows = model::build_rows(
             &self.sessions,
             &self.filter,
-            self.show_completed,
             self.hidden.ids(),
         );
         self.reanchor_selection();
@@ -4994,11 +4991,6 @@ impl App {
                 self.mode = Mode::Filter;
                 Action::Redraw
             }
-            KeyCode::Char('a') => {
-                self.show_completed = !self.show_completed;
-                self.rebuild_rows();
-                Action::Redraw
-            }
             // Reachable only without Ctrl: the `Ctrl-d`/`Ctrl-u` arms above
             // match first, so half-page scrolling is untouched.
             KeyCode::Char('d') => {
@@ -5352,7 +5344,7 @@ enum Force {
 ///   * `r` — a manual refresh is the operator ASKING for the poll that lists
 ///     the new session. Cancelling on it would make the obvious way to hurry
 ///     the jump along the one way to lose it.
-///   * `/` and `a` — view toggles, not cursor verbs. §8.6 answers those with
+///   * `/` — a view filter, not a cursor verb. §8.6 answers those with
 ///     the filtered-out flash instead.
 ///   * `?` `q` `R` `Esc` and every unbound key — they touch no selection.
 fn claims_the_cursor(key: KeyEvent) -> bool {
@@ -5577,7 +5569,6 @@ mod tests {
             overlay_viewport: 20,
             help_lines: 21,
             filter: String::new(),
-            show_completed: true,
             hidden: HiddenSet::new(),
             hidden_dirty: false,
             hidden_absent: std::collections::BTreeSet::new(),
@@ -7239,9 +7230,8 @@ mod tests {
         }
     }
 
-    /// The refusal has to name the right cause. A row that LEFT the list — `a`
-    /// hiding Completed, or a `/` filter matching the worktree path that
-    /// `claude stop` reverts — is not the operator moving the cursor, and the
+    /// The refusal has to name the right cause. A row that LEFT the list — a
+    /// `/` filter matching the worktree path that `claude stop` reverts — is not the operator moving the cursor, and the
     /// recovery is different.
     #[test]
     fn a_row_that_leaves_the_list_refuses_differently_from_a_cursor_move() {
@@ -9441,50 +9431,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `a` hides Completed. Confirming rather than assuming that a freshly
-    /// dispatched session is visible under it — and that the one shape which is
-    /// NOT (a task that finished before the next poll) takes the filtered-out
-    /// path rather than moving the cursor to a row that is not on screen.
-    #[test]
-    fn a_freshly_dispatched_session_is_visible_with_completed_hidden() {
-        // Working, and Idle — the two states a just-dispatched session can be
-        // in — both have rows while `a` is off.
-        let mut idle = bg("e44654bf", "fresh task", State::Working);
-        idle.status = Status::Idle;
-        idle.state = None;
-        for (label, fresh) in [
-            ("working", bg("e44654bf", "fresh task", State::Working)),
-            ("blocked", bg("e44654bf", "fresh task", State::Blocked)),
-            ("idle", idle),
-        ] {
-            let (mut a, tmp) = armed("jump-hide-completed");
-            a.show_completed = false;
-            a.rebuild_rows();
-            let mut all = three();
-            all.push(fresh);
-            poll_and_settle(&mut a, all);
-            assert_eq!(
-                a.selected_key.as_deref(),
-                Some("e44654bf-uuid"),
-                "{label} is not Completed, so `a` does not hide it"
-            );
-            let _ = std::fs::remove_dir_all(&tmp);
-        }
-
-        // The exception, stated: a session that is already Done when it lands
-        // has no row while `a` is off, so it is announced, not chased.
-        let (mut a, tmp) = armed("jump-hide-completed-done");
-        a.show_completed = false;
-        a.rebuild_rows();
-        let mut all = three();
-        all.push(bg("e44654bf", "fresh task", State::Done));
-        poll_and_settle(&mut a, all);
-        assert_eq!(a.selected_key.as_deref(), Some("aaaaaaaa-uuid"));
-        let (text, level) = a.message.clone().unwrap_or_default_msg();
-        assert_eq!((text.as_str(), level), ("dispatched fresh task — filtered out", MsgLevel::Warn));
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
     /// The selection contract: only ever a `Row::Session`, never a Header and
     /// never a Spacer — whichever group the new session lands in, including the
     /// one that sits directly under a Header and the one that sits after a
@@ -9639,8 +9585,8 @@ mod tests {
         }
 
         // `n` arms the next intent itself, `r` is the refresh that LANDS the
-        // one already armed, `/` and `a` are view toggles that §8.6 answers
-        // with the filtered-out flash, and the rest touch no selection at all.
+        // one already armed, `/` is a view filter that §8.6 answers with the
+        // filtered-out flash, and the rest (`a` now unbound) touch no selection.
         for c in ['n', 'r', '/', 'a', '?', 'q', 'R'] {
             assert!(!claims_the_cursor(press(c)), "{c} does not claim the cursor");
         }
@@ -10514,31 +10460,6 @@ mod tests {
         assert_eq!(session_rows(&a), ["kernel bugs", "prediction run"]);
         assert!(a.hidden.ids().is_empty());
         assert_eq!(a.filter, "n", "undo must not clear the filter");
-    }
-
-    #[test]
-    fn dismiss_and_undo_compose_with_the_completed_group_hidden() {
-        let mut a = app();
-        load(&mut a, four());
-        a.on_key(press('a')); // hide Completed
-        assert!(!a.show_completed);
-        assert_eq!(
-            session_rows(&a),
-            ["bt/reg-update", "kernel bugs", "ccmux scaffold"]
-        );
-
-        a.on_key(press('d'));
-        assert_eq!(session_rows(&a), ["kernel bugs", "ccmux scaffold"]);
-        // `a` hides a GROUP, `d` hides a SESSION: the Completed row is still
-        // filtered out and is not the row that was dismissed.
-        assert_eq!(a.hidden.ids(), ["aaaaaaaa-uuid"]);
-
-        a.on_key(press('u'));
-        assert_eq!(
-            session_rows(&a),
-            ["bt/reg-update", "kernel bugs", "ccmux scaffold"]
-        );
-        assert!(!a.show_completed, "undo must not re-show the Completed group");
     }
 
     /// The sharpest edge in the feature: the row under the cursor is the one

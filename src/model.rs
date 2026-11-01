@@ -495,11 +495,10 @@ pub enum Row {
 ///
 /// Filtering: case-insensitive substring of `filter` against
 /// `Session::filter_haystack()`. An empty `filter` matches everything.
-/// `show_completed == false` omits Completed and Codex's Unloaded rows.
 /// `hidden` holds `session_id`s dismissed with `d`; they are omitted too.
 ///
-/// All three filters live here, in the one pure function, so they cannot
-/// disagree: `/`, `a` and `d` compose by construction and every caller —
+/// Both filters live here, in the one pure function, so they cannot
+/// disagree: `/` and `d` compose by construction and every caller —
 /// including the header's `matching/total` count, which counts the `Row`s this
 /// returns — sees the same answer. Dismissal is deliberately NOT a mutation of
 /// `sessions`: the full poll stays intact, so `total` still counts the
@@ -511,23 +510,17 @@ pub enum Row {
 pub fn build_rows(
     sessions: &[Session],
     filter: &str,
-    show_completed: bool,
     hidden: &[String],
 ) -> Vec<Row> {
     let needle = filter.trim().to_lowercase();
     let matching: Vec<usize> = (0..sessions.len())
         .filter(|&i| !hidden.iter().any(|h| h == &sessions[i].session_id))
         .filter(|&i| needle.is_empty() || sessions[i].filter_haystack().contains(&needle))
-        .filter(|&i| show_completed || sessions[i].provider != Provider::Codex
-            || sessions[i].state != Some(State::Unloaded))
         .collect();
 
     // 5 headers + 4 spacers in the worst case.
     let mut rows = Vec::with_capacity(matching.len() + 9);
     for group in Group::all() {
-        if group == Group::Completed && !show_completed {
-            continue;
-        }
         let mut in_group: Vec<usize> = matching
             .iter()
             .copied()
@@ -1151,7 +1144,7 @@ mod tests {
     #[test]
     fn build_rows_groups_headers_and_order() {
         let s = sample();
-        let rows = build_rows(&s, "", true, &[]);
+        let rows = build_rows(&s, "", &[]);
         // Working: bt/reg-update + Kernel bugs (both state=working)
         // Working also gets the interactive busy session.
         // Idle: none. Completed: prediction analysis.
@@ -1193,7 +1186,7 @@ mod tests {
         idle.session_id = "i1".into();
 
         let sessions = vec![working, done, idle, blocked];
-        let rows = build_rows(&sessions, "", true, &[]);
+        let rows = build_rows(&sessions, "", &[]);
         assert_eq!(rows[0], Row::Header { group: Group::Blocked, count: 1 });
         assert_eq!(rows[1], Row::Session { idx: 3 });
         assert_eq!(rows[2], Row::Spacer);
@@ -1215,23 +1208,15 @@ mod tests {
     }
 
     #[test]
-    fn build_rows_hides_completed_when_asked() {
-        let s = sample();
-        let rows = build_rows(&s, "", false, &[]);
-        assert!(!rows.iter().any(|r| matches!(r, Row::Header { group: Group::Completed, .. })));
-        assert_eq!(rows.len(), 4);
-    }
-
-    #[test]
     fn build_rows_filtering() {
         let s = sample();
-        assert!(build_rows(&s, "zzz-no-such-thing", true, &[]).is_empty());
+        assert!(build_rows(&s, "zzz-no-such-thing", &[]).is_empty());
         // case-insensitive across name, cwd and short id
-        assert_eq!(build_rows(&s, "KERNEL", true, &[]).len(), 2); // header + row
-        assert_eq!(build_rows(&s, "kernel", true, &[]).len(), 2);
+        assert_eq!(build_rows(&s, "KERNEL", &[]).len(), 2); // header + row
+        assert_eq!(build_rows(&s, "kernel", &[]).len(), 2);
         // 2 groups, 2 rows, 1 spacer between them
-        assert_eq!(build_rows(&s, "foundation", true, &[]).len(), 5);
-        assert_eq!(build_rows(&s, "674b1d29", true, &[]).len(), 2);
+        assert_eq!(build_rows(&s, "foundation", &[]).len(), 5);
+        assert_eq!(build_rows(&s, "674b1d29", &[]).len(), 2);
     }
 
     #[test]
@@ -1242,7 +1227,7 @@ mod tests {
         b.session_id = "aaa".into();
         a.started_at = 100;
         b.started_at = 100;
-        let rows = build_rows(&[a, b], "", true, &[]);
+        let rows = build_rows(&[a, b], "", &[]);
         // equal started_at => session_id ascending: "aaa" (index 1) first
         assert_eq!(rows[1], Row::Session { idx: 1 });
         assert_eq!(rows[2], Row::Session { idx: 0 });
@@ -1250,8 +1235,8 @@ mod tests {
 
     #[test]
     fn build_rows_on_empty_input() {
-        assert!(build_rows(&[], "", true, &[]).is_empty());
-        assert!(build_rows(&[], "x", false, &[]).is_empty());
+        assert!(build_rows(&[], "", &[]).is_empty());
+        assert!(build_rows(&[], "x", &[]).is_empty());
     }
 
     #[test]
@@ -1597,7 +1582,7 @@ mod tests {
         expected.insert(0, "claude".into());
         for _ in 0..rows.len() {
             rows.rotate_left(1);
-            let view = build_rows(&rows, "", true, &[]);
+            let view = build_rows(&rows, "", &[]);
             let headers: Vec<_> = view.iter().filter_map(|r| match r {
                 Row::Header { group, count } => Some((*group, *count)), _ => None,
             }).collect();
@@ -1610,7 +1595,7 @@ mod tests {
     }
 
     #[test]
-    fn hiding_finished_work_filters_codex_unloaded_before_counting() {
+    fn finished_work_and_codex_unloaded_rows_are_always_listed() {
         let mut done = sess(Some("done"), Status::Idle, Some(State::Done));
         done.session_id = "done".into();
         let mut unloaded = sess(Some("unloaded"), Status::Idle, Some(State::Unloaded));
@@ -1620,15 +1605,10 @@ mod tests {
         idle.provider = Provider::Codex;
         idle.session_id = "idle".into();
         let rows = [done, unloaded, idle];
-        assert_eq!(build_rows(&rows, "", false, &[]), [
-            Row::Header { group: Group::Codex, count: 1 }, Row::Session { idx: 2 },
-        ]);
-        assert!(build_rows(&rows, "", false, &["idle".into()]).is_empty());
-        assert!(build_rows(&rows, "unloaded", false, &[]).is_empty());
-        assert_eq!(build_rows(&rows, "unloaded", true, &[]), [
+        assert_eq!(build_rows(&rows, "unloaded", &[]), [
             Row::Header { group: Group::Codex, count: 1 }, Row::Session { idx: 1 },
         ]);
-        let view = build_rows(&rows, "", true, &[]);
+        let view = build_rows(&rows, "", &[]);
         assert_eq!(view, [
             Row::Header { group: Group::Completed, count: 1 }, Row::Session { idx: 0 },
             Row::Spacer, Row::Header { group: Group::Codex, count: 2 },

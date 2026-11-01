@@ -378,8 +378,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
             .filter(|r| matches!(r, Row::Session { .. }))
             .count();
         // §6.2 AMENDMENT: the ratio shows whenever the list is showing fewer
-        // than all sessions, not only when `/` is active — `a` (hide Completed)
-        // also hides rows, and a bare total then contradicts the visible list.
+        // than all sessions, not only when `/` is active — `d` also hides rows,
+        // and a bare total then contradicts the visible list.
         let count = if matching == total {
             format!("{total}")
         } else {
@@ -1214,7 +1214,6 @@ const KEYS: &[(&str, &str)] = &[
     ("d", "hide row (pane stays)"),
     ("u", "undo the last hide"),
     ("/", "filter"),
-    ("a", "toggle Completed group"),
     ("r", "refresh + re-even panes"),
     ("R", "restart ccmux + agents"),
     ("?", "this help"),
@@ -1226,7 +1225,6 @@ const KEYS: &[(&str, &str)] = &[
 
 const CODEX_KEYS: &[(&str, &str)] = &[
     ("Codex", "last group; ▲ first"),
-    ("a", "also toggles ◇ rows"),
     ("◇", "not loaded in server"),
     ("", "last outcome unknown"),
     ("Enter", "open/jump Codex TUI"),
@@ -1579,7 +1577,7 @@ mod tests {
     }
 
     fn app_with(sessions: Vec<Session>) -> App {
-        let rows = build_rows(&sessions, "", true, &[]);
+        let rows = build_rows(&sessions, "", &[]);
         App {
             tmux_session: "ccmux".into(),
             sidebar_width: 34,
@@ -1597,7 +1595,6 @@ mod tests {
             overlay_viewport: 20,
             help_lines: help_line_count(false),
             filter: String::new(),
-            show_completed: true,
             hidden: crate::tmux::HiddenSet::new(),
             hidden_dirty: false,
             hidden_absent: std::collections::BTreeSet::new(),
@@ -1912,10 +1909,10 @@ mod tests {
         sessions[2].started_at = 0; // exercises a stale timestamp in the age column
         let mut app = app_with(sessions);
         app.filter = "session".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
+        app.rows = build_rows(&app.sessions, &app.filter, &[]);
         render(&app);
         app.filter = "zzz-nothing-matches".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
+        app.rows = build_rows(&app.sessions, &app.filter, &[]);
         render(&app);
     }
 
@@ -2027,7 +2024,7 @@ mod tests {
             s.started_at = 0;
         }
         app.now_ms = 3_600_000;
-        app.rows = build_rows(&app.sessions, "", true, &[]);
+        app.rows = build_rows(&app.sessions, "", &[]);
         let sid = app.sessions[0].session_id.clone();
         app.map.panes.insert(
             "%7".into(),
@@ -2058,26 +2055,6 @@ mod tests {
         assert!(row.contains("1h"), "the default lost the age rail: {row:?}");
     }
 
-    #[test]
-    fn header_count_reflects_a_hidden_group_not_only_a_filter() {
-        let mut app = app_with(many(6));
-        app.show_completed = false;
-        app.rows = build_rows(&app.sessions, "", false, &[]);
-        let rows = rows_at(&app, 40, 24);
-        assert!(
-            rows[0].contains("/6"),
-            "`a` hid rows but the header still claims all 6: {:?}",
-            rows[0]
-        );
-
-        // Nothing hidden: the bare total, not a ratio.
-        app.show_completed = true;
-        app.rows = build_rows(&app.sessions, "", true, &[]);
-        let rows = rows_at(&app, 40, 24);
-        assert!(rows[0].contains("6 sessions"), "{:?}", rows[0]);
-        assert!(!rows[0].contains("/6"), "{:?}", rows[0]);
-    }
-
     /// A dismissed session must stay in `total`. The count is the only thing
     /// on screen that still says the row exists, so `5/6` is what tells the
     /// operator that `d` hid something rather than that it ended.
@@ -2091,7 +2068,7 @@ mod tests {
             .unwrap_or_default();
         app.hidden = crate::tmux::HiddenSet::new();
         app.hidden.dismiss(&victim);
-        app.rows = build_rows(&app.sessions, "", true, app.hidden.ids());
+        app.rows = build_rows(&app.sessions, "", app.hidden.ids());
 
         let rows = rows_at(&app, 40, 24);
         assert!(
@@ -2455,7 +2432,7 @@ mod tests {
     fn header_shows_filter_ratio_and_group_titles() {
         let mut app = app_with(many(6));
         app.filter = "session number 1".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
+        app.rows = build_rows(&app.sessions, &app.filter, &[]);
         let mut term = Terminal::new(TestBackend::new(40, 24)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
         let dump = term.backend().buffer().content().iter().map(|c| c.symbol()).collect::<String>();
@@ -3168,7 +3145,7 @@ mod tests {
         // A count wide enough to crowd the chip degrades the COUNT, never the
         // rail: the dot is still on column W-1.
         app.filter = "session number 1".into();
-        app.rows = build_rows(&app.sessions, &app.filter, true, &[]);
+        app.rows = build_rows(&app.sessions, &app.filter, &[]);
         for w in [20u16, 26, crate::WIDTH_DEFAULT, 34, 40] {
             let row = rows_at(&app, w, 24)[0].clone();
             let cols: Vec<char> = row.chars().collect();

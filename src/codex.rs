@@ -627,6 +627,16 @@ fn imported(row: &Value) -> bool {
     absent("model") && absent("reasoningEffort")
 }
 
+/// A thread a Codex client started and nobody prompted: no name, no preview,
+/// nothing running. `codex --remote` with no `resume` creates one on startup,
+/// and the server keeps it loaded after that client quits, so it would be a
+/// row with no pane, no history and nothing to resume.
+fn never_prompted(row: &Value) -> bool {
+    let blank = |key| row.get(key).is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
+    blank("name") && blank("preview")
+        && row.get("status").and_then(|s| s.get("type")).and_then(Value::as_str) == Some("idle")
+}
+
 fn parse_thread(row: &Value, show_imports: bool) -> Result<Parsed, RowError> {
     let id = thread_id(row).ok_or(RowError::Invalid)?;
     if row.get("ephemeral") == Some(&Value::Bool(true)) {
@@ -777,7 +787,15 @@ impl Union {
             client.exclusions.remove(&id);
             self.observation.fail(CodexError::incomplete());
         }
+        // Skipped, not cached as an exclusion: it is read again every poll, so
+        // a name, a prompt or a turn lists it as soon as the server says so.
+        // Only a loaded thread inside the history window that history did not
+        // return — the state DB holds a thread once it has a user message —
+        // so an older prompted thread with a blank preview is still a row.
+        let unprompted = !history && never_prompted(&row)
+            && timestamp(&row, "updatedAt").is_some_and(|t| t >= self.observation.cutoff_ms);
         let valid = match parse_thread(&row, client.show_imports) {
+            Ok(Parsed::Eligible(_)) if unprompted => true,
             Ok(Parsed::Excluded(exclusion)) => {
                 if self.loaded.contains(&id) && !contradiction {
                     client.exclusions.insert(id.clone(), exclusion);

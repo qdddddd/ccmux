@@ -1953,6 +1953,55 @@ fn an_import_that_gains_a_model_contradicts_its_cached_exclusion() {
     assert_eq!(result.sessions.len(), 1);
 }
 
+/// `codex --remote` started with no prompt leaves a loaded, never-prompted
+/// thread behind. It is not a row, it is re-read every poll rather than
+/// cached, and the first name, prompt or turn makes it one.
+#[test]
+fn a_loaded_thread_nobody_prompted_is_skipped_until_it_has_something() {
+    let clock = FakeClock::default();
+    let mut client = client();
+    let mut blank = thread(1);
+    blank["name"] = Value::Null;
+    blank["preview"] = json!("");
+    let read_poll = |client: &mut CodexClient, row: &Value| {
+        let mut script = fleet(vec![], vec![id(1)]);
+        script.reads.insert(id(1), row.clone());
+        let mut connector = FakeConnector::new(&clock, script);
+        let result = client.poll_with(NOW, &clock, &mut connector);
+        let reads = connector.script.borrow().read_ids.len();
+        (result, reads)
+    };
+
+    let (result, reads) = read_poll(&mut client, &blank);
+    assert!(result.complete);
+    assert!(result.sessions.is_empty(), "an unprompted thread is not a row");
+    assert!(!client.exclusions.contains_key(&id(1)), "and it is not cached");
+    assert_eq!(reads, 1);
+
+    // Named, or running, with no history row yet: the next read lists it.
+    for (key, value) in [("name", json!("task")), ("status", json!({"type":"active","activeFlags":[]})),
+                         ("preview", json!("first prompt"))] {
+        let mut row = blank.clone();
+        row[key] = value;
+        let (result, reads) = read_poll(&mut client, &row);
+        assert_eq!(reads, 1, "{key}: re-read");
+        assert_eq!(result.sessions.len(), 1, "{key}");
+        assert!(result.complete, "{key}");
+        assert!(read_poll(&mut client, &blank).0.sessions.is_empty());
+    }
+
+    // History is authority: a thread there with an empty preview stays a row.
+    let mut connector = FakeConnector::new(&clock, fleet(vec![blank.clone()], vec![id(1)]));
+    assert_eq!(client.poll_with(NOW, &clock, &mut connector).sessions.len(), 1);
+
+    // Older than the history window: history could not have returned it, so
+    // a blank preview proves nothing and the row stays.
+    let mut old = blank.clone();
+    old["createdAt"] = json!(NOW / 1000 - 30 * 86_400);
+    old["updatedAt"] = json!(NOW / 1000 - 20 * 86_400);
+    assert_eq!(read_poll(&mut super::tests::client(), &old).0.sessions.len(), 1);
+}
+
 #[test]
 fn a_source_exclusion_outranks_the_import_rule() {
     let mut row = import_row(1);

@@ -87,7 +87,10 @@ The environment equivalents are `CCMUX_CODEX_URL` and
 selects the Codex executable. `CCMUX_CODEX_IMPORTS=show` lists the Claude
 conversations Codex Desktop imported as threads; they are hidden by default
 because they duplicate rows the sidebar already shows from Claude and no
-Codex work happens in them. Settings follow new tabs and `R` restarts.
+Codex work happens in them. A thread nobody has prompted yet is not listed
+either: `codex --remote` started without `resume` creates one, and the
+server keeps it after that client quits. It appears with its first prompt.
+Settings follow new tabs and `R` restarts.
 The token is read inside each attach pane, never placed in tmux options or
 command arguments. An empty URL disables Codex; an absent URL uses the
 loopback default above.
@@ -115,11 +118,10 @@ The list includes loaded threads and unloaded threads updated in the last
 seven days, limited to persistent, top-level threads. They share a final
 **Codex** group, with blocked threads first and unloaded threads last.
 Names have no provider prefix. `◇` means unloaded; it does not establish
-the last turn's outcome. `a` hides unloaded Codex rows along with the
-Claude Completed group.
+the last turn's outcome.
 
 `Enter/v/s/t` open the official Codex TUI; `x` closes a pane while work
-stays on the server. Filtering, navigation, `a`, `d/u` and `r` work
+stays on the server. Filtering, navigation, `d/u` and `r` work
 as usual; `r` also reloads credentials and DNS. `Ctrl-x` stops the current
 Codex turn, including one waiting for approval. Press it again within 2 s
 to permanently delete the thread and close its ccmux panes. Idle and unloaded
@@ -159,7 +161,6 @@ Stop and delete work for both providers; Codex differences are listed above.
 | `L` | Show the session's logs |
 | `d` / `u` | Hide the row from the list / undo the last hide |
 | `/` | Filter by name, cwd or short id |
-| `a` | Show or hide Completed and unloaded Codex rows |
 | `r` | Refresh, and re-assert the layout |
 | `R` | Restart ccmux and idle agents after an upgrade |
 | `?` | Help |
@@ -192,7 +193,7 @@ bind e run-shell 'sb="#{@ccmux_tab_sidebar}"; [ -n "$sb" ] && tmux set -p -t "$s
 ```
 
 The cursor stays put when the pane holds no ccmux session, when the row is
-hidden by `/` or `a`, or outside the list (an overlay or prompt is open).
+hidden by `/` or `d`, or outside the list (an overlay or prompt is open).
 Focusing the sidebar any other way leaves the cursor alone.
 
 ## The list
