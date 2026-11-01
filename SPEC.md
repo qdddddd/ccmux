@@ -268,6 +268,14 @@ kill-pane -t %25        ; resize-pane -t %24 -x 34
 
 The sidebar stays leftmost, full height, exactly 34 columns throughout.
 
+**The width is the base width or `w`'s override.** The base is `@ccmux_width`
+when set, else `--width`. `w` (§8.1) measures the listed rows once and holds
+that number as this sidebar process's override until the next `w`; every pin
+and even pass above reads it in place of the base (never below it, so a
+relaunch with a wider `--width` still wins), so it heals the same way.
+It is not written to `@ccmux_width`, which is session-wide and would widen
+every tab's sidebar, and `R` (§8.11) starts the new process at the base.
+
 ### 1.4 Spreading the content panes evenly
 
 `split-window` HALVES its target, so successive `v` presses give progressively
@@ -2259,6 +2267,7 @@ takes no visibility flag, and `a` is unbound in Normal mode. Only `/` and
 | `/` | enter filter mode | no |
 | `r` | force refresh **and** re-assert the layout (§1.3, §1.4) | no |
 | `R` | **restart ccmux in place** — this sidebar, every other tab's sidebar, every ccmux-opened Claude pane, and every agent with a **live worker** that is neither working, blocked nor already stopped, whether or not it has a pane, keeping every window, pane and layout (§8.11) | no |
+| `w` | toggle **full width**: widen the sidebar to the narrowest width that shows every listed name whole, measured once at the keypress (capped at `WIDTH_MAX`, never below the base width); again for the base width (§1.3) | no |
 | `?` | help overlay | no |
 | `q` | quit the sidebar (sessions and panes untouched) | no |
 | `Esc` | clear the filter if one is active, otherwise quit (§8.8) | no |
@@ -4968,7 +4977,7 @@ and every Claude call. `n` and `R` remain global verbs.
 | `L` | Warn: `Codex logs unavailable in v1 — use the Codex TUI`; no log overlay or history RPC |
 | `n` | open the ordinary Claude new-background prompt (§8.6), capturing `Provider::Claude` and the sidebar's local cwd; no Codex RPC |
 | `R` | global ccmux/Claude restart under the rules below; never a Codex restart |
-| navigation, `/`, `?`, `q/Esc` | existing behavior, including Codex rows and provider-specific help |
+| navigation, `/`, `w`, `?`, `q/Esc` | existing behavior, including Codex rows and provider-specific help |
 | `Tab` / `Shift-Tab` | cycle non-empty groups in Blocked, Working, Idle, Completed, Codex order, forward/reverse, wrapping |
 | `c`, `S`, other unbound keys | remain unbound; no new aliases |
 

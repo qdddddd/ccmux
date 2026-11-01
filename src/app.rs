@@ -561,6 +561,10 @@ pub struct App {
     pub open: BTreeMap<String, OpenPane>,
     /// `@ccmux_width`, which rides along free in the `list_tabs` read.
     pub width_opt: Option<u16>,
+    /// `w`'s full width, measured once at the keypress and held until the
+    /// next `w`. This process's only: `@ccmux_width` is session-wide and
+    /// would widen every tab's sidebar, and `R` starts it over at `None`.
+    pub width_override: Option<u16>,
     /// The shell command that starts a sidebar, handed down by `main.rs` so
     /// `t` can give the tab it creates its own sidebar. `app` never imports
     /// `main`; the DAG stays acyclic.
@@ -804,6 +808,7 @@ impl App {
             tabs: Vec::new(),
             open: BTreeMap::new(),
             width_opt: None,
+            width_override: None,
             sidebar_cmd: None,
             own_state_loaded: false,
             migrated: false,
@@ -2171,8 +2176,9 @@ impl App {
                 // `sidebar_choice` adopts it instead of re-registering.
                 let _ = tmux::set_tab_sidebar(&self.tmux_session, &sidebar);
                 // Pin immediately, or the tab flashes a 50/50 split until that
-                // sidebar's first tick.
-                tmux::pin_sidebar(&self.tmux_session, &sidebar, self.requested_width())
+                // sidebar's first tick. The base, not `w`'s override: that
+                // belongs to this sidebar, and the new one starts without it.
+                tmux::pin_sidebar(&self.tmux_session, &sidebar, self.base_width())
             }
             Err(e) => self.flash(format!("tab sidebar failed: {}", tmux_msg(&e)), MsgLevel::Warn),
         }
@@ -4530,12 +4536,69 @@ impl App {
         self.pinned_width_from(self.requested_width())
     }
 
+    /// `w`'s override when set, else `base_width`. Every pin and every even
+    /// pass reads this, so the override heals exactly as the base width does.
+    /// Floored at the base, so a relaunch with a wider `--width` is not
+    /// reverted by an override measured under the old one.
+    fn requested_width(&self) -> u16 {
+        let base = self.base_width();
+        self.width_override.map_or(base, |w| w.max(base))
+    }
+
     /// `@ccmux_width` when set and sane, else this process's `--width`. Read
     /// from the `list_tabs` snapshot, so it costs no tmux call of its own.
-    fn requested_width(&self) -> u16 {
+    fn base_width(&self) -> u16 {
         self.width_opt
             .map(|w| w.clamp(crate::WIDTH_MIN, crate::WIDTH_MAX))
             .unwrap_or(self.sidebar_width)
+    }
+
+    /// The width `w` widens to: every listed name whole, never narrower than
+    /// the base (a narrower sidebar would lose the age rail the measurement
+    /// assumes), never past `WIDTH_MAX`. `None` when the names already fit.
+    fn full_width(&self) -> Option<u16> {
+        let base = self.base_width();
+        if crate::ui::names_fit(self, usize::from(base)) {
+            return None;
+        }
+        let natural = u16::try_from(crate::ui::natural_width(self)).unwrap_or(u16::MAX);
+        let full = natural.clamp(crate::WIDTH_MIN, crate::WIDTH_MAX);
+        (full > base).then_some(full)
+    }
+
+    /// `w` — nvim-tree's width toggle: measure the longest row NOW and widen
+    /// to it; press again for the base width. Measured once, not tracked, so
+    /// a new long name or an age rolling over never resizes the sidebar on
+    /// its own.
+    ///
+    /// Pins only. Re-evening would undo a layout the operator arranged, and
+    /// the pin is forced through the zoom gate for the reason `r` is: the
+    /// keypress is the ask.
+    fn act_toggle_width(&mut self) {
+        if self.degraded {
+            return;
+        }
+        // The snapshot can be an `interval` stale; `act_repin` re-reads too.
+        self.refresh_panes();
+        let label = if self.width_override.take().is_some() {
+            "base width"
+        } else if let Some(full) = self.full_width() {
+            self.width_override = Some(full);
+            "full width"
+        } else {
+            self.flash("names already fit", MsgLevel::Info);
+            return;
+        };
+        if self.pinned_width().is_none() {
+            self.flash(format!("{label} once a pane opens"), MsgLevel::Info);
+            return;
+        }
+        self.pin_sidebar_with(Force::Yes);
+        self.refresh_panes();
+        match self.sidebar_pane.as_ref().and_then(|sb| tmux::pane_width(&self.panes, sb)) {
+            Some(w) => self.flash(format!("{label}, {w} cols"), MsgLevel::Info),
+            None => self.flash(label, MsgLevel::Info),
+        }
     }
 
     /// Spread the content panes of the sidebar's window evenly along one axis
@@ -5021,6 +5084,10 @@ impl App {
             // requires empty modifiers. It sits BELOW `_ if ctrl`, which is
             // correct — `Ctrl-R` is not this binding and must stay inert.
             KeyCode::Char('R') => self.act_restart(),
+            KeyCode::Char('w') => {
+                self.act_toggle_width();
+                Action::Redraw
+            }
             KeyCode::Char('?') => {
                 self.mode = Mode::Help;
                 self.help_scroll = 0;
@@ -5346,7 +5413,7 @@ enum Force {
 ///     the jump along the one way to lose it.
 ///   * `/` — a view filter, not a cursor verb. §8.6 answers those with
 ///     the filtered-out flash instead.
-///   * `?` `q` `R` `Esc` and every unbound key — they touch no selection.
+///   * `?` `q` `R` `w` `Esc` and every unbound key — they touch no selection.
 fn claims_the_cursor(key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     // Mirrors `key_normal`'s arm order, including its `_ if ctrl` catch-all:
@@ -5595,6 +5662,7 @@ mod tests {
             tabs: Vec::new(),
             open: BTreeMap::new(),
             width_opt: None,
+            width_override: None,
             sidebar_cmd: None,
             own_state_loaded: true,
             migrated: true,
@@ -5931,6 +5999,47 @@ mod tests {
         assert!(App::needs_repin(Some(20), 34), "a manual resize still heals");
         assert!(App::needs_repin(Some(60), 34), "so does a split that halved it");
         assert!(App::needs_repin(None, 34), "an unreadable snapshot pins, as it always did");
+    }
+
+    /// `w` widens the live sidebar to the longest name, the tick pin holds it
+    /// there, and a second `w` puts the base width back.
+    ///
+    /// Run with:
+    ///   cargo test -- --ignored --nocapture live_w_toggles
+    ///
+    /// Same socket caveat as the other live tests: run it by name.
+    #[test]
+    #[ignore = "mutates a tmux server; run by name (see the doc comment)"]
+    fn live_w_toggles_full_width() {
+        tmux::set_socket(Some(LIVE_SOCKET));
+        assert_eq!(tmux::socket().as_deref(), Some(LIVE_SOCKET), "throwaway socket only");
+
+        let mut a = live_app();
+        a.sessions[0].name = "a session name far too long for thirty-four columns".into();
+        a.rebuild_rows();
+        let rows = live_session_rows(&a);
+        a.selected = rows[0];
+        a.act_open(SplitDir::Vertical);
+        let full = a.full_width().expect("the long name needs more room");
+        assert_eq!(live_widths(&mut a)[0], 34);
+
+        a.on_key(press('w'));
+        let wide = live_widths(&mut a);
+        println!("\n== `w` — 120x40 window, base 34, full {full} ==");
+        println!("after w         : {wide:?}");
+        assert_eq!(wide[0], full);
+        assert_eq!(a.message.as_ref().map(|m| m.0.clone()), Some(format!("full width, {full} cols")));
+
+        // A tick holds the override instead of healing it back to 34.
+        a.refresh_panes();
+        a.pin_sidebar();
+        assert_eq!(live_widths(&mut a)[0], full, "the tick pins the override");
+
+        a.on_key(press('w'));
+        let back = live_widths(&mut a);
+        println!("after w again   : {back:?}");
+        assert_eq!(back[0], 34);
+        live_raw(&["kill-session", "-t", "=ccmux-even-test:"]);
     }
 
     /// `r` IS THE WAY BACK. The tick pin stands down on a matching width and
@@ -7506,6 +7615,44 @@ mod tests {
         // Unresolved sidebar: no pin.
         a.sidebar_pane = None;
         assert_eq!(a.pinned_width_from(34), None);
+    }
+
+    /// `w`'s measured width stands in for the base until it is cleared, and
+    /// is never narrower than the base or wider than `WIDTH_MAX`.
+    #[test]
+    fn the_width_override_replaces_the_base_and_only_widens() {
+        let mut a = app();
+        a.width_opt = Some(30);
+        a.sessions = vec![bg("c1", "short", State::Working)];
+        a.rebuild_rows();
+        assert_eq!(a.full_width(), None, "names already fit at the base");
+
+        a.sessions.push(bg("c2", &"n".repeat(50), State::Working));
+        a.rebuild_rows();
+        let full = a.full_width().expect("the long name needs more room");
+        assert_eq!(usize::from(full), crate::ui::natural_width(&a));
+        a.width_override = Some(full);
+        assert_eq!(a.requested_width(), full);
+        a.width_override = None;
+        assert_eq!(a.requested_width(), 30);
+
+        // A relaunch with a wider `--width` outranks an older, narrower override.
+        a.width_override = Some(40);
+        a.width_opt = Some(60);
+        assert_eq!(a.requested_width(), 60);
+        a.width_override = None;
+
+        // Below `RAIL_MIN` there is no rail, so an 18-column name fits a
+        // 24-column base whole and `w` has nothing to widen.
+        a.width_opt = Some(24);
+        a.sessions = vec![bg("c1", &"n".repeat(18), State::Working)];
+        a.rebuild_rows();
+        assert_eq!(a.full_width(), None);
+        a.width_opt = Some(30);
+
+        a.sessions.push(bg("c3", &"n".repeat(500), State::Working));
+        a.rebuild_rows();
+        assert_eq!(a.full_width(), Some(crate::WIDTH_MAX));
     }
 
     #[test]
@@ -9587,7 +9734,7 @@ mod tests {
         // `n` arms the next intent itself, `r` is the refresh that LANDS the
         // one already armed, `/` is a view filter that §8.6 answers with the
         // filtered-out flash, and the rest (`a` now unbound) touch no selection.
-        for c in ['n', 'r', '/', 'a', '?', 'q', 'R'] {
+        for c in ['n', 'r', '/', 'a', '?', 'q', 'R', 'w'] {
             assert!(!claims_the_cursor(press(c)), "{c} does not claim the cursor");
         }
         let shifted_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);

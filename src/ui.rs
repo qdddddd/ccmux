@@ -765,6 +765,48 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
     Line::from(spans)
 }
 
+/// The narrowest width at which every listed row shows its whole name, on
+/// `session_line`'s railed grid: gutter | name | gap | age | margin. What `w`
+/// widens the sidebar to. Measures `app.rows`, so filtered and hidden rows do
+/// not count; 0 with nothing listed.
+pub fn natural_width(app: &App) -> usize {
+    app.rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session { idx } => app.sessions.get(*idx),
+            _ => None,
+        })
+        .map(|s| {
+            let age = display_width(&format_age(s.started_at, app.now_ms)).max(NUM_W);
+            GUTTER + display_width(&s.name) + GAP + age + 1
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether every listed row already shows its whole name at width `w`, on
+/// `session_line`'s grid for that width: below `RAIL_MIN` there is no rail, so
+/// `natural_width`'s railed measure would overstate what a narrow base needs.
+pub fn names_fit(app: &App, w: usize) -> bool {
+    if w < MARGIN_MIN {
+        return false;
+    }
+    app.rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Session { idx } => app.sessions.get(*idx),
+            _ => None,
+        })
+        .all(|s| {
+            let right = if w >= RAIL_MIN {
+                GAP + display_width(&format_age(s.started_at, app.now_ms)).max(NUM_W)
+            } else {
+                0
+            };
+            display_width(&s.name) <= w.saturating_sub(GUTTER + right + margin(w))
+        })
+}
+
 fn pad_to(spans: &mut Vec<Span<'static>>, used: usize, w: usize, base: Style) {
     if used < w {
         spans.push(Span::styled(" ".repeat(w - used), base));
@@ -1216,6 +1258,7 @@ const KEYS: &[(&str, &str)] = &[
     ("/", "filter"),
     ("r", "refresh + re-even panes"),
     ("R", "restart ccmux + agents"),
+    ("w", "toggle full width"),
     ("?", "this help"),
     ("q", "quit sidebar"),
     ("Esc", "cancel window/filter"),
@@ -1618,6 +1661,7 @@ mod tests {
             tabs: Vec::new(),
             open: std::collections::BTreeMap::new(),
             width_opt: None,
+            width_override: None,
             sidebar_cmd: None,
             own_state_loaded: true,
             migrated: true,
@@ -2821,6 +2865,33 @@ mod tests {
     /// names (empty, CJK, 80 columns), hostile ages (`0s` .. `9999d`), pane
     /// indices that clamp the badge to `+` (12, 999) and both palettes.
     ///
+    /// `w` widens to `natural_width`, so at that width the longest listed
+    /// name must draw whole, and one column narrower it must not.
+    #[test]
+    fn natural_width_is_the_narrowest_width_that_shows_every_name_whole() {
+        let mut app = app_with(vec![
+            sess(1, Kind::Background, Status::Busy, Some(State::Working)),
+            sess(2, Kind::Background, Status::Busy, Some(State::Working)),
+        ]);
+        app.sessions[1].name = "回归模型数据清洗与因子测试流水线重构任务 and then some".into();
+        app.rows = build_rows(&app.sessions, "", &[]);
+        let p = Palette::dark();
+        let long = app.sessions[1].clone();
+        let text = |w: usize| -> String {
+            session_line(&app, &long, false, w, &p).spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let w = natural_width(&app);
+        assert!(w > 34, "the long name overflows the default: {w}");
+        assert!(text(w).contains(&long.name), "whole at {w}: {}", text(w));
+        assert!(!text(w - 1).contains(&long.name), "cut at {}: {}", w - 1, text(w - 1));
+
+        // Hidden by a filter, the long row stops counting.
+        app.rows = build_rows(&app.sessions, "number", &[]);
+        assert!(natural_width(&app) < w);
+        app.rows.clear();
+        assert_eq!(natural_width(&app), 0);
+    }
+
     /// The row this sweeps is Working/Busy throughout; every OTHER glyph is
     /// swept by `every_glyph_holds_the_grid_at_every_width` below.
     #[test]

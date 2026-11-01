@@ -162,6 +162,7 @@ Stop and delete work for both providers; Codex differences are listed above.
 | `d` / `u` | Hide the row from the list / undo the last hide |
 | `/` | Filter by name, cwd or short id |
 | `r` | Refresh, and re-assert the layout |
+| `w` | Toggle full width: widen the sidebar to fit the longest name, again to restore |
 | `R` | Restart ccmux and idle agents after an upgrade |
 | `?` | Help |
 | `q` | Quit the sidebar. Sessions and panes are untouched |
