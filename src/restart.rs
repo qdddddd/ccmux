@@ -569,7 +569,8 @@ pub struct Agents {
     ///
     /// Never counted at a paned session's stop. A stop is only half of a
     /// restart; the pane's attach is the other half, and it can fail
-    /// independently, so that verdict cannot be reached until PHASE 2 has run.
+    /// independently, so that verdict cannot be reached until its panes have
+    /// been respawned.
     /// See `stranded`.
     pub restarted: usize,
     /// Deliberately left on the old binary because the row was under Working or
@@ -607,7 +608,7 @@ pub struct Agents {
     ///
     /// Two ways in, one meaning. A paned session was stopped and its pane never
     /// came back up — the respawn failed, or the pane was gone by the time
-    /// PHASE 2 reached it. A paneless session's `claude respawn` errored and
+    /// its turn came. A paneless session's `claude respawn` errored and
     /// the poll that followed found the worker gone: the daemon carried out the
     /// halt and either did not start the new worker or could not report it, and
     /// there is no pane that might still have covered it.
@@ -623,7 +624,8 @@ pub struct Agents {
     ///
     /// From a pane it needs a respawn to fail to happen at all, which is why
     /// it is rare rather than impossible: `tmux kill-pane` on a Claude pane in
-    /// the seconds between PHASE 1 and PHASE 2 reproduces it exactly.
+    /// the moment between its session's stop and its respawn reproduces it
+    /// exactly.
     pub stranded: usize,
     /// THE PANELESS PASS DID NOT RUN, because ccmux could not establish who is
     /// attached to what (`agents::attached_ids` answered `None`: no readable
@@ -937,9 +939,110 @@ pub struct Pending {
     pub exe: PathBuf,
 }
 
+/// How many `claude stop`s `R` runs at once. Each is a ~155 MB `claude`
+/// process, so 6 caps the burst near 1 GB; raise it only with that in mind.
+pub const STOP_WIDTH: usize = 6;
+
+/// Run `f` over `items` on up to `width` threads, handing each result to
+/// `done` ON THE CALLER'S THREAD as soon as it lands, in completion order.
+///
+/// `None` is an item whose turn came after `deadline`: it was never run. The
+/// deadline is checked as each item is PULLED, so it stays a start gate for
+/// every item, not just for the batch — the pass overshoots by at most one
+/// call per worker, never by the whole queue.
+///
+/// Width 1 runs inline, in order, with no thread at all. That is what keeps
+/// the `thread_local!` recorders the restart tests assert on working, and it
+/// is the same code path minus the fan-out.
+pub fn for_each_bounded<T, R, F, D>(items: &[T], width: usize, deadline: Option<Instant>, f: F, mut done: D)
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+    D: FnMut(usize, Option<R>),
+{
+    let expired = || deadline.is_some_and(|d| Instant::now() >= d);
+    if width <= 1 || items.len() <= 1 {
+        for (i, item) in items.iter().enumerate() {
+            let r = if expired() { None } else { Some(f(item)) };
+            done(i, r);
+        }
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        for _ in 0..width.min(items.len()) {
+            let tx = tx.clone();
+            let (next, f, expired) = (&next, &f, &expired);
+            s.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = if expired() { None } else { Some(f(item)) };
+                    if tx.send((i, r)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        for (i, r) in rx {
+            done(i, r);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stops OVERLAP: four 100 ms calls on width 4 take about one call,
+    /// never more than `width` run at once, and every result is handed back
+    /// exactly once on the caller's thread.
+    #[test]
+    fn for_each_bounded_overlaps_up_to_width_and_reports_each_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let live = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..8).collect();
+        let caller = std::thread::current().id();
+        let mut seen = vec![0usize; items.len()];
+        let started = Instant::now();
+        for_each_bounded(
+            &items,
+            4,
+            None,
+            |&i| {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                live.fetch_sub(1, Ordering::SeqCst);
+                i * 10
+            },
+            |i, r| {
+                assert_eq!(std::thread::current().id(), caller, "done runs on the caller");
+                assert_eq!(r, Some(i * 10));
+                seen[i] += 1;
+            },
+        );
+        assert_eq!(seen, vec![1; 8]);
+        assert_eq!(peak.load(Ordering::SeqCst), 4, "width is the ceiling, and it is reached");
+        assert!(started.elapsed() < Duration::from_millis(700), "{:?} — ran serially", started.elapsed());
+    }
+
+    /// An item pulled after the deadline is never run, and is reported `None`.
+    #[test]
+    fn for_each_bounded_runs_nothing_past_the_deadline() {
+        for width in [1, 4] {
+            let mut got = Vec::new();
+            for_each_bounded(&[1, 2, 3], width, Some(Instant::now()), |_| panic!("ran past the deadline"), |i, r: Option<()>| {
+                got.push((i, r));
+            });
+            got.sort_by_key(|(i, _)| *i);
+            assert_eq!(got, vec![(0, None), (1, None), (2, None)]);
+        }
+    }
     use crate::model::{State, Status};
     use crate::tmux::{self, HiddenLog, PaneEntry, PaneMap, WindowId};
 

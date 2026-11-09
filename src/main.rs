@@ -698,9 +698,9 @@ fn timed_tick(
 enum HandoffStep {
     /// DRAW BEFORE ACTING, and this is the step that was missing.
     ///
-    /// `finish_restart` blocks: one `claude agents --json` plus one
-    /// `claude stop` per in-scope agent, ~0.9 s each measured, and up to
-    /// `AGENT_BUDGET` + one poll + one stop against a wedged daemon. All of it
+    /// `finish_restart` blocks: one `claude agents --json` plus the
+    /// `claude stop`s, `restart::STOP_WIDTH` at a time, and up to the 80 s
+    /// `AGENT_BUDGET` worst case against a wedged daemon. All of it
     /// used to happen between entering the alternate screen and the first
     /// `draw`, so the pane was BLANK for the whole pass — measured at 1.5 s for
     /// two agents and 30.5 s against a `claude stop` that hung. That is the
@@ -1109,7 +1109,7 @@ mod tests {
     /// `finish_restart` used to be called bare, between entering the alternate
     /// screen and the loop's first `draw`. Once it grew the agent pass — one
     /// `claude agents --json` and one `claude stop` per in-scope agent, ~0.9 s
-    /// each, up to `AGENT_BUDGET` + one poll + one stop against a wedged
+    /// each while they ran in turn, up to `AGENT_BUDGET` + one poll + one stop against a wedged
     /// `claude` — that gap became a pane that was BLANK and DEAF for the whole
     /// pass: measured at 1.5 s for two agents and 30.5 s with a hanging stop.
     ///

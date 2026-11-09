@@ -1709,6 +1709,7 @@ mod tests {
             agents_respawn: |_| panic!("ui test reached agents::respawn"),
             agents_attached: || panic!("ui test reached agents::attached_ids"),
             agent_budget: Duration::from_secs(60),
+            stop_width: 1,
         }
     }
 

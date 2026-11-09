@@ -3001,8 +3001,9 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
 7. main::run_sidebar, when restart::is_handoff(), in this order and no other
    (main::finish_handoff):
        flash "restarting the session…" (Info) and DRAW ONE FRAME
-           the pass below blocks for ~0.9 s per in-scope agent and reads no
-           input; without this the pane is blank for all of it
+           the pass below blocks for about one `claude stop` per STOP_WIDTH
+           in-scope agents and reads no input; without this the pane is
+           blank for all of it
        app.finish_restart():
            refresh_panes()                     fresh panes + every tab's records
 
@@ -3017,27 +3018,40 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
            tabs := list-windows, with MY window's map replaced by self.map
            plan := restart::plan(tabs, panes, own_pane)
 
-           PHASE 1 — the agents, before any pane is respawned. TWO SUB-PASSES,
-           one deadline: deadline := now + AGENT_BUDGET (60 s)
+           deadline := now + AGENT_BUDGET (60 s), one for the whole pass
 
-           1a — THE PANED AGENTS. Their resume is PHASE 2, so this only stops.
-           for id in plan.agent_ids():          # the Claude targets, deduped
-               past the deadline -> count the rest as failed, END THE PASS
-               agents::poll()                   # RE-READ, immediately before this stop
-                   Err  -> count the rest as failed, END THE PASS
-                   id absent -> count as failed, continue
+           PHASE 1 — the paned agents' verdicts, from ONE read.
+           ids := plan.agent_ids()              # the Claude targets, deduped
+           past the deadline -> all ids failed, SKIP PHASE 3
+           agents::poll()                       # ONE read, immediately before the stops
+               Err  -> all ids failed, SKIP PHASE 3
+           for id in ids:
+               id absent -> failed += 1
                restart::agent_verdict(session):
                    Busy       -> busy += 1                  # Working | Blocked
                    NotRunning -> nothing at all             # state == stopped
-                   Restart    -> agents::stop(id)           # bounded by STOP_TIMEOUT (10 s)
-                                   Ok  -> owed a resume by PHASE 2
-                                   Err -> failed += 1, CONTINUE
+                   Restart    -> to_stop += session
 
-           1b — THE PANELESS AGENTS, only if 1a did not end the pass. Live
+           PHASE 2 — the panes, unconditional on phase 1, each session's
+           after its own stop:
+           for t in plan.targets not holding a to_stop session:
+               respawn(t)                       # sidebars, busy, stopped, unreadable
+           restart::for_each_bounded(to_stop, STOP_WIDTH (6), deadline):
+               agents::stop(id)                 # in parallel; STOP_TIMEOUT (10 s) each;
+                                                # the deadline is checked as each is pulled
+                   Ok  -> owed a resume
+                   Err, or never started -> failed += 1
+               as each returns, on the sidebar's thread:
+                   respawn(t) for every target holding that session
+           respawn(t) := tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))  [R2-gated]
+                   Ok on a Claude target -> that short_id is RESUMED
+                   Err -> failed += 1
+
+           PHASE 3 — THE PANELESS AGENTS, last: they touch no pane. Live
            workers with NO CLIENT ANYWHERE; one call does both halves.
            agents::attached_ids()               # every `claude attach <id>` on the box
-               None -> blind = true, SKIP 1b     # could not look != looked and found none
-           agents::poll()                       # ENUMERATE; Err -> skip 1b, count nothing
+               None -> blind = true, SKIP         # could not look != looked and found none
+           agents::poll()                       # ENUMERATE; Err -> skip, count nothing
            for t in restart::headless_targets(fleet, plan.held, attached):
                past the deadline -> count the rest as failed, stop
                agents::poll()                   # RE-READ, immediately before this act
@@ -3054,14 +3068,8 @@ THE IMAGE THAT COMES UP DOES THE REST — it is the proof the binary runs.
                                             no worker     -> stranded += 1
                                             Err           -> stranded += 1, rest failed, stop
 
-           PHASE 2 — the panes, unconditional on phase 1:
-           for t in plan.targets:
-               tmux::respawn_pane(session, t.pane, cmd | attach_pane_cmd(short_id))  [R2-gated]
-                   Ok on a Claude target -> that short_id is RESUMED
-                   Err -> failed += 1
-
-           PHASE 3 — close 1a's books, which only phase 2 can. 1b settled its
-           own: `claude respawn` does both halves in one call.
+           PHASE 4 — close the paned books, which only phase 2 can. Phase 3
+           settled its own: `claude respawn` does both halves in one call.
            for id in stopped:                   # the PANED ids only
                resumed  -> restarted += 1
                not      -> stranded += 1        # halted, nothing will resume it
@@ -3099,7 +3107,7 @@ ccmux can bring back, and that are neither working nor blocked nor already
 stopped.** Two populations answer "can bring back" two different ways, and they
 are disjoint by construction.
 
-*Scope 1a, the paned agents* — `Plan::agent_ids`: exactly the panes this same
+*Scope: the paned agents* — `Plan::agent_ids`: exactly the panes this same
 plan is about to respawn with `claude attach <id>`, deduped by session. The
 pane's attach IS the resume. A pane parked after `Ctrl+Z` (`@ccmux_detached`) is
 out: that pane is not respawned, so nothing would re-attach its session and the
@@ -3107,7 +3115,7 @@ out: that pane is not respawned, so nothing would re-attach its session and the
 be — the pane is respawned either way, and its attach resumes the session
 whether a worker was up or not.
 
-*Scope 1b, the paneless agents* — `restart::headless_targets`: a LIVE WORKER,
+*Scope: the paneless agents* — `restart::headless_targets`: a LIVE WORKER,
 NO CLIENT ANYWHERE, and the shape the command needs (a background kind, a
 non-empty short id). The verb is `claude respawn <id>` (PROBE-FINDINGS §2),
 which needs no terminal, so for the first time a session ccmux never opened can
@@ -3204,7 +3212,7 @@ through a wrapper whose argv[0] is neither `claude` nor `CCMUX_CLAUDE_BIN`'s own
 file name.
 
 *Blind* — a scan that could not RUN (`attached_ids` returns `None`: no readable
-`/proc`) is not a scan that found nobody. Sub-pass 1b is skipped entirely and
+`/proc`) is not a scan that found nobody. The paneless pass is skipped entirely and
 the footer says `paneless pass skipped`. The alternative is the fail-open
 reading, and the act it would have authorised is stopping every attach client
 on the machine.
@@ -3214,7 +3222,7 @@ previous inventory when a tmux read fails, which is right for every drawing
 reader and wrong here: the process that runs this pass is a FRESH image whose
 previous inventory is EMPTY, so a failed `list-panes` or `list-windows` leaves a
 blank picture rather than a stale one. `plan` then yields no targets AND no
-`held`, and 1b read the whole machine's fleet as nobody's — it halted and
+`held`, and the paneless pass read the whole machine's fleet as nobody's — it halted and
 restarted the very sessions this window had open in panes and respawned none of
 them, while reporting success. Renaming the tmux session out from under a
 running ccmux produces it. `panes_fresh` and `tabs_fresh` gate the whole of
@@ -3277,25 +3285,28 @@ it is resumed straight after.
 the window cannot be closed, only narrowed. `App::sessions` is up to a poll
 interval old and is EMPTY in the process that runs this pass (`finish_restart`
 precedes the first `tick`), and one snapshot taken at the top of the loop would
-age by ~0.66 s per session ahead of the current one. So the fleet is re-read
-immediately before EVERY stop: each decision rests on data at most one
-`claude agents --json` round trip old (~0.21 s measured), and what remains is a
-session that goes idle -> working inside that window. It is stopped, and the
+age by ~0.66 s per session ahead of the current one if the stops ran in turn.
+So the fleet is read once, immediately before the paned stops are launched
+together: each decision rests on data about one `claude agents --json` round
+trip old (~0.15 s measured) plus its queue wait behind at most
+`ceil(N / STOP_WIDTH) - 1` earlier stops, and what remains is a session that
+goes idle -> working inside that window. It is stopped, and the
 work in flight is lost — the same exposure `Ctrl+X` has always had, one poll
 wide instead of one poll interval wide.
 
 *Failure* — one failed `claude stop`, or one failed `claude respawn`, costs
 that agent and nothing else: it is counted and the pass continues. A failed POLL
 ends the pass instead, because without it ccmux cannot tell working from idle
-and every later act would be a guess; a failed ENUMERATION poll skips sub-pass
-1b and counts nothing, because unlike 1a ccmux cannot name a single agent it
-missed and a made-up number in the footer is worse than silence.
-`AGENT_BUDGET` (60 s) caps the whole pass, both sub-passes inside it — the
-per-call bounds multiply, and the pane pass must not be lost to a wedged daemon.
-It is a START GATE: the deadline is checked before each poll+act group and no
+and every later act would be a guess; a failed ENUMERATION poll skips the
+paneless pass and counts nothing, because unlike the paned one ccmux cannot
+name a single agent it missed and a made-up number in the footer is worse than
+silence. `AGENT_BUDGET` (60 s) caps the whole pass, both populations inside it
+— the per-call bounds multiply, and the pane pass must not be lost to a wedged
+daemon. It is a START GATE: the deadline is checked before the paned read, as
+each parallel stop is pulled, and before each paneless poll+act group, and no
 call can be cut short once begun, so the true worst case is
 `AGENT_BUDGET + POLL_TIMEOUT + RESPAWN_TIMEOUT + POLL_TIMEOUT` = **80 s**, once
-per pass. In every one of those cases PHASE 2 still runs.
+per pass. In every one of those cases the panes are still respawned.
 
 **A FAILED `respawn` IS NOT A FACT ABOUT THE WORKER.** `run_bounded` SIGKILLs
 the client at `RESPAWN_TIMEOUT` while the daemon carries the restart out
@@ -3313,10 +3324,10 @@ rules out.
 
 *Counting the restarts* — a `claude stop` that returned Ok is HALF a restart.
 The resume is the other half and it can fail on its own: for a paned agent it is
-the pane's respawned `claude attach` (kill that pane between the phases and the
+the pane's respawned `claude attach` (kill that pane before it is respawned and the
 agent is halted with nothing left to resume it). So it is not counted at the
-stop; a paned session's verdict waits for PHASE 3. A paneless one has no such
-split — `claude respawn` is both halves — and settles in 1b. Running again
+stop; a paned session's verdict waits for PHASE 4. A paneless one has no such
+split — `claude respawn` is both halves — and settles in the paneless pass. Running again
 either way it is `restarted`; halted with nothing to bring it back either way it
 is `stranded` — reported as `N left stopped`, its own word
 because it is the only outcome of `R` that asks the operator to do something
@@ -3341,27 +3352,29 @@ never saw: a buffered `Ctrl+X` arrives with `cx_last_press == None`, so the
 burst guard does not fire, and it stops whatever is on row 0 — the top of the
 Blocked group, which is the agent `R` had just refused to touch.
 
-*Ordering* — every stop lands before ANY respawn, the headless ones included.
+*Ordering* — each session's stop lands before ANY of its panes is respawned.
 `claude attach` is what resumes a paned session, so `stop` then `attach`
 composes (the pane comes up holding a live session on the new binary) while
 `attach` then `stop` does not (the pane re-attaches the old worker, draws it,
-and is then halted underneath itself). Not merely "each stop before its own
-pane": two panes may hold one session, so the whole-phase boundary is the only
-version of the rule with no ordering left to get wrong.
+and is then halted underneath itself). Two panes may hold one session, so the
+unit is the session: all of its panes wait for its one stop. Panes owed no
+stop — sidebars, and sessions that are busy, stopped or unreadable — wait for
+nothing and are respawned first.
 
-Within PHASE 1 the paned stops go FIRST and the paneless respawns follow, and
-both halves of that are deliberate. The paned stops go first because their
-resume is PHASE 2, which cannot begin until PHASE 1 ends — every second spent
-elsewhere before them is a second longer that every paned session sits halted
-with no attach yet. The paneless work sits inside PHASE 1 rather than after PHASE 2
-because those sessions touch no pane and so have no ordering relationship with
-the respawns in either direction; putting them in the earlier phase costs
-nothing and keeps "every stop before any respawn" a property of the phase
-boundary rather than of a case analysis. And each headless stop is followed AT
-ONCE by its own resume rather than batching the stops: there is no pane fallback
-for these, so if the process died between the halves nothing anywhere would
-bring that session back, and pairing them makes the halted window one `claude`
-round trip instead of the rest of the pass.
+The paned stops run in parallel, up to `STOP_WIDTH` (6) at once — each is a
+~155 MB `claude` process, so 6 caps the burst near 1 GB — and each session's
+panes come back the moment its own stop returns rather than after the slowest.
+Serial, the pass cost a poll and a stop per session (~0.8 s each) with every
+pane dead until the last; now it costs about one stop per `STOP_WIDTH`
+sessions.
+
+The paneless work runs LAST, after every pane is back: those sessions touch no
+pane and so have no ordering relationship with the respawns in either
+direction, and every second spent on them first would be a second longer that
+every paned session sat halted with no attach. Each headless halt is still
+followed AT ONCE by its own resume, in one `claude respawn`: there is no pane
+fallback for these, so if the process died between the halves nothing anywhere
+would bring that session back.
 
 **NOTHING IS KILLED UNTIL THE NEW IMAGE IS RUNNING.** `respawn-pane -k` has no
 undo: the pane is killed, the replacement command runs, and if that command
