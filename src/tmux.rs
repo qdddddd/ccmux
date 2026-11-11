@@ -48,6 +48,9 @@ pub const OPT_HIDDEN: &str = "@ccmux_hidden";
 pub const OPT_TAB_SIDEBAR: &str = "@ccmux_tab_sidebar";
 pub const OPT_TAB_MAP: &str = "@ccmux_tab_map";
 pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
+/// That window's fragment of the shared UNREAD log (§6.4, §11.6): the same
+/// op-log shape as `@ccmux_tab_hidden`, under its own version tag.
+pub const OPT_TAB_UNREAD: &str = "@ccmux_tab_unread";
 
 /// PANE-scoped, and one of two ccmux options not written by ccmux (the other
 /// is `OPT_PANE_JUMP_FROM`): the
@@ -116,6 +119,23 @@ const HIDDEN_LOG_VERSION: u32 = 2;
 /// `HIDDEN_MAX`: the row reappears.
 const HIDDEN_OPS_MAX: usize = 128;
 
+/// `@ccmux_tab_unread` schema version. A third number, so a fragment of either
+/// other shape read through the wrong field folds to empty rather than to a
+/// set of marks (or dismissals) nobody minted.
+const UNREAD_LOG_VERSION: u32 = 3;
+/// Operations one window's `@ccmux_tab_unread` fragment will carry. Unlike the
+/// dismissal log, an unread fragment KEEPS its `add:false` (seen) ops until the
+/// session retires (`prune_unread_log`), so it settles at one op per listed
+/// session that ever finished a turn. The worst op — a Codex-tagged one — is
+/// about 105 bytes serialized, so 128 sits near 13.5 KB, under tmux's ~16 KB
+/// `set-option` wall. Overflow evicts the OLDEST seen tombstone first, and an
+/// add (the lowest-ranked one other than the op being pushed) only when no
+/// tombstone is left. Tombstones accumulate in normal use, so evicting adds
+/// first would leave a full fragment holding about one live mark; an evicted
+/// tombstone costs only the rare re-mark of a read row by a sidebar still
+/// holding an even older running stamp for that session.
+const UNREAD_OPS_MAX: usize = 128;
+
 /// `-F` format for `list_panes_in_session`. Field order is authoritative
 /// (SPEC §3.2) and mirrored by `parse_pane_line`.
 ///
@@ -181,21 +201,29 @@ const PANE_FMT: &str = concat!(
 
 const PANE_FIELDS: usize = 14;
 
-/// `-F` format for `list_tabs`. The two JSON blobs are LAST so a value that
+/// `-F` format for `list_tabs`. The JSON blobs are LAST so a value that
 /// somehow contained a tab could only corrupt the final field, never shift a
 /// fixed one. JSON cannot contain a raw tab (serde_json escapes control
 /// characters) and tmux does not re-expand format sequences inside an option
 /// value — both verified on 3.4.
+///
+/// `@ccmux_tab_unread` is the seventh field and the newest, so it is the one a
+/// short line may lack: `parse_tab_lines` requires the first six and reads an
+/// absent or unparsable seventh as an empty fragment.
 const TAB_FMT: &str = concat!(
     "#{window_id}\t",
     "#{window_index}\t",
     "#{@ccmux_tab_sidebar}\t",
     "#{@ccmux_width}\t",
     "#{@ccmux_tab_map}\t",
-    "#{@ccmux_tab_hidden}",
+    "#{@ccmux_tab_hidden}\t",
+    "#{@ccmux_tab_unread}",
 );
 
-const TAB_FIELDS: usize = 6;
+const TAB_FIELDS: usize = 7;
+/// Fields a line must carry to be a tab at all: everything before the unread
+/// fragment. Fewer and the line is skipped, as before.
+const TAB_FIELDS_MIN: usize = 6;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -1488,6 +1516,8 @@ pub struct TabInfo {
     pub map: PaneMap,
     /// `@ccmux_tab_hidden` — that tab's fragment of the shared dismissal log.
     pub hidden: HiddenLog,
+    /// `@ccmux_tab_unread` — that tab's fragment of the shared unread log.
+    pub unread: UnreadLog,
 }
 
 /// `tmux list-windows -t '=<session>:' -F …` — the whole cross-tab picture and
@@ -1514,7 +1544,7 @@ fn parse_tab_lines(out: &str) -> (Vec<TabInfo>, Option<u16>) {
             continue;
         }
         let parts: Vec<&str> = line.splitn(TAB_FIELDS, '\t').collect();
-        if parts.len() < TAB_FIELDS {
+        if parts.len() < TAB_FIELDS_MIN {
             continue;
         }
         let (Some(window), Ok(index)) = (WindowId::parse(parts[0]), parts[1].parse::<u32>()) else {
@@ -1528,7 +1558,8 @@ fn parse_tab_lines(out: &str) -> (Vec<TabInfo>, Option<u16>) {
             index,
             sidebar: PaneId::parse(parts[2]),
             map: parse_map(parts[4]),
-            hidden: parse_hidden_log(parts[5]),
+            hidden: parse_op_log(parts[5]),
+            unread: parts.get(6).map(|raw| parse_op_log(raw)).unwrap_or_default(),
         });
     }
     (tabs, width)
@@ -1601,6 +1632,18 @@ pub fn save_tab_hidden(
     let json = serde_json::to_string(log)
         .map_err(|e| TmuxError::Parse(format!("cannot serialize hidden log: {e}")))?;
     set_window_option_cached(session, pane, window, OPT_TAB_HIDDEN, json)
+}
+
+/// Serialize and write `@ccmux_tab_unread` for `pane`'s window.
+pub fn save_tab_unread(
+    session: &str,
+    pane: &PaneId,
+    window: &WindowId,
+    log: &UnreadLog,
+) -> Result<(), TmuxError> {
+    let json = serde_json::to_string(log)
+        .map_err(|e| TmuxError::Parse(format!("cannot serialize unread log: {e}")))?;
+    set_window_option_cached(session, pane, window, OPT_TAB_UNREAD, json)
 }
 
 /// The ONE write into a window this process does not own: `t` seeds the new
@@ -2247,24 +2290,39 @@ impl HiddenOp {
     }
 }
 
-/// One window's fragment of the shared dismissal log.
+/// One window's fragment of a shared op log.
+///
+/// Generic over its schema version `V`, which is also its KIND: the dismissal
+/// log (`HiddenLog`, v2) and the unread log (`UnreadLog`, v3) share one op
+/// shape, one push/fold/prune and one lifecycle, and differ only in the tag a
+/// reader checks, the cap and what overflow evicts (`push`), and whether
+/// tombstones are garbage-collected. A fragment read through the wrong field
+/// fails the tag check and is empty.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct HiddenLog {
-    /// Schema version. Current = 2. A different value is treated as empty.
+pub struct OpLog<const V: u32> {
+    /// Schema version. Must equal `V`; a different value is treated as empty.
     pub v: u32,
     #[serde(default)]
     pub ops: Vec<HiddenOp>,
 }
 
-impl Default for HiddenLog {
+/// `@ccmux_tab_hidden`: dismissals (`add`) and their undos (`add: false`).
+pub type HiddenLog = OpLog<HIDDEN_LOG_VERSION>;
+/// `@ccmux_tab_unread`: a finished turn nobody has looked at (`add`), and the
+/// look (`add: false`, "seen").
+pub type UnreadLog = OpLog<UNREAD_LOG_VERSION>;
+
+impl<const V: u32> Default for OpLog<V> {
     fn default() -> Self {
-        HiddenLog::new()
+        OpLog::new()
     }
 }
 
-impl HiddenLog {
+impl<const V: u32> OpLog<V> {
+    const MAX_OPS: usize = if V == UNREAD_LOG_VERSION { UNREAD_OPS_MAX } else { HIDDEN_OPS_MAX };
+
     pub fn new() -> Self {
-        HiddenLog { v: HIDDEN_LOG_VERSION, ops: Vec::new() }
+        OpLog { v: V, ops: Vec::new() }
     }
 
     /// Append `op` unless its identity is already held. Idempotent on
@@ -2295,18 +2353,38 @@ impl HiddenLog {
             });
             return changed || self.ops.len() != before;
         }
+        let rank = op.rank();
+        // Unread only (the hidden log keeps its plain oldest-first cap): the
+        // oldest tombstones go before any add, and never the op just pushed —
+        // a back-dated add can be the lowest-ranked op in the fragment.
+        let unread = V == UNREAD_LOG_VERSION;
+        if unread {
+            // An op one of my own outranks can never win the fold (a stale
+            // sidebar's late add under its own seen, an adopted older copy):
+            // taking it would only spend a slot, and at the cap evict a live
+            // op. My own ops it outranks can never win again (prune's
+            // COMPACT), so they go first, for the same reason.
+            if self.ops.iter().any(|cur| cur.id == op.id && cur.rank() > rank) {
+                return false;
+            }
+            self.ops.retain(|cur| cur.id != op.id);
+        }
         self.ops.push(op);
-        while self.ops.len() > HIDDEN_OPS_MAX {
-            let Some(oldest) = self
+        while self.ops.len() > Self::MAX_OPS {
+            // The op just pushed is last. Exempt by position, not by rank: two
+            // adds from one poll share a stamp.
+            let pushed = self.ops.len() - 1;
+            let Some(victim) = self
                 .ops
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, o)| o.rank())
+                .filter(|(i, _)| !unread || *i != pushed)
+                .min_by_key(|(_, o)| (unread && o.add, o.rank()))
                 .map(|(i, _)| i)
             else {
                 break;
             };
-            self.ops.remove(oldest);
+            self.ops.remove(victim);
         }
         true
     }
@@ -2326,6 +2404,29 @@ impl HiddenLog {
     }
 }
 
+/// The winning op per id across every fragment: a last-writer-wins register
+/// keyed by the total order `(seq, org, add)`. Provider metadata of duplicate
+/// identities is merged BEFORE a winner is chosen (§12.9).
+pub fn fold_winners<'a, const V: u32, I: IntoIterator<Item = &'a OpLog<V>>>(
+    frags: I,
+) -> BTreeMap<String, HiddenOp> {
+    let mut winner: BTreeMap<String, HiddenOp> = BTreeMap::new();
+    for log in frags {
+        for op in &log.ops {
+            match winner.get_mut(op.id.as_str()) {
+                Some(cur) if cur.identity() == op.identity() => {
+                    if op.provider == Provider::Codex { cur.provider = Provider::Codex; }
+                }
+                Some(cur) if cur.rank() > op.rank() => {}
+                _ => {
+                    winner.insert(op.id.clone(), op.clone());
+                }
+            }
+        }
+    }
+    winner
+}
+
 /// Fold every fragment into the shared dismissed set.
 ///
 /// A last-writer-wins register per id, keyed by the total order `(seq, org)` —
@@ -2337,27 +2438,19 @@ impl HiddenLog {
 /// "oldest first" contract: `model::build_rows` is unaffected and
 /// `HiddenSet::undo` still pops the newest dismissal.
 pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> HiddenSet {
-    let mut winner: BTreeMap<&str, HiddenOp> = BTreeMap::new();
-    for log in frags {
-        for op in &log.ops {
-            match winner.get_mut(op.id.as_str()) {
-                Some(cur) if cur.identity() == op.identity() => {
-                    if op.provider == Provider::Codex { cur.provider = Provider::Codex; }
-                }
-                Some(cur) if cur.rank() > op.rank() => {}
-                _ => {
-                    winner.insert(op.id.as_str(), op.clone());
-                }
-            }
-        }
-    }
-    let mut live: Vec<HiddenOp> = winner.into_values().filter(|o| o.add).collect();
+    let mut live: Vec<HiddenOp> = fold_winners(frags).into_values().filter(|o| o.add).collect();
     live.sort_by(|a, b| (a.seq, a.org, &a.id).cmp(&(b.seq, b.org, &b.id)));
     let mut set = HiddenSet::new();
     for op in live {
         set.dismiss_for(op.provider, &op.id);
     }
     set
+}
+
+/// Fold every fragment into the shared unread set: the ids whose winning op
+/// is an `add`, with the provider each was minted for.
+pub fn fold_unread<'a, I: IntoIterator<Item = &'a UnreadLog>>(frags: I) -> BTreeMap<String, Provider> {
+    fold_winners(frags).into_values().filter(|o| o.add).map(|o| (o.id, o.provider)).collect()
 }
 
 /// Garbage-collect `mine` against what the other fragments already carry.
@@ -2374,6 +2467,21 @@ pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> Hidde
 /// P1 then P2 settle a resolved disagreement to empty in two ticks.
 /// Returns true when `mine` changed.
 pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool {
+    prune_op_log(mine, others, true)
+}
+
+/// `prune_hidden_log` WITHOUT P2. A dismissal is Lamport-stamped, so nothing
+/// minted later can sit below an old undo and the undo may go once it has
+/// nothing left to suppress. An unread `add` is NOT: it carries the
+/// back-dated stamp of the last poll that saw its session running, and a
+/// sidebar that was off screen can mint one long after the operator looked.
+/// The seen tombstone is the only thing that outranks it, so it stays until
+/// the session retires (the two-strike absence rule) or the cap evicts it.
+pub fn prune_unread_log(mine: &mut UnreadLog, others: &[&UnreadLog]) -> bool {
+    prune_op_log(mine, others, false)
+}
+
+fn prune_op_log<const V: u32>(mine: &mut OpLog<V>, others: &[&OpLog<V>], gc_tombstones: bool) -> bool {
     // Upgrade BEFORE compacting/ranking: a stripped copy must not outlive the
     // only tagged duplicate merely because the latter belonged to a dead tab.
     let tagged: HashSet<(String, bool, u64, u64)> = mine.ops.iter()
@@ -2415,17 +2523,17 @@ pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool {
         }
         let keep = match best.get(op.id.as_str()) {
             Some(other) => *other <= op.rank(), // P1
-            None => op.add,                    // P2
+            None => op.add || !gc_tombstones,   // P2
         };
         keep && kept.insert(op.id.clone()) // coalesce same-identity copies
     });
     upgraded || mine.ops.len() != before
 }
 
-fn parse_hidden_log(raw: &str) -> HiddenLog {
-    match serde_json::from_str::<HiddenLog>(raw) {
-        Ok(l) if l.v == HIDDEN_LOG_VERSION => l,
-        _ => HiddenLog::new(),
+fn parse_op_log<const V: u32>(raw: &str) -> OpLog<V> {
+    match serde_json::from_str::<OpLog<V>>(raw) {
+        Ok(l) if l.v == V => l,
+        _ => OpLog::new(),
     }
 }
 
@@ -3441,6 +3549,77 @@ mod tests {
         assert!(parse_tab_lines("").0.is_empty());
     }
 
+    /// `@ccmux_tab_unread` is the seventh field. A line that lacks it — a
+    /// six-field line — still yields its map and dismissals; an unparsable
+    /// value, or a fragment of the OTHER kind, reads as an empty unread log,
+    /// never as marks.
+    #[test]
+    fn parse_tab_lines_reads_the_unread_fragment_as_the_seventh_field() {
+        let hidden = r#"{"v":2,"ops":[{"id":"u-x","add":true,"seq":9,"org":0}]}"#;
+        let unread = r#"{"v":3,"ops":[{"id":"u-y","add":true,"seq":7,"org":0}]}"#;
+        let line = |seventh: Option<&str>| match seventh {
+            Some(u) => format!("@0\t1\t%3\t34\t\t{hidden}\t{u}\n"),
+            None => format!("@0\t1\t%3\t34\t\t{hidden}\n"),
+        };
+        let (tabs, _) = parse_tab_lines(&line(Some(unread)));
+        assert_eq!(fold_unread([&tabs[0].unread]).keys().collect::<Vec<_>>(), ["u-y"]);
+        assert_eq!(tabs[0].hidden.ops.len(), 1, "the sixth field is untouched");
+        for seventh in [None, Some(""), Some("{oops"), Some(hidden), Some(r#"{"v":3,"ops":"x"}"#)] {
+            let (tabs, _) = parse_tab_lines(&line(seventh));
+            assert_eq!(tabs.len(), 1, "{seventh:?}: the tab survives");
+            assert_eq!(tabs[0].hidden.ops.len(), 1, "{seventh:?}: dismissals survive");
+            assert!(tabs[0].unread.ops.is_empty(), "{seventh:?}: no marks invented");
+        }
+        // And the other direction: an unread fragment in the hidden field.
+        let (tabs, _) = parse_tab_lines(&format!("@0\t1\t%3\t34\t\t{unread}\t{unread}\n"));
+        assert!(tabs[0].hidden.ops.is_empty(), "a v3 fragment hides nothing");
+    }
+
+    /// The unread cap evicts the oldest seen tombstone first, an add only when
+    /// no tombstone is left, and never the op being pushed.
+    #[test]
+    fn the_unread_cap_evicts_oldest_tombstones_first_and_keeps_the_new_op() {
+        let mut log = UnreadLog::new();
+        for i in 0..UNREAD_OPS_MAX as u64 {
+            log.push(op(&format!("s{i}"), false, 100 + i, 1));
+        }
+        assert!(log.push(op("new", true, 1, 1)), "a full log of tombstones still takes a mark");
+        assert!(log.ops.iter().any(|o| o.id == "new"));
+        assert!(!log.ops.iter().any(|o| o.id == "s0"), "the oldest tombstone goes");
+        log.push(op("newer", true, 2, 1));
+        assert!(log.ops.iter().any(|o| o.id == "new"), "the older add survives");
+        assert!(!log.ops.iter().any(|o| o.id == "s1") && log.ops.len() == UNREAD_OPS_MAX);
+        let before = log.clone();
+        assert!(!log.push(op("s5", true, 3, 2)), "a stale add under my own seen can never win");
+        assert_eq!(log, before, "and evicts nothing");
+
+        // No tombstone left: the lowest-ranked add goes, never the pushed one,
+        // even when the pushed add is back-dated below every other.
+        let mut adds = UnreadLog::new();
+        for i in 0..UNREAD_OPS_MAX as u64 {
+            adds.push(op(&format!("a{i}"), true, 100 + i, 1));
+        }
+        assert!(adds.push(op("late", true, 1, 1)));
+        assert!(adds.ops.iter().any(|o| o.id == "late"), "the pushed op is never the victim");
+        assert!(!adds.ops.iter().any(|o| o.id == "a0") && adds.ops.len() == UNREAD_OPS_MAX);
+    }
+
+    /// A fragment that has filled with seen tombstones — the steady state of
+    /// a long-lived session — keeps every live mark pushed into it.
+    #[test]
+    fn a_full_unread_log_of_tombstones_keeps_every_add() {
+        let mut log = UnreadLog::new();
+        for i in 0..UNREAD_OPS_MAX as u64 {
+            log.push(op(&format!("s{i}"), false, 1_000 + i, 1));
+        }
+        for i in 0..5 {
+            log.push(op(&format!("m{i}"), true, 10 + i, 1));
+        }
+        assert_eq!(log.ops.len(), UNREAD_OPS_MAX);
+        let marks: Vec<_> = fold_unread([&log]).into_keys().filter(|id| id.starts_with('m')).collect();
+        assert_eq!(marks, ["m0", "m1", "m2", "m3", "m4"]);
+    }
+
     #[test]
     fn parse_new_tab_output_wants_all_three_fields() {
         let ok = parse_new_tab_output("@4\t3\t%12\n").expect("parses");
@@ -3574,14 +3753,14 @@ mod tests {
             json,
             r#"{"v":2,"ops":[{"id":"uuid-a","add":true,"seq":1787640000000,"org":3}]}"#
         );
-        assert_eq!(parse_hidden_log(&json), l);
+        assert_eq!(parse_op_log::<HIDDEN_LOG_VERSION>(&json), l);
         // Unset, corrupt, or a schema this build does not know: empty, never an
         // error — showing too much is the safe direction.
-        assert!(parse_hidden_log("").ops.is_empty());
-        assert!(parse_hidden_log("{oops").ops.is_empty());
-        assert!(parse_hidden_log(r#"{"v":99,"ops":[{"id":"x","add":true,"seq":1,"org":0}]}"#).ops.is_empty());
+        assert!(parse_op_log::<HIDDEN_LOG_VERSION>("").ops.is_empty());
+        assert!(parse_op_log::<HIDDEN_LOG_VERSION>("{oops").ops.is_empty());
+        assert!(parse_op_log::<HIDDEN_LOG_VERSION>(r#"{"v":99,"ops":[{"id":"x","add":true,"seq":1,"org":0}]}"#).ops.is_empty());
         // The `@ccmux_hidden` SET shape must not be readable as a log.
-        assert!(parse_hidden_log(r#"{"v":1,"ids":["x"]}"#).ops.is_empty());
+        assert!(parse_op_log::<HIDDEN_LOG_VERSION>(r#"{"v":1,"ids":["x"]}"#).ops.is_empty());
     }
 
     #[test]
@@ -4124,7 +4303,7 @@ mod tests {
         assert!(!serde_json::to_string(&plain).expect("json").contains("provider"));
         let wire = serde_json::to_string(&log(&[tagged.clone()])).expect("json");
         assert!(wire.contains(r#""provider":"codex""#));
-        assert_eq!(parse_hidden_log(&wire).ops, vec![tagged]);
+        assert_eq!(parse_op_log::<HIDDEN_LOG_VERSION>(&wire).ops, vec![tagged]);
         for bad in [serde_json::Value::Null, serde_json::json!("future"), serde_json::json!(1)] {
             let mut value = serde_json::to_value(&plain).expect("json");
             value["provider"] = bad;

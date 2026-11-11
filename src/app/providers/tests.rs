@@ -183,7 +183,7 @@ fn mapped_in_another_tab(a: &mut App, target: &Session) {
         short_id:target.id.clone().unwrap(), name:target.name.clone(), opened_at:1,
     });
     a.tabs.push(TabInfo { window:WindowId::parse("@9").unwrap(), index:9,
-        sidebar:None, map:remote, hidden:HiddenLog::new() });
+        sidebar:None, map:remote, hidden:HiddenLog::new(), unread: Default::default() });
 }
 
 /// A Working Claude row above `codex`, with the cursor on `codex`.
@@ -1769,4 +1769,105 @@ fn a_deleted_polled_row_stays_gone_after_an_incomplete_poll() {
     assert!(codex_names(&a).is_empty());
     poll(&mut a, vec![], false);
     assert!(codex_names(&a).is_empty(), "the cached row came back after an incomplete poll");
+}
+
+/// Codex turns are judged only on rows an observation actually returned: an
+/// incomplete listing that omits a running thread keeps its cached row AND
+/// its running stamp, and the end is marked with that stamp.
+#[test]
+fn a_codex_turn_end_is_marked_only_from_rows_the_observation_returned() {
+    let mut a = configured();
+    let (running, other) = (row(1, CodexStatus::Active { flags: vec![] }), row(2, CodexStatus::Idle));
+    a.now_ms = 1_000;
+    poll(&mut a, vec![running.clone(), other.clone()], true);
+    a.now_ms = 2_000;
+    poll(&mut a, vec![other.clone()], false);
+    assert!(a.sessions.iter().any(|s| s.session_id == running.session_id), "cached row kept");
+    assert!(a.unread.set.is_empty());
+    a.now_ms = 3_000;
+    poll(&mut a, vec![row(1, CodexStatus::Idle), other], true);
+    assert!(a.is_unread(Provider::Codex, &running.session_id));
+    assert!(!a.is_unread(Provider::Codex, &row(2, CodexStatus::Idle).session_id), "never seen running");
+    let add = a.unread.log.ops.iter().find(|o| o.add).unwrap();
+    assert_eq!((add.provider, add.seq), (Provider::Codex, 1_000));
+}
+
+/// Codex unread ops and running stamps retire after two consecutive COMPLETE
+/// Codex observations without the thread. An incomplete Codex observation and
+/// a complete Claude poll in between neither add nor reset a strike.
+#[test]
+fn absence_from_two_complete_codex_observations_retires_unread_state() {
+    let mut a = configured();
+    let active = || CodexStatus::Active { flags: vec![] };
+    let (gone, kept, running) = (row(1, active()), row(2, active()), row(3, active()));
+    a.now_ms = 1_000;
+    poll(&mut a, vec![gone.clone(), kept.clone()], true);
+    a.now_ms = 2_000;
+    poll(&mut a, vec![row(1, CodexStatus::Idle), row(2, CodexStatus::Idle), running.clone()], true);
+    assert!(a.is_unread(Provider::Codex, &gone.session_id) && a.is_unread(Provider::Codex, &kept.session_id));
+    assert!(a.unread.last_running.contains_key(&running.session_id));
+    poll(&mut a, vec![row(2, CodexStatus::Idle)], true);
+    assert!(a.is_unread(Provider::Codex, &gone.session_id), "one absence is only a strike");
+    poll(&mut a, vec![], false);
+    a.apply_poll(Ok(payload(vec![claude()])));
+    poll(&mut a, vec![row(2, CodexStatus::Idle)], true);
+    assert!(!a.unread.log.ops.iter().any(|o| o.id == gone.session_id), "the absent thread's ops retire");
+    assert!(!a.unread.last_running.contains_key(&running.session_id), "and so does its running stamp");
+    assert!(a.is_unread(Provider::Codex, &kept.session_id), "a listed thread keeps its mark");
+}
+
+/// `Ctrl+X` on a running Codex turn ends it by the operator's hand, which
+/// Codex reports only as `idle`: no mark, even through a lagging poll that
+/// still says `active`. The thread's next turn is marked as usual.
+#[test]
+fn a_codex_turn_stopped_with_ctrl_x_is_not_marked() {
+    let mut a = configured();
+    let active = || row(1, CodexStatus::Active { flags: vec![] });
+    let id = active().session_id;
+    a.now_ms = 1_000;
+    poll(&mut a, vec![active()], true);
+    a.rebuild_rows();
+    ctrl_x(&mut a);
+    assert_eq!(SCRIPT.with(|s| s.borrow().stop_ids.clone()), std::slice::from_ref(&id));
+    a.now_ms = 2_000;
+    poll(&mut a, vec![active()], true); // the interrupt has not landed yet
+    a.now_ms = 3_000;
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    assert!(!a.is_unread(Provider::Codex, &id), "the operator stopped this turn");
+    a.now_ms = 4_000;
+    poll(&mut a, vec![active()], true);
+    a.now_ms = 5_000;
+    poll(&mut a, vec![row(1, CodexStatus::Idle)], true);
+    assert!(a.is_unread(Provider::Codex, &id), "the next turn ends on its own");
+}
+
+/// The tick-time watermark trusts only a row the provider's latest poll
+/// succeeded and returned. After a failed Claude poll, and for a Codex row an
+/// incomplete observation kept from cache, a look at a row the snapshot calls
+/// finished mints no seen (it may be running again by now) and keeps its
+/// edge, so the next good poll takes the look.
+#[test]
+fn the_tick_watermark_skips_rows_the_last_poll_did_not_return() {
+    let mut a = configured();
+    let (cdx, other) = (row(1, CodexStatus::Idle), row(2, CodexStatus::Idle));
+    a.apply_poll(Ok(payload(vec![claude()])));
+    poll(&mut a, vec![cdx.clone(), other.clone()], true);
+    claude_error(&mut a, "boom");
+    poll(&mut a, vec![other.clone()], false);
+    assert!(a.sessions.iter().any(|s| s.session_id == cdx.session_id), "cached row kept");
+    for (n, s) in [claude(), cdx.clone()].iter().enumerate() {
+        let pane = PaneId::parse(&format!("%{}", 20 + n)).unwrap();
+        a.map.insert(&pane, PaneEntry { provider: s.provider, session_id: s.session_id.clone(),
+            short_id: s.id.clone().unwrap(), name: s.name.clone(), opened_at: 1 });
+        a.panes.push(PaneInfo { id: pane, index: 2, left: 35, top: 0, width: 60, height: 40,
+            active: false, window_index: 1, window_id: WindowId::parse("@1").unwrap(), window_active: true,
+            session_clients: 1, window_viewers: Some(1), window_zoomed: false, detached: false, shell: false });
+    }
+    let seen = |a: &App, id: &str| a.unread.log.ops.iter().any(|o| o.id == id && !o.add);
+    a.tick_unread_seen();
+    assert!(!seen(&a, "claude-id"), "the Claude snapshot predates a failed poll");
+    assert!(!seen(&a, &cdx.session_id), "the Codex row was not in the last observation");
+    a.apply_poll(Ok(payload(vec![claude()])));
+    poll(&mut a, vec![cdx.clone(), other], true);
+    assert!(seen(&a, "claude-id") && seen(&a, &cdx.session_id), "the look is taken after a good poll");
 }

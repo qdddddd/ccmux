@@ -754,9 +754,10 @@ enum RestartStep {
     /// Skip it and a failed `exec` leaves the operator with a wedged terminal —
     /// no echo, no newline translation — and no sidebar to fix it from.
     RestoreTerminal,
-    /// `App::shutdown` — the deferred `@ccmux_tab_map` / `@ccmux_tab_hidden`
-    /// writes. There is no next `tick` to land them in, exactly as at `q`, so a
-    /// dismissal made since the last tick would not survive the restart.
+    /// `App::shutdown` — the deferred `@ccmux_tab_map` / `@ccmux_tab_hidden` /
+    /// `@ccmux_tab_unread` writes. There is no next `tick` to land them in,
+    /// exactly as at `q`, so a dismissal (or an unread mark) made since the
+    /// last tick would not survive the restart.
     FlushTmuxState,
 }
 
@@ -1021,7 +1022,7 @@ mod tests {
             index: window,
             sidebar: sidebar.and_then(PaneId::parse),
             map,
-            hidden: tmux::HiddenLog::new(),
+            hidden: tmux::HiddenLog::new(), unread: Default::default(),
         }
     }
 

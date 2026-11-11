@@ -58,6 +58,10 @@ pub struct Palette {
     pub aqua_elsewhere: Color,
     pub orange: Color,
     pub sel_bg: Color,
+    /// The unread row's ground (§6.4): a pale green tint behind an UNSELECTED
+    /// row whose turn ended unseen. Selection wins, since the band is the
+    /// cursor; the `•` still carries the mark there.
+    pub unread_bg: Color,
 }
 
 impl Palette {
@@ -84,6 +88,9 @@ impl Palette {
             aqua_elsewhere: Color::Rgb(0x7c, 0x6f, 0x64),
             orange: Color::Rgb(0xfe, 0x80, 0x19),
             sel_bg: Color::Rgb(0x3c, 0x38, 0x36),
+            // Dark olive: 1.18:1 off the ground, so it reads as a tint, not a
+            // band. fg 9.12, gray 4.50 on it; `dim` (3.41) promotes to gray.
+            unread_bg: Color::Rgb(0x32, 0x36, 0x1a),
         }
     }
 
@@ -136,6 +143,8 @@ impl Palette {
             // 5.74:1 ground, 4.75:1 band, ΔE 28.8 from `aqua`.
             aqua_elsewhere: Color::Rgb(0xa8, 0x99, 0x84),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
+            // Pale green; every row ink clears 4.0:1 on it (lowest: aqua 4.63).
+            unread_bg: Color::Rgb(0xe3, 0xec, 0xc1),
         }
     }
 
@@ -461,13 +470,20 @@ fn push(spans: &mut Vec<Span<'static>>, used: &mut usize, text: &str, style: Sty
 // columns. `draw_header` already right-aligns its poll dot at `w - 2`, i.e.
 // column W-1, which is why it needs no edit.
 
-/// The fixed left gutter: cap/marker(1) + pane badge(1) + glyph(1) + space(1).
+/// The fixed left gutter: cap/marker(1) + pane badge(1) + glyph(1) + unread(1).
+/// The fourth column is the unread mark (`UNREAD_MARK`) on a row whose turn
+/// ended unwatched, and the blank that separates glyph from name otherwise.
 /// It is FOUR columns at every width that has a gutter and never varies, which
 /// is what puts the status glyph on column 3 and the name on column 5 of every
 /// row alike. See `session_line` for why the badge cannot be allowed to grow.
 const GUTTER: usize = 4;
 /// One blank column between the name field and the rail.
 const GAP: usize = 1;
+/// The unread mark (§6.4): a finished turn nobody has looked at. One column in
+/// tmux and in `display_width` alike (U+2022 is narrow), in `p.fg` — the ink
+/// the name of a Working row already wears, so it adds no contrast surface on
+/// either ground or on `sel_bg`, and no hue that already means something.
+const UNREAD_MARK: &str = "•";
 /// Nominal rail field. A wider age (`9999d`) spills into that row's own name.
 const NUM_W: usize = 3;
 /// The gutter and the right margin exist at or above this width.
@@ -646,17 +662,33 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         return Line::from(Vec::<Span>::new());
     }
     let (glyph, glyph_color) = status_glyph(sess, p);
+    let unread = app.is_unread(sess.provider, &sess.session_id);
+    // Selection wins over the unread tint: the band is the cursor.
     let base = if selected {
         Style::default().bg(p.sel_bg)
+    } else if unread {
+        Style::default().bg(p.unread_bg)
     } else {
         Style::default()
     };
     // Selection forces `p.fg`: `p.dim` is 3.16:1 on the dark `sel_bg`, so a
-    // selected Completed row would otherwise be dim-on-band.
+    // selected Completed row would otherwise be dim-on-band. An unread row's
+    // name also takes `p.fg` — it is the row asking to be read, and `p.dim`
+    // is 3.41:1 on the dark tint.
     let name_style = if selected {
         base.fg(p.fg).add_modifier(Modifier::BOLD)
+    } else if unread {
+        base.fg(p.fg)
     } else {
         base.fg(name_tier(sess, p))
+    };
+
+    // Column 4 (or the column after the glyph on the narrow rung): the unread
+    // mark, or the blank it replaces. Never widens the row.
+    let gap = if unread {
+        Span::styled(UNREAD_MARK.to_string(), base.fg(p.fg))
+    } else {
+        Span::styled(" ".to_string(), base)
     };
 
     // W < 6: glyph only.
@@ -668,10 +700,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
 
     // 6..=19: glyph + space + name (truncated to W-2), no gutter, no margin.
     if w < MARGIN_MIN {
-        let mut spans = vec![
-            Span::styled(glyph.to_string(), base.fg(glyph_color)),
-            Span::styled(" ".to_string(), base),
-        ];
+        let mut spans = vec![Span::styled(glyph.to_string(), base.fg(glyph_color)), gap];
         let name = truncate_end(&sess.name, w.saturating_sub(2));
         let used = 2 + display_width(&name);
         spans.push(Span::styled(name, name_style));
@@ -737,7 +766,8 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         None => spans.push(Span::styled(" ".to_string(), base)),
     }
     spans.push(Span::styled(glyph.to_string(), base.fg(glyph_color)));
-    spans.push(Span::styled(" ".to_string(), base));
+    // `spans[3]`: the name stays `spans[4]` whether or not the mark is drawn.
+    spans.push(gap);
     let mut used = GUTTER + display_width(&name);
     spans.push(Span::styled(name, name_style));
 
@@ -755,7 +785,7 @@ fn session_line(app: &App, sess: &Session, selected: bool, w: usize, p: &Palette
         // row's age promotes one rung. This is a contrast fix, not a flourish.
         spans.push(Span::styled(
             a,
-            base.fg(if selected { p.gray } else { p.dim }),
+            base.fg(if selected || unread { p.gray } else { p.dim }),
         ));
         used += lead + aw;
     }
@@ -1264,6 +1294,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Esc", "cancel window/filter"),
     ("Ctrl-c", "quit from any mode"),
     ("▌N", "in tab N (blank: here)"),
+    ("•", "finished, not yet viewed"),
 ];
 
 const CODEX_KEYS: &[(&str, &str)] = &[
@@ -1644,6 +1675,7 @@ mod tests {
             hidden_log: crate::tmux::HiddenLog::new(),
             last_frags: std::collections::BTreeMap::new(),
             seq_seen: 0,
+            unread: Default::default(),
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -1743,7 +1775,7 @@ mod tests {
             index,
             sidebar: sidebar.and_then(PaneId::parse),
             map: PaneMap::new(),
-            hidden: crate::tmux::HiddenLog::new(),
+            hidden: crate::tmux::HiddenLog::new(), unread: Default::default(),
         }
     }
 
@@ -2978,14 +3010,19 @@ mod tests {
             (Status::Unknown("pondering".into()), None),                 // ?
         ];
         let mut app = app_with(vec![sess(1, Kind::Background, Status::Busy, Some(State::Working))]);
+        assert_eq!(display_width(UNREAD_MARK), 1, "the unread mark is one display column");
         for (status, state) in variants {
             app.sessions[0].status = status.clone();
             app.sessions[0].state = state.clone();
             // The mark itself must be one cell, or the grid arithmetic is a lie.
             let (glyph, _) = status_glyph(&app.sessions[0], &Palette::dark());
             assert_eq!(display_width(glyph), 1, "{glyph:?} is not one display column");
-            for name in ["", "alpha/opt", "回归模型数据清洗与因子测试流水线重构任务"] {
+            for (name, unread) in [("", false), ("alpha/opt", true), ("回归模型数据清洗与因子测试流水线重构任务", true)] {
                 app.sessions[0].name = name.to_string();
+                app.unread.set.clear();
+                if unread {
+                    app.unread.set.insert(app.sessions[0].session_id.clone(), Provider::Claude);
+                }
                 for selected in [false, true] {
                     for w in 0..=120usize {
                         for pal in [Palette::light(), Palette::dark()] {
@@ -3397,6 +3434,51 @@ mod tests {
         }
     }
 
+    /// The unread mark takes the blank after the glyph — column 4 with a
+    /// gutter, column 2 on the narrow rung — and nothing else moves: the name
+    /// is still `spans[4]` and starts on column 5, and below 6 columns the
+    /// row is the glyph alone.
+    #[test]
+    fn the_unread_mark_sits_after_the_glyph_and_moves_nothing() {
+        let p = Palette::dark();
+        let mut app = app_with(vec![sess(1, Kind::Background, Status::Idle, Some(State::Done))]);
+        app.sessions[0].name = "alpha".into();
+        let sid = app.sessions[0].session_id.clone();
+        for w in [0usize, 3, 5, 6, 12, 19, 20, 28, 34, 60] {
+            app.unread.set.clear();
+            let read = session_line(&app, &app.sessions[0], false, w, &p);
+            app.unread.set.insert(sid.clone(), Provider::Claude);
+            let unread = session_line(&app, &app.sessions[0], false, w, &p);
+            assert_eq!(line_w(&unread), w, "w={w}");
+            let (a, b) = (line_cols(&read), line_cols(&unread));
+            let at = match w {
+                0..=5 => {
+                    assert_eq!(a, b, "w={w}: below 6 columns there is no room for it");
+                    continue;
+                }
+                6..=19 => 1,
+                _ => 3,
+            };
+            assert_eq!((a[at], b[at]), (' ', '•'), "w={w}: {b:?}");
+            let differs: Vec<usize> = (0..w).filter(|&i| a[i] != b[i]).collect();
+            assert_eq!(differs, vec![at], "w={w}: only the mark's cell changes");
+            if w >= 20 {
+                assert_eq!(unread.spans[4].content, "alpha", "w={w}: the name is still spans[4]");
+                assert_eq!(unread.spans[3].style.fg, Some(p.fg), "w={w}: inked in p.fg");
+            }
+        }
+        // The tint fills the whole unselected row; selection's band wins.
+        for (selected, bg) in [(false, p.unread_bg), (true, p.sel_bg)] {
+            let l = session_line(&app, &app.sessions[0], selected, 34, &p);
+            assert!(l.spans.iter().all(|s| s.style.bg == Some(bg)), "selected={selected}: {l:?}");
+        }
+        // A mark for the same id under the other provider is not this row's.
+        app.unread.set.clear();
+        app.unread.set.insert(sid, Provider::Codex);
+        assert!(session_line(&app, &app.sessions[0], false, 34, &p).spans.iter().all(|s| s.style.bg.is_none()));
+        assert_eq!(line_cols(&session_line(&app, &app.sessions[0], false, 34, &p))[3], ' ');
+    }
+
     /// The width oracle itself, measured against the terminal rather than
     /// against itself. `every_session_line_is_exactly_the_sidebar_width` sums a
     /// row with `display_width`, so it cannot catch `display_width` being wrong
@@ -3436,6 +3518,12 @@ mod tests {
         ] {
             app.sessions[0].name = name.to_string();
             for w in 6..=60usize {
+                // The unread mark is measured by the same oracle: U+2022 is
+                // one column in tmux, as it is in `display_width`.
+                app.unread.set.clear();
+                if w % 2 == 0 {
+                    app.unread.set.insert(app.sessions[0].session_id.clone(), Provider::Claude);
+                }
                 for selected in [false, true] {
                     let l = session_line(&app, &app.sessions[0], selected, w, &p);
                     let text: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
@@ -3738,6 +3826,10 @@ mod tests {
             ] {
                 let r = ratio(c, p.sel_bg);
                 assert!(r >= 4.0, "{name}.{field} is {r:.2}:1 on sel_bg, needs >= 4.0:1");
+                // An unselected unread row paints the same inks (name `fg`,
+                // age `gray`, any glyph) on `unread_bg`.
+                let r = ratio(c, p.unread_bg);
+                assert!(r >= 4.0, "{name}.{field} is {r:.2}:1 on unread_bg, needs >= 4.0:1");
             }
         }
     }

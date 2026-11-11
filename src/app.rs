@@ -8,6 +8,8 @@
 
 pub mod providers;
 use providers::{CodexPoll, Diagnostics};
+pub mod unread;
+use unread::Unread;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -541,8 +543,14 @@ pub struct App {
     pub last_frags: BTreeMap<u64, HiddenLog>,
     /// Lamport clock: the largest stamp seen in any fragment, including my own
     /// writes. `next_seq` is `max(now_ms, seq_seen + 1)`, so a stamp is
-    /// monotonic per process even across a backward wall-clock step.
+    /// monotonic per process even across a backward wall-clock step. It
+    /// covers BOTH logs: every unread fragment's stamps are folded in too, so
+    /// a seen op always outranks every unread add folded so far (§11.6).
     pub seq_seen: u64,
+    /// The unread marks (§6.4, §11.6): this process's fragment of the shared
+    /// `@ccmux_tab_unread` log, its fold, and the in-memory turn tracking that
+    /// mints into it.
+    pub unread: Unread,
 
     // tmux
     pub map: PaneMap,
@@ -797,6 +805,7 @@ impl App {
             hidden_log: HiddenLog::new(),
             last_frags: BTreeMap::new(),
             seq_seen: 0,
+            unread: Unread::default(),
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -893,6 +902,9 @@ impl App {
         self.map = PaneMap::new();
         self.hidden = HiddenSet::new();
         self.hidden_log = HiddenLog::new();
+        // No turn has been observed running yet, so no mark can be minted
+        // until one is: startup never invents a mark.
+        self.unread = Unread::default();
         // A fresh process has seen no polls, so no id has a strike against it.
         // Adopting a stored fragment must not import one either: an id
         // dismissed in a previous run is owed the same two chances as a fresh
@@ -915,11 +927,15 @@ impl App {
     ///      4b. on Ok ONLY: reconcile the dismissed set against the fresh poll
     ///      — 4 and 4b are `apply_poll`, which is where their whole policy
     ///      lives so it can be tested without shelling out to `claude`
+    ///      4c. `tick_unread_seen`: an unread id whose pane is on screen
+    ///      anywhere is read, and a fresh look at a finished row leaves a
+    ///      watermark seen (SPEC §11.6) — from the inventory of step 2
     ///   5. rebuild rows, re-anchor selection by selected_key
     ///      5b. settle `n`'s pending cursor jump against the rebuilt rows —
     ///      `tick_pending_jump`, which needs both the fresh `sessions` and the
     ///      rows the filters just decided
-    ///   6. flush the map if map_dirty, and the dismissed set if hidden_dirty
+    ///   6. flush the map if map_dirty, the dismissed set if hidden_dirty,
+    ///      and the unread log if `unread.dirty`
     ///   7. pin_sidebar (unconditional, §1.3)
     ///   8. last_poll = Instant::now()
     ///
@@ -949,6 +965,11 @@ impl App {
         // ages toward being dropped on the strength of a poll never taken.
         let polled = self.poll_providers();
 
+        // 4c — a mark whose session is on screen anywhere is read. After the
+        // poll, so a mark minted on this very tick is judged by this tick's
+        // inventory rather than waiting one more.
+        self.tick_unread_seen();
+
         // 5
         self.rebuild_rows();
 
@@ -958,6 +979,7 @@ impl App {
         // 6
         self.save_map_now();
         self.save_hidden_now();
+        self.save_unread_now();
 
         // 7 — unconditional (§1.3); this is what heals a manual resize.
         self.pin_sidebar();
@@ -1022,9 +1044,18 @@ impl App {
                 if self.relink_maps() {
                     self.rebuild_open();
                 }
+                // After the re-keying above, not before the sessions are
+                // replaced: a `/clear`'s new id must find the running stamp
+                // `carry_renames` moved onto it, and the "is it on screen"
+                // check reads maps `relink_maps` has just re-pointed.
+                let observed: Vec<Session> = self.sessions.iter()
+                    .filter(|s| s.provider == Provider::Claude).cloned().collect();
+                self.observe_turns(Provider::Claude, &observed);
+                self.reconcile_unread(Provider::Claude, complete);
             }
             Err(e) => {
                 self.note_claude_failure(&e);
+                self.unread_poll_failed(Provider::Claude);
                 self.fail_streak = self.fail_streak.saturating_add(1);
                 self.poll_error = Some(model::truncate_end(&agents_msg(&e), POLL_ERR_MAX));
                 // A failed poll says nothing about whether the fleet is still.
@@ -1952,6 +1983,7 @@ impl App {
     /// pane that closed since the last tick would name nothing, and a pane
     /// opened since would have none.
     pub fn act_open_pick(&mut self, dir: SplitDir) {
+        self.unread_seen_selected();
         let Some((sel, cmd)) = self.open_guards(None) else {
             return;
         };
@@ -2112,6 +2144,7 @@ impl App {
     /// existence of any process in that window, which is what keeps
     /// `@ccmux_tab_map` a single-writer option.
     pub fn act_open_tab(&mut self) {
+        self.unread_seen_selected();
         if self.degraded {
             self.flash("not inside tmux — tabs unavailable", MsgLevel::Warn);
             return;
@@ -2272,6 +2305,7 @@ impl App {
 
     /// `Enter` — open or jump. SPEC §8.3.
     pub fn act_enter(&mut self) {
+        self.unread_seen_selected();
         if self.degraded {
             self.flash("not inside tmux — open unavailable", MsgLevel::Warn);
             return;
@@ -2684,6 +2718,7 @@ impl App {
                 self.flash(format!("stop failed: {}", error.message), MsgLevel::Error);
                 return;
             }
+            self.unread_turn_stopped(&session.session_id);
             self.act_force_refresh();
         }
         let label = session_label(session);
@@ -3766,7 +3801,7 @@ impl App {
                     index,
                     sidebar: self.sidebar_pane.clone(),
                     map: self.map.clone(),
-                    hidden: HiddenLog::new(),
+                    hidden: HiddenLog::new(), unread: Default::default(),
                 });
             }
         }
@@ -4048,6 +4083,7 @@ impl App {
         }
         self.adopt_orphan_fragments();
         self.refold_hidden();
+        self.refold_unread();
         self.rebuild_open();
     }
 
@@ -4161,7 +4197,8 @@ impl App {
     }
 
     /// The rest of what `/clear` re-keys: an agent listed under the same short
-    /// id with a new session id keeps the cursor and its dismissal. `before`
+    /// id with a new session id keeps the cursor, its dismissal, and its
+    /// unread state (`carry_unread`). `before`
     /// is the previous poll's Claude short id -> session id.
     fn carry_renames(&mut self, before: &BTreeMap<String, String>) {
         let renames: Vec<(String, String)> = self
@@ -4178,6 +4215,7 @@ impl App {
             if self.selected_key.as_deref() == Some(old.as_str()) {
                 self.selected_key = Some(new.clone());
             }
+            self.carry_unread(&old, &new);
             if self.hidden.provider_of(&old) == Some(Provider::Claude)
                 && self.hidden.dismiss_for(Provider::Claude, &new)
             {
@@ -4213,7 +4251,9 @@ impl App {
         if self.own_state_loaded || self.own_window.is_none() {
             return;
         }
-        let Some((map, log)) = self.own_tab().map(|t| (t.map.clone(), t.hidden.clone())) else {
+        let Some((map, log, unread)) =
+            self.own_tab().map(|t| (t.map.clone(), t.hidden.clone(), t.unread.clone()))
+        else {
             return; // retry once the window enumeration resolves
         };
         // Interim entries win same-provider ties: they name a pane this
@@ -4230,6 +4270,11 @@ impl App {
         for op in log.ops {
             if self.hidden_log.push(op) {
                 self.hidden_dirty = true;
+            }
+        }
+        for op in unread.ops {
+            if self.unread.log.push(op) {
+                self.unread.dirty = true;
             }
         }
         self.own_state_loaded = true;
@@ -4307,11 +4352,28 @@ impl App {
             .filter(|(num, _)| !live.contains(num))
             .map(|(_, log)| log.clone())
             .collect();
-        if !orphans.is_empty() && self.is_adopter() {
+        let unread_orphans: Vec<tmux::UnreadLog> = self
+            .unread
+            .last_frags
+            .iter()
+            .filter(|(num, _)| !live.contains(num))
+            .map(|(_, log)| log.clone())
+            .collect();
+        if (!orphans.is_empty() || !unread_orphans.is_empty()) && self.is_adopter() {
             for log in orphans {
                 for op in log.ops {
                     if self.hidden_log.push(op) {
                         self.hidden_dirty = true;
+                    }
+                }
+            }
+            // The unread log is adopted on exactly the same terms: a closed
+            // tab must not take a mark — or the seen tombstone that keeps a
+            // stale mark from coming back — with it.
+            for log in unread_orphans {
+                for op in log.ops {
+                    if self.unread.log.push(op) {
+                        self.unread.dirty = true;
                     }
                 }
             }
@@ -4322,6 +4384,12 @@ impl App {
             .iter()
             .filter(|t| Some(&t.window) != mine.as_ref())
             .map(|t| (t.window.num(), t.hidden.clone()))
+            .collect();
+        self.unread.last_frags = self
+            .tabs
+            .iter()
+            .filter(|t| Some(&t.window) != mine.as_ref())
+            .map(|t| (t.window.num(), t.unread.clone()))
             .collect();
     }
 
@@ -4777,6 +4845,7 @@ impl App {
         self.end_pick();
         self.save_map_now();
         self.save_hidden_now();
+        self.save_unread_now();
     }
 
     /// `#{window_index}` of the window the sidebar lives in — the only window
@@ -5631,6 +5700,7 @@ mod tests {
             hidden_log: HiddenLog::new(),
             last_frags: BTreeMap::new(),
             seq_seen: 0,
+            unread: Unread::default(),
             mode: Mode::Normal,
             prompt: None,
             logs: None,
@@ -7925,7 +7995,7 @@ mod tests {
             index,
             sidebar: sidebar.and_then(PaneId::parse),
             map: PaneMap::new(),
-            hidden: HiddenLog::new(),
+            hidden: HiddenLog::new(), unread: Default::default(),
         }
     }
 
@@ -11311,14 +11381,14 @@ mod tests {
                 index: 1,
                 sidebar: PaneId::parse("%1"),
                 map: m1,
-                hidden: HiddenLog::new(),
+                hidden: HiddenLog::new(), unread: Default::default(),
             },
             TabInfo {
                 window: WindowId::parse("@2").expect("window id"),
                 index: 2,
                 sidebar: PaneId::parse("%4"),
                 map: m2,
-                hidden: HiddenLog::new(),
+                hidden: HiddenLog::new(), unread: Default::default(),
             },
         ];
         a.respawn = recording_respawn;

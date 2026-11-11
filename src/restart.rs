@@ -1089,7 +1089,7 @@ mod tests {
             index: 1,
             sidebar: sidebar.map(|s| PaneId::parse(s).expect("pane id")),
             map: map(entries),
-            hidden: HiddenLog::new(),
+            hidden: HiddenLog::new(), unread: Default::default(),
         }
     }
 

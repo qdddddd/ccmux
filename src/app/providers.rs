@@ -251,9 +251,16 @@ impl App {
         self.diagnostics.codex.explicit_refresh = explicit;
         match result {
             Ok(observation) => {
+                // The rows THIS observation returned, before `apply` settles
+                // the deletion filter: an incomplete one keeps cached rows it
+                // did not re-read, and those say nothing about a turn.
+                let observed: Vec<Session> = observation.sessions.iter()
+                    .filter(|row| !self.codex.deleted.contains(&row.session_id))
+                    .cloned().collect();
                 self.codex.apply(&observation);
                 self.sessions.retain(|s| s.provider != Provider::Codex);
                 self.sessions.extend(self.codex.rows.values().cloned());
+                self.observe_turns(Provider::Codex, &observed);
                 for raw in observation.source_drift {
                     let label = format!("codex source {raw}");
                     if !self.drift_seen.contains(&label) { self.drift_pending.insert(label); }
@@ -268,9 +275,11 @@ impl App {
                     self.diagnostics.codex.failure(FailureCategory::Codex(diagnostic.kind), diagnostic.message);
                 }
                 self.reconcile_hidden(Provider::Codex, observation.complete);
+                self.reconcile_unread(Provider::Codex, observation.complete);
             }
             Err(error) => {
                 self.codex.failed();
+                self.unread_poll_failed(Provider::Codex);
                 self.diagnostics.codex.failure(FailureCategory::Codex(error.kind), error.message);
             }
         }

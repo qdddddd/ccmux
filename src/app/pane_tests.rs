@@ -53,7 +53,7 @@ impl Server {
             session: session.into(),
             panes: vec![Pane { id: "%1".into(), window: 1, index: 1, latch: String::new(), pick: String::new() }],
             tabs: BTreeMap::from([(1, TabInfo { window: wid(1), index: 1, sidebar: Some(pid("%1")),
-                map: PaneMap::new(), hidden: HiddenLog::new() })]), wopts: BTreeMap::new(), calls: vec![], next: 10, zoomed: false,
+                map: PaneMap::new(), hidden: HiddenLog::new(), unread: Default::default() })]), wopts: BTreeMap::new(), calls: vec![], next: 10, zoomed: false,
         }
     }
 
@@ -122,9 +122,10 @@ impl Server {
             }
             "list-windows" => {
                 assert_eq!(target(), format!("={}:", self.session));
-                Ok(self.tabs.values().map(|t| format!("{}\t{}\t{}\t34\t{}\t{}",
+                Ok(self.tabs.values().map(|t| format!("{}\t{}\t{}\t34\t{}\t{}\t{}",
                     t.window, t.index, t.sidebar.as_ref().map(PaneId::as_str).unwrap_or(""),
                     serde_json::to_string(&t.map).unwrap(), serde_json::to_string(&t.hidden).unwrap(),
+                    serde_json::to_string(&t.unread).unwrap(),
                 )).collect::<Vec<_>>().join("\n"))
             }
             "split-window" => {
@@ -138,7 +139,7 @@ impl Server {
                 assert_eq!(target(), format!("={}:", self.session));
                 let window = self.tabs.keys().max().copied().unwrap() + 1;
                 self.tabs.insert(window, TabInfo { window: wid(window), index: window, sidebar: None,
-                    map: PaneMap::new(), hidden: HiddenLog::new() });
+                    map: PaneMap::new(), hidden: HiddenLog::new(), unread: Default::default() });
                 let pane = self.add_pane(window);
                 Ok(format!("@{window}\t{window}\t{pane}"))
             }
@@ -151,6 +152,7 @@ impl Server {
                     tmux::OPT_TAB_MAP => tab.map = serde_json::from_str(value).unwrap(),
                     tmux::OPT_TAB_SIDEBAR => tab.sidebar = Some(pid(value)),
                     tmux::OPT_TAB_HIDDEN => tab.hidden = serde_json::from_str(value).unwrap(),
+                    tmux::OPT_TAB_UNREAD => tab.unread = serde_json::from_str(value).unwrap(),
                     _ => panic!("unexpected option {key}"),
                 }
                 Ok(String::new())
@@ -214,7 +216,7 @@ fn with_sidebar(test: impl FnOnce(&mut App, &Rc<RefCell<Server>>)) {
 fn map_pane(a: &mut App, server: &Rc<RefCell<Server>>, window: u32, row: &Session, latch: &str) -> String {
     let mut s = server.borrow_mut();
     s.tabs.entry(window).or_insert_with(|| TabInfo { window: wid(window), index: window, sidebar: None,
-        map: PaneMap::new(), hidden: HiddenLog::new() });
+        map: PaneMap::new(), hidden: HiddenLog::new(), unread: Default::default() });
     let pane = s.add_pane(window);
     s.panes.last_mut().unwrap().latch = latch.into();
     s.tabs.get_mut(&window).unwrap().map.insert(&pid(&pane), record(row));
@@ -473,7 +475,7 @@ fn a_cancelled_pick_restores_its_own_window_whatever_moved() {
             {
                 let mut s = server.borrow_mut();
                 s.tabs.entry(2).or_insert_with(|| TabInfo { window: wid(2), index: 2, sidebar: None,
-                    map: PaneMap::new(), hidden: HiddenLog::new() });
+                    map: PaneMap::new(), hidden: HiddenLog::new(), unread: Default::default() });
                 let moved = match change {
                     "sidebar moved" => "%1",
                     "label moved" => ids[1].as_str(),
@@ -891,7 +893,7 @@ fn delete_closes_the_codex_pane_in_another_tab() {
 fn map_in_tab_without_refresh(server: &Rc<RefCell<Server>>, window: u32, row: &Session) {
     let mut s = server.borrow_mut();
     s.tabs.insert(window, TabInfo { window: wid(window), index: window, sidebar: None,
-        map: PaneMap::new(), hidden: HiddenLog::new() });
+        map: PaneMap::new(), hidden: HiddenLog::new(), unread: Default::default() });
     let pane = s.add_pane(window);
     s.tabs.get_mut(&window).unwrap().map.insert(&pid(&pane), record(row));
 }
@@ -961,5 +963,26 @@ fn r_from_a_codex_row_restarts_only_sidebars_and_claude_and_reports_each_skip_on
         let note = &a.message.as_ref().unwrap().0;
         assert_eq!(note, "restarted 1 sidebar, 1 pane, 0 agents (1 not restarted); Codex panes skipped: 2");
         assert!(agents::test_spawn::calls().is_empty());
+    });
+}
+
+/// An unread mark outlives its sidebar: `shutdown` (also `R`'s pre-exec
+/// flush) writes this window's `@ccmux_tab_unread`, and the next process in
+/// the window adopts it on its first refresh.
+#[test]
+fn unread_marks_survive_a_sidebar_restart() {
+    with_sidebar(|a, server| {
+        a.unread.log.push(HiddenOp { provider: Provider::Codex, id: ID.into(), add: true, seq: 7, org: 1 });
+        a.unread.dirty = true;
+        a.shutdown();
+        assert_eq!(server.borrow().tabs[&1].unread, a.unread.log, "flushed to my own window");
+        assert!(!a.unread.dirty);
+
+        let mut next = super::tests::app();
+        next.tmux_session = a.tmux_session.clone();
+        next.own_pane = Some(pid("%1"));
+        next.own_state_loaded = false;
+        next.refresh_panes();
+        assert!(next.is_unread(Provider::Codex, ID), "adopted by the next process");
     });
 }

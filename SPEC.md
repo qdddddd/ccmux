@@ -910,6 +910,9 @@ pub struct TabInfo {
     pub sidebar: Option<PaneId>,
     pub map: PaneMap,
     pub hidden: HiddenLog,
+    /// `@ccmux_tab_unread`, the seventh `list-windows` field (§11.6). Absent
+    /// or unparsable reads as empty; the first six fields alone make a tab.
+    pub unread: UnreadLog,
 }
 
 /// `tmux list-windows -t '=<session>:' -F …` — the whole cross-tab picture and
@@ -933,6 +936,9 @@ pub fn set_tab_sidebar(session: &str, pane: &PaneId) -> Result<(), TmuxError>;
 pub fn save_tab_map(session: &str, pane: &PaneId, window: &WindowId, map: &PaneMap)
     -> Result<(), TmuxError>;
 pub fn save_tab_hidden(session: &str, pane: &PaneId, window: &WindowId, log: &HiddenLog)
+    -> Result<(), TmuxError>;
+/// `@ccmux_tab_unread` (§11.6), on the same terms.
+pub fn save_tab_unread(session: &str, pane: &PaneId, window: &WindowId, log: &UnreadLog)
     -> Result<(), TmuxError>;
 
 /// The ONE write into a window this process does not own: `t` seeds the new
@@ -961,9 +967,12 @@ pub fn clear_pick_labels(session: &str, window: &WindowId, labelled: &[PaneId])
 /// reader orders it identically.
 pub struct HiddenOp { pub id: String, pub add: bool, pub seq: u64, pub org: u64 }
 
-/// One window's fragment of the shared dismissal log. Schema version 2.
-pub struct HiddenLog { pub v: u32, pub ops: Vec<HiddenOp> }
-impl HiddenLog {
+/// One window's fragment of a shared op log. `V` is the schema version and
+/// the log's kind: a fragment whose `v != V` reads as empty.
+pub struct OpLog<const V: u32> { pub v: u32, pub ops: Vec<HiddenOp> }
+pub type HiddenLog = OpLog<2>; // the dismissal log
+pub type UnreadLog = OpLog<3>; // the unread log (§11.6)
+impl<const V: u32> OpLog<V> {
     pub fn new() -> Self;
     pub fn push(&mut self, op: HiddenOp) -> bool;   // idempotent, capped
     pub fn max_seq(&self) -> u64;
@@ -977,6 +986,15 @@ pub fn fold_hidden<'a, I: IntoIterator<Item = &'a HiddenLog>>(frags: I) -> Hidde
 
 /// Garbage-collect one's OWN fragment against what the others already carry.
 pub fn prune_hidden_log(mine: &mut HiddenLog, others: &[&HiddenLog]) -> bool;
+
+/// The winning op per id across fragments (the register `fold_hidden` reads).
+pub fn fold_winners<'a, const V: u32, I: IntoIterator<Item = &'a OpLog<V>>>(frags: I)
+    -> BTreeMap<String, HiddenOp>;
+/// The unread set: ids whose winner is an add, with their provider.
+pub fn fold_unread<'a, I: IntoIterator<Item = &'a UnreadLog>>(frags: I)
+    -> BTreeMap<String, Provider>;
+/// `prune_hidden_log` without tombstone GC (§11.6).
+pub fn prune_unread_log(mine: &mut UnreadLog, others: &[&UnreadLog]) -> bool;
 
 // ── Shell quoting (§7) ──────────────────────────────────────────────────────
 
@@ -1370,11 +1388,16 @@ impl App {
     ///      exclusion is a display policy and lives in `apply_poll`, not in
     ///      the parser; the decision lives in `poll_step`, which takes the
     ///      fetch as a closure so a skipped poll spawns nothing.
+    ///      4c. tick_unread_seen: an unread id whose pane is on screen
+    ///      anywhere is read, and a fresh look at a finished row leaves a
+    ///      watermark seen (§11.6). AFTER the poll, so a mark minted on this
+    ///      tick is judged by this tick's inventory. No tmux call.
     ///   5. rebuild rows, re-anchor selection by selected_key
     ///      5b. tick_pending_jump: settle `n`'s cursor intent against the
     ///      rebuilt rows (§8.6). AFTER the rebuild, because it asks both
     ///      whether the session is listed and whether it has a row.
-    ///   6. flush the map if map_dirty
+    ///   6. flush the map if map_dirty, the dismissed set if hidden_dirty,
+    ///      and the unread log if unread.dirty
     ///   7. pin_sidebar (unconditional, §1.3)
     ///   8. last_poll = Instant::now()
     /// Only step 4 is gated. Everything else runs every tick (§4.2).
@@ -1945,7 +1968,7 @@ Fixed-width row, left to right:
 col 0        open marker          ┐ the 4-column gutter, GUTTER
 col 1        tab badge            │
 col 2        status glyph         │
-col 3        space                ┘
+col 3        unread mark / space  ┘
 cols 4..     name (flexible, end-truncated)
              right side: [age]
 ```
@@ -2044,6 +2067,27 @@ Idle. An unrecognised value keeps `?` and keeps its group; what makes it loud is
 `App::note_drift`, which names it in the footer — and keeps naming it until the
 warning has actually been on screen with nothing covering it.
 
+**Unread mark (col 3)** — `•` (U+2022) in `p.fg` on a row whose turn ended
+while nobody was looking (§11.6), the separating space otherwise. It replaces
+that space rather than adding a column, so the name keeps col 4 and stays
+`spans[4]`. U+2022 is one column in tmux and in `display_width`, which
+`an_emoji_name_still_ends_the_row_on_the_rail` measures. `p.fg` is the ink a
+Working row's name already wears, so it clears 4.0:1 on both grounds and on
+`sel_bg` in both palettes, and it takes no hue that already means something.
+
+| Condition | Glyph | Colour |
+|---|---|---|
+| unread: the fold of `@ccmux_tab_unread` holds this id, same provider | `•` | `p.fg` |
+| otherwise | ` ` | — |
+
+**Unread row ground** — an UNSELECTED unread row is painted on `p.unread_bg`
+across its full width, a pale green tint (`#e3ecc1` light, `#32361a` dark),
+with its name forced to `p.fg` and its age promoted `p.dim` -> `p.gray`, the
+same promotions the selected row takes. Every ink such a row can paint clears
+4.0:1 on the tint in both palettes (`light_accents_are_readable_and_the_band_is_safe`);
+the dark tint is why `p.dim` cannot stay (3.41:1). A SELECTED unread row keeps
+`p.sel_bg`, because the band is the cursor; the `•` still marks it there.
+
 **Age** — `model::format_age`, right-aligned in the final 4 columns, `p.dim`.
 
 **Selected row** — background `p.sel_bg`, foreground forced to `p.fg`, and the
@@ -2054,10 +2098,10 @@ keeps its own colour. No cursor character is drawn; the bar is the cursor.
 
 | `W` | Row content |
 |---|---|
-| `>= 28` | the 4-column gutter (marker + tab badge + glyph) + name + age |
+| `>= 28` | the 4-column gutter (marker + tab badge + glyph + unread) + name + age |
 | `20..=27` | the same gutter + name, no age |
-| `6..=19` | glyph + name, name truncated to `W-2` |
-| `< 6` | glyph only; if `W == 0`, nothing |
+| `6..=19` | glyph + unread mark (or space) + name, name truncated to `W-2` |
+| `< 6` | glyph only, no unread mark; if `W == 0`, nothing |
 
 The gutter is all-or-nothing at `MARGIN_MIN` (20) and the age appears at
 `RAIL_MIN` (28). The 28-column default sits exactly on `RAIL_MIN` — a
@@ -2991,7 +3035,7 @@ THE IMAGE THAT PRESSES `R` KILLS NOTHING.
 5. main::event_loop, in this order and no other:
        drain buffered input   (type-ahead would survive the exec)
        restore_terminal()     (leave the alt screen, drop raw mode, drop paste + focus reporting)
-       app.shutdown()         (the deferred @ccmux_tab_map / @ccmux_tab_hidden writes)
+       app.shutdown()         (the deferred @ccmux_tab_map / @ccmux_tab_hidden / @ccmux_tab_unread writes)
        exec(exe, argv[1..], CCMUX_RESTART=<this pid>)
 6. exec returns only on FAILURE: re-enter raw mode + the alt screen, then flash
    "restart failed: <err>" (Error) and keep running. Every pane in the session
@@ -3848,6 +3892,7 @@ representable, rather than made unlikely.
 |---|---|---|---|
 | `@ccmux_tab_map` | **window** | that window's own sidebar, addressed through its own pane. One documented exception: `t`'s pre-write, provably ordered before that window has a process (§8.10). | every sidebar, as a union |
 | `@ccmux_tab_hidden` | **window** | that window's own sidebar | every sidebar, as a fold |
+| `@ccmux_tab_unread` | **window** | that window's own sidebar | every sidebar, as a fold (§11.6) |
 | `@ccmux_tab_sidebar` | **window** | the launcher's heal, `t` (§8.10 step 7), AND that window's own sidebar — the only multi-writer key, and safely so: all three write the same function of ground truth, the pane id of the process that IS that window's sidebar. Nobody reads the value to compute the value, so there is no read-modify-write to lose and every writer converges. | every sidebar, the launcher |
 | `@ccmux_width` | session | the launcher only | every sidebar, every tick |
 | `@ccmux_map` | session | `configure_session` once, and the one-time migration | `main::run_launcher`'s ownership guard |
@@ -3890,6 +3935,8 @@ suite's seeding seam hermetic now that writes are pane-targeted.
 ### 11.3 `@ccmux_tab_hidden` — a shared set, still one writer per option
 
 **AMENDED BY §12.9:** optional provider, identity-based dedup, and Codex retirement exclusion.
+**REUSED BY §11.6:** the unread log is this log under version 3, without tombstone GC, and with
+its own cap rule (oldest tombstones evicted before adds; an op my own fragment outranks is refused).
 
 A dismissal is about the SESSION LIST, which is the same list in every tab, so
 its effect must be session-wide. Session-wide and single-writer are reconciled
@@ -4033,6 +4080,161 @@ A session open in two tabs shows the tab `Enter` would take you to, which is als
 the one `x` acts on — this sidebar's own tab whenever the session has a pane
 there (§5.5), so the badge is blank exactly when the pane is on screen in front
 of you. The digit therefore never lies about where the verbs go.
+
+### 11.6 `@ccmux_tab_unread` — the unread marks
+
+A row whose agent FINISHED A TURN that nobody has looked at since carries
+§6.4's `•`. Marks must show in every tab and survive a sidebar restart (`R`,
+respawn), and only the on-screen sidebar polls, so they live in a shared log,
+built exactly like §11.3's: each window's sidebar writes only its own
+`@ccmux_tab_unread` fragment, and the unread set is a fold of all of them.
+
+**Shape.** The same op (`{provider?, id, add, seq, org}`), the same push
+(except at the cap, under Retirement), fold, compaction, P1, adoption, deferred flush (tick step 6 and `App::shutdown`,
+which also runs before `R`'s exec), cached writer and error flash as
+`@ccmux_tab_hidden`; `tmux::OpLog<V>` is one type for both. `add: true` is a
+mark, `add: false` is "seen". The version tag is **3** (hidden is 2, the legacy
+set 1), so a fragment read through the wrong field folds to empty. It is the
+seventh `TAB_FMT` field; a line that lacks it, or carries garbage there, still
+yields the tab, with an empty unread fragment.
+
+**Detection**, in memory, per process. `last_running[id]` is the wall-clock ms
+of the latest poll that saw the row RUNNING: Claude with a non-terminal state
+(not done/stopped/unloaded/blocked) and `status == busy`; Codex `active`
+without a waiting flag. Note `Group::Working` is not "running" — it includes
+`working`/`idle`. When a later poll shows the row:
+
+| new state | effect |
+|---|---|
+| running | `last_running[id] = now`, never lowered (a look may have raised it, under Seen) |
+| finished: Claude `done`, or `working`/absent/unmodelled state with `status: idle`; Codex `idle`, `notLoaded`, `systemError` | entry removed; mint an ADD stamped with the entry's ms — or, if the session is on screen right now, a SEEN instead (below) |
+| stopped, blocked, waiting, unmodelled | entry removed, nothing minted |
+
+A failed poll, a skipped one, a row absent from the poll, and (Codex) a row an
+incomplete observation did not return leave the entry alone (until Retirement
+below). A fresh process
+has no entries, so startup never invents a mark. `/clear`'s re-key
+(`carry_renames`) moves the entry and copies the id's winning op to the new id
+verbatim, stamp and origin kept. A Codex turn that `Ctrl+X` interrupts is
+ended by the operator, as Claude's `stopped` is, but Codex reports it only as
+`idle`: a successful stop removes the entry, and the thread takes no new one
+until an observation finds it not running, so a poll that still says `active`
+after the interrupt does not re-arm it.
+
+**Stamps — the one place this log differs from §11.3.** An ADD's `seq` is the
+back-dated last-running ms (or the raise under Seen), NOT a Lamport stamp; a
+SEEN's is the Lamport `next_seq`, and `seq_seen` folds in every unread fragment, so a seen always
+outranks every add folded so far (`(seq, org, add)` would otherwise let an add
+win an exact tie). A sidebar that comes back on screen holding an older
+running stamp therefore mints an add that loses to the seen already in the
+log. For the same reason **seen tombstones are not garbage-collected** (no P2):
+the late add can arrive after every other op on the id is gone. A tombstone
+lives until its session retires or the cap evicts it.
+
+**Seen.** Each tick, after the poll, an id in the folded set is read when any
+live pane mapped to it in ANY tab's map is on screen: its window is rendered
+(`window_viewers > 0`, or `session_clients > 0 && window_active` on a tmux
+without the format — the `App::watchers` expression) and, in a zoomed window,
+it is the active pane. A pane latched `@ccmux_detached` (parked by `Ctrl+Z`,
+or handed to a shell) does NOT count: its attach has exited, so it shows the
+resume prompt or a shell, never a turn that ends after it — and "park it, let
+it run, mark it when it finishes" is the case the mark exists for. This is
+the same reading `rebuild_open` gives such a pane. No tmux call is added; the
+tick's own inventory answers, and a stale one (`panes_fresh == false`)
+answers no. `Enter`, `v`,
+`s` and `t` also mark the selected row seen at the keypress, whatever the verb
+then does. A poll that finds a row finished while its pane is on screen mints
+a SEEN rather than nothing — when it saw the turn end, and once per look
+otherwise (edge-triggered: an id re-arms when its pane leaves the screen).
+A look that begins between two polls at a row the latest poll found finished
+gets the same once-per-look seen from tick step 4c, but only from a TRUSTED
+snapshot: the sidebar's poll gate is open (an off-screen sidebar's snapshot is
+too old), and the row's provider's most recent poll succeeded and returned it.
+After a failed poll, or for a Codex row an incomplete observation kept from
+cache, the look mints nothing and keeps its edge, so the next good poll takes
+it. That watermark is what stops another tab's older running stamp from
+marking a turn the operator has already read. Otherwise a seen is minted only
+for an id in the folded set.
+
+A look at a row whose trusted snapshot has it RUNNING (a seen minted here, or
+its pane on screen at a tick) reads an earlier turn's mark, not the turn in
+progress: it raises `last_running[id]` strictly above every stamp folded so
+far, so the add that closes that turn outranks the look's seen, whichever tab
+minted it. An untrusted snapshot raises nothing, so an off-screen sidebar
+still holding an older running stamp keeps losing to the seen.
+
+**Retirement.** An id of either provider in my fragment (or in
+`last_running`, or a stopped Codex thread) absent from two consecutive
+COMPLETE observations of its own provider loses its ops and its entry, as
+§11.3. Strikes are kept per provider,
+so a Claude poll never resets a Codex strike or the reverse; an incomplete,
+failed or skipped observation neither adds nor clears one. A Codex thread is
+absent when the provider's row cache after a complete observation lacks it:
+a thread deleted from ccmux but still returned by the server counts as absent,
+and a hidden import is never listed. Codex unread ops retire, unlike Codex
+dismissals (§12.9): retiring one costs at most a mark on a thread that has left
+the listing window, while keeping them would fill the fragment with
+tombstones.
+
+`UNREAD_OPS_MAX` (128 ops, about 13.5 KB worst case under the ~16 KB
+`set-option` wall) bounds a fragment. Overflow evicts the OLDEST seen
+tombstone, and an add — the lowest-ranked other than the op being pushed —
+only when no tombstone is left. Tombstones accumulate in normal use (one per
+finished session viewed), so evicting adds first would leave a full fragment
+holding about one live mark at a time; an evicted tombstone costs only the
+rare re-mark under Limits below. An incoming op that one of my own ops on its
+id outranks is refused (it can never win the fold, and would only cost a
+slot), and one that is accepted first drops my own ops on its id.
+
+**Degraded** (no tmux): the log and the fold are in memory only, nothing is
+flushed, there is no pane inventory, and only `Enter`/`v`/`s`/`t` clear a mark.
+
+**Limits**, stated plainly:
+- A mark lags the real turn end by up to one `claude agents` poll interval.
+  The idle ladder (§4.2) climbs while a row stays busy — the fingerprint does
+  not change between two busy polls — so on a still fleet that is up to
+  `IDLE_MAX` (30 s). Codex's ladder behaves the same. Poll policy is
+  deliberately unchanged.
+- A turn that starts and ends between two polls is never seen running and is
+  never marked. With no ccmux window on screen nothing polls at all, so the
+  lag is then unbounded and a turn wholly inside that gap is never marked.
+- Running stamps are in memory: a turn that ends between a sidebar's exit (or
+  `R`'s exec) and the new process's first poll is not marked.
+- A turn watched to its end can still be marked. The on-screen tab's last
+  poll saw the row running and its ladder had grown (up to `IDLE_MAX`); the
+  turn ended during the look, and the operator left before that tab polled
+  again. Nothing then knows whether the end fell inside the look, so no seen
+  is minted, and a tab that saw the row running EARLIER mints its add when it
+  next polls. Minting a seen on leaving instead would lose every mark for a
+  turn left running and ended before the next poll; closing the gap either
+  way needs a poll on leaving, which poll policy does not take. The raise
+  under Seen errs the same way: a turn that ended after the last poll but
+  before a look at it is marked when the operator leaves before the next one.
+  With two sidebars polling at once (two clients), the raise can also lift
+  one sidebar's ladder-stale running stamp past the watermark the other
+  minted on finding the row finished, so the watermark does not stop that
+  mark either. The same lift can carry that sidebar's stamp past a seen for a
+  mark already read, so the row is marked again when that sidebar next polls
+  it finished.
+- A seen another tab mints for a look after the on-screen sidebar's last tick
+  inside it (or for a look too short to hold one) is not raised past: the
+  turn running during that look is not marked when it ends.
+- A Codex thread stopped with `Ctrl+X` that starts a new turn before any poll
+  finds it not running is not marked when that turn ends.
+- A pane latched `@ccmux_detached` never reads a mark, even when its last
+  output is the end of the turn (parked after the turn ended): `Enter`, or
+  resuming the pane, clears it.
+- An evicted seen tombstone (the cap takes the oldest first) or a retired
+  one can let a sidebar still holding an even older running stamp for that
+  session mark a row the operator has already read — after eviction, or if a
+  retired session (a Codex thread back inside the listing window, say)
+  reappears.
+- Reaching `done` does not end a `claude attach`: a `done` row keeps its
+  worker (`pid` present, PROBE-FINDINGS §1), and the measured ways the client
+  ends are `Ctrl+Z`, `claude stop` and `claude respawn` (`Session <id> has
+  exited.`, PROBE-FINDINGS §§2–3). Whether the worker's later exit to dormant
+  (`pid: null`) also ends it is unmeasured; a pane latched `@ccmux_detached`
+  never counts as viewed either way.
 
 ---
 
@@ -5530,8 +5732,8 @@ have these tests; existing Claude tests remain authoritative except for
   no provider tie-break in rank. Simulate an old adopter dropping the field:
   a surviving tagged copy repairs it, unrelated Claude dismissals survive,
   and the all-copies-stripped limitation is represented explicitly.
-  Codex never retires by absence/window aging; only complete Claude
-  observations advance Claude's two-strike rule. Hidden `u` works when
+  A Codex dismissal never retires by absence/window aging; only complete
+  Claude observations advance Claude's two-strike rule for dismissals. Hidden `u` works when
   its Codex row has aged out or the provider is down.
 - **Verbs/wrappers:** drive keys through `on_key`; assert each remaining
   refusal and absence of RPC/subprocess/modal side effects. Test provider
