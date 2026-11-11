@@ -152,6 +152,7 @@ Stop and delete work for both providers; Codex differences are listed above.
 | `g` / `G` | First / last session |
 | `Ctrl-d` / `Ctrl-u` | Half a page down / up |
 | `Tab` / `Shift-Tab` | Next / previous group |
+| `Ctrl-j` / `Ctrl-k` | Next / previous unread (green) row, wrapping |
 | `Enter` | Jump to the session's pane, or open it in a vertical split |
 | `v` / `s` | Open in a side-by-side / stacked split. With two or more panes beside the sidebar, pick which one to split |
 | `t` | Open in a new tab |

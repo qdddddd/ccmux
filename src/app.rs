@@ -1753,6 +1753,31 @@ impl App {
         }
     }
 
+    /// Move to the next (or previous) unread row (§6.4's green ground),
+    /// wrapping like `cycle_group`. The current row is never its own target,
+    /// so with no OTHER unread row listed the cursor stays put. Walks `rows`,
+    /// so filtered and hidden rows are skipped exactly as `j`/`k` skip them.
+    pub fn cycle_unread(&mut self, forward: bool) {
+        let n = self.rows.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.selected.min(n - 1);
+        let unread = |i: usize| match self.rows.get(i) {
+            Some(Row::Session { idx }) => self
+                .sessions
+                .get(*idx)
+                .is_some_and(|s| self.is_unread(s.provider, &s.session_id)),
+            _ => false,
+        };
+        let hit = (1..n)
+            .map(|k| if forward { (cur + k) % n } else { (cur + n - k) % n })
+            .find(|&i| unread(i));
+        if let Some(i) = hit {
+            self.set_selected(i);
+        }
+    }
+
     /// Move to the first session row of the next (or previous) non-empty group.
     /// `rows` only carries headers for non-empty groups (§6.3), so walking the
     /// header positions *is* walking the non-empty groups.
@@ -5044,6 +5069,16 @@ impl App {
             // precedent `Ctrl-c`/`Ctrl-C` already set in `on_key` — a terminal
             // that reports the chord shifted must not find the key inert.
             KeyCode::Char('x') | KeyCode::Char('X') if ctrl => self.act_ctrl_x(),
+            // Raw mode delivers `Ctrl-J` (LF) as `Char('j')` + CONTROL, not as
+            // `Enter`; `'J'`/`'K'` on the `Ctrl-X` precedent above.
+            KeyCode::Char('j') | KeyCode::Char('J') if ctrl => {
+                self.cycle_unread(true);
+                Action::Redraw
+            }
+            KeyCode::Char('k') | KeyCode::Char('K') if ctrl => {
+                self.cycle_unread(false);
+                Action::Redraw
+            }
             _ if ctrl => Action::None,
 
             KeyCode::Char('j') | KeyCode::Down => {
@@ -5451,7 +5486,8 @@ enum Force {
 /// Does this Normal-mode key take the cursor away from `n`'s pending jump
 /// (§8.6)? Two populations, and the second is the one that is easy to forget:
 ///
-///   * THE MOVES — `j` `k` `↓` `↑` `g` `G` `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`.
+///   * THE MOVES — `j` `k` `↓` `↑` `g` `G` `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`
+///     `Ctrl-j` `Ctrl-k`.
 ///     Answered on the KEY and not on the resulting move, because a move that
 ///     found no row still happened as far as the operator is concerned: `k` on
 ///     the top row and `j` on the bottom one never reach `set_selected`, and
@@ -5479,6 +5515,8 @@ fn claims_the_cursor(key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Char('d') | KeyCode::Char('u') if ctrl => true,
         KeyCode::Char('x') | KeyCode::Char('X') if ctrl => true,
+        KeyCode::Char('j') | KeyCode::Char('J') if ctrl => true,
+        KeyCode::Char('k') | KeyCode::Char('K') if ctrl => true,
         _ if ctrl => false,
 
         KeyCode::Char('j') | KeyCode::Down => true,
@@ -8638,6 +8676,64 @@ mod tests {
         assert!(a.hidden.ids().is_empty());
     }
 
+    /// `Ctrl-J`/`Ctrl-K` visit only the green rows, across groups, wrapping;
+    /// with no other unread row, and on an empty list, they move nothing.
+    #[test]
+    fn ctrl_j_and_ctrl_k_cycle_through_unread_rows_only() {
+        let mut a = app();
+        let mut idle = bg("cccccccc", "three", State::Unknown("parked".into()));
+        idle.status = Status::Idle;
+        load(
+            &mut a,
+            vec![
+                bg("aaaaaaaa", "one", State::Working),
+                bg("bbbbbbbb", "two", State::Done),
+                idle,
+            ],
+        );
+        let name = |a: &App| a.selected_session().map(|s| s.name.clone());
+        assert_eq!(name(&a).as_deref(), Some("one"));
+
+        // Nothing unread: both keys are inert.
+        a.on_key(ctrl('j'));
+        a.on_key(ctrl('k'));
+        assert_eq!(name(&a).as_deref(), Some("one"));
+
+        for sid in ["cccccccc-uuid", "bbbbbbbb-uuid"] {
+            a.unread.set.insert(sid.into(), Provider::Claude);
+        }
+        // Rows read Working(one), Idle(three), Completed(two).
+        a.on_key(ctrl('j'));
+        assert_eq!(name(&a).as_deref(), Some("three"));
+        assert_eq!(a.selected_key.as_deref(), Some("cccccccc-uuid"), "the cursor key follows");
+        a.on_key(ctrl('j'));
+        assert_eq!(name(&a).as_deref(), Some("two"));
+        a.on_key(ctrl('j'));
+        assert_eq!(name(&a).as_deref(), Some("three"), "wraps past the end");
+        a.on_key(ctrl('k'));
+        assert_eq!(name(&a).as_deref(), Some("two"), "wraps past the top");
+        a.on_key(ctrl('k'));
+        assert_eq!(name(&a).as_deref(), Some("three"));
+
+        // Only the current row is unread: it is not its own target.
+        a.unread.set.clear();
+        a.unread.set.insert("cccccccc-uuid".into(), Provider::Claude);
+        a.on_key(ctrl('j'));
+        a.on_key(ctrl('k'));
+        assert_eq!(name(&a).as_deref(), Some("three"));
+
+        // A mark under another provider is not this row's mark.
+        a.unread.set.insert("aaaaaaaa-uuid".into(), Provider::Codex);
+        a.on_key(ctrl('j'));
+        assert_eq!(name(&a).as_deref(), Some("three"));
+
+        a.sessions.clear();
+        a.rebuild_rows();
+        a.on_key(ctrl('j'));
+        a.on_key(ctrl('k'));
+        assert!(a.selected_session().is_none());
+    }
+
     #[test]
     fn navigation_never_lands_on_a_header_and_survives_an_empty_list() {
         let mut a = app();
@@ -9781,7 +9877,7 @@ mod tests {
             let k = KeyEvent::new(code, KeyModifiers::NONE);
             assert!(claims_the_cursor(k), "{code:?} claims the cursor");
         }
-        for c in ['d', 'u', 'x', 'X'] {
+        for c in ['d', 'u', 'x', 'X', 'j', 'k'] {
             assert!(claims_the_cursor(ctrl(c)), "C-{c} claims the cursor");
         }
         // Uppercase bindings arrive with SHIFT set, exactly as `key_normal`
@@ -9799,7 +9895,7 @@ mod tests {
         }
         let shifted_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
         assert!(!claims_the_cursor(shifted_r), "shifted R does not claim the cursor");
-        for c in ['j', 'k', 'g', 'n', 'z'] {
+        for c in ['g', 'n', 'z'] {
             assert!(!claims_the_cursor(ctrl(c)), "C-{c} is unbound and inert");
         }
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);

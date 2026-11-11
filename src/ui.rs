@@ -1255,6 +1255,7 @@ const KEYS: &[(&str, &str)] = &[
     ("Ctrl-d/u", "half page down/up"),
     ("Tab", "next group"),
     ("S-Tab", "previous group"),
+    ("Ctrl-j/k", "next/prev unread"),
     ("Enter", "open or jump to pane"),
     ("v", "open in vertical split"),
     ("s", "open in horizontal split"),

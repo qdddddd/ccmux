@@ -2076,7 +2076,8 @@ same promotions the selected row takes. Every ink such a row can paint clears
 4.0:1 on the tint in both palettes (`light_accents_are_readable_and_the_band_is_safe`);
 the dark tint is why `p.dim` cannot stay (3.41:1). A SELECTED unread row keeps
 `p.sel_bg`, because the band is the cursor, and so shows no mark until the
-cursor leaves it.
+cursor leaves it. `Ctrl-j`/`Ctrl-k` (§8.1) move the cursor between unread rows;
+landing on one is not opening it, so the mark stays.
 
 **Age** — `model::format_age`, right-aligned in the final 4 columns, `p.dim`.
 
@@ -2288,6 +2289,7 @@ takes no visibility flag, and `a` is unbound in Normal mode. Only `/` and
 | `Ctrl-u` | up half a viewport | no |
 | `Tab` | jump to the first row of the next non-empty group | no |
 | `BackTab` (`Shift-Tab`) | previous non-empty group | no |
+| `Ctrl-j` / `Ctrl-k` | next / previous unread row (§6.4), wrapping; never the current row, so with no other unread row listed it moves nothing | no |
 | `Enter` | **open or jump** — §8.3; a pane you have detached from is not a jump target | no |
 | `v` | open in a **vertical** split (vim `:vsplit`, side by side, tmux `-h`); with two or more panes beside the sidebar, pick which one to split (§8.4) | no |
 | `s` | open in a **horizontal** split (vim `:split`, stacked, tmux `-v`); picks like `v` | no |
@@ -2862,7 +2864,7 @@ daemon-owned, and closing its pane never touched it.
   - It is cancelled the moment the operator takes the cursor, by
     `cancel_pending_jump` in `key_normal`, on the KEYPRESS; `claims_the_cursor`
     is the table. Two populations: every cursor move (`j` `k` `↓` `↑` `g` `G`
-    `Tab` `S-Tab` `Ctrl-d` `Ctrl-u`), **including one that hits the end of the
+    `Tab` `S-Tab` `Ctrl-d` `Ctrl-u` `Ctrl-j` `Ctrl-k`), **including one that hits the end of the
     list and moves nothing**, and every verb that acts on the row under the
     cursor (`Enter` `v` `s` `t` `x` `Ctrl-x` `L` `d` `u`). Not `n` (it arms the
     next one), not `r` (the refresh that lands this one), not `/` or `a` (view
