@@ -1968,7 +1968,7 @@ Fixed-width row, left to right:
 col 0        open marker          ┐ the 4-column gutter, GUTTER
 col 1        tab badge            │
 col 2        status glyph         │
-col 3        unread mark / space  ┘
+col 3        space                ┘
 cols 4..     name (flexible, end-truncated)
              right side: [age]
 ```
@@ -2067,26 +2067,16 @@ Idle. An unrecognised value keeps `?` and keeps its group; what makes it loud is
 `App::note_drift`, which names it in the footer — and keeps naming it until the
 warning has actually been on screen with nothing covering it.
 
-**Unread mark (col 3)** — `•` (U+2022) in `p.fg` on a row whose turn ended
-while nobody was looking (§11.6), the separating space otherwise. It replaces
-that space rather than adding a column, so the name keeps col 4 and stays
-`spans[4]`. U+2022 is one column in tmux and in `display_width`, which
-`an_emoji_name_still_ends_the_row_on_the_rail` measures. `p.fg` is the ink a
-Working row's name already wears, so it clears 4.0:1 on both grounds and on
-`sel_bg` in both palettes, and it takes no hue that already means something.
-
-| Condition | Glyph | Colour |
-|---|---|---|
-| unread: the fold of `@ccmux_tab_unread` holds this id, same provider | `•` | `p.fg` |
-| otherwise | ` ` | — |
-
-**Unread row ground** — an UNSELECTED unread row is painted on `p.unread_bg`
-across its full width, a pale green tint (`#e3ecc1` light, `#32361a` dark),
+**Unread row ground** — the unread mark. An UNSELECTED row whose turn ended
+while nobody was looking (§11.6: the fold of `@ccmux_tab_unread` holds this id,
+same provider) is painted on `p.unread_bg` across its full width; it adds no
+glyph and moves no column. The tint is pale green (`#e3ecc1` light, `#32361a` dark),
 with its name forced to `p.fg` and its age promoted `p.dim` -> `p.gray`, the
 same promotions the selected row takes. Every ink such a row can paint clears
 4.0:1 on the tint in both palettes (`light_accents_are_readable_and_the_band_is_safe`);
 the dark tint is why `p.dim` cannot stay (3.41:1). A SELECTED unread row keeps
-`p.sel_bg`, because the band is the cursor; the `•` still marks it there.
+`p.sel_bg`, because the band is the cursor, and so shows no mark until the
+cursor leaves it.
 
 **Age** — `model::format_age`, right-aligned in the final 4 columns, `p.dim`.
 
@@ -2098,10 +2088,10 @@ keeps its own colour. No cursor character is drawn; the bar is the cursor.
 
 | `W` | Row content |
 |---|---|
-| `>= 28` | the 4-column gutter (marker + tab badge + glyph + unread) + name + age |
+| `>= 28` | the 4-column gutter (marker + tab badge + glyph) + name + age |
 | `20..=27` | the same gutter + name, no age |
-| `6..=19` | glyph + unread mark (or space) + name, name truncated to `W-2` |
-| `< 6` | glyph only, no unread mark; if `W == 0`, nothing |
+| `6..=19` | glyph + name, name truncated to `W-2` |
+| `< 6` | glyph only; if `W == 0`, nothing |
 
 The gutter is all-or-nothing at `MARGIN_MIN` (20) and the age appears at
 `RAIL_MIN` (28). The 28-column default sits exactly on `RAIL_MIN` — a
@@ -4084,7 +4074,7 @@ of you. The digit therefore never lies about where the verbs go.
 ### 11.6 `@ccmux_tab_unread` — the unread marks
 
 A row whose agent FINISHED A TURN that nobody has looked at since carries
-§6.4's `•`. Marks must show in every tab and survive a sidebar restart (`R`,
+§6.4's green row ground. Marks must show in every tab and survive a sidebar restart (`R`,
 respawn), and only the on-screen sidebar polls, so they live in a shared log,
 built exactly like §11.3's: each window's sidebar writes only its own
 `@ccmux_tab_unread` fragment, and the unread set is a fold of all of them.

@@ -219,10 +219,10 @@ Empty groups have no header.
 | `▌` aqua | Open in a pane in this tab |
 | `▌` grey | Open in a pane in another tab |
 | `2` | The tab it is open in. `+` means tab 10 or higher |
-| `•` after the glyph, green row | Finished a turn you have not looked at yet |
+| Green row background | Finished a turn you have not looked at yet |
 
-The `•` and the pale green row background (dropped while the row is
-selected) appear when a row that ccmux saw working finishes its turn
+The pale green background (hidden while the cursor is on the row)
+appears when a row that ccmux saw working finishes its turn
 on its own. A stop, a question or a permission prompt does not set it.
 It clears once a pane showing that session is on screen in any tab, or
 when you press `Enter`, `v`, `s` or `t` on the row. A pane you parked with
