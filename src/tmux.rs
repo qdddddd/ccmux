@@ -52,8 +52,7 @@ pub const OPT_TAB_HIDDEN: &str = "@ccmux_tab_hidden";
 /// op-log shape as `@ccmux_tab_hidden`, under its own version tag.
 pub const OPT_TAB_UNREAD: &str = "@ccmux_tab_unread";
 
-/// PANE-scoped, and one of two ccmux options not written by ccmux (the other
-/// is `OPT_PANE_JUMP_FROM`): the
+/// PANE-scoped, and the one ccmux option ccmux never writes: the
 /// attach pane's own command line sets it to `1` on the way out, just before it
 /// `exec`s the operator's shell (`agents::attach_pane_cmd`). ccmux only ever
 /// READS it, through `PANE_FMT`.
@@ -78,9 +77,8 @@ pub const LATCH_PARKED: &str = "1";
 /// `OPT_PANE_DETACHED`'s value once the pane has become the operator's shell.
 pub const LATCH_SHELL: &str = "shell";
 
-/// PANE-scoped, set on a SIDEBAR pane, and the second ccmux option not written
-/// by ccmux: the operator's "focus the sidebar" tmux binding records the pane
-/// it was pressed in, just before its `select-pane` moves focus here, e.g.
+/// PANE-scoped, set on a SIDEBAR pane: the operator's "focus the sidebar"
+/// tmux binding records the pane it was pressed in, just before its `select-pane` moves focus here, e.g.
 ///
 /// ```text
 /// bind e run-shell 'sb="#{@ccmux_tab_sidebar}"; [ -n "$sb" ] && tmux set -p -t "$sb" @ccmux_jump_from "#{pane_id}" \; select-pane -t "$sb"'
@@ -89,6 +87,13 @@ pub const LATCH_SHELL: &str = "shell";
 /// The sidebar reads and unsets it on focus-in (`take_jump_from`) and puts the
 /// cursor on that pane's row. A focus-in with no value — a mouse click, a
 /// window switch, the terminal regaining OS focus — leaves the cursor alone.
+///
+/// ccmux writes it too, on ANOTHER tab's sidebar only: when `Enter` jumps to a
+/// pane in that tab (`point_sidebar_at`, which also passes focus through the
+/// sidebar so it gets a focus-in), or `t` opens one (`set_jump_from`), so that
+/// sidebar's cursor lands on the session the operator just went to. Its tick
+/// also takes a value it sees through `PANE_FMT`: the new tab's sidebar gets
+/// no focus-in, and a focus-in can be lost (`focus-events off`).
 pub const OPT_PANE_JUMP_FROM: &str = "@ccmux_jump_from";
 
 /// The empty `@ccmux_map` value. Still written once at session creation, and
@@ -196,7 +201,8 @@ const PANE_FMT: &str = concat!(
     "#{session_attached}\t",
     "#{window_active_clients}\t",
     "#{window_zoomed_flag}\t",
-    "#{@ccmux_detached}",
+    "#{@ccmux_detached}\t",
+    "#{@ccmux_jump_from}",
 );
 
 const PANE_FIELDS: usize = 14;
@@ -414,6 +420,10 @@ pub struct PaneInfo {
     /// treats the two states alike. Only §8.2's delete tells them apart: a
     /// parked pane is closed, a shell pane is left for `x`.
     pub shell: bool,
+    /// `#{@ccmux_jump_from}` (`OPT_PANE_JUMP_FROM`) on this pane, when it holds
+    /// a pane id. Read here so a sidebar notices a value left for it without
+    /// spending a tmux call per tick; `take_jump_from` still does the unset.
+    pub jump_from: Option<PaneId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -908,6 +918,9 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
     // live shell (`restart::plan`).
     let shell = parts[13] == LATCH_SHELL;
     let detached = parts[13] == LATCH_PARKED || shell;
+    // Lenient: absent on a listing from before the field existed, and empty on
+    // every pane nobody pointed anywhere.
+    let jump_from = parts.get(14).and_then(|v| PaneId::parse(v.trim()));
 
     Ok(PaneInfo {
         id,
@@ -925,6 +938,7 @@ fn parse_pane_line(line: &str) -> Result<PaneInfo, TmuxError> {
         window_zoomed,
         detached,
         shell,
+        jump_from,
     })
 }
 
@@ -1607,6 +1621,23 @@ pub fn take_jump_from(session: &str, sidebar: &PaneId) -> Result<Option<PaneId>,
     }
     tmux(&["set-option", "-p", "-u", "-t", sidebar.as_str(), OPT_PANE_JUMP_FROM])?;
     Ok(PaneId::parse(raw.trim()))
+}
+
+/// Point another tab's `sidebar` at `pane` (see `OPT_PANE_JUMP_FROM`).
+pub fn set_jump_from(session: &str, sidebar: &PaneId, pane: &PaneId) -> Result<(), TmuxError> {
+    assert_in_session(sidebar, session)?;
+    tmux(&["set-option", "-p", "-t", sidebar.as_str(), OPT_PANE_JUMP_FROM, pane.as_str()]).map(|_| ())
+}
+
+/// `set_jump_from`, then pass focus THROUGH `sidebar` on the way to `pane`, so
+/// tmux delivers it a focus-in and its `on_focus_gained` moves the cursor now
+/// rather than on its next tick. The caller's `select_pane(pane)` follows and
+/// takes focus on to the agent pane. Verified on 3.5a with an attached client:
+/// the sidebar reads `ESC [ I` then `ESC [ O`.
+pub fn point_sidebar_at(session: &str, sidebar: &PaneId, pane: &PaneId) -> Result<(), TmuxError> {
+    set_jump_from(session, sidebar, pane)?;
+    tmux(&["select-window", "-t", sidebar.as_str()])?;
+    tmux(&["select-pane", "-t", sidebar.as_str()]).map(|_| ())
 }
 
 /// Serialize and write `@ccmux_tab_map` for `pane`'s window, skipping the write
@@ -2592,7 +2623,7 @@ mod tests {
             window_viewers: Some(1),
             window_zoomed: false,
             detached: false,
-            shell: false,
+            shell: false, jump_from: None,
         }
     }
 
@@ -2666,7 +2697,7 @@ mod tests {
             window_viewers: Some(1),
             window_zoomed: false,
             detached: false,
-            shell: false,
+            shell: false, jump_from: None,
         }
     }
 

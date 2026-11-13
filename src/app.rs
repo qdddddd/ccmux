@@ -976,6 +976,9 @@ impl App {
         // 5b — `n`'s cursor intent, once the rows it asks about are rebuilt.
         self.tick_pending_jump(polled);
 
+        // 5c — a row another tab's sidebar pointed this one at.
+        self.tick_jump_from();
+
         // 6
         self.save_map_now();
         self.save_hidden_now();
@@ -1552,6 +1555,49 @@ impl App {
         match tmux::take_jump_from(&self.tmux_session, &me) {
             Ok(Some(from)) if self.select_pane_row(&from) => Action::Redraw,
             _ => Action::None,
+        }
+    }
+
+    /// The tick's half of `on_focus_gained`: take a `@ccmux_jump_from` left on
+    /// this sidebar while it was not focused. Another tab's `Enter` or `t`
+    /// writes one when it sends the operator to a pane in this window, and no
+    /// focus-in follows, because focus lands on that pane. Read from the pane
+    /// inventory the tick already took, so an unpointed sidebar pays nothing.
+    fn tick_jump_from(&mut self) {
+        if self.degraded || !self.panes_fresh {
+            return;
+        }
+        let Some(me) = self.own_pane.clone() else {
+            return;
+        };
+        if !self.panes.iter().any(|p| p.id == me && p.jump_from.is_some()) {
+            return;
+        }
+        if let Ok(Some(from)) = tmux::take_jump_from(&self.tmux_session, &me) {
+            self.select_pane_row(&from);
+        }
+    }
+
+    /// Leave `pane`'s row for the sidebar of the tab `pane` is in, when that
+    /// is not this tab: its cursor otherwise stays on whatever row it last had
+    /// while the operator looks at the session this sidebar just sent them to.
+    /// The window is read off the live inventory, not off whichever map lists
+    /// the pane, because a pane moved between tabs keeps its old map entry.
+    /// Runs BEFORE the jump's own `select_pane`, which then moves focus on from
+    /// that sidebar to `pane` (`tmux::point_sidebar_at`). Best effort: a
+    /// failure costs only the other sidebar's cursor position.
+    fn point_tab_sidebar_at(&self, pane: &PaneId) {
+        let Some(window) = self.panes.iter().find(|p| &p.id == pane).map(|p| &p.window_id) else {
+            return;
+        };
+        if Some(window) == self.own_window.as_ref() {
+            return;
+        }
+        let Some(sidebar) = self.tabs.iter().find(|t| &t.window == window).and_then(|t| t.sidebar.as_ref()) else {
+            return;
+        };
+        if Some(sidebar) != self.own_pane.as_ref() {
+            let _ = tmux::point_sidebar_at(&self.tmux_session, sidebar, pane);
         }
     }
 
@@ -2238,6 +2284,9 @@ impl App {
                 // of this key computes (§11.1), and the child's
                 // `sidebar_choice` adopts it instead of re-registering.
                 let _ = tmux::set_tab_sidebar(&self.tmux_session, &sidebar);
+                // Start the new sidebar's cursor on the session it was opened
+                // for; its first tick takes this (`tick_jump_from`).
+                let _ = tmux::set_jump_from(&self.tmux_session, &sidebar, &claude);
                 // Pin immediately, or the tab flashes a 50/50 split until that
                 // sidebar's first tick. The base, not `w`'s override: that
                 // belongs to this sidebar, and the new one starts without it.
@@ -5003,6 +5052,7 @@ impl App {
     /// Only the wording changes.
     fn jump_to_ccmux_pane(&mut self, pane: &PaneId) {
         let where_ = self.tab_suffix(pane);
+        self.point_tab_sidebar_at(pane);
         match tmux::select_pane(&self.tmux_session, pane) {
             Ok(()) => match self.pane_index_of(pane) {
                 Some(i) => self.flash(format!("jumped to pane {i}{where_}"), MsgLevel::Info),
@@ -6451,7 +6501,7 @@ mod tests {
             window_viewers: Some(1),
             window_zoomed: false,
             detached: false,
-            shell: false,
+            shell: false, jump_from: None,
         }
     }
 

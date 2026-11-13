@@ -62,7 +62,7 @@ fn show(a: &mut App, id: &str, on_screen: bool) {
     a.panes = vec![PaneInfo {
         id: pane, index: 2, left: 35, top: 0, width: 60, height: 40, active: false,
         window_index: 1, window_id: window(1), window_active: on_screen, session_clients: 1,
-        window_viewers: Some(u32::from(on_screen)), window_zoomed: false, detached: false, shell: false,
+        window_viewers: Some(u32::from(on_screen)), window_zoomed: false, detached: false, shell: false, jump_from: None,
     }];
 }
 
@@ -212,7 +212,7 @@ fn the_seen_rule_reads_the_inventory_including_zoom_and_detached_panes() {
     let base = PaneInfo {
         id: PaneId::parse("%9").unwrap(), index: 2, left: 35, top: 0, width: 60, height: 40,
         active: false, window_index: 2, window_id: window(2), window_active: false, session_clients: 1,
-        window_viewers: Some(1), window_zoomed: false, detached: false, shell: false,
+        window_viewers: Some(1), window_zoomed: false, detached: false, shell: false, jump_from: None,
     };
     assert!(pane_on_screen(&base));
     assert!(!pane_on_screen(&PaneInfo { window_viewers: Some(0), ..base.clone() }));

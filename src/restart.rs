@@ -1062,7 +1062,7 @@ mod tests {
             window_viewers: Some(1),
             window_zoomed: false,
             detached: false,
-            shell: false,
+            shell: false, jump_from: None,
         }
     }
 

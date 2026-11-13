@@ -28,7 +28,7 @@ fn wid(id: u32) -> WindowId { WindowId::parse(&format!("@{id}")).unwrap() }
 fn key(a: &mut App, code: KeyCode) -> Action { a.on_key(KeyEvent::new(code, KeyModifiers::NONE)) }
 fn press(a: &mut App, code: char) -> Action { key(a, KeyCode::Char(code)) }
 
-struct Pane { id: String, window: u32, index: u32, latch: String, pick: String }
+struct Pane { id: String, window: u32, index: u32, latch: String, pick: String, jump: String }
 
 struct Server {
     session: String,
@@ -51,7 +51,7 @@ impl Server {
     fn new(session: &str) -> Self {
         Self {
             session: session.into(),
-            panes: vec![Pane { id: "%1".into(), window: 1, index: 1, latch: String::new(), pick: String::new() }],
+            panes: vec![Pane { id: "%1".into(), window: 1, index: 1, latch: String::new(), pick: String::new(), jump: String::new() }],
             tabs: BTreeMap::from([(1, TabInfo { window: wid(1), index: 1, sidebar: Some(pid("%1")),
                 map: PaneMap::new(), hidden: HiddenLog::new(), unread: Default::default() })]), wopts: BTreeMap::new(), calls: vec![], next: 10, zoomed: false,
         }
@@ -61,7 +61,7 @@ impl Server {
         let id = format!("%{}", self.next);
         self.next += 1;
         let index = self.panes.iter().filter(|p| p.window == window).count() as u32 + 1;
-        self.panes.push(Pane { id: id.clone(), window, index, latch: String::new(), pick: String::new() });
+        self.panes.push(Pane { id: id.clone(), window, index, latch: String::new(), pick: String::new(), jump: String::new() });
         id
     }
 
@@ -71,6 +71,10 @@ impl Server {
         let target = || args.windows(2).find(|w| w[0] == "-t").map(|w| w[1].as_str()).unwrap();
         let window_of = |s: &Self, pane: &str| s.panes.iter().find(|p| p.id == pane).map(|p| p.window);
         match args[0].as_str() {
+            "show-options" if args.last().unwrap() == tmux::OPT_PANE_JUMP_FROM => {
+                let id = target();
+                Ok(self.panes.iter().find(|p| p.id == id).map(|p| p.jump.clone()).unwrap_or_default())
+            }
             "show-options" => {
                 let window = window_of(self, target()).ok_or_else(|| tmux_err(args, "no such window"))?;
                 let name = args.last().unwrap();
@@ -88,9 +92,13 @@ impl Server {
             "set-option" if args.contains(&"-p".to_string()) => {
                 let id = target().to_owned();
                 let pane = self.panes.iter_mut().find(|p| p.id == id).ok_or_else(|| tmux_err(args, "no such pane"))?;
-                if args.contains(&"-u".to_string()) {
+                if args.contains(&"-u".to_string()) && args.last().unwrap() == tmux::OPT_PANE_JUMP_FROM {
+                    pane.jump.clear();
+                } else if args.contains(&"-u".to_string()) {
                     assert_eq!(args.last().unwrap(), tmux::OPT_PANE_PICK);
                     pane.pick.clear();
+                } else if args[args.len() - 2] == tmux::OPT_PANE_JUMP_FROM {
+                    pane.jump = args.last().unwrap().clone();
                 } else {
                     assert_eq!(&args[args.len() - 2], tmux::OPT_PANE_PICK);
                     pane.pick = args.last().unwrap().clone();
@@ -116,9 +124,9 @@ impl Server {
             "list-panes" => {
                 assert_eq!(target(), format!("={}:", self.session));
                 Ok(self.panes.iter().map(|p| format!(
-                    "{}\t{}\t{}\t0\t{}\t40\t0\t{}\t@{}\t1\t1\t1\t{}\t{}",
+                    "{}\t{}\t{}\t0\t{}\t40\t0\t{}\t@{}\t1\t1\t1\t{}\t{}\t{}",
                     p.id, p.index, if p.index == 1 { 0 } else { 35 }, if p.index == 1 { 34 } else { 60 },
-                    p.window, p.window, u8::from(self.zoomed), p.latch)).collect::<Vec<_>>().join("\n"))
+                    p.window, p.window, u8::from(self.zoomed), p.latch, p.jump)).collect::<Vec<_>>().join("\n"))
             }
             "list-windows" => {
                 assert_eq!(target(), format!("={}:", self.session));
@@ -729,6 +737,39 @@ fn cross_tab_enter_and_x_keep_the_foreign_map_owned_by_its_sidebar() {
         assert_eq!(s.tabs[&2].map, original);
         assert!(s.calls("set-option").is_empty());
         assert_eq!(a.message.as_ref().unwrap().0, "closed pane 1 in tab 2 — Codex work stays on server");
+    });
+}
+
+#[test]
+fn cross_tab_enter_puts_that_tabs_sidebar_cursor_on_the_session() {
+    with_sidebar(|a, server| {
+        let pane = map_pane(a, server, 2, &row(), "");
+        let theirs = server.borrow_mut().add_pane(2);
+        server.borrow_mut().tabs.get_mut(&2).unwrap().sidebar = Some(pid(&theirs));
+        a.refresh_panes();
+        key(a, KeyCode::Enter);
+        let jump = |s: &Rc<RefCell<Server>>, id: &str| s.borrow().panes.iter().find(|p| p.id == id).unwrap().jump.clone();
+        assert_eq!(jump(server, &theirs), pane);
+        assert_eq!(jump(server, "%1"), "", "this tab's own sidebar is never pointed");
+        let focus: Vec<String> = server.borrow().calls("select-pane").iter().map(|c| c.last().unwrap().clone()).collect();
+        assert_eq!(focus, [theirs.clone(), pane.clone()], "focus passes through that sidebar to the pane");
+
+        // Tab 2's sidebar, its cursor on another row, takes it on its tick.
+        let mut b = super::tests::app();
+        b.tmux_session = a.tmux_session.clone();
+        b.own_pane = Some(pid(&theirs));
+        b.own_state_loaded = false;
+        let mut other = row();
+        other.session_id = "01a0a609-12a6-7000-8000-000000000000".into();
+        b.sessions = vec![other.clone(), row()];
+        b.rebuild_rows();
+        b.refresh_panes();
+        let at = |b: &App, id: &str| (0..b.rows.len()).find(|&i| matches!(b.rows[i],
+            Row::Session { idx } if b.sessions[idx].session_id == id)).unwrap();
+        b.set_selected(at(&b, &other.session_id));
+        b.tick_jump_from();
+        assert_eq!(b.selected_session().unwrap().session_id, ID);
+        assert_eq!(jump(server, &theirs), "", "taken once");
     });
 }
 

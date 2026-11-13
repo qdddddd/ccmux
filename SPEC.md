@@ -1567,8 +1567,16 @@ in, BEFORE its `select-pane`, so the value is in place when focus-in arrives.
 cursor to its session's row — Normal mode only, visible rows only, closing a
 `Ctrl+X` arm the move crosses as a key move would. No value means no move, so
 a mouse click, a window switch, or the terminal regaining OS focus never
-disturbs the cursor. Like `@ccmux_detached`, ccmux never writes this option;
-it only reads and unsets it. The map lookup falls back to other tabs' maps for
+disturbs the cursor. ccmux writes the option itself in one case: when `Enter`
+jumps to a pane in ANOTHER tab, or `t` opens a tab, it sets the option on that
+tab's sidebar (resolved from the pane's live window, never from the map that
+lists it) to the pane it went to. For `Enter` it then selects that sidebar
+before the agent pane, so the sidebar gets a real focus-in and moves at once;
+the tmux last-pane of that window becomes the sidebar. As a fallback, and for
+`t`'s new sidebar, which gets no focus-in, the tick also takes a value it sees
+on its own pane row in the `list-panes` inventory (`PANE_FMT` carries
+`#{@ccmux_jump_from}`) and moves the cursor the same way. A jump within the sidebar's own window
+writes nothing. The map lookup falls back to other tabs' maps for
 a pane moved into this window, and the move cancels `n`'s pending jump. A
 `drain_pending_input` that discards a `FocusGained` reports it, and its caller
 still runs `on_focus_gained`. `restore_terminal` disables the reporting again.

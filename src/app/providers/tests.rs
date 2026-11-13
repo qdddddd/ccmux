@@ -1861,7 +1861,7 @@ fn the_tick_watermark_skips_rows_the_last_poll_did_not_return() {
             short_id: s.id.clone().unwrap(), name: s.name.clone(), opened_at: 1 });
         a.panes.push(PaneInfo { id: pane, index: 2, left: 35, top: 0, width: 60, height: 40,
             active: false, window_index: 1, window_id: WindowId::parse("@1").unwrap(), window_active: true,
-            session_clients: 1, window_viewers: Some(1), window_zoomed: false, detached: false, shell: false });
+            session_clients: 1, window_viewers: Some(1), window_zoomed: false, detached: false, shell: false, jump_from: None });
     }
     let seen = |a: &App, id: &str| a.unread.log.ops.iter().any(|o| o.id == id && !o.add);
     a.tick_unread_seen();
