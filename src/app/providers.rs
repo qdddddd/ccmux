@@ -145,9 +145,16 @@ impl CodexPoll {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct PiPoll {
+    catalog: Option<crate::pi::Catalog>,
+    last_attempt: Option<Instant>,
+    pub(super) force: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureCategory {
-    CommandUnavailable, CommandFailed, InvalidPayload, Codex(CodexFailureKind),
+    CommandUnavailable, CommandFailed, InvalidPayload, Codex(CodexFailureKind), PiCatalog,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -209,6 +216,7 @@ impl ProviderDiagnostic {
             (Provider::Claude, false) => "agents",
             (Provider::Codex, true) => "codex refresh failed",
             (Provider::Codex, false) => "codex degraded",
+            (Provider::Pi, _) => "pi sessions",
         };
         Some(format!("{label}: {}", pending.reason))
     }
@@ -218,6 +226,7 @@ impl ProviderDiagnostic {
 pub struct Diagnostics {
     pub claude: ProviderDiagnostic,
     pub codex: ProviderDiagnostic,
+    pi: ProviderDiagnostic,
     runtime: BTreeMap<String, RuntimeWarning>,
     next_episode: u64,
     runtime_flash: Option<RuntimeFlash>,
@@ -235,9 +244,36 @@ impl App {
     pub(super) fn poll_providers(&mut self) -> bool {
         let claude = self.poll_step(self.agents_poll);
         let codex = self.poll_codex();
+        self.poll_pi();
         if self.pending_jump.as_ref().is_some_and(|jump| jump.provider == Provider::Codex) {
             codex
         } else { claude }
+    }
+
+    pub(crate) fn enable_pi_catalog(&mut self) {
+        self.pi.catalog = crate::pi::Catalog::from_env();
+    }
+
+    fn poll_pi(&mut self) {
+        let watched = self.watchers().polls();
+        let Some(catalog) = &mut self.pi.catalog else { return; };
+        let now = Instant::now();
+        let explicit = std::mem::take(&mut self.pi.force);
+        if !explicit && (!watched || self.pi.last_attempt.is_some_and(|last|
+            now.saturating_duration_since(last) < self.interval))
+        {
+            return;
+        }
+        self.pi.last_attempt = Some(now);
+        self.diagnostics.pi.explicit_refresh = explicit;
+        match catalog.poll() {
+            Ok(rows) => {
+                self.sessions.retain(|row| row.provider != Provider::Pi);
+                self.sessions.extend(rows);
+                self.diagnostics.pi.success();
+            }
+            Err(error) => self.diagnostics.pi.failure(FailureCategory::PiCatalog, error.to_string()),
+        }
     }
 
     pub fn poll_codex(&mut self) -> bool {
@@ -310,6 +346,7 @@ impl App {
         if self.codex_enabled()
             && let Some(text) = self.diagnostics.codex.take_ready(now, Provider::Codex)
         { parts.push(text); }
+        if let Some(text) = self.diagnostics.pi.take_ready(now, Provider::Pi) { parts.push(text); }
         if parts.is_empty() { return false; }
         self.flash(parts.join("; "), MsgLevel::Error);
         self.msg_deadline = now.checked_add(MSG_TTL);

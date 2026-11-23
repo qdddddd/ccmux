@@ -122,6 +122,7 @@ pub struct Plan {
     pub detached: usize,
     /// Live Codex panes, including parked clients. Never restart targets.
     pub codex: usize,
+    pub pi: usize,
     /// EVERY SESSION A LIVE CCMUX PANE NAMES, respawned or not — the line
     /// between `R`'s two agent populations.
     ///
@@ -320,7 +321,7 @@ pub fn agent_verdict(s: &Session) -> Verdict {
     match s.group() {
         Group::Idle | Group::Completed => Verdict::Restart,
         Group::Working | Group::Blocked => Verdict::Busy,
-        Group::Codex => Verdict::NotRunning,
+        Group::Codex | Group::Pi => Verdict::NotRunning,
     }
 }
 
@@ -469,11 +470,19 @@ pub struct Headless {
 /// one call site's discipline.
 pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
     let live: HashSet<&PaneId> = panes.iter().map(|p| &p.id).collect();
-    let codex: HashSet<PaneId> = tabs.iter().flat_map(|t| t.map.panes.iter())
-        .filter(|(_, entry)| entry.provider == Provider::Codex)
-        .filter_map(|(raw, _)| PaneId::parse(raw))
-        .filter(|id| live.contains(id)).collect();
-    let mut out = Plan { codex: codex.len(), ..Plan::default() };
+    let mut codex = HashSet::new();
+    let mut pi = HashSet::new();
+    for (raw, entry) in tabs.iter().flat_map(|t| &t.map.panes) {
+        let panes = match entry.provider {
+            Provider::Claude => continue,
+            Provider::Codex => &mut codex,
+            Provider::Pi => &mut pi,
+        };
+        if let Some(id) = PaneId::parse(raw).filter(|id| live.contains(id)) {
+            panes.insert(id);
+        }
+    }
+    let mut out = Plan { codex: codex.len(), pi: pi.len(), ..Plan::default() };
     let mut seen: HashSet<PaneId> = HashSet::new();
     if let Some(me) = me {
         // Never a target of a respawn, whatever the records say.
@@ -487,7 +496,7 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
         // about the window that carries it.
         if let Some(sb) = tab.sidebar.as_ref()
             && live.contains(sb)
-            && !codex.contains(sb)
+            && !codex.contains(sb) && !pi.contains(sb)
             && panes.iter().any(|p| &p.id == sb && p.window_id == tab.window)
             && seen.insert(sb.clone())
         {
@@ -499,12 +508,12 @@ pub fn plan(tabs: &[TabInfo], panes: &[PaneInfo], me: Option<&PaneId>) -> Plan {
         // the same commands in the same order.
         for (raw, entry) in &tab.map.panes {
             if entry.provider != Provider::Claude {
-                continue; // Codex panes are never restarted or handed to Claude.
+                continue; // Only Claude attach panes take part in agent restart.
             }
             let Some(pane) = PaneId::parse(raw) else {
                 continue;
             };
-            if !live.contains(&pane) || codex.contains(&pane) {
+            if !live.contains(&pane) || codex.contains(&pane) || pi.contains(&pane) {
                 continue;
             }
             // HELD, whichever arm the pane lands in below — and BEFORE the
@@ -663,6 +672,7 @@ pub struct Report {
     /// (`Plan::skipped`).
     pub skipped: usize,
     pub codex: usize,
+    pub pi: usize,
     /// The agent pass.
     pub agents: Agents,
 }
@@ -735,6 +745,9 @@ pub fn note(r: &Report) -> String {
     }
     if r.codex > 0 {
         s.push_str(&format!("; Codex panes skipped: {}", r.codex));
+    }
+    if r.pi > 0 {
+        s.push_str(&format!("; Pi panes skipped: {}", r.pi));
     }
     s
 }
@@ -1738,6 +1751,7 @@ mod tests {
             failed,
             skipped,
             codex: 0,
+            pi: 0,
             agents: Agents::default(),
         };
         assert_eq!(note(&r(3, 4, 0, 0)), "restarted 3 sidebars, 4 panes");
@@ -1819,6 +1833,7 @@ mod tests {
                 failed: 1,
                 skipped: 4,
                 codex: 0,
+                pi: 0,
                 agents: Agents {
                     restarted: 1,
                     busy: 2,

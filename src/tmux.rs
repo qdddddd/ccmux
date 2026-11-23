@@ -102,7 +102,7 @@ pub const OPT_PANE_JUMP_FROM: &str = "@ccmux_jump_from";
 /// The LIVE map is `@ccmux_tab_map`, one per window.
 pub const EMPTY_MAP_JSON: &str = r#"{"v":1,"panes":{}}"#;
 
-/// Claude-only maps keep the original bytes; Codex entries require v2.
+/// Claude-only maps keep the original bytes; provider-tagged entries require v2.
 const MAP_VERSION: u32 = 1;
 const MIXED_MAP_VERSION: u32 = 2;
 /// `@ccmux_hidden` schema version. A different value is treated as empty.
@@ -1980,6 +1980,9 @@ impl<'de> serde::Deserialize<'de> for PaneMap {
             if entry.provider == Provider::Codex && !valid_codex_id(&entry.session_id) {
                 return Err(serde::de::Error::custom("invalid Codex thread id in pane map"));
             }
+            if entry.provider == Provider::Pi && !crate::pi::valid_session_path(&entry.session_id) {
+                return Err(serde::de::Error::custom("invalid Pi session path in pane map"));
+            }
             if panes.values().any(|e| e.session_id == entry.session_id && e.provider != entry.provider) {
                 return Err(serde::de::Error::custom("provider conflict in pane map"));
             }
@@ -1991,7 +1994,7 @@ impl<'de> serde::Deserialize<'de> for PaneMap {
 
 impl PaneMap {
     fn wire_version(&self) -> u32 {
-        if self.panes.values().any(|e| e.provider == Provider::Codex) {
+        if self.panes.values().any(|e| !e.provider.is_claude()) {
             MIXED_MAP_VERSION
         } else {
             MAP_VERSION
@@ -2230,7 +2233,7 @@ impl HiddenSet {
             return false;
         }
         self.ids.push(id.to_string());
-        if provider == Provider::Codex {
+        if !provider.is_claude() {
             self.providers.insert(id.to_string(), provider);
         }
         while self.ids.len() > HIDDEN_MAX {
@@ -2247,8 +2250,7 @@ impl HiddenSet {
         Some(id)
     }
 
-    /// Retire absent Claude ids. Codex dismissals have no automatic retirement
-    /// because its listing is a window, not an absence proof (§12.9).
+    /// Retire absent Claude ids. Codex and Pi dismissals remain until undone.
     /// True when anything was dropped.
     ///
     /// `retain` preserves order, so removing from the middle of the stack
@@ -2260,7 +2262,7 @@ impl HiddenSet {
         let alive: HashSet<&str> = live.into_iter().collect();
         let before = self.ids.len();
         self.ids.retain(|id| alive.contains(id.as_str())
-            || self.providers.get(id) == Some(&Provider::Codex));
+            || self.providers.get(id).is_some_and(|provider| !provider.is_claude()));
         self.providers.retain(|id, _| self.ids.contains(id));
         self.ids.len() != before
     }
@@ -2367,13 +2369,12 @@ impl<const V: u32> OpLog<V> {
         if let Some(index) = self.ops.iter().position(|cur| cur.identity() == op.identity()) {
             // An old adopter may have stripped the optional field. A tagged
             // copy wins in either order, including duplicates already on disk.
-            let codex = op.provider == Provider::Codex || self.ops.iter().any(|cur| {
-                cur.identity() == op.identity() && cur.provider == Provider::Codex
-            });
-            let changed = codex && self.ops[index].provider != Provider::Codex;
-            if codex {
-                self.ops[index].provider = Provider::Codex;
-            }
+            let provider = self.ops.iter()
+                .filter(|cur| cur.identity() == op.identity())
+                .map(|cur| cur.provider).chain([op.provider])
+                .find(|provider| !provider.is_claude()).unwrap_or_default();
+            let changed = provider != self.ops[index].provider;
+            self.ops[index].provider = provider;
             let before = self.ops.len();
             let mut kept = false;
             self.ops.retain(|cur| {
@@ -2446,7 +2447,7 @@ pub fn fold_winners<'a, const V: u32, I: IntoIterator<Item = &'a OpLog<V>>>(
         for op in &log.ops {
             match winner.get_mut(op.id.as_str()) {
                 Some(cur) if cur.identity() == op.identity() => {
-                    if op.provider == Provider::Codex { cur.provider = Provider::Codex; }
+                    if cur.provider.is_claude() { cur.provider = op.provider; }
                 }
                 Some(cur) if cur.rank() > op.rank() => {}
                 _ => {
@@ -2515,17 +2516,17 @@ pub fn prune_unread_log(mine: &mut UnreadLog, others: &[&UnreadLog]) -> bool {
 fn prune_op_log<const V: u32>(mine: &mut OpLog<V>, others: &[&OpLog<V>], gc_tombstones: bool) -> bool {
     // Upgrade BEFORE compacting/ranking: a stripped copy must not outlive the
     // only tagged duplicate merely because the latter belonged to a dead tab.
-    let tagged: HashSet<(String, bool, u64, u64)> = mine.ops.iter()
+    let tagged: HashMap<_, _> = mine.ops.iter()
         .chain(others.iter().flat_map(|log| log.ops.iter()))
-        .filter(|op| op.provider == Provider::Codex)
-        .map(|op| (op.id.clone(), op.add, op.seq, op.org))
+        .filter(|op| !op.provider.is_claude())
+        .map(|op| ((op.id.clone(), op.add, op.seq, op.org), op.provider))
         .collect();
     let mut upgraded = false;
     for op in &mut mine.ops {
-        if op.provider != Provider::Codex
-            && tagged.contains(&(op.id.clone(), op.add, op.seq, op.org))
+        if op.provider.is_claude()
+            && let Some(provider) = tagged.get(&(op.id.clone(), op.add, op.seq, op.org))
         {
-            op.provider = Provider::Codex;
+            op.provider = *provider;
             upgraded = true;
         }
     }

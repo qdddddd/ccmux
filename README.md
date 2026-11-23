@@ -1,7 +1,7 @@
 # ccmux
 
-A tmux-backed, neovim-style frontend for Claude Code background sessions and
-Codex sessions.
+A tmux-backed, neovim-style frontend for Claude Code background sessions,
+Codex sessions and local Pi sessions.
 
 `claude agents` gives you a fleet view. ccmux gives you a workspace: a session
 list pinned to the left of a tmux window, with the real agent TUIs open in
@@ -37,8 +37,7 @@ cargo install --path .
 ```
 
 Requires `tmux` and the `claude` CLI on `PATH`, and Rust with edition 2024.
-The `codex` CLI is needed only to open a Codex row; listing them works
-without it.
+The `codex` and `pi` CLIs are needed to open their respective sessions.
 
 ## Launch
 
@@ -142,9 +141,32 @@ Codex deletion uses `thread/delete` and cannot be undone. The working
 directory is kept. As with Claude, the first press keeps the conversation
 available to resume; only the second press deletes it.
 
+## Pi sessions
+
+The **Pi** group lists saved sessions by most recently modified. The row uses
+Pi's session name, or the first prompt if the session has no name. ccmux scans
+`~/.pi/agent/sessions/` by default. It also honors `PI_CODING_AGENT_DIR`,
+`PI_CODING_AGENT_SESSION_DIR` and the user-level `sessionDir` setting. Set
+`PI_CODING_AGENT_SESSION_DIR` to list files from a custom directory used with
+Pi's `--session-dir`. `CCMUX_PI_BIN` selects the Pi executable. These variables
+must be available to the sidebar's tmux environment.
+
+Use `Enter`, `v`, `s` or `t` to resume a session in the Pi TUI. `/quit` in Pi
+parks the pane. Enter resumes the original launch target, `s` opens a shell,
+and `q` closes the pane. `x` closes the pane and ends its local Pi process.
+To start another conversation, use Pi directly or `/new` in the Pi TUI. After
+`/new` or `/resume`, the pane mapping still refers to the original launch target.
+`d/u` hide and restore rows, `r` refreshes, and `R` skips Pi panes.
+
+Exit any running Pi client for the session before deleting its file. On a Pi
+row, press `Ctrl-x`, then press it again within 2 seconds after the confirmation
+appears. This permanently deletes the selected `.jsonl` file. ccmux checks for
+active panes it opened for the session in this workspace. A Pi row represents a
+saved file. It carries no live turn or unread status.
+
 ## Keys
 
-Stop and delete work for both providers; Codex differences are listed above.
+Stop and delete behavior depends on the selected provider.
 
 | Key | Action |
 |---|---|
@@ -156,8 +178,8 @@ Stop and delete work for both providers; Codex differences are listed above.
 | `Enter` | Jump to the session's pane, or open it in a vertical split |
 | `v` / `s` | Open in a side-by-side / stacked split. With two or more panes beside the sidebar, pick which one to split |
 | `t` | Open in a new tab |
-| `x` | Close the session's pane. The agent keeps running |
-| `Ctrl-x` | Stop; press again within 2 s to delete the session and close its panes |
+| `x` | Close the session's pane. Claude and Codex work stays on the server |
+| `Ctrl-x` | Claude/Codex: stop or offer deletion. Pi: offer file deletion. Press again within 2 s to confirm |
 | `n` | Dispatch a new background session |
 | `L` | Show the session's logs |
 | `d` / `u` | Hide the row from the list / undo the last hide |
@@ -203,8 +225,8 @@ Focusing the sidebar any other way leaves the cursor alone.
 Claude rows list only background sessions: those started with `claude --bg` or `n`.
 Interactive Claude sessions cannot be attached into a split, so they are left out.
 
-Groups run **Blocked**, **Working**, **Idle**, **Completed**, **Codex**.
-The first four contain Claude rows; every Codex state stays in Codex.
+Groups run **Blocked**, **Working**, **Idle**, **Completed**, **Codex**, **Pi**.
+The first four contain Claude rows. Codex and Pi each have their own group.
 Empty groups have no header.
 
 | Glyph | Meaning |
@@ -215,7 +237,7 @@ Empty groups have no header.
 | `○` gray | Idle |
 | `✓` green | Completed |
 | `■` gray | Stopped. Opening it resumes it |
-| `◇` gray | Codex thread unloaded from this server |
+| `◇` gray | Saved Pi session or unloaded Codex thread |
 | `?` purple | An unrecognized state, or Codex `systemError`; the footer reports the value or runtime error |
 | `▌` aqua | Open in a pane in this tab |
 | `▌` grey | Open in a pane in another tab |
@@ -304,6 +326,7 @@ as they are.
 | Stopped or finished sessions | Skipped, never started |
 | Detached panes | Skipped, and counted as `skipped` |
 | Codex panes | Skipped; the app-server is untouched |
+| Pi panes | Skipped |
 | Agents attached anywhere else on the machine | Skipped |
 
 A restarted agent keeps its id, name and conversation. Its age resets, because
@@ -321,7 +344,7 @@ v2 pane map, including Claude pane records, and strip Codex dismissal tags.
 
 ## Safety
 
-- `x` closes a pane and never stops the agent.
+- `x` closes a pane. This ends a local Pi process. Claude and Codex work stays on the server.
 - `d` only hides a row.
 - On a Claude row, `Ctrl-x` is the only verb that can **delete** a session.
   The first press stops it; the conversation is kept and `Enter` resumes it.
@@ -338,8 +361,8 @@ v2 pane map, including Claude pane records, and strip Codex dismissal tags.
   presses until its 2 s would have ended only say
   `delete window closed — nothing deleted`. A press within 750 ms of the
   previous one is ignored, and the footer says so; a held key deletes nothing.
-- A delete closes the panes parked on that session, but not a pane you turned
-  into a shell with `s`.
+- A Claude or Codex delete closes the panes parked on that session and leaves login shells open.
+- On a Pi row, the first `Ctrl-x` offers file deletion. A confirmed second press removes the session file.
 - `R` also runs `claude stop` and `claude respawn`, only on idle or done agents,
   and resumes each one straight away. It never deletes anything and never starts
   a session that was not running.
@@ -360,7 +383,7 @@ stall the sidebar for longer than that.
 ## Degraded mode
 
 `ccmux sidebar` also runs outside tmux. The list, filtering, `n`, `L`,
-`d` and `u` work, and so does `Ctrl-x` on Claude rows. `Enter`, `v`, `s`, `t`,
+`d` and `u` work, and so does `Ctrl-x` on Claude and Pi rows. `Enter`, `v`, `s`, `t`,
 `x`, `R` and `Ctrl-x` on Codex rows refuse with a message.
 
 ## Development
