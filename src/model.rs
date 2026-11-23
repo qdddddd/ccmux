@@ -13,6 +13,7 @@ pub enum Provider {
     #[default]
     Claude,
     Codex,
+    Pi,
 }
 
 impl Provider {
@@ -115,6 +116,7 @@ pub enum Group {
     Completed = 3,
     /// All Codex states stay together, after the four Claude groups.
     Codex = 4,
+    Pi = 5,
 }
 
 impl Group {
@@ -125,11 +127,12 @@ impl Group {
             Group::Idle => "Idle",
             Group::Completed => "Completed",
             Group::Codex => "Codex",
+            Group::Pi => "Pi",
         }
     }
 
-    pub fn all() -> [Group; 5] {
-        [Group::Blocked, Group::Working, Group::Idle, Group::Completed, Group::Codex]
+    pub fn all() -> [Group; 6] {
+        [Group::Blocked, Group::Working, Group::Idle, Group::Completed, Group::Codex, Group::Pi]
     }
 
     /// SPEC §3.1 surface. `App::cycle_group` walks `rows`' header positions
@@ -141,7 +144,8 @@ impl Group {
             Group::Working => Group::Idle,
             Group::Idle => Group::Completed,
             Group::Completed => Group::Codex,
-            Group::Codex => Group::Blocked,
+            Group::Codex => Group::Pi,
+            Group::Pi => Group::Blocked,
         }
     }
 
@@ -149,7 +153,8 @@ impl Group {
     #[allow(dead_code)]
     pub fn prev(self) -> Group {
         match self {
-            Group::Blocked => Group::Codex,
+            Group::Blocked => Group::Pi,
+            Group::Pi => Group::Codex,
             Group::Working => Group::Blocked,
             Group::Idle => Group::Working,
             Group::Completed => Group::Idle,
@@ -173,7 +178,7 @@ pub struct Session {
     pub codex: Option<CodexMeta>,
     /// 8-hex short id. `None` for `kind == Interactive`.
     pub id: Option<String>,
-    /// UUID. Stable. THE primary key everywhere in ccmux.
+    /// Stable provider address. Pi uses the absolute session file path.
     pub session_id: String,
     /// The worker's pid, **read for its PRESENCE and never for its value**.
     ///
@@ -254,7 +259,11 @@ impl Session {
     /// cannot disagree. `the_blocked_glyph_and_the_blocked_group_never_disagree`
     /// pins that across the whole state x status matrix.
     pub fn group(&self) -> Group {
-        if self.provider == Provider::Codex { return Group::Codex; }
+        match self.provider {
+            Provider::Codex => return Group::Codex,
+            Provider::Pi => return Group::Pi,
+            Provider::Claude => {}
+        }
         match &self.state {
             // Claude's terminal states still outrank a stale waiting status.
             Some(State::Done) | Some(State::Stopped) | Some(State::Unloaded) => Group::Completed,
@@ -309,9 +318,13 @@ impl Session {
         if let Some(id) = &self.id {
             out.push_str(id);
         }
-        if self.provider == Provider::Codex {
-            out.push_str(" codex ");
-            out.push_str(&self.session_id);
+        match self.provider {
+            Provider::Codex => {
+                out.push_str(" codex ");
+                out.push_str(&self.session_id);
+            }
+            Provider::Pi => out.push_str(" pi"),
+            Provider::Claude => {}
         }
         out.to_lowercase()
     }
@@ -518,8 +531,7 @@ pub fn build_rows(
         .filter(|&i| needle.is_empty() || sessions[i].filter_haystack().contains(&needle))
         .collect();
 
-    // 5 headers + 4 spacers in the worst case.
-    let mut rows = Vec::with_capacity(matching.len() + 9);
+    let mut rows = Vec::with_capacity(matching.len() + 2 * Group::all().len() - 1);
     for group in Group::all() {
         let mut in_group: Vec<usize> = matching
             .iter()
@@ -571,7 +583,7 @@ pub fn format_age(started_at_ms: i64, now_ms: i64) -> String {
 
 /// Terminal text is not escaped by ratatui. Strip controls and whole escape
 /// sequences before path elision, keeping the original cwd in the model.
-fn clean_display_text(raw: &str) -> String {
+pub(crate) fn clean_display_text(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1099,13 +1111,15 @@ mod tests {
         assert_eq!(Group::Codex.title(), "Codex");
         assert_eq!(
             Group::all(),
-            [Group::Blocked, Group::Working, Group::Idle, Group::Completed, Group::Codex]
+            [Group::Blocked, Group::Working, Group::Idle, Group::Completed, Group::Codex, Group::Pi]
         );
         assert_eq!(Group::Blocked.next(), Group::Working);
         assert_eq!(Group::Working.next(), Group::Idle);
         assert_eq!(Group::Completed.next(), Group::Codex);
-        assert_eq!(Group::Codex.next(), Group::Blocked);
-        assert_eq!(Group::Blocked.prev(), Group::Codex);
+        assert_eq!(Group::Codex.next(), Group::Pi);
+        assert_eq!(Group::Pi.next(), Group::Blocked);
+        assert_eq!(Group::Blocked.prev(), Group::Pi);
+        assert_eq!(Group::Pi.prev(), Group::Codex);
         assert_eq!(Group::Codex.prev(), Group::Completed);
         assert_eq!(Group::Working.prev(), Group::Blocked);
         assert!(Group::Blocked < Group::Working);

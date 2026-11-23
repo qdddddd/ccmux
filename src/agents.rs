@@ -74,6 +74,8 @@ impl std::fmt::Display for AgentsError {
                 write!(f, "codex not configured — open unavailable"),
             AgentsError::NotConfigured(Provider::Claude) =>
                 write!(f, "claude not configured — open unavailable"),
+            AgentsError::NotConfigured(Provider::Pi) =>
+                write!(f, "pi not configured — open unavailable"),
         }
     }
 }
@@ -697,6 +699,17 @@ fn attach_cmd(
             if !crate::model::valid_codex_id(native_id) { return Err(AgentsError::NotAttachable); }
             codex_attach_cmd(native_id, config, crate::tmux::socket().as_deref())
         }
+        Provider::Pi => {
+            if !crate::pi::valid_session_path(native_id) { return Err(AgentsError::NotAttachable); }
+            let bin = std::env::var("CCMUX_PI_BIN").ok()
+                .filter(|bin| !bin.trim().is_empty()).unwrap_or_else(|| "pi".into());
+            let path = sh_quote(native_id);
+            let invocation = format!("{} --session {path}", sh_quote(&bin));
+            let guarded = format!(
+                "if [ -f {path} ]; then {invocation}; else printf '%s\\n' 'Pi session file is missing' >&2; false; fi"
+            );
+            Ok(session_pane_cmd(&guarded, &invocation, "Pi", crate::tmux::socket().as_deref()))
+        }
     }
 }
 
@@ -867,18 +880,22 @@ fn codex_attach_cmd(id: &str, config: &CodexConfig, socket: Option<&str>) -> Res
         file = sh_quote(token_file),
         bin = sh_quote(&config.bin), url = sh_quote(&config.url), id = sh_quote(id),
     );
-    let shown = sh_quote(&invocation);
+    Ok(session_pane_cmd(&invocation, &invocation, "Codex", socket))
+}
+
+fn session_pane_cmd(invocation: &str, resume: &str, label: &str, socket: Option<&str>) -> String {
+    let shown = sh_quote(resume);
     let tmux = match socket {
         Some(socket) => format!("tmux -L {}", sh_quote(socket)),
         None => "tmux".into(),
     };
-    Ok(format!(
+    format!(
         "while :; do \
          case \"${{TMUX_PANE:-}}\" in %*) case \"${{TMUX_PANE#%}}\" in ''|*[!0-9]*) exit 2;; esac;; *) exit 2;; esac; \
          {tmux} set-option -p -u -t \"$TMUX_PANE\" {opt} 2>/dev/null; \
          {invocation}; rc=$?; \
          {tmux} set-option -p -t \"$TMUX_PANE\" {opt} 1 2>/dev/null; \
-         printf '\\n[ccmux] Codex attach exited (rc=%s). resume: %s\\n' \"$rc\" {shown}; \
+         printf '\\n[ccmux] {label} attach exited (rc=%s). resume: %s\\n' \"$rc\" {shown}; \
          printf '[ccmux] enter=resume  s=shell  q=close pane: '; \
          read ans || ans=q; \
          case \"$ans\" in s|S) break;; q|Q) exit \"$rc\";; esac; \
@@ -888,7 +905,7 @@ fn codex_attach_cmd(id: &str, config: &CodexConfig, socket: Option<&str>) -> Res
          [ -x \"${{SHELL:-}}\" ] || SHELL=/bin/sh; \
          exec \"$SHELL\" -l",
         opt = OPT_PANE_DETACHED, shell = LATCH_SHELL,
-    ))
+    )
 }
 
 // The ignored live harness needs the real wrapper on its fixed throwaway

@@ -10,6 +10,7 @@
 mod agents;
 mod app;
 mod codex;
+mod pi;
 mod model;
 mod restart;
 mod settings;
@@ -468,6 +469,7 @@ fn run_sidebar(cli: &Cli, interval_ms: u64, codex: &settings::CodexSettings) -> 
     let width = cli.width.clamp(WIDTH_MIN, WIDTH_MAX);
     let interval = Duration::from_millis(interval_ms.clamp(INTERVAL_MIN_MS, INTERVAL_MAX_MS));
     let mut app = app::App::new(cli.session.clone(), width, interval, resolve_dark(cli));
+    app.enable_pi_catalog();
     // `t` gives the tab it creates its own sidebar, and the command that starts
     // one is built here, from the same `current_exe()` + `sh_join` builder the
     // launcher uses. `app` never imports `main`; the string is handed down, so

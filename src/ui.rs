@@ -508,7 +508,7 @@ fn name_tier(sess: &Session, p: &Palette) -> Color {
         // first group on screen, under a yellow rule, behind a yellow `▲`.
         Group::Blocked | Group::Working => p.fg,
         Group::Idle => p.gray,
-        Group::Completed => p.dim,
+        Group::Completed | Group::Pi => p.dim,
         Group::Codex => match sess.state {
             Some(State::Blocked | State::Working) => p.fg,
             Some(State::Unloaded) => p.dim,
@@ -527,7 +527,7 @@ fn group_accent(g: Group, p: &Palette) -> Color {
         Group::Working => p.orange,
         Group::Idle => p.blue,
         Group::Completed => p.gray,
-        Group::Codex => p.aqua,
+        Group::Codex | Group::Pi => p.aqua,
     }
 }
 
@@ -628,6 +628,7 @@ fn status_glyph(sess: &Session, p: &Palette) -> (&'static str, Color) {
             _ => ("◐", p.blue),
         },
         Group::Codex if sess.state == Some(State::Working) => ("●", p.orange),
+        Group::Pi => ("◇", p.gray),
         Group::Idle | Group::Codex => ("○", p.gray),
         // Unreachable in practice — `group()` returns Completed only for
         // `Done`/`Stopped`, and both returned above — but kept as a real arm
@@ -901,10 +902,14 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     };
 
     let short = sess.id.clone().unwrap_or_else(|| "—".to_string());
-    let kind = if sess.provider == Provider::Codex { "codex" } else { match sess.kind {
-        Kind::Background => "background",
-        Kind::Interactive => "interactive",
-    }};
+    let kind = match sess.provider {
+        Provider::Pi => "pi",
+        Provider::Codex => "codex",
+        Provider::Claude => match sess.kind {
+            Kind::Background => "background",
+            Kind::Interactive => "interactive",
+        },
+    };
     // Most `state: "done"` rows carry no `status` key (9 of 14 done rows on
     // 2026-08-31; the rest said `idle`), and an absent key parses to
     // `Status::Unknown("")`, so the state is resolved FIRST here for the same
@@ -919,6 +924,8 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
             Some(crate::model::CodexStatus::Active { .. }) if !matches!(sess.status, Status::Unknown(_)) => "working",
             _ => "unknown",
         }.to_string()
+    } else if sess.provider == Provider::Pi {
+        "saved".to_string()
     } else if matches!(sess.state, Some(State::Done)) {
         "done".to_string()
     } else if matches!(sess.state, Some(State::Stopped)) {
@@ -1180,6 +1187,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         return;
     }
     let m = margin(w);
+    let pi_selected = selected_session(app).is_some_and(|row| row.provider == Provider::Pi);
     let mut spans: Vec<Span> = Vec::new();
     let mut used = 0usize;
     // The pairs only start appearing once the layout has a gutter and a margin
@@ -1187,6 +1195,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
     if w >= MARGIN_MIN {
         let budget = w - m - hw - 1; // the rail, plus at least one blank column
         for &(key, text) in HINTS {
+            let text = match (pi_selected, key) {
+                (true, "C-x") => "delete file",
+                (true, "n" | "L") => continue,
+                _ => text,
+            };
             let pair = display_width(key) + 1 + display_width(text);
             let want = if used == 0 { pair } else { used + 2 + pair };
             if want > budget {
@@ -1263,7 +1276,7 @@ const KEYS: &[(&str, &str)] = &[
     // overlay's 26 columns, like every other row here.
     ("", "2+ panes: press a label"),
     ("t", "open in a new tab"),
-    ("x", "close pane (agent lives)"),
+    ("x", "close pane"),
     ("Ctrl-x", "stop session"),
     // Sized to survive the default 28-column overlay uncut: the escalation's
     // CONSEQUENCE is the half an operator must be able to read, and the
@@ -1696,6 +1709,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
+            pi: Default::default(),
             codex_stop: |_, _| panic!("render test reached codex stop RPC"),
             codex_start: |_, _, _| panic!("render test reached codex start RPC"),
             codex_delete: |_, _, _| panic!("render test reached codex delete RPC"),

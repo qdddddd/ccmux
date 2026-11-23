@@ -616,6 +616,7 @@ pub struct App {
     pub msg_deadline: Option<Instant>,
     pub poll_error: Option<String>,
     pub codex: CodexPoll,
+    pub(crate) pi: providers::PiPoll,
     /// Codex session operations; tests install explicit recorders.
     pub codex_stop: fn(&CodexConfig, &str) -> Result<(), CodexDiagnostic>,
     pub codex_start: fn(&CodexConfig, &str, &str) -> Result<String, CodexDiagnostic>,
@@ -838,6 +839,7 @@ impl App {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
+            pi: Default::default(),
             codex_stop: crate::codex::stop,
             codex_start: crate::codex::start,
             codex_delete: crate::codex::delete,
@@ -1026,8 +1028,8 @@ impl App {
                 // scan the same population or the ignored test can fail over a
                 // row the running sidebar never had a word to say about.
                 self.note_drift(&payload.sessions);
-                let codex_rows: Vec<_> = self.sessions.iter()
-                    .filter(|s| s.provider == Provider::Codex).cloned().collect();
+                let other_rows: Vec<_> = self.sessions.iter()
+                    .filter(|s| s.provider != Provider::Claude).cloned().collect();
                 let before: BTreeMap<String, String> = self.sessions.iter()
                     .filter(|s| s.provider == Provider::Claude)
                     .filter_map(|s| Some((s.id.clone()?, s.session_id.clone())))
@@ -1036,7 +1038,7 @@ impl App {
                     .sessions
                     .into_iter()
                     .filter(|s| s.provider == Provider::Claude && s.kind != model::Kind::Interactive)
-                    .chain(codex_rows)
+                    .chain(other_rows)
                     .collect();
                 self.diagnostics.claude.success();
                 self.poll_error = None;
@@ -1537,7 +1539,7 @@ impl App {
             self.pending_delete.as_ref().map(|pending| &pending.target))
             .is_some_and(|arm| {
                 selected.is_some_and(|row| row.provider != arm.provider)
-                    || (arm.provider == Provider::Codex
+                    || (!arm.provider.is_claude()
                         && selected.is_none_or(|row| row.session_id != arm.session_id))
             })
     }
@@ -1914,6 +1916,7 @@ impl App {
         let answered = polled && match jump.provider {
             Provider::Claude => self.poll_error.is_none(),
             Provider::Codex => matches!(self.diagnostics.codex.health, providers::Health::Healthy),
+            Provider::Pi => false,
         };
 
         // THE KEY MISMATCH resolved: `--bg` named it by short id, the cursor is
@@ -1925,6 +1928,7 @@ impl App {
             .find(|s| s.provider == jump.provider && match jump.provider {
                 Provider::Claude => s.id.as_deref() == Some(jump.short_id.as_str()),
                 Provider::Codex => s.session_id == jump.short_id,
+                Provider::Pi => false,
             })
             .map(|s| (s.session_id.clone(), session_label(s)));
 
@@ -2412,7 +2416,7 @@ impl App {
         }
     }
 
-    /// `x` — close the pane, leaving the agent running. SPEC §8.5.
+    /// `x` — close the session's pane. SPEC §8.5.
     pub fn act_close_pane(&mut self) {
         if self.degraded {
             self.flash("not inside tmux — close unavailable", MsgLevel::Warn);
@@ -2421,13 +2425,6 @@ impl App {
         let Some(sel) = self.selected_session() else {
             return;
         };
-        // §8.5's interactive refusal is GONE, not relaxed — the spec no
-        // longer carries the step at all.
-        // PROBE-FINDINGS §3 proves `kill-pane` leaves the agent running for
-        // BACKGROUND sessions, which are daemon-owned — and `apply_poll` now
-        // lists nothing else, so the refusal had no row left to fire on. An
-        // interactive session, which IS a descendant of its pane's pid
-        // (PROBE §4), can no longer be selected here at all.
         let provider = sel.provider;
         let session_id = sel.session_id.clone();
         // `pane_of_any`, not `pane_of`: a pane whose attach has exited into a
@@ -2444,21 +2441,11 @@ impl App {
         match self.kill_owned_pane(&pane) {
             Ok(killed_here) => {
                 self.settle_after_kill(killed_here);
-                // §8.5's last step: this wording is the operator-facing
-                // statement of PROBE-FINDINGS §3, shown every time, so nobody
-                // confuses `x` with `Ctrl+X`.
-                //
-                // ONE WORDING, and deliberately. A version that said "— shell"
-                // for a detached pane read `PaneInfo::detached` out of an
-                // inventory `tick` refreshes and a keypress does not, so it
-                // announced the wrong thing for up to a `tick_interval` after
-                // a `Ctrl+Z` — and `x` has no other reason to re-read tmux.
-                // The sentence below is true either way: the agent is a
-                // background one, daemon-owned, and closing its pane never
-                // touched it (§8.5).
-                let outcome = if provider == Provider::Codex {
-                    "Codex work stays on server"
-                } else { "agent still running" };
+                let outcome = match provider {
+                    Provider::Claude => "agent still running",
+                    Provider::Codex => "Codex work stays on server",
+                    Provider::Pi => "Pi session can be resumed",
+                };
                 match idx {
                     Some(i) => self.flash(
                         format!("closed pane {i}{where_} — {outcome}"),
@@ -2716,9 +2703,10 @@ impl App {
             self.flash("no session selected", MsgLevel::Warn);
             return;
         };
-        if sel.provider == Provider::Codex {
-            self.stop_codex_and_arm(&sel);
-            return;
+        match sel.provider {
+            Provider::Codex => return self.stop_codex_and_arm(&sel),
+            Provider::Pi => return self.arm_pi_delete(&sel),
+            Provider::Claude => {}
         }
         if !sel.is_attachable() {
             // §9.7's wording, unchanged by the move off `S`.
@@ -2776,6 +2764,36 @@ impl App {
     }
 
     /// Stop an active Codex turn, then offer deletion of the captured thread.
+    fn pi_delete_available(&mut self, session_id: &str) -> bool {
+        if self.degraded { return true; }
+        self.refresh_panes();
+        if !self.panes_fresh || !self.tabs_fresh {
+            self.flash("Could not verify Pi panes — deletion cancelled", MsgLevel::Warn);
+            return false;
+        }
+        if self.panes_showing(Provider::Pi, session_id).iter().any(|pane|
+            self.panes.iter().any(|info| &info.id == pane && !info.detached))
+        {
+            self.flash("Exit the Pi session before deleting its file", MsgLevel::Warn);
+            return false;
+        }
+        true
+    }
+
+    fn arm_pi_delete(&mut self, session: &Session) {
+        if !self.pi_delete_available(&session.session_id) { return; }
+        match crate::pi::file_identity(&session.session_id) {
+            Ok(identity) => self.open_window(StopArm {
+                provider: Provider::Pi,
+                session_id: session.session_id.clone(),
+                short_id: identity,
+                name: session.name.clone(),
+                at: Instant::now(),
+            }),
+            Err(error) => self.flash(format!("delete unavailable: {error}"), MsgLevel::Error),
+        }
+    }
+
     fn stop_codex_and_arm(&mut self, session: &Session) {
         if let Some(reason) = self.codex_delete_refusal(session, true) {
             self.flash(reason, MsgLevel::Warn);
@@ -2937,9 +2955,10 @@ impl App {
         if self.mode != Mode::Normal || self.should_quit {
             return;
         }
-        if arm.provider == Provider::Codex {
-            self.run_codex_delete(arm);
-            return;
+        match arm.provider {
+            Provider::Codex => return self.run_codex_delete(arm),
+            Provider::Pi => return self.run_pi_delete(arm),
+            Provider::Claude => {}
         }
         let label = model::truncate_end(&arm.name, LABEL_MAX);
         // Fail closed: re-validate the CAPTURED id against the current poll. A
@@ -2983,6 +3002,26 @@ impl App {
         // Without it a `Ctrl+X` buffered during the freeze dequeues with a
         // stale gap, reads as a fresh FIRST press, and stops whatever row the
         // cursor fell to when the deleted session left the list.
+        self.stamp_ctrl_x(Instant::now());
+    }
+
+    fn run_pi_delete(&mut self, arm: StopArm) {
+        if !self.selected_session().is_some_and(|row|
+            row.provider == Provider::Pi && row.session_id == arm.session_id)
+        {
+            self.flash("Selection changed — deletion cancelled", MsgLevel::Warn);
+        } else if self.pi_delete_available(&arm.session_id) {
+            match crate::pi::delete(&arm.session_id, &arm.short_id) {
+                Ok(()) => {
+                    self.sessions.retain(|row| row.provider != Provider::Pi || row.session_id != arm.session_id);
+                    self.rebuild_rows();
+                    let label = model::truncate_end(&arm.name, LABEL_MAX);
+                    self.flash(format!("deleted {label}"), MsgLevel::Info);
+                    self.act_force_refresh();
+                }
+                Err(error) => self.flash(format!("delete failed: {error}"), MsgLevel::Error),
+            }
+        }
         self.stamp_ctrl_x(Instant::now());
     }
 
@@ -3125,6 +3164,9 @@ impl App {
         let label = model::truncate_end(&arm.name, LABEL_MAX);
         if arm.provider == Provider::Codex {
             Some(format!("{CODEX_INVITATION}{label} — cannot be undone"))
+        } else if arm.provider == Provider::Pi {
+            let prefix = if self.cx_refused { "too fast — Ctrl+X" } else { "Ctrl+X again" };
+            Some(format!("{prefix}: delete Pi file for {label} — cannot be undone"))
         } else {
             if self.cx_refused {
                 // Says the last press did not count. At five rows and up it
@@ -3259,6 +3301,10 @@ impl App {
             self.flash("Codex logs unavailable in v1 — use the Codex TUI", MsgLevel::Warn);
             return;
         }
+        if self.selected_session().is_some_and(|s| s.provider == Provider::Pi) {
+            self.flash("Open the Pi session to view its conversation", MsgLevel::Warn);
+            return;
+        }
         let Some(sel) = self.selected_session() else {
             return;
         };
@@ -3292,6 +3338,7 @@ impl App {
     pub fn act_force_refresh(&mut self) {
         self.force_poll = true;
         if self.codex_enabled() { self.codex.force = true; }
+        self.pi.force = true;
         self.last_poll = Instant::now()
             .checked_sub(self.tick_interval())
             .unwrap_or_else(Instant::now);
@@ -3539,6 +3586,7 @@ impl App {
                 failed,
                 skipped: plan.skipped(),
                 codex: plan.codex,
+                pi: plan.pi,
                 agents,
             }),
             MsgLevel::Info,
@@ -3997,6 +4045,7 @@ impl App {
         let provider = self.prompt.as_ref().map_or(Provider::Claude, |p| p.kind.provider());
         let result = match provider {
             Provider::Claude => (self.dispatch)(provider, cwd, task).map_err(|error| agents_msg(&error)),
+            Provider::Pi => unreachable!("Pi has no background dispatch prompt"),
             Provider::Codex => self.codex.settings.config()
                 .and_then(|config| (self.codex_start)(&config, cwd, task))
                 .map(Some).map_err(|error| error.message),
@@ -5182,6 +5231,12 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('n') => {
+                if self.selected_session().is_some_and(|s| s.provider == Provider::Pi)
+                    || matches!(self.rows.get(self.selected), Some(Row::Header { group: Group::Pi, .. }))
+                {
+                    self.flash("Use /new in Pi to start a conversation", MsgLevel::Info);
+                    return Action::Redraw;
+                }
                 let codex = self.selected_session().is_some_and(|s| s.provider == Provider::Codex)
                     || matches!(self.rows.get(self.selected), Some(Row::Header { group: Group::Codex, .. }));
                 self.open_prompt(if codex { PromptKind::NewCodex } else { PromptKind::NewBackground });
@@ -5826,6 +5881,7 @@ mod tests {
             msg_deadline: None,
             poll_error: None,
             codex: Default::default(),
+            pi: Default::default(),
             codex_stop: |_, _| panic!("unit test reached codex stop RPC"),
             codex_start: |_, _, _| panic!("unit test reached codex start RPC"),
             codex_delete: |_, _, _| panic!("unit test reached codex delete RPC"),
@@ -6441,6 +6497,55 @@ mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// A Pi confirmation must remove the exact captured file and keep other
+    /// conversations available, even if a replacement appears at that path.
+    #[test]
+    fn pi_ctrl_x_confirms_file_deletion_and_rejects_replacements() {
+        let root = std::env::temp_dir().join(format!(
+            "ccmux-pi-delete-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let target = root.join("target.jsonl");
+        let other = root.join("other.jsonl");
+        std::fs::write(&target, r#"{"type":"session","id":"target","cwd":"/tmp"}"#).unwrap();
+        std::fs::write(&other, r#"{"type":"session","id":"other","cwd":"/tmp"}"#).unwrap();
+
+        let mut a = app();
+        a.degraded = true;
+        let mut catalog = crate::pi::Catalog::new(root.clone(), false);
+        a.sessions = catalog.poll().unwrap();
+        a.selected_key = Some(target.to_str().unwrap().into());
+        a.rebuild_rows();
+        assert_eq!(a.selected_session().unwrap().session_id, target.to_str().unwrap());
+        a.on_key(ctrl('x'));
+        assert!(target.exists());
+        assert!(a.arm_hint().unwrap().contains("delete Pi file"));
+        a.cx_last_press = Some(Instant::now() - CX_MIN_GAP);
+        a.on_key(ctrl('x'));
+        assert!(target.exists());
+        a.pending_delete.as_mut().unwrap().at -= CX_SETTLE;
+        assert!(a.tick_stop_arm());
+        assert!(!target.exists());
+        assert!(other.exists());
+        assert_eq!(a.selected_session().unwrap().session_id, other.to_str().unwrap());
+
+        a.cx_last_press = Some(Instant::now() - CX_MIN_GAP);
+        a.on_key(ctrl('x'));
+        std::fs::rename(&other, root.join("original")).unwrap();
+        std::fs::write(&other, "replacement").unwrap();
+        a.cx_last_press = Some(Instant::now() - CX_MIN_GAP);
+        a.on_key(ctrl('x'));
+        a.pending_delete.as_mut().unwrap().at -= CX_SETTLE;
+        assert!(a.tick_stop_arm());
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "replacement");
+        assert!(a.message.as_ref().unwrap().0.contains("file was replaced"));
     }
 
     /// A successful, COMPLETE poll — what `agents::poll` returns when nothing
