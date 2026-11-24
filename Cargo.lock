@@ -139,6 +139,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "getrandom",
  "log",
  "ratatui",
  "serde",

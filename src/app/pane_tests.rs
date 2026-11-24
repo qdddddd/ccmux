@@ -221,6 +221,49 @@ fn with_sidebar(test: impl FnOnce(&mut App, &Rc<RefCell<Server>>)) {
     });
 }
 
+#[test]
+fn n_in_pi_section_opens_and_maps_a_fresh_pane_in_the_chosen_directory() {
+    for header in [false, true] {
+        with_sidebar(|a, server| {
+            let mut pi = row();
+            pi.provider = Provider::Pi;
+            pi.codex = None;
+            pi.session_id = "/fixture/sessions/existing.jsonl".into();
+            a.pi.catalog = Some(crate::pi::Catalog::new("/fixture/sessions".into(), true));
+            a.sessions = vec![pi.clone()];
+            a.rebuild_rows();
+            if header {
+                a.selected = 0;
+            }
+
+            press(a, 'n');
+            let current = std::env::current_dir().unwrap();
+            let cwd = current.canonicalize().unwrap();
+            let cwd = cwd.to_str().unwrap();
+            let prompt = a.prompt.as_mut().unwrap();
+            assert_eq!(prompt.kind, PromptKind::NewPi);
+            assert_eq!(prompt.focus, 0);
+            assert_eq!(prompt.fields, [if header { current.to_str().unwrap() } else { &pi.cwd }]);
+            prompt.fields[0] = cwd.into();
+            key(a, KeyCode::Enter);
+
+            assert_eq!(a.mode, Mode::Normal);
+            let server = server.borrow();
+            let entry = server.tabs[&1].map.get(&pid("%10")).unwrap();
+            assert_eq!(entry.provider, Provider::Pi);
+            assert_ne!(entry.session_id, pi.session_id);
+            let project = cwd.trim_start_matches('/').replace(['/', '\\', ':'], "-");
+            assert!(entry.session_id.starts_with(&format!("/fixture/sessions/--{project}--/")));
+            let split = server.calls("split-window");
+            assert_eq!(split.len(), 1);
+            let command = split[0].last().unwrap();
+            assert!(command.contains(&format!("cd {} &&", tmux::sh_quote(cwd))));
+            assert!(command.contains(&format!("--session {}", tmux::sh_quote(&entry.session_id))));
+            assert_eq!(server.calls("select-pane")[0].last().unwrap(), "%10");
+        });
+    }
+}
+
 fn map_pane(a: &mut App, server: &Rc<RefCell<Server>>, window: u32, row: &Session, latch: &str) -> String {
     let mut s = server.borrow_mut();
     s.tabs.entry(window).or_insert_with(|| TabInfo { window: wid(window), index: window, sidebar: None,

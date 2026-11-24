@@ -154,8 +154,11 @@ must be available to the sidebar's tmux environment.
 Use `Enter`, `v`, `s` or `t` to resume a session in the Pi TUI. `/quit` in Pi
 parks the pane. Enter resumes the original launch target, `s` opens a shell,
 and `q` closes the pane. `x` closes the pane and ends its local Pi process.
-To start another conversation, use Pi directly or `/new` in the Pi TUI. After
-`/new` or `/resume`, the pane mapping still refers to the original launch target.
+On a Pi row or the Pi group heading, press `n` to choose a working directory
+and open a new Pi session in a side-by-side split. The directory field supports
+`~`, `Tab` completion, and creating a missing directory with a second `Enter`.
+After `/new` or `/resume` inside Pi, the pane mapping still refers to the
+original launch target.
 `d/u` hide and restore rows, `r` refreshes, and `R` skips Pi panes.
 
 Exit any running Pi client for the session before deleting its file. On a Pi
@@ -180,7 +183,7 @@ Stop and delete behavior depends on the selected provider.
 | `t` | Open in a new tab |
 | `x` | Close the session's pane. Claude and Codex work stays on the server |
 | `Ctrl-x` | Claude/Codex: stop or offer deletion. Pi: offer file deletion. Press again within 2 s to confirm |
-| `n` | Dispatch a new background session |
+| `n` | Start a session for the selected provider |
 | `L` | Show the session's logs |
 | `d` / `u` | Hide the row from the list / undo the last hide |
 | `/` | Filter by name, cwd or short id |
@@ -299,15 +302,16 @@ The pane then waits instead of closing:
 While a pane is detached, the sidebar no longer counts it as open, and `R`
 leaves it alone. `x` still closes it.
 
-## Dispatching with `n`
+## Starting a session with `n`
 
-`n` asks for a task and a working directory, prefilled from the selected row.
-The directory field expands `~` and `Tab`-completes. If the directory does not
-exist, a second `Enter` creates it. Only one level is created, and never over an
-existing file.
+For Claude and Codex, `n` asks for a task and a working directory, prefilled
+from the selected row. For Pi, it asks for a working directory and opens the
+Pi TUI. The directory field expands `~` and `Tab`-completes. If the directory
+does not exist, a second `Enter` creates it. Only one level is created, and
+never over an existing file.
 
-The cursor moves to the new session once it is listed. Moving the cursor
-yourself first cancels that.
+For Claude and Codex, the cursor moves to the new session once it is listed.
+Moving the cursor yourself first cancels that.
 
 ## Restarting after an upgrade
 

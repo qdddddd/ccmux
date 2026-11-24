@@ -25,6 +25,7 @@
 //! only shell string produced is `attach_pane_cmd`, which is handed to tmux
 //! (RULE Q2) and quotes every interpolation through `tmux::sh_quote`.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::collections::BTreeSet;
@@ -701,16 +702,28 @@ fn attach_cmd(
         }
         Provider::Pi => {
             if !crate::pi::valid_session_path(native_id) { return Err(AgentsError::NotAttachable); }
-            let bin = std::env::var("CCMUX_PI_BIN").ok()
-                .filter(|bin| !bin.trim().is_empty()).unwrap_or_else(|| "pi".into());
             let path = sh_quote(native_id);
-            let invocation = format!("{} --session {path}", sh_quote(&bin));
+            let invocation = format!("{} --session {path}", sh_quote(&pi_bin()));
             let guarded = format!(
                 "if [ -f {path} ]; then {invocation}; else printf '%s\\n' 'Pi session file is missing' >&2; false; fi"
             );
             Ok(session_pane_cmd(&guarded, &invocation, "Pi", crate::tmux::socket().as_deref()))
         }
     }
+}
+
+fn pi_bin() -> String {
+    std::env::var("CCMUX_PI_BIN").ok()
+        .filter(|bin| !bin.trim().is_empty()).unwrap_or_else(|| "pi".into())
+}
+
+pub fn new_pi_pane_cmd(cwd: &str, path: &str) -> String {
+    let dir = Path::new(path).parent().expect("absolute Pi session path");
+    let invocation = format!(
+        "cd {} && {} --session-dir {} --session {}",
+        sh_quote(cwd), sh_quote(&pi_bin()), sh_quote(&dir.to_string_lossy()), sh_quote(path),
+    );
+    session_pane_cmd(&invocation, &invocation, "Pi", crate::tmux::socket().as_deref())
 }
 
 /// Shell command for a pane that attaches a background session.

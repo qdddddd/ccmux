@@ -147,7 +147,7 @@ impl CodexPoll {
 
 #[derive(Default)]
 pub(crate) struct PiPoll {
-    catalog: Option<crate::pi::Catalog>,
+    pub(super) catalog: Option<crate::pi::Catalog>,
     last_attempt: Option<Instant>,
     pub(super) force: bool,
 }

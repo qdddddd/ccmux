@@ -31,6 +31,23 @@ impl Catalog {
         Some(Self::new(std::path::absolute(root).ok()?, project_dirs))
     }
 
+    pub fn new_session_path(&self, cwd: &str) -> io::Result<String> {
+        let dir = if self.project_dirs {
+            // Match Pi's default per-project directory so its picker finds the session.
+            let project = cwd.trim_start_matches('/').replace(['/', '\\', ':'], "-");
+            self.root.join(format!("--{project}--"))
+        } else {
+            self.root.clone()
+        };
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let timestamp = Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
+        let id = u128::from_be_bytes(random);
+        let path = dir.join(format!("{timestamp}_ccmux-{id:032x}.jsonl"));
+        path.into_os_string().into_string().ok().filter(|path| valid_session_path(path))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid Pi session path"))
+    }
+
     pub(crate) fn new(root: PathBuf, project_dirs: bool) -> Self {
         Self {
             root,

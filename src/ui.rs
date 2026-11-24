@@ -143,8 +143,8 @@ impl Palette {
             // 5.74:1 ground, 4.75:1 band, ΔE 28.8 from `aqua`.
             aqua_elsewhere: Color::Rgb(0xa8, 0x99, 0x84),
             sel_bg: Color::Rgb(0xeb, 0xdb, 0xb2),
-            // Pale green; every row ink clears 4.0:1 on it (lowest: aqua 4.63).
-            unread_bg: Color::Rgb(0xe3, 0xec, 0xc1),
+            // Pi gruvbox-light's `toolSuccessBg`.
+            unread_bg: Color::Rgb(0xe3, 0xe2, 0xb6),
         }
     }
 
@@ -1197,7 +1197,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App, p: &Palette) {
         for &(key, text) in HINTS {
             let text = match (pi_selected, key) {
                 (true, "C-x") => "delete file",
-                (true, "n" | "L") => continue,
+                (true, "L") => continue,
                 _ => text,
             };
             let pair = display_width(key) + 1 + display_width(text);
@@ -1283,7 +1283,7 @@ const KEYS: &[(&str, &str)] = &[
     // two-second window is stated where it is actionable — the footer warning
     // that stands while it is open. `C-x` as on Codex's `C-x ×2` line below.
     ("C-x ×2", "delete + worktree"),
-    ("n", "new background session"),
+    ("n", "new session"),
     ("L", "logs for this session"),
     ("d", "hide row (pane stays)"),
     ("u", "undo the last hide"),
@@ -1431,9 +1431,11 @@ fn draw_prompt(f: &mut Frame, area: Rect, kind: PromptKind, prompt: Option<&Prom
     let title = match kind {
         PromptKind::NewBackground => " new background session ",
         PromptKind::NewCodex => " new Codex session ",
+        PromptKind::NewPi => " new Pi session ",
     };
     let labels: &[&str] = match kind {
         PromptKind::NewBackground | PromptKind::NewCodex => &["cwd ", "task"],
+        PromptKind::NewPi => &["cwd"],
     };
 
     let want_h = (labels.len() as u16).saturating_add(5);

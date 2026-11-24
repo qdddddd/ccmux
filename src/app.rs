@@ -300,9 +300,11 @@ enum KillRefused {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
-    /// `n` — two fields: 0 = cwd, 1 = task text.
+    /// `n` with a working directory and task.
     NewBackground,
     NewCodex,
+    /// `n` with a working directory for an interactive Pi pane.
+    NewPi,
 }
 
 impl PromptKind {
@@ -310,6 +312,7 @@ impl PromptKind {
         match self {
             Self::NewBackground => Provider::Claude,
             Self::NewCodex => Provider::Codex,
+            Self::NewPi => Provider::Pi,
         }
     }
 }
@@ -317,7 +320,7 @@ impl PromptKind {
 #[derive(Debug, Clone)]
 pub struct Prompt {
     pub kind: PromptKind,
-    /// `NewBackground`: ["<cwd>", "<task>"].
+    /// Working directory followed by the task field for background sessions.
     pub fields: Vec<String>,
     pub focus: usize,
     pub cursor: usize,
@@ -2158,6 +2161,14 @@ impl App {
     /// split `anchor`, record the pane, persist, even, pin, and say where it
     /// went.
     fn open_into(&mut self, sel: &Session, cmd: &str, anchor: &PaneId, dir: SplitDir) {
+        if let Err((text, level)) = self.split_session(sel, cmd, anchor, dir) {
+            self.flash(text, level);
+        }
+    }
+
+    fn split_session(
+        &mut self, sel: &Session, cmd: &str, anchor: &PaneId, dir: SplitDir,
+    ) -> Result<PaneId, (String, MsgLevel)> {
         let provider = sel.provider;
         let session_id = sel.session_id.clone();
         let short_id = sel.id.clone().unwrap_or_default();
@@ -2178,8 +2189,7 @@ impl App {
                     },
                 );
                 if !recorded {
-                    self.flash("provider conflict in pane map", MsgLevel::Warn);
-                    return;
+                    return Err(("provider conflict in pane map".into(), MsgLevel::Warn));
                 }
                 self.map_dirty = true;
                 // Refresh before flashing: the new pane's `#{pane_index}` only
@@ -2198,8 +2208,9 @@ impl App {
                     Some(i) => self.flash(format!("opened {label} in pane {i}"), MsgLevel::Info),
                     None => self.flash(format!("opened {label}"), MsgLevel::Info),
                 }
+                Ok(pane)
             }
-            Err(e) => self.flash(format!("split failed: {}", tmux_msg(&e)), MsgLevel::Error),
+            Err(e) => Err((format!("split failed: {}", tmux_msg(&e)), MsgLevel::Error)),
         }
     }
 
@@ -3930,8 +3941,7 @@ impl App {
         tabs
     }
 
-    /// `Enter` inside a prompt. SPEC §8.6 (§8.7, the interactive prompt, is
-    /// gone along with its `c` binding).
+    /// Submit the `n` prompt (SPEC §8.6).
     ///
     /// The cwd field is trimmed and `~`-expanded before any check, so the path
     /// the detail block renders (`~/x`) is also a path the operator may type.
@@ -3947,11 +3957,21 @@ impl App {
             return;
         };
 
+        if p.kind == PromptKind::NewPi {
+            if self.degraded {
+                self.flash("not inside tmux — Pi launch unavailable", MsgLevel::Warn);
+                return;
+            }
+            if self.pi.catalog.is_none() {
+                self.flash("Pi session directory unavailable", MsgLevel::Warn);
+                return;
+            }
+        }
+
         match p.kind {
-            PromptKind::NewBackground | PromptKind::NewCodex => {
-                let task = p.fields.get(1).cloned().unwrap_or_default();
-                let task = task.trim().to_string();
-                if task.is_empty() {
+            PromptKind::NewBackground | PromptKind::NewCodex | PromptKind::NewPi => {
+                let task = p.fields.get(1).map_or("", |task| task.trim());
+                if p.kind != PromptKind::NewPi && task.is_empty() {
                     self.flash("task cannot be empty", MsgLevel::Warn);
                     return; // stay in the prompt
                 }
@@ -3971,7 +3991,7 @@ impl App {
                     }
                 };
                 if Path::new(&cwd).is_dir() {
-                    self.dispatch_and_close(&cwd, &task, None);
+                    self.start_from_prompt(p.kind, &cwd, task, None);
                     return;
                 }
 
@@ -4016,7 +4036,7 @@ impl App {
                 if p.pending_create.as_deref() == Some(cwd.as_str()) {
                     // Second Enter on the SAME expanded path: create + dispatch.
                     match std::fs::create_dir(path) {
-                        Ok(()) => self.dispatch_and_close(&cwd, &task, Some(shown)),
+                        Ok(()) => self.start_from_prompt(p.kind, &cwd, task, Some(shown)),
                         Err(e) => {
                             // Name the path: the operator must know WHAT was
                             // not created without re-reading the field.
@@ -4035,6 +4055,58 @@ impl App {
                 }
             }
         }
+    }
+
+    fn start_from_prompt(&mut self, kind: PromptKind, cwd: &str, task: &str, created: Option<String>) {
+        if kind != PromptKind::NewPi {
+            self.dispatch_and_close(cwd, task, created);
+            return;
+        }
+
+        self.disarm_create();
+        match self.open_new_pi(cwd) {
+            Ok(()) => {
+                self.prompt = None;
+                self.mode = Mode::Normal;
+                self.pi.force = true;
+            }
+            Err(error) => {
+                let message = match created {
+                    Some(dir) => format!("created {dir}, but Pi launch failed: {error}"),
+                    None => format!("Pi launch failed: {error}"),
+                };
+                self.flash(message, MsgLevel::Error);
+            }
+        }
+    }
+
+    fn open_new_pi(&mut self, cwd: &str) -> Result<(), String> {
+        let cwd = Path::new(cwd).canonicalize().map_err(|error| error.to_string())?
+            .into_os_string().into_string().map_err(|_| "cwd is not UTF-8")?;
+        let catalog = self.pi.catalog.as_ref().ok_or("Pi session directory unavailable")?;
+        let path = catalog.new_session_path(&cwd).map_err(|error| error.to_string())?;
+        let cmd = agents::new_pi_pane_cmd(&cwd, &path);
+        self.refresh_panes();
+        let anchor = self.split_anchor().ok_or("no pane to split — sidebar unmapped")?;
+        let session = Session {
+            provider: Provider::Pi,
+            codex: None,
+            id: None,
+            session_id: path,
+            pid: None,
+            cwd,
+            kind: model::Kind::Interactive,
+            started_at: self.now_ms,
+            name: "Pi session".into(),
+            status: model::Status::Idle,
+            state: None,
+        };
+        let pane = self.split_session(&session, &cmd, &anchor, SplitDir::Vertical)
+            .map_err(|(text, _)| text)?;
+        if let Err(error) = tmux::select_pane(&self.tmux_session, &pane) {
+            self.flash(format!("opened Pi session, but focus failed: {}", tmux_msg(&error)), MsgLevel::Warn);
+        }
+        Ok(())
     }
 
     /// The one exit that dispatches: `agents::dispatch_background` through the
@@ -5121,12 +5193,9 @@ impl App {
                     .map(|p| p.to_string_lossy().into_owned())
             })
             .unwrap_or_default();
-        let fields = match kind {
-            PromptKind::NewBackground | PromptKind::NewCodex => vec![cwd, String::new()],
-        };
-        // §8.6: the task field starts empty and is focused.
-        let focus: usize = match kind {
-            PromptKind::NewBackground | PromptKind::NewCodex => 1,
+        let (fields, focus) = match kind {
+            PromptKind::NewBackground | PromptKind::NewCodex => (vec![cwd, String::new()], 1),
+            PromptKind::NewPi => (vec![cwd], 0),
         };
         let cursor = fields.get(focus).map(|s| s.chars().count()).unwrap_or(0);
         self.prompt = Some(Prompt {
@@ -5231,15 +5300,15 @@ impl App {
                 Action::Redraw
             }
             KeyCode::Char('n') => {
-                if self.selected_session().is_some_and(|s| s.provider == Provider::Pi)
-                    || matches!(self.rows.get(self.selected), Some(Row::Header { group: Group::Pi, .. }))
-                {
-                    self.flash("Use /new in Pi to start a conversation", MsgLevel::Info);
-                    return Action::Redraw;
-                }
-                let codex = self.selected_session().is_some_and(|s| s.provider == Provider::Codex)
-                    || matches!(self.rows.get(self.selected), Some(Row::Header { group: Group::Codex, .. }));
-                self.open_prompt(if codex { PromptKind::NewCodex } else { PromptKind::NewBackground });
+                let group = match self.rows.get(self.selected) {
+                    Some(Row::Header { group, .. }) => Some(*group),
+                    _ => self.selected_session().map(Session::group),
+                };
+                self.open_prompt(match group {
+                    Some(Group::Pi) => PromptKind::NewPi,
+                    Some(Group::Codex) => PromptKind::NewCodex,
+                    _ => PromptKind::NewBackground,
+                });
                 Action::Redraw
             }
             KeyCode::Char('L') => {
